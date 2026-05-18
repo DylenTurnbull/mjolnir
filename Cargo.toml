@@ -1,13 +1,14 @@
 [package]
-name = "brokk-tui"
+name = "hammer"
 version = "0.1.0"
 edition = "2024"
-description = "Terminal UI client for the Agent Client Protocol (ACP)"
+description = "Forge-grade terminal client for any Agent Client Protocol (ACP) server"
 license = "GPL-3.0"
+repository = "https://github.com/BrokkAi/hammer"
 publish = false
 
 [[bin]]
-name = "brokk-tui"
+name = "hammer"
 path = "src/main.rs"
 
 [dependencies]

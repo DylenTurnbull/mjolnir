@@ -296,7 +296,7 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         .unwrap_or_else(|| "no session".to_string());
     let mode = state.current_mode.as_deref().unwrap_or("-");
     let header = format!(
-        " brokk-tui | {} | session {} | mode {} ",
+        " hammer | {} | session {} | mode {} ",
         state.connection_status, session, mode
     );
     let p = Paragraph::new(header).style(Style::default().add_modifier(Modifier::REVERSED));

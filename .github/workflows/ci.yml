@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [ 'master', 'ci/**' ]
+  pull_request:
+    branches: [ 'master' ]
+
+jobs:
+  hammer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Cache cargo registry and build
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-hammer-cargo-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-hammer-cargo-
+
+    - name: Check Rust formatting
+      run: cargo fmt --check
+
+    - name: Run Clippy lints
+      run: cargo clippy --all-targets -- -D warnings
+
+    - name: Build hammer
+      run: cargo build --release
+
+    - name: Run tests
+      run: cargo test
