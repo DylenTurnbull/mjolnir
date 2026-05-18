@@ -1,4 +1,4 @@
-//! hammer: an interactive terminal client for an ACP-speaking agent.
+//! mjolnir: an interactive terminal client for an ACP-speaking agent.
 //!
 //! Spawns the agent as a child process, talks JSON-RPC over its stdio,
 //! and renders the session in a ratatui chat UI.
@@ -15,7 +15,7 @@ use clap::Parser;
 use tokio::sync::mpsc;
 
 #[derive(Parser)]
-#[command(name = "hammer", version, about = "Interactive ACP chat TUI")]
+#[command(name = "mj", version, about = "Interactive ACP chat TUI")]
 struct Cli {
     /// Command to spawn the ACP agent. Parsed with shell-words so quoted
     /// arguments are honored. Defaults to `brokk-acp` on PATH.
