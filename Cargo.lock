@@ -576,24 +576,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hammer"
-version = "0.1.0"
-dependencies = [
- "agent-client-protocol",
- "anyhow",
- "clap",
- "crossterm",
- "futures",
- "ratatui",
- "serde_json",
- "shell-words",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -825,6 +807,24 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mjolnir"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "clap",
+ "crossterm",
+ "futures",
+ "ratatui",
+ "serde_json",
+ "shell-words",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -7,7 +7,7 @@ on:
     branches: [ 'master' ]
 
 jobs:
-  hammer:
+  mjolnir:
     strategy:
       fail-fast: false
       matrix:
@@ -29,9 +29,9 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-hammer-cargo-${{ hashFiles('Cargo.lock') }}
+        key: ${{ runner.os }}-mjolnir-cargo-${{ hashFiles('Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-hammer-cargo-
+          ${{ runner.os }}-mjolnir-cargo-
 
     - name: Check Rust formatting
       run: cargo fmt --check
@@ -39,7 +39,7 @@ jobs:
     - name: Run Clippy lints
       run: cargo clippy --all-targets -- -D warnings
 
-    - name: Build hammer
+    - name: Build mjolnir
       run: cargo build --release
 
     - name: Run tests

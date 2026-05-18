@@ -1,14 +1,14 @@
 [package]
-name = "hammer"
+name = "mjolnir"
 version = "0.1.0"
 edition = "2024"
 description = "Forge-grade terminal client for any Agent Client Protocol (ACP) server"
 license = "GPL-3.0"
-repository = "https://github.com/BrokkAi/hammer"
+repository = "https://github.com/BrokkAi/mjolnir"
 publish = false
 
 [[bin]]
-name = "hammer"
+name = "mj"
 path = "src/main.rs"
 
 [dependencies]
