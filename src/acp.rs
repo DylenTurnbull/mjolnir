@@ -160,27 +160,11 @@ async fn drive_session(
     while let Some(cmd) = ui_rx.recv().await {
         match cmd {
             UiCommand::SendPrompt { text } => {
-                let req = PromptRequest::new(
-                    session_id.clone(),
-                    vec![ContentBlock::Text(TextContent::new(text))],
-                );
-                match conn.send_request(req).block_task().await {
-                    Ok(resp) => {
-                        let _ = ui_tx.send(UiEvent::PromptDone {
-                            stop_reason: resp.stop_reason,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = ui_tx.send(UiEvent::Warning(format!("prompt failed: {e}")));
-                    }
+                if !drive_prompt_turn(&conn, &session_id, text, ui_tx, ui_rx).await? {
+                    break;
                 }
             }
-            UiCommand::CancelPrompt => {
-                if let Err(e) = conn.send_notification(CancelNotification::new(session_id.clone()))
-                {
-                    let _ = ui_tx.send(UiEvent::Warning(format!("cancel failed: {e}")));
-                }
-            }
+            UiCommand::CancelPrompt => {}
             UiCommand::Shutdown => break,
         }
     }
@@ -198,8 +182,10 @@ fn spawn_agent(
 )> {
     let mut cmd = Command::new(command);
     cmd.args(args);
+    // If the runtime task is aborted, dropping the child should still terminate it.
     cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true);
     match stderr_path {
         Some(path) => {
             let file = std::fs::OpenOptions::new()
@@ -221,6 +207,60 @@ fn spawn_agent(
     Ok((child, stdin, stdout))
 }
 
+async fn drive_prompt_turn(
+    conn: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    text: String,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
+) -> Result<bool> {
+    let req = PromptRequest::new(
+        session_id.clone(),
+        vec![ContentBlock::Text(TextContent::new(text))],
+    );
+    let prompt = conn.send_request(req).block_task();
+    tokio::pin!(prompt);
+
+    let mut cancel_sent = false;
+    loop {
+        tokio::select! {
+            prompt_result = &mut prompt => {
+                match prompt_result {
+                    Ok(resp) => {
+                        let _ = ui_tx.send(UiEvent::PromptDone {
+                            stop_reason: resp.stop_reason,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = ui_tx.send(UiEvent::Warning(format!("prompt failed: {e}")));
+                    }
+                }
+                return Ok(true);
+            }
+            maybe_cmd = ui_rx.recv() => {
+                match maybe_cmd {
+                    Some(UiCommand::CancelPrompt) => {
+                        if !cancel_sent {
+                            if let Err(e) = conn.send_notification(CancelNotification::new(session_id.clone())) {
+                                let _ = ui_tx.send(UiEvent::Warning(format!("cancel failed: {e}")));
+                            }
+                            cancel_sent = true;
+                        }
+                    }
+                    Some(UiCommand::Shutdown) | None => {
+                        return Ok(false);
+                    }
+                    Some(UiCommand::SendPrompt { .. }) => {
+                        let _ = ui_tx.send(UiEvent::Warning(
+                            "prompt already in flight".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +268,10 @@ mod tests {
     use agent_client_protocol::schema::{
         ContentBlock, ContentChunk, InitializeResponse, NewSessionResponse, PromptResponse,
         SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
     use tokio::io::split;
@@ -277,6 +321,66 @@ mod tests {
             )
             .connect_with(transport, |_cx| async move {
                 // Keep the agent alive until the client side closes.
+                futures::future::pending::<()>().await;
+                Ok(())
+            })
+            .await;
+    }
+
+    async fn run_mock_agent_with_cancel(
+        stream: tokio::io::DuplexStream,
+        cancel_hits: Arc<AtomicUsize>,
+    ) {
+        let (r, w) = split(stream);
+        let transport = ByteStreams::new(w.compat_write(), r.compat());
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_rx_for_prompt = cancel_rx.clone();
+        let cancel_tx_for_notification = cancel_tx.clone();
+        let cancel_hits_for_notification = cancel_hits.clone();
+        let _ = AgentRole
+            .builder()
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::InitializeRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(InitializeResponse::new(
+                        agent_client_protocol::schema::ProtocolVersion::V1,
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::NewSessionRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(NewSessionResponse::new(SessionId::new("test-session")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::PromptRequest, responder, _cx| {
+                    let mut cancel_rx = cancel_rx_for_prompt.clone();
+                    tokio::spawn(async move {
+                        while !*cancel_rx.borrow() {
+                            if cancel_rx.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                        let _ = responder.respond(PromptResponse::new(StopReason::Cancelled));
+                    });
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_notification(
+                async move |_notif: agent_client_protocol::schema::CancelNotification, _cx| {
+                    cancel_hits_for_notification.fetch_add(1, Ordering::SeqCst);
+                    let _ = cancel_tx_for_notification.send(true);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(transport, |_cx| async move {
                 futures::future::pending::<()>().await;
                 Ok(())
             })
@@ -348,6 +452,74 @@ mod tests {
 
         cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
         let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
+        agent_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_cancel_notification_is_forwarded() {
+        let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
+
+        let cancel_hits = Arc::new(AtomicUsize::new(0));
+        let agent_task = tokio::spawn(run_mock_agent_with_cancel(agent_side, cancel_hits.clone()));
+
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        let client_task = tokio::spawn(drive_client(
+            client_transport,
+            std::env::temp_dir(),
+            ui_tx,
+            cmd_rx,
+        ));
+
+        let mut saw_connected = false;
+        let mut saw_session = false;
+        while !(saw_connected && saw_session) {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timeout waiting for handshake")
+                .expect("channel closed");
+            match ev {
+                UiEvent::Connected { .. } => saw_connected = true,
+                UiEvent::SessionStarted { .. } => saw_session = true,
+                UiEvent::Warning(_) | UiEvent::Fatal(_) => panic!("unexpected: {ev:?}"),
+                _ => {}
+            }
+        }
+
+        cmd_tx
+            .send(UiCommand::SendPrompt {
+                text: "hello".to_string(),
+            })
+            .expect("send prompt");
+        cmd_tx.send(UiCommand::CancelPrompt).expect("send cancel");
+
+        let mut saw_cancelled = false;
+        while !saw_cancelled {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timeout waiting for cancelled prompt")
+                .expect("channel closed");
+            match ev {
+                UiEvent::PromptDone { stop_reason } => {
+                    assert!(matches!(stop_reason, StopReason::Cancelled));
+                    saw_cancelled = true;
+                }
+                UiEvent::Warning(_) | UiEvent::Fatal(_) => panic!("unexpected: {ev:?}"),
+                _ => {}
+            }
+        }
+
+        assert_eq!(cancel_hits.load(Ordering::SeqCst), 1);
+
+        cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
+        let join = tokio::time::timeout(Duration::from_secs(2), client_task)
+            .await
+            .expect("drive_client did not return after shutdown");
+        join.expect("client task panicked")
+            .expect("drive_client returned error");
         agent_task.abort();
     }
 
