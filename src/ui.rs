@@ -41,17 +41,17 @@ struct TranscriptScrollState {
 impl TranscriptScrollState {
     /// Preserve the visible transcript when new wrapped lines arrive
     /// or the terminal is resized.
-    fn reconcile(&mut self, scroll_offset: &mut u16, rendered_lines: usize, visible_rows: u16) {
+    fn reconcile(&mut self, scroll_offset: &mut usize, rendered_lines: usize, visible_rows: u16) {
         if let Some((previous_lines, previous_visible_rows)) = self.last_rendered_lines
             && *scroll_offset > 0
         {
             let previous_top = previous_lines
                 .saturating_sub(previous_visible_rows as usize)
-                .saturating_sub(*scroll_offset as usize);
+                .saturating_sub(*scroll_offset);
             let current_top = rendered_lines.saturating_sub(visible_rows as usize);
             let preserved_top = previous_top.min(current_top);
             let next_offset = current_top.saturating_sub(preserved_top);
-            *scroll_offset = next_offset.min(u16::MAX as usize) as u16;
+            *scroll_offset = next_offset;
         }
         self.last_rendered_lines = Some((rendered_lines, visible_rows));
     }
@@ -373,7 +373,7 @@ fn draw_transcript(
     transcript_scroll.reconcile(&mut state.scroll_offset, total, inner.height);
     let top = total
         .saturating_sub(inner.height as usize)
-        .saturating_sub(state.scroll_offset as usize)
+        .saturating_sub(state.scroll_offset)
         .min(u16::MAX as usize) as u16;
     let paragraph = paragraph.scroll((top, 0));
     f.render_widget(paragraph, inner);
@@ -688,6 +688,34 @@ mod tests {
     }
 
     #[test]
+    fn runtime_closed_ignores_text_input() {
+        let mut state = AppState::new();
+        state.runtime_closed = true;
+        state.input = "keep".to_string();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('x')));
+
+        assert_eq!(state.input, "keep");
+        assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn runtime_closed_quits_on_ctrl_c() {
+        let mut state = AppState::new();
+        state.runtime_closed = true;
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            CtEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        );
+
+        assert!(state.should_quit);
+    }
+
+    #[test]
     fn transcript_scroll_stays_pinned_to_bottom_when_following() {
         let mut tracker = TranscriptScrollState::default();
         let mut offset = 0;
@@ -723,6 +751,18 @@ mod tests {
     }
 
     #[test]
+    fn transcript_scroll_reconciles_offsets_above_u16_max() {
+        let mut tracker = TranscriptScrollState::default();
+        let mut offset = 0;
+
+        tracker.reconcile(&mut offset, 80_000, 24);
+        offset = u16::MAX as usize + 5;
+        tracker.reconcile(&mut offset, 80_050, 24);
+
+        assert_eq!(offset, u16::MAX as usize + 55);
+    }
+
+    #[test]
     fn runtime_closed_keeps_transcript_scrolling_active() {
         let mut state = AppState::new();
         state.runtime_closed = true;
@@ -735,33 +775,5 @@ mod tests {
         handle_crossterm(&mut state, &cmd_tx, key(KeyCode::PageDown));
         assert_eq!(state.scroll_offset, 0);
         assert!(!state.should_quit);
-    }
-
-    #[test]
-    fn runtime_closed_ignores_text_input() {
-        let mut state = AppState::new();
-        state.runtime_closed = true;
-        state.input = "keep".to_string();
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-
-        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('x')));
-
-        assert_eq!(state.input, "keep");
-        assert!(!state.should_quit);
-    }
-
-    #[test]
-    fn runtime_closed_quits_on_ctrl_c() {
-        let mut state = AppState::new();
-        state.runtime_closed = true;
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-
-        handle_crossterm(
-            &mut state,
-            &cmd_tx,
-            CtEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-        );
-
-        assert!(state.should_quit);
     }
 }
