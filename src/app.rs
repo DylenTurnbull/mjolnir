@@ -1,10 +1,10 @@
 //! UI state machine.
 //!
 //! Holds the transcript, current tool-call table, input buffer, and the
-//! at-most-one pending permission prompt. Every incoming ACP event is
+//! FIFO queue of pending permission prompts. Every incoming ACP event is
 //! folded in through `apply_event`; ratatui then renders from this state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use agent_client_protocol::schema::{
     AvailableCommand, Plan, PlanEntry, SessionConfigId, SessionConfigKind, SessionConfigOption,
@@ -13,7 +13,7 @@ use agent_client_protocol::schema::{
     ToolCallUpdate, ToolKind,
 };
 
-use crate::event::{PermissionPrompt, UiEvent, content_block_text};
+use crate::event::{PermissionDecision, PermissionPrompt, UiEvent, content_block_text};
 
 /// How the UI loop ends, so `main` can decide whether to quit entirely
 /// or restart the session with a different agent.
@@ -113,6 +113,30 @@ pub enum TurnState {
     Streaming,
 }
 
+/// Lifecycle of the ACP connection from launch through shutdown.
+///
+/// Driven by `UiEvent`s from the ACP runtime plus a couple of UI-initiated
+/// transitions (`record_user_prompt`, `mark_cancelling`). The header label
+/// is derived from this state, so it doubles as the externally visible
+/// connection indicator described in PLANS.md M1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// Agent process is being spawned and `initialize` is in flight.
+    Launching,
+    /// `initialize` succeeded; `session/new` is in flight.
+    Initializing,
+    /// Session is open and accepting prompts.
+    Ready,
+    /// A prompt turn is streaming responses.
+    Streaming,
+    /// Cancellation was requested; awaiting the final `PromptDone`.
+    Cancelling,
+    /// Runtime shut down cleanly (UI quit or agent EOF).
+    Closed,
+    /// Runtime ended with a fatal error.
+    Fatal,
+}
+
 /// Severity attached to transient status text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
@@ -155,7 +179,7 @@ impl StatusMessage {
 pub struct AppState {
     pub agent_label: String,
     pub session_id: Option<String>,
-    pub connection_status: String,
+    pub connection_state: ConnectionState,
     pub current_mode: Option<String>,
     pub available_commands: Vec<AvailableCommand>,
     pub session_config_options: Vec<SessionConfigOption>,
@@ -163,7 +187,16 @@ pub struct AppState {
     pub tool_calls: HashMap<String, ToolCallView>,
     pub input: String,
     pub turn: TurnState,
-    pub pending_permission: Option<PendingPermission>,
+    /// FIFO queue of permission prompts. The front element is the one
+    /// currently shown in the modal; new requests are pushed to the back
+    /// so they aren't silently dropped when one is already on screen.
+    ///
+    /// Private so callers can't accidentally bypass the queue invariants
+    /// (e.g. push without going through `apply_event`, or take without
+    /// answering the responder). External code goes through
+    /// `has_pending_permission` / `pending_permission` /
+    /// `take_pending_permission` / `cancel_all_pending_permissions`.
+    permission_queue: VecDeque<PendingPermission>,
     pub config_picker: Option<ConfigPicker>,
     /// Scroll offset measured in rendered lines from the bottom of the
     /// transcript. `0` keeps the view pinned to the newest line.
@@ -207,7 +240,7 @@ impl AppState {
         Self {
             agent_label: String::new(),
             session_id: None,
-            connection_status: "connecting...".to_string(),
+            connection_state: ConnectionState::Launching,
             current_mode: None,
             available_commands: Vec::new(),
             session_config_options: Vec::new(),
@@ -215,7 +248,7 @@ impl AppState {
             tool_calls: HashMap::new(),
             input: String::new(),
             turn: TurnState::Idle,
-            pending_permission: None,
+            permission_queue: VecDeque::new(),
             config_picker: None,
             scroll_offset: 0,
             exit_reason: None,
@@ -236,10 +269,15 @@ impl AppState {
     pub fn mark_runtime_closed(&mut self) {
         self.runtime_closed = true;
         self.turn = TurnState::Idle;
-        self.pending_permission = None;
+        self.cancel_all_pending_permissions();
         self.config_picker = None;
         self.autocomplete = Autocomplete::default();
-        self.connection_status = "disconnected".to_string();
+        // Preserve Fatal: a fatal event always supersedes a clean close,
+        // since the channel-drop that triggers this method follows the
+        // Fatal event by design.
+        if self.connection_state != ConnectionState::Fatal {
+            self.connection_state = ConnectionState::Closed;
+        }
 
         let is_fatal = matches!(
             self.status_line,
@@ -255,11 +293,63 @@ impl AppState {
         }
     }
 
+    /// Note that the user has requested cancellation of the in-flight
+    /// prompt. Idempotent and only meaningful while `Streaming`.
+    pub fn mark_cancelling(&mut self) {
+        if self.connection_state == ConnectionState::Streaming {
+            self.connection_state = ConnectionState::Cancelling;
+        }
+    }
+
+    /// The permission prompt the UI should currently render, if any.
+    pub fn pending_permission(&self) -> Option<&PendingPermission> {
+        self.permission_queue.front()
+    }
+
+    /// Mutable accessor for the front prompt (used to move the option
+    /// cursor without removing it from the queue).
+    pub fn pending_permission_mut(&mut self) -> Option<&mut PendingPermission> {
+        self.permission_queue.front_mut()
+    }
+
+    /// True when there is at least one queued permission prompt.
+    pub fn has_pending_permission(&self) -> bool {
+        !self.permission_queue.is_empty()
+    }
+
+    /// Number of prompts queued, including the one currently displayed.
+    pub fn pending_permission_count(&self) -> usize {
+        self.permission_queue.len()
+    }
+
+    /// Pop the currently-displayed prompt off the front of the queue.
+    /// The caller is responsible for sending a decision through the
+    /// `prompt.responder` before dropping it.
+    pub fn take_pending_permission(&mut self) -> Option<PendingPermission> {
+        self.permission_queue.pop_front()
+    }
+
+    /// Drain every queued permission prompt and send `Cancelled` through
+    /// each responder. Used during fatal shutdown / runtime close.
+    ///
+    /// Note: the agent doesn't observe a difference between this and
+    /// dropping the senders -- by the time we reach this method the ACP
+    /// transport has typically already closed, and the receiver side maps
+    /// both `Ok(Cancelled)` and `Err(RecvError)` to the same outcome. The
+    /// explicit send is for code-clarity at the call site (intentional
+    /// cancel vs. accidental drop), not for any wire-level guarantee.
+    pub fn cancel_all_pending_permissions(&mut self) {
+        while let Some(pending) = self.permission_queue.pop_front() {
+            let _ = pending.prompt.responder.send(PermissionDecision::Cancelled);
+        }
+    }
+
     /// Push a user prompt into the transcript immediately, before the
     /// command reaches the runtime. Keeps the UI responsive.
     pub fn record_user_prompt(&mut self, text: String) {
         self.transcript.push(Entry::UserPrompt(text));
         self.turn = TurnState::Streaming;
+        self.connection_state = ConnectionState::Streaming;
         self.scroll_offset = 0;
         // Sending the prompt clears the input; tear down any open
         // autocomplete popover so it doesn't linger over an empty buffer.
@@ -359,7 +449,7 @@ impl AppState {
     /// usually significant, for example when it groups commands by category).
     pub fn update_autocomplete(&mut self) {
         let trigger_active = self.input.starts_with('/')
-            && self.pending_permission.is_none()
+            && !self.has_pending_permission()
             && self.config_picker.is_none()
             && self.turn == TurnState::Idle;
         if !trigger_active {
@@ -465,15 +555,19 @@ impl AppState {
                     (Some(n), None) => n,
                     _ => "agent".to_string(),
                 };
-                self.connection_status = format!("connected to {}", self.agent_label);
+                self.connection_state = ConnectionState::Initializing;
             }
             UiEvent::SessionStarted { session_id } => {
                 self.session_id = Some(session_id);
-                self.connection_status = format!("session ready ({})", self.agent_label);
+                self.connection_state = ConnectionState::Ready;
             }
             UiEvent::SessionUpdate(u) => self.apply_session_update(u),
             UiEvent::PermissionRequest(prompt) => {
-                self.pending_permission = Some(PendingPermission {
+                // Append to the queue rather than replacing the current
+                // pending prompt: overwriting would drop the prior
+                // oneshot responder, which the agent reads as a silent
+                // cancel even though the user never saw it.
+                self.permission_queue.push_back(PendingPermission {
                     prompt,
                     selected: 0,
                 });
@@ -481,6 +575,15 @@ impl AppState {
             }
             UiEvent::PromptDone { stop_reason } => {
                 self.turn = TurnState::Idle;
+                // Drop out of Streaming/Cancelling and back to Ready when
+                // the turn lands. Leave non-prompt states (Fatal, Closed,
+                // unexpected Ready) untouched.
+                if matches!(
+                    self.connection_state,
+                    ConnectionState::Streaming | ConnectionState::Cancelling
+                ) {
+                    self.connection_state = ConnectionState::Ready;
+                }
                 self.set_status_line(StatusKind::Info, format!("turn done: {stop_reason:?}"));
                 self.update_autocomplete();
             }
@@ -489,7 +592,7 @@ impl AppState {
             }
             UiEvent::Fatal(msg) => {
                 self.transcript.push(Entry::System(format!("fatal: {msg}")));
-                self.connection_status = "disconnected".to_string();
+                self.connection_state = ConnectionState::Fatal;
                 self.turn = TurnState::Idle;
                 self.status_line = Some(StatusMessage::fatal(msg));
                 self.mark_runtime_closed();
@@ -817,8 +920,10 @@ pub fn stop_reason_label(reason: StopReason) -> &'static str {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::{
-        ConfigOptionUpdate, ContentBlock, ContentChunk, PermissionOption, PermissionOptionKind,
-        SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, TextContent,
+        AudioContent, ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff,
+        EmbeddedResource, EmbeddedResourceResource, ImageContent, PermissionOption,
+        PermissionOptionKind, ResourceLink, SessionConfigOption, SessionConfigOptionCategory,
+        SessionConfigSelectOption, Terminal, TextContent, TextResourceContents,
     };
 
     fn text_chunk(s: &str) -> ContentChunk {
@@ -881,20 +986,138 @@ mod tests {
     }
 
     #[test]
+    fn content_block_variants_render_with_visible_placeholders() {
+        // PLANS.md M2 calls for ContentBlock variants beyond Text to
+        // degrade visibly instead of silently panicking. This pumps each
+        // known variant through `AgentMessageChunk` and asserts the
+        // transcript shows a labelled placeholder so the user knows
+        // something was sent even if we can't render it inline yet.
+        let blocks: Vec<(ContentBlock, &str)> = vec![
+            (ContentBlock::Text(TextContent::new("hi")), "hi"),
+            (
+                ContentBlock::Image(ImageContent::new("data", "image/png")),
+                "[image]",
+            ),
+            (
+                ContentBlock::Audio(AudioContent::new("data", "audio/wav")),
+                "[audio]",
+            ),
+            (
+                ContentBlock::ResourceLink(ResourceLink::new("readme", "file:///readme.md")),
+                "[link file:///readme.md]",
+            ),
+            (
+                ContentBlock::Resource(EmbeddedResource::new(
+                    EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
+                        "snippet",
+                        "file:///snippet.txt",
+                    )),
+                )),
+                "[resource]",
+            ),
+        ];
+
+        for (block, expected_substring) in blocks {
+            let mut s = AppState::new();
+            s.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(block.clone()),
+            )));
+            assert_eq!(
+                s.transcript.len(),
+                1,
+                "block {block:?} produced an empty transcript"
+            );
+            match &s.transcript[0] {
+                Entry::AgentMessage(text) => assert!(
+                    text.contains(expected_substring),
+                    "block {block:?} rendered as {text:?}, expected substring {expected_substring:?}"
+                ),
+                other => panic!("block {block:?} produced unexpected entry: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn agent_chunks_keep_folding_while_permission_modal_is_open() {
+        // The permission modal owns the keyboard but must NOT block the
+        // ACP event pipeline -- chunks streamed concurrently with the
+        // prompt that triggered the modal still belong in the transcript.
+        // Otherwise scrolling back to read what led to the prompt would
+        // show a gap.
+        let mut s = AppState::new();
+        let (prompt, _rx) = permission_prompt_with_id("call-1");
+        s.apply_event(UiEvent::PermissionRequest(prompt));
+        assert!(s.has_pending_permission());
+
+        s.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk("thinking..."),
+        )));
+
+        assert!(s.has_pending_permission(), "modal must remain queued");
+        assert_eq!(s.transcript.len(), 1);
+        match &s.transcript[0] {
+            Entry::AgentMessage(text) => assert_eq!(text, "thinking..."),
+            other => panic!("unexpected entry: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_content_diff_and_terminal_render_as_placeholders() {
+        // Diff and Terminal variants don't have inline rendering yet
+        // (M2 territory) but they must not panic and must show *some*
+        // labelled placeholder so the user knows the tool produced
+        // structured output.
+        let mut s = AppState::new();
+        let mut fields = agent_client_protocol::schema::ToolCallUpdateFields::default();
+        fields.content = Some(vec![
+            ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(
+                "stdout: ok",
+            )))),
+            ToolCallContent::Diff(Diff::new("/tmp/file.rs", "new contents")),
+            ToolCallContent::Terminal(Terminal::new(
+                agent_client_protocol::schema::TerminalId::new("term-1"),
+            )),
+        ]);
+        let update = ToolCallUpdate::new("call-1", fields);
+        s.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(
+            update,
+        )));
+
+        let view = s.tool_calls.get("call-1").expect("view");
+        assert_eq!(view.body.len(), 3);
+        assert!(
+            view.body[0].contains("stdout: ok"),
+            "expected text content, got {:?}",
+            view.body[0]
+        );
+        assert!(
+            view.body[1].contains("[diff"),
+            "expected diff placeholder, got {:?}",
+            view.body[1]
+        );
+        assert!(
+            view.body[2].contains("[terminal"),
+            "expected terminal placeholder, got {:?}",
+            view.body[2]
+        );
+    }
+
+    #[test]
     fn fatal_event_sets_fatal_status_and_closes_runtime() {
         let mut s = AppState::new();
         s.autocomplete.visible = true;
-        s.pending_permission = Some(PendingPermission {
-            prompt: permission_prompt(),
-            selected: 0,
-        });
+        // Queue a real permission prompt via the production event path
+        // rather than poking the field directly; same shape as what the
+        // runtime would send.
+        s.apply_event(UiEvent::PermissionRequest(permission_prompt()));
+        assert!(s.has_pending_permission());
 
         s.apply_event(UiEvent::Fatal("boom".to_string()));
 
         assert!(s.runtime_closed);
         assert_eq!(s.turn, TurnState::Idle);
-        assert_eq!(s.connection_status, "disconnected");
-        assert!(s.pending_permission.is_none());
+        assert_eq!(s.connection_state, ConnectionState::Fatal);
+        assert!(!s.has_pending_permission());
         assert!(!s.autocomplete.visible);
         assert_eq!(s.transcript.len(), 1);
         match &s.transcript[0] {
@@ -1061,7 +1284,10 @@ mod tests {
         s.mark_runtime_closed();
 
         assert!(s.runtime_closed);
-        assert_eq!(s.connection_status, "disconnected");
+        // A pre-existing Fatal status must outlast the clean-close path:
+        // otherwise the user gets a generic "disconnected" instead of the
+        // real error.
+        assert_eq!(s.connection_state, ConnectionState::Closed);
         let status = s.status_line.expect("status");
         assert_eq!(status.kind, StatusKind::Fatal);
         assert_eq!(status.text, "boom");
@@ -1078,6 +1304,166 @@ mod tests {
         let status = s.status_line.expect("status");
         assert_eq!(status.kind, StatusKind::Info);
         assert_eq!(status.text, "acp runtime closed; press Ctrl-C to quit");
+    }
+
+    #[test]
+    fn connection_state_progresses_through_launch_to_streaming_to_ready() {
+        let mut s = AppState::new();
+        assert_eq!(s.connection_state, ConnectionState::Launching);
+
+        s.apply_event(UiEvent::Connected {
+            agent_name: Some("anvil".into()),
+            agent_version: Some("0.1".into()),
+        });
+        assert_eq!(s.connection_state, ConnectionState::Initializing);
+
+        s.apply_event(UiEvent::SessionStarted {
+            session_id: "sess-1".into(),
+        });
+        assert_eq!(s.connection_state, ConnectionState::Ready);
+
+        s.record_user_prompt("hi".to_string());
+        assert_eq!(s.connection_state, ConnectionState::Streaming);
+
+        s.mark_cancelling();
+        assert_eq!(s.connection_state, ConnectionState::Cancelling);
+
+        s.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::Cancelled,
+        });
+        assert_eq!(s.connection_state, ConnectionState::Ready);
+        assert_eq!(s.turn, TurnState::Idle);
+    }
+
+    #[test]
+    fn mark_cancelling_is_noop_outside_streaming() {
+        // Cancelling is only meaningful while a prompt is in flight; from
+        // Ready, a stray Ctrl-C must not lie about the connection state.
+        let mut s = AppState::new();
+        s.apply_event(UiEvent::Connected {
+            agent_name: Some("anvil".into()),
+            agent_version: None,
+        });
+        s.apply_event(UiEvent::SessionStarted {
+            session_id: "sess-1".into(),
+        });
+        assert_eq!(s.connection_state, ConnectionState::Ready);
+
+        s.mark_cancelling();
+        assert_eq!(s.connection_state, ConnectionState::Ready);
+    }
+
+    #[test]
+    fn fatal_state_outlasts_runtime_close() {
+        // Fatal arrives via UiEvent::Fatal, which internally calls
+        // mark_runtime_closed. A subsequent mark_runtime_closed (the
+        // channel-drop path in ui_loop) must not downgrade Fatal to Closed.
+        let mut s = AppState::new();
+        s.apply_event(UiEvent::Fatal("kaboom".to_string()));
+        assert_eq!(s.connection_state, ConnectionState::Fatal);
+
+        s.mark_runtime_closed();
+        assert_eq!(s.connection_state, ConnectionState::Fatal);
+    }
+
+    #[test]
+    fn permission_request_queues_behind_existing_modal() {
+        // Two consecutive PermissionRequest events must enqueue rather
+        // than replace. Overwriting would drop the prior oneshot, which
+        // the agent reads as a silent cancel even though the user never
+        // saw that prompt.
+        let mut s = AppState::new();
+        let (prompt_a, _rx_a) = permission_prompt_with_id("call-a");
+        let (prompt_b, _rx_b) = permission_prompt_with_id("call-b");
+
+        s.apply_event(UiEvent::PermissionRequest(prompt_a));
+        s.apply_event(UiEvent::PermissionRequest(prompt_b));
+
+        assert!(s.has_pending_permission());
+        assert_eq!(s.pending_permission_count(), 2);
+        assert_eq!(
+            s.pending_permission()
+                .expect("front")
+                .prompt
+                .tool_call
+                .tool_call_id
+                .to_string(),
+            "call-a",
+            "the first-enqueued prompt must remain at the front",
+        );
+    }
+
+    #[test]
+    fn permission_queue_is_fifo_and_routes_decisions_to_the_right_prompt() {
+        // Verify both FIFO order (A is at the front before B) and that
+        // the responder we send a decision through belongs to the prompt
+        // the user just saw, not a later one in the queue.
+        let mut s = AppState::new();
+        let (prompt_a, rx_a) = permission_prompt_with_id("call-a");
+        let (prompt_b, rx_b) = permission_prompt_with_id("call-b");
+
+        s.apply_event(UiEvent::PermissionRequest(prompt_a));
+        s.apply_event(UiEvent::PermissionRequest(prompt_b));
+
+        let front_a = s.take_pending_permission().expect("front a");
+        assert_eq!(front_a.prompt.tool_call.tool_call_id.to_string(), "call-a");
+        let _ = front_a
+            .prompt
+            .responder
+            .send(PermissionDecision::Selected("allow".into()));
+        match rx_a.blocking_recv() {
+            Ok(PermissionDecision::Selected(id)) => assert_eq!(id, "allow"),
+            other => panic!("rx_a expected Selected, got {other:?}"),
+        }
+
+        let front_b = s.take_pending_permission().expect("front b");
+        assert_eq!(front_b.prompt.tool_call.tool_call_id.to_string(), "call-b");
+        let _ = front_b.prompt.responder.send(PermissionDecision::Cancelled);
+        match rx_b.blocking_recv() {
+            Ok(PermissionDecision::Cancelled) => {}
+            other => panic!("rx_b expected Cancelled, got {other:?}"),
+        }
+
+        assert!(!s.has_pending_permission());
+    }
+
+    #[test]
+    fn runtime_close_cancels_all_queued_permissions() {
+        // Closing the runtime while prompts are queued must cancel every
+        // one of them explicitly so the agent sees a deterministic
+        // outcome instead of inferring "cancelled" from a dropped sender.
+        let mut s = AppState::new();
+        let (prompt_a, rx_a) = permission_prompt_with_id("call-a");
+        let (prompt_b, rx_b) = permission_prompt_with_id("call-b");
+
+        s.apply_event(UiEvent::PermissionRequest(prompt_a));
+        s.apply_event(UiEvent::PermissionRequest(prompt_b));
+
+        s.mark_runtime_closed();
+
+        assert!(!s.has_pending_permission());
+        assert!(matches!(
+            rx_a.blocking_recv(),
+            Ok(PermissionDecision::Cancelled)
+        ));
+        assert!(matches!(
+            rx_b.blocking_recv(),
+            Ok(PermissionDecision::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn prompt_done_after_fatal_does_not_resurrect_ready() {
+        // A stray PromptDone arriving after Fatal (e.g. queued before the
+        // fatal error propagated) must not flip the lifecycle back to
+        // Ready; Fatal sticks until the user quits.
+        let mut s = AppState::new();
+        s.apply_event(UiEvent::Fatal("kaboom".to_string()));
+
+        s.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+        });
+        assert_eq!(s.connection_state, ConnectionState::Fatal);
     }
 
     #[test]
@@ -1127,10 +1513,25 @@ mod tests {
     }
 
     fn permission_prompt() -> PermissionPrompt {
-        let (responder, _rx) = tokio::sync::oneshot::channel();
-        PermissionPrompt {
+        let (prompt, _rx) = permission_prompt_with_id("call-1");
+        prompt
+    }
+
+    /// Build a `PermissionPrompt` and keep its responder receiver so the
+    /// test can assert what decision (if any) was sent back to it.
+    fn permission_prompt_with_id(
+        call_id: &str,
+    ) -> (
+        PermissionPrompt,
+        tokio::sync::oneshot::Receiver<PermissionDecision>,
+    ) {
+        let (responder, rx) = tokio::sync::oneshot::channel();
+        let prompt = PermissionPrompt {
+            // Convert to owned: `ToolCallId: From<&'static str>` rejects
+            // a borrowed `&str` because it would have to inline the
+            // lifetime, so go through `String`.
             tool_call: ToolCallUpdate::new(
-                "call-1",
+                call_id.to_string(),
                 agent_client_protocol::schema::ToolCallUpdateFields::default(),
             ),
             options: vec![PermissionOption::new(
@@ -1139,7 +1540,8 @@ mod tests {
                 PermissionOptionKind::AllowOnce,
             )],
             responder,
-        }
+        };
+        (prompt, rx)
     }
 
     #[test]

@@ -28,9 +28,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use tokio::sync::mpsc;
 
 use crate::app::{
-    AppState, ConfigValueChoice, Entry, PendingPermission, StatusKind, StatusMessage, TurnState,
-    UiExitReason, config_option_choices, config_option_current_value_label, permission_kind_label,
-    stop_reason_label,
+    AppState, ConfigValueChoice, ConnectionState, Entry, PendingPermission, StatusKind,
+    StatusMessage, TurnState, UiExitReason, config_option_choices,
+    config_option_current_value_label, permission_kind_label, stop_reason_label,
 };
 use crate::event::{PermissionDecision, UiCommand, UiEvent};
 
@@ -152,7 +152,7 @@ fn handle_crossterm(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiComma
     }
 
     // Permission modal owns the keyboard while it's open.
-    if state.pending_permission.is_some() {
+    if state.has_pending_permission() {
         handle_permission_key(state, key.code);
         return;
     }
@@ -196,6 +196,7 @@ fn handle_crossterm(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiComma
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
             if state.turn == TurnState::Streaming {
                 let _ = cmd_tx.send(UiCommand::CancelPrompt);
+                state.mark_cancelling();
                 state.status_line = Some(StatusMessage::info("cancelling..."));
             } else if state.input.is_empty() {
                 state.exit_reason = Some(UiExitReason::Quit);
@@ -275,7 +276,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
 }
 
 fn handle_permission_key(state: &mut AppState, code: KeyCode) {
-    let Some(pending) = state.pending_permission.as_mut() else {
+    let Some(pending) = state.pending_permission_mut() else {
         return;
     };
     let len = pending.prompt.options.len().max(1);
@@ -291,7 +292,7 @@ fn handle_permission_key(state: &mut AppState, code: KeyCode) {
             pending.selected = (pending.selected + 1) % len;
         }
         KeyCode::Enter => {
-            let pending = state.pending_permission.take().expect("checked above");
+            let pending = state.take_pending_permission().expect("checked above");
             let PendingPermission { prompt, selected } = pending;
             let decision = prompt
                 .options
@@ -302,7 +303,7 @@ fn handle_permission_key(state: &mut AppState, code: KeyCode) {
             state.update_autocomplete();
         }
         KeyCode::Esc => {
-            let pending = state.pending_permission.take().expect("checked above");
+            let pending = state.take_pending_permission().expect("checked above");
             let _ = pending.prompt.responder.send(PermissionDecision::Cancelled);
             state.update_autocomplete();
         }
@@ -449,8 +450,8 @@ fn draw(
         draw_config_value_picker_modal(f, f.area(), state);
     }
 
-    if let Some(pending) = state.pending_permission.as_ref() {
-        draw_permission_modal(f, f.area(), pending);
+    if let Some(pending) = state.pending_permission() {
+        draw_permission_modal(f, f.area(), pending, state.pending_permission_count());
     }
 }
 
@@ -470,10 +471,34 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let mode = state.current_mode.as_deref().unwrap_or("-");
     let header = format!(
         " mjolnir | {} | session {} | mode {} ",
-        state.connection_status, session, mode
+        connection_state_label(state),
+        session,
+        mode
     );
     let p = Paragraph::new(header).style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_widget(p, area);
+}
+
+/// Render the lifecycle state for the header. Once the agent has identified
+/// itself we suffix the label with the agent name so users with multiple
+/// running clients can tell them apart.
+pub(crate) fn connection_state_label(state: &AppState) -> String {
+    let agent_suffix = || {
+        if state.agent_label.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", state.agent_label)
+        }
+    };
+    match state.connection_state {
+        ConnectionState::Launching => "launching...".to_string(),
+        ConnectionState::Initializing => format!("initializing{}", agent_suffix()),
+        ConnectionState::Ready => format!("ready{}", agent_suffix()),
+        ConnectionState::Streaming => format!("streaming{}", agent_suffix()),
+        ConnectionState::Cancelling => format!("cancelling{}", agent_suffix()),
+        ConnectionState::Closed => "disconnected".to_string(),
+        ConnectionState::Fatal => "fatal".to_string(),
+    }
 }
 
 fn draw_transcript(
@@ -607,7 +632,7 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
 
     if !state.runtime_closed
         && state.turn != TurnState::Streaming
-        && state.pending_permission.is_none()
+        && !state.has_pending_permission()
         && state.config_picker.is_none()
     {
         // Place a fake cursor at end of input. Estimated, ASCII only.
@@ -677,7 +702,12 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     f.render_widget(p, area);
 }
 
-fn draw_permission_modal(f: &mut ratatui::Frame, area: Rect, pending: &PendingPermission) {
+fn draw_permission_modal(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    pending: &PendingPermission,
+    queue_len: usize,
+) {
     let width = area.width.saturating_sub(8).min(80);
     let height = (pending.prompt.options.len() as u16 + 6).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
@@ -685,9 +715,16 @@ fn draw_permission_modal(f: &mut ratatui::Frame, area: Rect, pending: &PendingPe
     let rect = Rect::new(x, y, width, height);
 
     f.render_widget(Clear, rect);
+    // Surface queue depth so the user knows another prompt is waiting
+    // behind this one rather than wondering why one just popped up.
+    let title = if queue_len > 1 {
+        format!(" permission request (1 of {queue_len}) ")
+    } else {
+        " permission request ".to_string()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" permission request ")
+        .title(title)
         .style(Style::default().fg(Color::Yellow));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -1065,6 +1102,43 @@ mod tests {
         tracker.reconcile(&mut offset, 80_050, 24);
 
         assert_eq!(offset, u16::MAX as usize + 55);
+    }
+
+    /// Integration of the three scrolling concerns that fired together in
+    /// practice: the user scrolls up, more chunks arrive, then the
+    /// terminal resizes. The visible top-of-window must stay anchored to
+    /// whatever the user was reading. Individual concerns are covered by
+    /// the tests above; this exercises them in sequence.
+    #[test]
+    fn streaming_chunks_and_resize_preserve_user_scroll_anchor() {
+        let mut tracker = TranscriptScrollState::default();
+        let mut offset = 0;
+
+        // Initial frame: 100 wrapped rows visible in a 20-row window,
+        // pinned to bottom.
+        tracker.reconcile(&mut offset, 100, 20);
+
+        // User scrolls up by 12 rows.
+        offset = 12;
+
+        // Streaming chunks grow the transcript by 8 rows.
+        tracker.reconcile(&mut offset, 108, 20);
+        // Top-of-window should still be at the same content line, so the
+        // offset grows by exactly the number of new rows.
+        assert_eq!(offset, 20, "new rows must not shift the user's view");
+
+        // Terminal resizes taller (28 rows visible).
+        tracker.reconcile(&mut offset, 108, 28);
+        // Window grew by 8 rows so the same top-line is now 8 rows
+        // closer to bottom; offset drops by 8.
+        assert_eq!(offset, 12, "resize must not shift the user's view");
+
+        // More chunks arrive after the resize.
+        tracker.reconcile(&mut offset, 116, 28);
+        assert_eq!(
+            offset, 20,
+            "subsequent rows still grow the offset by their count"
+        );
     }
 
     #[test]
