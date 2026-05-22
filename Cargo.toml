@@ -5,7 +5,7 @@ edition = "2024"
 description = "Forge-grade terminal client for any Agent Client Protocol (ACP) server"
 license = "GPL-3.0"
 repository = "https://github.com/BrokkAi/mjolnir"
-publish = false
+publish = true
 
 [[bin]]
 name = "mj"
