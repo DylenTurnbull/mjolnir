@@ -28,3 +28,6 @@ target/
 
 # Brokk
 .brokk/
+
+# Mjolnir linked worktrees
+.mjolnir/worktrees/
