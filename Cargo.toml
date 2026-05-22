@@ -1,5 +1,5 @@
 [package]
-name = "mjolnir"
+name = "brokk-mjolnir"
 version = "0.2.0"
 edition = "2024"
 description = "Forge-grade terminal client for any Agent Client Protocol (ACP) server"

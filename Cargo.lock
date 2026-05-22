@@ -319,6 +319,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "brokk-mjolnir"
+version = "0.2.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "clap",
+ "crossterm",
+ "dirs",
+ "flate2",
+ "futures",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "zip",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1549,32 +1575,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "mjolnir"
-version = "0.2.0"
-dependencies = [
- "agent-client-protocol",
- "anyhow",
- "clap",
- "crossterm",
- "dirs",
- "flate2",
- "futures",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "shell-words",
- "tar",
- "tempfile",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "zip",
 ]
 
 [[package]]
