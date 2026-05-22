@@ -1,0 +1,136 @@
+name: GitHub Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-cross:
+    name: Cross-build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            bin: mj
+          - target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            bin: mj
+          - target: x86_64-pc-windows-gnu
+            archive: zip
+            bin: mj.exe
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build release binary
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Package archive
+        shell: bash
+        run: |
+          name="brokk-mjolnir-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$name/"
+          cp README.md LICENSE "$name/"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip -r "$name.zip" "$name"
+            shasum -a 256 "$name.zip" > "$name.zip.sha256"
+          else
+            tar czf "$name.tar.gz" "$name"
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            brokk-mjolnir-*.tar.gz
+            brokk-mjolnir-*.tar.gz.sha256
+            brokk-mjolnir-*.zip
+            brokk-mjolnir-*.zip.sha256
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Build x86_64 binary
+        run: cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Build aarch64 binary
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create \
+            target/x86_64-apple-darwin/release/mj \
+            target/aarch64-apple-darwin/release/mj \
+            -output target/universal-apple-darwin/release/mj
+          lipo -info target/universal-apple-darwin/release/mj
+
+      - name: Package archive
+        run: |
+          name="brokk-mjolnir-${GITHUB_REF_NAME}-universal-apple-darwin"
+          mkdir "$name"
+          cp target/universal-apple-darwin/release/mj "$name/"
+          cp README.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: universal-apple-darwin
+          path: |
+            brokk-mjolnir-*.tar.gz
+            brokk-mjolnir-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: [build-cross, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/brokk-mjolnir-*.tar.gz
+            artifacts/brokk-mjolnir-*.tar.gz.sha256
+            artifacts/brokk-mjolnir-*.zip
+            artifacts/brokk-mjolnir-*.zip.sha256
