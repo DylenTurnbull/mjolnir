@@ -65,23 +65,26 @@ and reused on subsequent launches.
 
 - `--cwd`: workspace directory used for the ACP session. Defaults to the current
   directory.
-- `--log-file`: write TUI logs to a file. Equivalent env var:
+- `--debug-file` (alias: `--log-file`): write TUI logs to a file. Equivalent
+  env var:
   `BROKK_TUI_LOG`.
-- `--worktree`: create a linked Git worktree under
+- `-w, --worktree`: create a linked Git worktree under
   `<project>/.mjolnir/worktrees/` and run the ACP session from the matching
   directory inside that worktree. When the path is not already ignored, `mj`
   prompts before startup and adds `.mjolnir/worktrees/` to the project
   `.gitignore` if you answer yes.
 - `--agent-stderr`: capture the agent subprocess stderr to a file. Equivalent
   env var: `BROKK_TUI_AGENT_STDERR`.
+- `--permission-mode`: controls headless `--print` permission handling. Canonical
+  values: `default`, `acceptEdits`, `bypassPermissions`.
 
 There is no `--command` / `--agent` flag: pick the agent interactively the
 first time and re-pick later with `/mj:agents`. To force a fresh picker, delete
 `~/.config/mj/config.toml`.
 
 Logging is disabled by default because the TUI owns the terminal. Set
-`BROKK_TUI_LOG_LEVEL` to override the default `info` filter when `--log-file` is
-enabled.
+`BROKK_TUI_LOG_LEVEL` to override the default `info` filter when `--debug-file`
+is enabled.
 
 ## Keyboard Controls
 

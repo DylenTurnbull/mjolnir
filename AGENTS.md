@@ -1,5 +1,9 @@
 # Repository Guidelines
 
+## Developer Experience
+
+Other things being equal, prefer to follow Claude Code conventions, e.g. in commandline parameters.
+
 ## Project Structure & Module Organization
 
 This repository is a Rust 2024 crate named `mjolnir` that builds the `mj` binary. Source code lives in `src/`:
@@ -19,7 +23,7 @@ There is no separate `tests/` directory today; tests are colocated in module-lev
 - `cargo clippy --all-targets -- -D warnings` runs lints with warnings treated as errors, matching CI.
 - `cargo test` runs unit tests.
 - `cargo build --release` builds the optimized `mj` binary.
-- `cargo run -- --command "anvil" --cwd .` runs the TUI against an ACP server command.
+- `cargo run -- --cwd .` runs the TUI in the current workspace and opens the agent picker when no agent is configured yet.
 
 ## Coding Style & Naming Conventions
 
@@ -35,4 +39,4 @@ Recent commits use concise, imperative summaries such as `rename crate to mjolni
 
 ## Security & Configuration Tips
 
-Do not log to stderr while the TUI owns the terminal. Use `--log-file` or `BROKK_TUI_LOG` for diagnostics and `--agent-stderr` or `BROKK_TUI_AGENT_STDERR` to capture agent subprocess stderr. Avoid committing generated `target/` artifacts or local machine configuration.
+Do not log to stderr while the TUI owns the terminal. Use `--debug-file` (or compatibility alias `--log-file`) and `BROKK_TUI_LOG` for diagnostics, and `--agent-stderr` or `BROKK_TUI_AGENT_STDERR` to capture agent subprocess stderr. Avoid committing generated `target/` artifacts or local machine configuration.

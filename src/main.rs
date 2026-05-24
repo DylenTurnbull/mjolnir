@@ -28,7 +28,7 @@ use crate::config::{Config, SelectedAgent};
 use crate::picker::PickerOutcome;
 use crate::worktree::CreatedWorktree;
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(name = "mj", version, about = "Interactive ACP chat TUI")]
 struct Cli {
     /// Run one prompt non-interactively and print the result.
@@ -47,8 +47,8 @@ struct Cli {
     /// Permission handling for `--print`.
     ///
     /// `default` rejects permission prompts so headless runs never hang.
-    /// `accept-edits` accepts edit/delete/move prompts but rejects shell
-    /// execution. `bypass-permissions` accepts every permission prompt.
+    /// `acceptEdits` accepts edit/delete/move prompts but rejects shell
+    /// execution. `bypassPermissions` accepts every permission prompt.
     #[arg(long, value_enum, default_value_t = HeadlessPermissionMode::Default)]
     permission_mode: HeadlessPermissionMode,
 
@@ -59,7 +59,7 @@ struct Cli {
 
     /// Path to a log file. When unset, logging is disabled because the
     /// TUI owns the terminal and stderr would corrupt the screen.
-    #[arg(long, env = "BROKK_TUI_LOG")]
+    #[arg(long = "debug-file", visible_alias = "log-file", env = "BROKK_TUI_LOG")]
     log_file: Option<PathBuf>,
 
     /// Run the ACP session in a Git worktree.
@@ -68,7 +68,7 @@ struct Cli {
     /// <project>/.mjolnir/worktrees/ with a random adjective-noun name
     /// (e.g. `bold-robin`). With a value, reuses an existing worktree
     /// by name (short name under .mjolnir/worktrees/) or by path.
-    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    #[arg(short = 'w', long, num_args = 0..=1, default_missing_value = "")]
     worktree: Option<String>,
 
     /// Capture the agent subprocess's stderr to this file. When unset
@@ -98,7 +98,9 @@ impl From<HeadlessOutputFormat> for headless::OutputFormat {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum HeadlessPermissionMode {
     Default,
+    #[value(name = "acceptEdits", alias = "accept-edits")]
     AcceptEdits,
+    #[value(name = "bypassPermissions", alias = "bypass-permissions")]
     BypassPermissions,
 }
 
@@ -414,4 +416,78 @@ fn init_logging(path: Option<&std::path::Path>) -> Result<()> {
         .with_ansi(false)
         .init();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn parse_accepts_debug_file_aliases() {
+        let cli = Cli::try_parse_from(["mj", "--debug-file", "debug.log"]).expect("parse");
+        assert_eq!(cli.log_file, Some(PathBuf::from("debug.log")));
+
+        let cli = Cli::try_parse_from(["mj", "--log-file", "legacy.log"]).expect("parse");
+        assert_eq!(cli.log_file, Some(PathBuf::from("legacy.log")));
+    }
+
+    #[test]
+    fn parse_accepts_worktree_short_flag() {
+        let cli = Cli::try_parse_from(["mj", "-w"]).expect("parse");
+        assert_eq!(cli.worktree, Some(String::new()));
+
+        let cli = Cli::try_parse_from(["mj", "-w", "named-tree"]).expect("parse");
+        assert_eq!(cli.worktree.as_deref(), Some("named-tree"));
+    }
+
+    #[test]
+    fn parse_accepts_permission_mode_canonical_and_legacy_values() {
+        let canonical = Cli::try_parse_from(["mj", "--permission-mode", "acceptEdits"])
+            .expect("parse canonical");
+        assert!(matches!(
+            canonical.permission_mode,
+            HeadlessPermissionMode::AcceptEdits
+        ));
+
+        let legacy = Cli::try_parse_from(["mj", "--permission-mode", "accept-edits"])
+            .expect("parse legacy");
+        assert!(matches!(
+            legacy.permission_mode,
+            HeadlessPermissionMode::AcceptEdits
+        ));
+
+        let canonical = Cli::try_parse_from(["mj", "--permission-mode", "bypassPermissions"])
+            .expect("parse canonical");
+        assert!(matches!(
+            canonical.permission_mode,
+            HeadlessPermissionMode::BypassPermissions
+        ));
+
+        let legacy = Cli::try_parse_from(["mj", "--permission-mode", "bypass-permissions"])
+            .expect("parse legacy");
+        assert!(matches!(
+            legacy.permission_mode,
+            HeadlessPermissionMode::BypassPermissions
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_permission_mode_value() {
+        let err = Cli::try_parse_from(["mj", "--permission-mode", "auto"]).expect_err("reject");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn help_shows_canonical_flags_and_values() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help().to_string();
+
+        assert!(help.contains("--debug-file <LOG_FILE>"));
+        assert!(help.contains("[aliases: --log-file]"));
+        assert!(help.contains("-w, --worktree [<WORKTREE>]"));
+        assert!(help.contains("[possible values: default, acceptEdits, bypassPermissions]"));
+        assert!(!help.contains("accept-edits"));
+        assert!(!help.contains("bypass-permissions"));
+    }
 }
