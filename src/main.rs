@@ -9,6 +9,7 @@ mod acp;
 mod app;
 mod config;
 mod event;
+mod headless;
 mod install;
 mod picker;
 mod registry;
@@ -19,7 +20,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tokio::sync::mpsc;
 
 use crate::app::UiExitReason;
@@ -30,6 +31,27 @@ use crate::worktree::CreatedWorktree;
 #[derive(Parser)]
 #[command(name = "mj", version, about = "Interactive ACP chat TUI")]
 struct Cli {
+    /// Run one prompt non-interactively and print the result.
+    ///
+    /// Matches Claude Code's `--print`/`-p` shape where practical: provide
+    /// the prompt as the optional value, or omit the value/read `-` to read
+    /// stdin. Headless mode uses the configured agent from
+    /// `~/.config/mj/config.toml`; it does not open the interactive picker.
+    #[arg(short = 'p', long = "print", value_name = "PROMPT", num_args = 0..=1, default_missing_value = "-")]
+    print: Option<String>,
+
+    /// Output format for `--print`.
+    #[arg(long, value_enum, default_value_t = HeadlessOutputFormat::Text)]
+    output_format: HeadlessOutputFormat,
+
+    /// Permission handling for `--print`.
+    ///
+    /// `default` rejects permission prompts so headless runs never hang.
+    /// `accept-edits` accepts edit/delete/move prompts but rejects shell
+    /// execution. `bypass-permissions` accepts every permission prompt.
+    #[arg(long, value_enum, default_value_t = HeadlessPermissionMode::Default)]
+    permission_mode: HeadlessPermissionMode,
+
     /// Working directory used when opening a new session. Defaults to
     /// the current directory.
     #[arg(long)]
@@ -56,6 +78,40 @@ struct Cli {
     agent_stderr: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum HeadlessOutputFormat {
+    Text,
+    Json,
+    StreamJson,
+}
+
+impl From<HeadlessOutputFormat> for headless::OutputFormat {
+    fn from(value: HeadlessOutputFormat) -> Self {
+        match value {
+            HeadlessOutputFormat::Text => Self::Text,
+            HeadlessOutputFormat::Json => Self::Json,
+            HeadlessOutputFormat::StreamJson => Self::StreamJson,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum HeadlessPermissionMode {
+    Default,
+    AcceptEdits,
+    BypassPermissions,
+}
+
+impl From<HeadlessPermissionMode> for headless::PermissionMode {
+    fn from(value: HeadlessPermissionMode) -> Self {
+        match value {
+            HeadlessPermissionMode::Default => Self::Default,
+            HeadlessPermissionMode::AcceptEdits => Self::AcceptEdits,
+            HeadlessPermissionMode::BypassPermissions => Self::BypassPermissions,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -65,6 +121,19 @@ async fn main() -> Result<()> {
         Some(p) => p,
         None => std::env::current_dir().context("current dir")?,
     };
+
+    if let Some(prompt_arg) = cli.print {
+        let prompt = read_headless_prompt(prompt_arg)?;
+        return headless::run(headless::RunConfig {
+            prompt,
+            cwd,
+            agent_stderr: cli.agent_stderr,
+            output_format: cli.output_format.into(),
+            permission_mode: cli.permission_mode.into(),
+        })
+        .await;
+    }
+
     let (cwd, worktree) = match cli.worktree.as_deref() {
         None => (cwd, None),
         Some("") => {
@@ -113,6 +182,18 @@ async fn main() -> Result<()> {
     }
 
     result
+}
+
+fn read_headless_prompt(prompt_arg: String) -> Result<String> {
+    if prompt_arg != "-" {
+        return Ok(prompt_arg);
+    }
+    use std::io::Read;
+    let mut prompt = String::new();
+    std::io::stdin()
+        .read_to_string(&mut prompt)
+        .context("read prompt from stdin")?;
+    Ok(prompt)
 }
 
 fn prepare_new_worktree(cwd: &std::path::Path) -> Result<CreatedWorktree> {
