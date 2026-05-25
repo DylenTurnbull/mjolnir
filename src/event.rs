@@ -19,8 +19,8 @@ pub enum UiEvent {
         agent_name: Option<String>,
         agent_version: Option<String>,
     },
-    /// A new session has been opened; future updates carry this session id.
-    SessionStarted { session_id: String },
+    /// A session has been opened or loaded; future updates carry this session id.
+    SessionStarted { session_id: String, resumed: bool },
     /// A streaming or status update from the agent. We forward the raw
     /// `SessionUpdate` enum and let the UI state machine decide how to
     /// fold each variant into the transcript.

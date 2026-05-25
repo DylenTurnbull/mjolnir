@@ -36,6 +36,7 @@ pub enum PermissionMode {
 pub struct RunConfig {
     pub prompt: String,
     pub cwd: PathBuf,
+    pub resume_session: Option<String>,
     pub agent_stderr: Option<PathBuf>,
     pub output_format: OutputFormat,
     pub permission_mode: PermissionMode,
@@ -50,6 +51,7 @@ enum StreamRecord<'a> {
     },
     SessionStarted {
         session_id: &'a str,
+        resumed: bool,
     },
     AgentMessage {
         text: &'a str,
@@ -81,16 +83,22 @@ enum StreamRecord<'a> {
     },
     Result {
         stop_reason: String,
+        session_id: Option<&'a str>,
+        resumed: bool,
         text: &'a str,
         usage: Option<&'a Usage>,
+        error: Option<&'a str>,
     },
 }
 
 #[derive(Debug, Serialize)]
 struct JsonResult<'a> {
+    session_id: Option<&'a str>,
+    resumed: bool,
     result: &'a str,
     stop_reason: String,
     usage: Option<&'a Usage>,
+    error: Option<&'a str>,
 }
 
 #[derive(Debug, Default)]
@@ -120,6 +128,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         command: agent.program,
         args: agent.args,
         cwd: cfg.cwd,
+        resume_session: cfg.resume_session.clone(),
         env: agent.env,
         agent_stderr: cfg.agent_stderr,
     };
@@ -131,6 +140,11 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let mut saw_terminal_event = false;
     let mut stop_reason = None;
     let mut usage = None;
+    let mut session_id = None;
+    let mut resumed = false;
+    let mut terminal_error = None;
+    let mut prompt_sent = false;
+    let mut collecting_turn_output = false;
 
     while let Some(event) = event_rx.recv().await {
         if matches!(cfg.output_format, OutputFormat::StreamJson) {
@@ -149,14 +163,21 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     })?;
                 }
             }
-            UiEvent::SessionStarted { session_id } => {
+            UiEvent::SessionStarted {
+                session_id: started_session_id,
+                resumed: was_resumed,
+            } => {
+                session_id = Some(started_session_id.clone());
+                resumed = was_resumed;
                 if matches!(cfg.output_format, OutputFormat::StreamJson) {
                     emit_json(&StreamRecord::SessionStarted {
-                        session_id: &session_id,
+                        session_id: &started_session_id,
+                        resumed: was_resumed,
                     })?;
                 }
                 if !sent_prompt {
                     sent_prompt = true;
+                    prompt_sent = true;
                     cmd_tx
                         .send(UiCommand::SendPrompt {
                             text: cfg.prompt.clone(),
@@ -165,7 +186,12 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 }
             }
             UiEvent::SessionUpdate(update) => {
-                apply_session_update(&mut state, update);
+                apply_session_update(
+                    &mut state,
+                    update,
+                    prompt_sent,
+                    &mut collecting_turn_output,
+                );
             }
             UiEvent::PermissionRequest(prompt) => {
                 let decision =
@@ -199,9 +225,10 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 if matches!(cfg.output_format, OutputFormat::StreamJson) {
                     emit_json(&StreamRecord::Error { message: &message })?;
                 }
+                terminal_error = Some(message);
+                saw_terminal_event = true;
                 let _ = cmd_tx.send(UiCommand::Shutdown);
-                let _ = runtime.await;
-                bail!("{message}");
+                break;
             }
             UiEvent::Warning(message) => {
                 if matches!(cfg.output_format, OutputFormat::StreamJson) {
@@ -226,7 +253,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         }
     }
 
-    let stop_reason = stop_reason.unwrap_or(StopReason::Cancelled);
+    let stop_reason_label = stop_reason
+        .map(stop_reason_label)
+        .unwrap_or_else(|| if terminal_error.is_some() { "error" } else { "cancelled" });
     match cfg.output_format {
         OutputFormat::Text => {
             print!("{}", state.final_text);
@@ -236,46 +265,73 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         }
         OutputFormat::Json => {
             emit_json(&JsonResult {
+                session_id: session_id.as_deref(),
+                resumed,
                 result: &state.final_text,
-                stop_reason: stop_reason_label(stop_reason).to_string(),
+                stop_reason: stop_reason_label.to_string(),
                 usage: usage.as_ref(),
+                error: terminal_error.as_deref(),
             })?;
         }
         OutputFormat::StreamJson => {
             emit_json(&StreamRecord::Result {
-                stop_reason: stop_reason_label(stop_reason).to_string(),
+                stop_reason: stop_reason_label.to_string(),
+                session_id: session_id.as_deref(),
+                resumed,
                 text: &state.final_text,
                 usage: usage.as_ref(),
+                error: terminal_error.as_deref(),
             })?;
         }
     }
 
-    if matches!(
-        stop_reason,
+    if let Some(message) = terminal_error {
+        Err(anyhow!(message))
+    } else if matches!(
+        stop_reason.unwrap_or(StopReason::Cancelled),
         StopReason::EndTurn | StopReason::MaxTokens | StopReason::MaxTurnRequests
     ) {
         Ok(())
     } else {
         Err(anyhow!(
             "prompt stopped with {}",
-            stop_reason_label(stop_reason)
+            stop_reason_label
         ))
     }
 }
 
-fn apply_session_update(state: &mut HeadlessState, update: SessionUpdate) {
+fn apply_session_update(
+    state: &mut HeadlessState,
+    update: SessionUpdate,
+    prompt_sent: bool,
+    collecting_turn_output: &mut bool,
+) {
     match update {
+        SessionUpdate::UserMessageChunk(_) if prompt_sent => {
+            *collecting_turn_output = true;
+        }
+        SessionUpdate::AgentThoughtChunk(_) if prompt_sent => {
+            *collecting_turn_output = true;
+        }
         SessionUpdate::AgentMessageChunk(chunk) => {
-            state
-                .final_text
-                .push_str(&content_block_text(&chunk.content));
+            if *collecting_turn_output {
+                state
+                    .final_text
+                    .push_str(&content_block_text(&chunk.content));
+            }
         }
         SessionUpdate::ToolCall(tool_call) => {
+            if prompt_sent {
+                *collecting_turn_output = true;
+            }
             state
                 .tool_calls
                 .insert(tool_call.tool_call_id.to_string(), tool_call);
         }
         SessionUpdate::ToolCallUpdate(update) => {
+            if prompt_sent {
+                *collecting_turn_output = true;
+            }
             let id = update.tool_call_id.to_string();
             if let Some(existing) = state.tool_calls.get_mut(&id) {
                 existing.update(update.fields);

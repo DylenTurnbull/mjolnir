@@ -680,7 +680,7 @@ impl AppState {
                 };
                 self.connection_state = ConnectionState::Initializing;
             }
-            UiEvent::SessionStarted { session_id } => {
+            UiEvent::SessionStarted { session_id, .. } => {
                 self.session_id = Some(session_id);
                 self.connection_state = ConnectionState::Ready;
             }
@@ -1419,6 +1419,7 @@ mod tests {
 
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
+            resumed: false,
         });
         assert_eq!(s.connection_state, ConnectionState::Ready);
 
@@ -1445,6 +1446,7 @@ mod tests {
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
+            resumed: false,
         });
         s.record_user_prompt("hi".to_string());
 
@@ -1468,6 +1470,7 @@ mod tests {
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
+            resumed: false,
         });
         s.record_user_prompt("hi".to_string());
 
@@ -1508,6 +1511,7 @@ mod tests {
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
+            resumed: false,
         });
         assert_eq!(s.connection_state, ConnectionState::Ready);
 
@@ -1878,6 +1882,7 @@ mod tests {
         );
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
+            resumed: false,
         });
         assert!(!s.is_streaming(), "Ready must not count as streaming");
         s.input = "/cre".to_string();

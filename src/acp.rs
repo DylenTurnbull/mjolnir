@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::{
     CancelNotification, ClientCapabilities, ConfigOptionUpdate, ContentBlock, ErrorCode,
-    FileSystemCapabilities, InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate,
+    FileSystemCapabilities, InitializeRequest, LoadSessionRequest, NewSessionRequest,
+    PromptRequest, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
+    SessionUpdate,
     SetSessionConfigOptionRequest, TextContent,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
@@ -25,6 +26,7 @@ pub struct AcpRuntimeConfig {
     pub command: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    pub resume_session: Option<String>,
     /// Environment variables to inject into the spawned agent process.
     /// Used for agents that require knobs like `AUGMENT_DISABLE_AUTO_UPDATE=1`.
     pub env: HashMap<String, String>,
@@ -224,6 +226,7 @@ pub async fn run(
         let drive = drive_client(
             transport,
             cfg.cwd.clone(),
+            cfg.resume_session.clone(),
             ui_tx.clone(),
             ui_rx,
             fatal_emitted.clone(),
@@ -281,6 +284,7 @@ pub async fn run(
 pub async fn drive_client<T>(
     transport: T,
     cwd: PathBuf,
+    resume_session: Option<String>,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     mut ui_rx: mpsc::UnboundedReceiver<UiCommand>,
     fatal_emitted: Arc<AtomicBool>,
@@ -326,7 +330,9 @@ where
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, |conn: ConnectionTo<Agent>| async move {
-            if let Err(e) = drive_session(conn, cwd, &ui_tx, &mut ui_rx, fatal_emitted).await {
+            if let Err(e) =
+                drive_session(conn, cwd, resume_session, &ui_tx, &mut ui_rx, fatal_emitted).await
+            {
                 let msg = format!("{e:#}");
                 return Err(agent_client_protocol::Error::internal_error()
                     .data(serde_json::Value::String(msg)));
@@ -345,6 +351,7 @@ where
 async fn drive_session(
     conn: ConnectionTo<Agent>,
     cwd: PathBuf,
+    resume_session: Option<String>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
     fatal_emitted: Arc<AtomicBool>,
@@ -373,24 +380,42 @@ async fn drive_session(
         agent_version: init_resp.agent_info.as_ref().map(|i| i.version.clone()),
     });
 
-    let session = match conn
-        .send_request(NewSessionRequest::new(cwd))
-        .block_task()
-        .await
-    {
-        Ok(s) => s,
-        Err(source) => {
-            let launch_err = classify_session_error(source);
-            let text = launch_err.to_string();
-            emit_fatal(ui_tx, &fatal_emitted, text.clone());
-            return Err(anyhow::anyhow!(text));
+    let (session_id, config_options, resumed) = match resume_session {
+        Some(existing_session_id) => {
+            let session_id = SessionId::from(existing_session_id.clone());
+            match conn
+                .send_request(LoadSessionRequest::new(session_id.clone(), cwd.clone()))
+                .block_task()
+                .await
+            {
+                Ok(s) => (session_id, s.config_options, true),
+                Err(source) => {
+                    let launch_err = classify_session_error(source);
+                    let text = launch_err.to_string();
+                    emit_fatal(ui_tx, &fatal_emitted, text.clone());
+                    return Err(anyhow::anyhow!(text));
+                }
+            }
         }
+        None => match conn
+            .send_request(NewSessionRequest::new(cwd))
+            .block_task()
+            .await
+        {
+            Ok(s) => (s.session_id, s.config_options, false),
+            Err(source) => {
+                let launch_err = classify_session_error(source);
+                let text = launch_err.to_string();
+                emit_fatal(ui_tx, &fatal_emitted, text.clone());
+                return Err(anyhow::anyhow!(text));
+            }
+        },
     };
-    let session_id: SessionId = session.session_id;
     let _ = ui_tx.send(UiEvent::SessionStarted {
         session_id: session_id.to_string(),
+        resumed,
     });
-    if let Some(config_options) = session.config_options {
+    if let Some(config_options) = config_options {
         let _ = ui_tx.send(UiEvent::SessionUpdate(SessionUpdate::ConfigOptionUpdate(
             ConfigOptionUpdate::new(config_options),
         )));
@@ -588,9 +613,9 @@ mod tests {
     use super::*;
     use agent_client_protocol::Agent as AgentRole;
     use agent_client_protocol::schema::{
-        ContentBlock, ContentChunk, InitializeResponse, NewSessionResponse, PromptResponse,
-        SessionConfigId, SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
-        SetSessionConfigOptionRequest, StopReason, TextContent,
+        ContentBlock, ContentChunk, InitializeResponse, LoadSessionResponse, NewSessionResponse,
+        PromptResponse, SessionConfigId, SessionConfigValueId, SessionId, SessionNotification,
+        SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent,
     };
     use std::sync::{
         Arc,
@@ -622,6 +647,14 @@ mod tests {
                             responder,
                             _cx| {
                     responder.respond(NewSessionResponse::new(SessionId::new("test-session")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::LoadSessionRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(LoadSessionResponse::new())
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -832,6 +865,7 @@ mod tests {
         let client_task = tokio::spawn(drive_client(
             client_transport,
             std::env::temp_dir(),
+            None,
             ui_tx,
             cmd_rx,
             Arc::new(AtomicBool::new(false)),
@@ -888,6 +922,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resumed_prompt_turn_against_mock_agent() {
+        let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
+
+        let agent_task = tokio::spawn(run_mock_agent(agent_side));
+
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        let client_task = tokio::spawn(drive_client(
+            client_transport,
+            std::env::temp_dir(),
+            Some("existing-session".to_string()),
+            ui_tx,
+            cmd_rx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let mut saw_resumed_session = false;
+        while !saw_resumed_session {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timeout waiting for resumed handshake")
+                .expect("channel closed");
+            match ev {
+                UiEvent::SessionStarted {
+                    session_id,
+                    resumed,
+                } => {
+                    assert_eq!(session_id, "existing-session");
+                    assert!(resumed);
+                    saw_resumed_session = true;
+                }
+                UiEvent::Warning(_) | UiEvent::Fatal(_) => panic!("unexpected: {ev:?}"),
+                _ => {}
+            }
+        }
+
+        cmd_tx
+            .send(UiCommand::SendPrompt {
+                text: "resume".to_string(),
+            })
+            .expect("send prompt");
+
+        let mut saw_done = false;
+        while !saw_done {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timeout waiting for resumed prompt")
+                .expect("channel closed");
+            match ev {
+                UiEvent::PromptDone { stop_reason, .. } => {
+                    assert!(matches!(stop_reason, StopReason::EndTurn));
+                    saw_done = true;
+                }
+                UiEvent::Warning(_) | UiEvent::Fatal(_) => panic!("unexpected: {ev:?}"),
+                _ => {}
+            }
+        }
+
+        cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
+        agent_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn prompt_error_emits_prompt_failed() {
         let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
         let (cr, cw) = split(client_side);
@@ -901,6 +1002,7 @@ mod tests {
         let client_task = tokio::spawn(drive_client(
             client_transport,
             std::env::temp_dir(),
+            None,
             ui_tx,
             cmd_rx,
             Arc::new(AtomicBool::new(false)),
@@ -967,6 +1069,7 @@ mod tests {
         let client_task = tokio::spawn(drive_client(
             client_transport,
             std::env::temp_dir(),
+            None,
             ui_tx,
             cmd_rx,
             Arc::new(AtomicBool::new(false)),
@@ -1035,6 +1138,7 @@ mod tests {
         let client_task = tokio::spawn(drive_client(
             client_transport,
             std::env::temp_dir(),
+            None,
             ui_tx,
             cmd_rx,
             Arc::new(AtomicBool::new(false)),
@@ -1081,6 +1185,7 @@ mod tests {
         let client_task = tokio::spawn(drive_client(
             client_transport,
             std::env::temp_dir(),
+            None,
             ui_tx,
             cmd_rx,
             Arc::new(AtomicBool::new(false)),
@@ -1151,6 +1256,7 @@ mod tests {
         let client_task = tokio::spawn(drive_client(
             client_transport,
             std::env::temp_dir(),
+            None,
             ui_tx,
             cmd_rx,
             Arc::new(AtomicBool::new(false)),
@@ -1187,6 +1293,7 @@ mod tests {
             command: PathBuf::from("definitely-not-a-real-mjolnir-command"),
             args: Vec::new(),
             cwd: std::env::temp_dir(),
+            resume_session: None,
             env: HashMap::new(),
             agent_stderr: None,
         };
@@ -1236,6 +1343,7 @@ mod tests {
             command: PathBuf::from("does-not-need-to-exist"),
             args: Vec::new(),
             cwd: std::env::temp_dir(),
+            resume_session: None,
             env: HashMap::new(),
             agent_stderr: Some(bad_stderr),
         };
@@ -1364,6 +1472,7 @@ mod tests {
             command,
             args,
             cwd: std::env::temp_dir(),
+            resume_session: None,
             env: HashMap::new(),
             agent_stderr: None,
         };
@@ -1382,6 +1491,7 @@ mod tests {
             command,
             args,
             cwd: std::env::temp_dir(),
+            resume_session: None,
             env: HashMap::new(),
             agent_stderr: None,
         };
@@ -1560,6 +1670,7 @@ mod tests {
         let client_task = tokio::spawn(drive_client(
             client_transport,
             std::env::temp_dir(),
+            None,
             ui_tx,
             cmd_rx,
             fatal_emitted.clone(),

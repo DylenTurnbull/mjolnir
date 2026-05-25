@@ -57,6 +57,11 @@ struct Cli {
     #[arg(long)]
     cwd: Option<PathBuf>,
 
+    /// Resume an existing ACP session in headless mode instead of
+    /// opening a new one.
+    #[arg(long)]
+    resume_session: Option<String>,
+
     /// Path to a log file. When unset, logging is disabled because the
     /// TUI owns the terminal and stderr would corrupt the screen.
     #[arg(long = "debug-file", visible_alias = "log-file", env = "BROKK_TUI_LOG")]
@@ -129,6 +134,7 @@ async fn main() -> Result<()> {
         return headless::run(headless::RunConfig {
             prompt,
             cwd,
+            resume_session: cli.resume_session,
             agent_stderr: cli.agent_stderr,
             output_format: cli.output_format.into(),
             permission_mode: cli.permission_mode.into(),
@@ -337,6 +343,7 @@ async fn run_session(
         command: agent.program.clone(),
         args: agent.args.clone(),
         cwd,
+        resume_session: None,
         env: agent.env.clone(),
         agent_stderr,
     };
@@ -476,6 +483,13 @@ mod tests {
     fn parse_rejects_unknown_permission_mode_value() {
         let err = Cli::try_parse_from(["mj", "--permission-mode", "auto"]).expect_err("reject");
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn parse_accepts_resume_session() {
+        let cli = Cli::try_parse_from(["mj", "--print", "hi", "--resume-session", "sess-123"])
+            .expect("parse");
+        assert_eq!(cli.resume_session.as_deref(), Some("sess-123"));
     }
 
     #[test]
