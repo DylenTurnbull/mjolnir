@@ -3249,6 +3249,10 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Backspace to clear")),
             "rendered lines: {rendered_lines:?}"
+        );
+    }
+
+    #[test]
     fn bracketed_paste_appends_cleaned_text_to_input() {
         let mut state = AppState::new();
         state.input = "prefix ".to_string();
