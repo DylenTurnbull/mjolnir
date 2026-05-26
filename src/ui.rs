@@ -2167,7 +2167,9 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let gutter_style = if state.runtime_closed || state.is_streaming() {
         Style::default().fg(Color::DarkGray)
     } else {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     };
     let gutter = Paragraph::new(">").style(gutter_style);
     f.render_widget(gutter, gutter_area);
