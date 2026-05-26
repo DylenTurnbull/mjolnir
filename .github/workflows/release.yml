@@ -65,44 +65,6 @@ jobs:
             brokk-mjolnir-*.zip.sha256
           if-no-files-found: error
 
-  build-windows:
-    name: Build x86_64-pc-windows-msvc
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Install cargo-xwin
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-xwin
-
-      - name: Build release binary
-        run: cargo xwin build --release --locked --target x86_64-pc-windows-msvc
-
-      - name: Package archive
-        shell: bash
-        run: |
-          name="brokk-mjolnir-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc"
-          mkdir "$name"
-          cp "target/x86_64-pc-windows-msvc/release/mj.exe" "$name/"
-          cp README.md LICENSE "$name/"
-          zip -r "$name.zip" "$name"
-          shasum -a 256 "$name.zip" > "$name.zip.sha256"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: x86_64-pc-windows-msvc
-          path: |
-            brokk-mjolnir-*.zip
-            brokk-mjolnir-*.zip.sha256
-          if-no-files-found: error
-
   build-macos:
     name: Build macOS universal
     runs-on: macos-latest
