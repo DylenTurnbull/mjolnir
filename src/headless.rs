@@ -309,12 +309,10 @@ fn apply_session_update(
         SessionUpdate::AgentThoughtChunk(_) if prompt_sent => {
             *collecting_turn_output = true;
         }
-        SessionUpdate::AgentMessageChunk(chunk) => {
-            if *collecting_turn_output {
-                state
-                    .final_text
-                    .push_str(&content_block_text(&chunk.content));
-            }
+        SessionUpdate::AgentMessageChunk(chunk) if *collecting_turn_output => {
+            state
+                .final_text
+                .push_str(&content_block_text(&chunk.content));
         }
         SessionUpdate::ToolCall(tool_call) => {
             if prompt_sent {
