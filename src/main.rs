@@ -457,8 +457,8 @@ mod tests {
             HeadlessPermissionMode::AcceptEdits
         ));
 
-        let legacy = Cli::try_parse_from(["mj", "--permission-mode", "accept-edits"])
-            .expect("parse legacy");
+        let legacy =
+            Cli::try_parse_from(["mj", "--permission-mode", "accept-edits"]).expect("parse legacy");
         assert!(matches!(
             legacy.permission_mode,
             HeadlessPermissionMode::AcceptEdits

@@ -186,12 +186,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 }
             }
             UiEvent::SessionUpdate(update) => {
-                apply_session_update(
-                    &mut state,
-                    update,
-                    prompt_sent,
-                    &mut collecting_turn_output,
-                );
+                apply_session_update(&mut state, update, prompt_sent, &mut collecting_turn_output);
             }
             UiEvent::PermissionRequest(prompt) => {
                 let decision =
@@ -253,9 +248,13 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         }
     }
 
-    let stop_reason_label = stop_reason
-        .map(stop_reason_label)
-        .unwrap_or_else(|| if terminal_error.is_some() { "error" } else { "cancelled" });
+    let stop_reason_label = stop_reason.map(stop_reason_label).unwrap_or_else(|| {
+        if terminal_error.is_some() {
+            "error"
+        } else {
+            "cancelled"
+        }
+    });
     match cfg.output_format {
         OutputFormat::Text => {
             print!("{}", state.final_text);
@@ -293,10 +292,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     ) {
         Ok(())
     } else {
-        Err(anyhow!(
-            "prompt stopped with {}",
-            stop_reason_label
-        ))
+        Err(anyhow!("prompt stopped with {}", stop_reason_label))
     }
 }
 

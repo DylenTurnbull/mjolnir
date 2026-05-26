@@ -11,8 +11,7 @@ use agent_client_protocol::schema::{
     FileSystemCapabilities, InitializeRequest, LoadSessionRequest, NewSessionRequest,
     PromptRequest, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
-    SessionUpdate,
-    SetSessionConfigOptionRequest, TextContent,
+    SessionUpdate, SetSessionConfigOptionRequest, TextContent,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::Result;
@@ -653,9 +652,7 @@ mod tests {
             .on_receive_request(
                 async move |_req: agent_client_protocol::schema::LoadSessionRequest,
                             responder,
-                            _cx| {
-                    responder.respond(LoadSessionResponse::new())
-                },
+                            _cx| { responder.respond(LoadSessionResponse::new()) },
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
