@@ -234,6 +234,7 @@ impl TokenUsage {
 pub struct AppState {
     pub agent_label: String,
     pub session_id: Option<String>,
+    pub session_title: Option<String>,
     pub connection_state: ConnectionState,
     pub current_mode: Option<String>,
     pub available_commands: Vec<AvailableCommand>,
@@ -355,6 +356,7 @@ impl AppState {
         Self {
             agent_label: String::new(),
             session_id: None,
+            session_title: None,
             connection_state: ConnectionState::Launching,
             current_mode: None,
             available_commands: Vec::new(),
@@ -873,15 +875,11 @@ impl AppState {
 
     pub fn apply_event(&mut self, event: UiEvent) {
         match event {
-            UiEvent::Connected {
-                agent_name,
-                agent_version,
-            } => {
-                self.agent_label = match (agent_name, agent_version) {
-                    (Some(n), Some(v)) => format!("{n} {v}"),
-                    (Some(n), None) => n,
-                    _ => "agent".to_string(),
-                };
+            UiEvent::Connected { .. } => {
+                // Keep the pre-filled agent_label (the configured
+                // executable name). The agent may report a different
+                // name over ACP, but the user wants to see which
+                // binary they wired up in config.
                 self.connection_state = ConnectionState::Initializing;
             }
             UiEvent::SessionStarted { session_id, .. } => {
@@ -1041,6 +1039,7 @@ impl AppState {
             }
             SessionUpdate::SessionInfoUpdate(info) => {
                 if let Some(title) = info.title.value() {
+                    self.session_title = Some(title.clone());
                     self.transcript
                         .push(Entry::System(format!("session title: {title}")));
                     self.bump_transcript_revision();
