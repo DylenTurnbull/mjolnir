@@ -995,11 +995,16 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
     });
 }
 
+fn clamp_permission_selected(selected: usize, option_count: usize) -> usize {
+    selected.min(option_count.saturating_sub(1))
+}
+
 fn handle_permission_key(state: &mut AppState, code: KeyCode) {
     let Some(pending) = state.pending_permission_mut() else {
         return;
     };
     let len = pending.prompt.options.len().max(1);
+    pending.selected = clamp_permission_selected(pending.selected, pending.prompt.options.len());
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
             if pending.selected == 0 {
@@ -2257,8 +2262,12 @@ fn draw_permission_modal(
     pending: &PendingPermission,
     queue_len: usize,
 ) {
-    // Calculate dimensions based on content
-    let width = area.width.saturating_sub(8).min(80);
+    // Keep the permission prompt roomy: clipped choices are worse than
+    // covering more of the transcript while the modal owns the keyboard.
+    let width = area.width.saturating_sub(4).min(100);
+    if width == 0 || area.height == 0 {
+        return;
+    }
 
     // Build the header paragraph to measure its wrapped height
     let title = pending
@@ -2276,10 +2285,18 @@ fn draw_permission_modal(
     // Calculate wrapped header height (accounting for block borders and padding)
     let inner_width = width.saturating_sub(2); // Block borders
     let header_height = header_para.line_count(inner_width) as u16;
+    let option_rows = pending.prompt.options.len().min(u16::MAX as usize) as u16;
 
-    // Height = header + options + footer + borders
-    let height = (header_height + pending.prompt.options.len() as u16 + 4)
-        .min(area.height.saturating_sub(4));
+    // Height = header + options + footer + borders, plus slack for a
+    // larger default modal. Extra rows naturally go to the options list.
+    let content_height = header_height.saturating_add(option_rows).saturating_add(3);
+    let height = content_height
+        .saturating_add(6)
+        .max(18)
+        .min(area.height.saturating_sub(2));
+    if height == 0 {
+        return;
+    }
 
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
@@ -2300,24 +2317,36 @@ fn draw_permission_modal(
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
+    let footer_height = 1.min(inner.height);
+    let measured_header_height = header_height.min(inner.height.saturating_sub(footer_height));
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(header_height),
+            Constraint::Length(measured_header_height),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(footer_height),
         ])
         .split(inner);
 
     f.render_widget(header_para, layout[0]);
+
+    let visible_options = usize::from(layout[1].height);
+    let selected = clamp_permission_selected(pending.selected, pending.prompt.options.len());
+    let first_visible = if visible_options == 0 || pending.prompt.options.len() <= visible_options {
+        0
+    } else {
+        selected.saturating_add(1).saturating_sub(visible_options)
+    };
 
     let items: Vec<ListItem> = pending
         .prompt
         .options
         .iter()
         .enumerate()
+        .skip(first_visible)
+        .take(visible_options)
         .map(|(i, opt)| {
-            let marker = if i == pending.selected { ">" } else { " " };
+            let marker = if i == selected { ">" } else { " " };
             let kind = permission_kind_label(opt.kind);
             ListItem::new(format!("{marker} {} ({kind})", opt.name))
         })
@@ -2653,7 +2682,8 @@ mod tests {
 
     use super::*;
     use agent_client_protocol::schema::{
-        SessionConfigOption, SessionConfigSelectOption, ToolCallStatus, ToolKind,
+        PermissionOption, PermissionOptionKind, SessionConfigOption, SessionConfigSelectOption,
+        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
@@ -2671,6 +2701,46 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn buffer_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buffer.area().height)
+            .map(|y| {
+                (0..buffer.area().width)
+                    .map(|x| buffer.cell((x, y)).expect("cell").symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn permission_pending_with_options(
+        title: &str,
+        option_names: &[&str],
+        selected: usize,
+    ) -> PendingPermission {
+        let (responder, _rx) = tokio::sync::oneshot::channel();
+        let mut fields = ToolCallUpdateFields::default();
+        fields.title = Some(title.to_string());
+        let options = option_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                PermissionOption::new(
+                    format!("option-{i}"),
+                    (*name).to_string(),
+                    PermissionOptionKind::AllowOnce,
+                )
+            })
+            .collect();
+
+        PendingPermission {
+            prompt: crate::event::PermissionPrompt {
+                tool_call: ToolCallUpdate::new("call-1", fields),
+                options,
+                responder,
+            },
+            selected,
+        }
     }
 
     #[test]
@@ -3049,6 +3119,55 @@ mod tests {
         state.scroll_offset = 0;
         state.expand_tool_outputs = true;
         assert!(transcript_block_title(&state).contains("tool output: expanded"));
+    }
+
+    #[test]
+    fn permission_modal_renders_all_short_options() {
+        let pending = permission_pending_with_options(
+            "run shell command",
+            &["Allow once", "Allow always", "Reject"],
+            0,
+        );
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_permission_modal(frame, frame.area(), &pending, 1))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        for expected in [
+            "Allow once (allow once)",
+            "Allow always (allow once)",
+            "Reject (allow once)",
+            "Enter to confirm",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}; rendered:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_modal_clamps_out_of_bounds_selected_option() {
+        let pending = permission_pending_with_options(
+            "run shell command",
+            &["Allow once", "Allow always", "Reject"],
+            99,
+        );
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_permission_modal(frame, frame.area(), &pending, 1))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(
+            rendered.contains("> Reject (allow once)"),
+            "clamped selection should be rendered; rendered:\n{rendered}"
+        );
     }
 
     #[test]
