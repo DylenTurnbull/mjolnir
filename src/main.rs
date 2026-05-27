@@ -1,9 +1,9 @@
 //! mjolnir: an interactive terminal client for any ACP-speaking agent.
 //!
 //! Picks an agent (from the ACP registry, the bundled `anvil` default, or
-//! a Custom command) the first time it runs, persists the choice to
-//! `~/.config/mj/config.toml`, then spawns the agent as a child process
-//! and renders the session in a ratatui chat UI.
+//! a Custom command) for each new session, persists global picker
+//! preferences to `~/.config/mj/config.toml`, then spawns the agent as a
+//! child process and renders the session in a ratatui chat UI.
 
 mod acp;
 mod app;
@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 
 use crate::app::UiExitReason;
 use crate::config::{Config, SelectedAgent, history_path};
-use crate::picker::PickerOutcome;
+use crate::picker::{PickerOutcome, PickerPreferences, PickerResult};
 use crate::session::SessionEntryJson;
 use crate::worktree::CreatedWorktree;
 
@@ -93,18 +93,19 @@ struct Cli {
 enum Commands {
     /// Resume an existing ACP session.
     ///
-    /// Without arguments, opens an interactive session picker that lists
-    /// available sessions from the configured agent. With a session ID,
-    /// resumes that session directly without prompting.
+    /// Opens the agent picker first so the session is listed or loaded
+    /// from the agent that owns it. Without a session ID, opens an
+    /// interactive session picker for the chosen agent.
     ///
-    /// Use `--list` to print sessions in headless mode (no TUI).
+    /// Use `--list` to print sessions from the configured default agent
+    /// in headless mode (no TUI).
     Resume(ResumeArgs),
 }
 
 #[derive(Debug, clap::Args)]
 struct ResumeArgs {
-    /// Session ID to resume directly. When omitted, opens an interactive
-    /// picker that fetches the session list from the configured agent.
+    /// Session ID to resume from the chosen agent. When omitted, opens an
+    /// interactive picker that fetches the chosen agent's session list.
     session_id: Option<String>,
 
     /// List available sessions and exit (headless, no TUI). Optionally
@@ -211,6 +212,7 @@ async fn main() -> Result<()> {
         cli.agent_stderr,
         worktree_label.clone(),
         None,
+        None,
     )
     .await;
 
@@ -243,8 +245,8 @@ fn print_resume_hint(session_id: &str, worktree_label: Option<&str>) {
     }
 }
 
-/// Handle the `mj resume` subcommand: list sessions, pick one interactively,
-/// or resume directly by ID.
+/// Handle the `mj resume` subcommand: pick the agent to resume from, list
+/// sessions, pick one interactively, or resume directly by ID.
 async fn run_resume(args: ResumeArgs) -> Result<()> {
     let cwd = match args.cwd.clone() {
         Some(p) => p,
@@ -253,18 +255,17 @@ async fn run_resume(args: ResumeArgs) -> Result<()> {
     let (cwd, worktree) = prepare_worktree_for_arg(cwd, args.worktree.as_deref())?;
     let worktree_label = worktree_label(worktree.as_ref());
 
-    // Load the configured agent (same as headless mode).
-    let config_path = config::default_config_path();
-    let cfg =
-        Config::load(&config_path).with_context(|| format!("load {}", config_path.display()))?;
-    let agent = cfg.agent.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no agent configured; run `mj` once to pick an agent before resuming sessions"
-        )
-    })?;
-
     // `--list`: headless listing, print and exit.
     if args.list {
+        // Load the configured agent (same as headless mode).
+        let config_path = config::default_config_path();
+        let cfg = Config::load(&config_path)
+            .with_context(|| format!("load {}", config_path.display()))?;
+        let agent = cfg.agent.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no default agent configured; run `mj` once to pick an agent before listing sessions"
+            )
+        })?;
         let sessions = session::list_sessions(&agent, cwd, args.agent_stderr.as_deref()).await?;
         match args.format {
             HeadlessOutputFormat::Json | HeadlessOutputFormat::StreamJson => {
@@ -291,7 +292,18 @@ async fn run_resume(args: ResumeArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Direct ID: skip the picker and launch TUI with that session.
+    let mut terminal = ui::setup_terminal().context("setup terminal")?;
+    let agent = pick_agent_for_resume(&mut terminal).await;
+    if let Err(e) = ui::restore_terminal(&mut terminal) {
+        tracing::warn!("restore terminal (agent picker) failed: {e}");
+    }
+    let Some(agent) = agent? else {
+        eprintln!("Cancelled.");
+        let _ = handle_worktree_after_tui(worktree.as_ref());
+        return Ok(());
+    };
+
+    // Direct ID: launch the TUI with the chosen agent and session.
     if let Some(session_id) = args.session_id.clone() {
         let mut terminal = ui::setup_terminal().context("setup terminal")?;
         let result = run_app(
@@ -300,6 +312,7 @@ async fn run_resume(args: ResumeArgs) -> Result<()> {
             args.agent_stderr.clone(),
             worktree_label.clone(),
             Some(session_id.clone()),
+            Some(agent),
         )
         .await;
         if let Err(e) = ui::restore_terminal(&mut terminal) {
@@ -315,14 +328,15 @@ async fn run_resume(args: ResumeArgs) -> Result<()> {
         return result.map(|_| ());
     }
 
-    // Interactive picker: fetch sessions first (agent is killed after listing),
-    // then set up the TUI to show the picker, then launch the chosen session
-    // with a fresh agent.
+    // Interactive picker: fetch sessions from the chosen agent first (agent is
+    // killed after listing), then set up the TUI to show the session picker,
+    // then launch the chosen session with a fresh process for the same agent.
     eprintln!("Fetching sessions from agent...");
     let sessions =
         session::list_sessions(&agent, cwd.clone(), args.agent_stderr.as_deref()).await?;
     if sessions.is_empty() {
         eprintln!("No sessions available.");
+        let _ = handle_worktree_after_tui(worktree.as_ref());
         return Ok(());
     }
 
@@ -338,6 +352,7 @@ async fn run_resume(args: ResumeArgs) -> Result<()> {
     match outcome {
         session::ResumeOutcome::Cancelled => {
             eprintln!("Cancelled.");
+            let _ = handle_worktree_after_tui(worktree.as_ref());
             Ok(())
         }
         session::ResumeOutcome::Selected(entry) => {
@@ -350,6 +365,7 @@ async fn run_resume(args: ResumeArgs) -> Result<()> {
                 args.agent_stderr,
                 worktree_label.clone(),
                 Some(entry.session_id),
+                Some(agent),
             )
             .await;
             if let Err(e) = ui::restore_terminal(&mut terminal) {
@@ -365,6 +381,26 @@ async fn run_resume(args: ResumeArgs) -> Result<()> {
             result.map(|_| ())
         }
     }
+}
+
+async fn pick_agent_for_resume(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+) -> Result<Option<SelectedAgent>> {
+    let config_path = config::default_config_path();
+    let mut cfg =
+        Config::load(&config_path).with_context(|| format!("load {}", config_path.display()))?;
+
+    let picker_result = run_picker_with_registry(terminal, &cfg).await?;
+    apply_picker_preferences(&mut cfg, picker_result.preferences);
+    let selected = picker_result.outcome.map(picker_outcome_to_selected);
+    if cfg.agent.is_none()
+        && let Some(agent) = selected.as_ref()
+    {
+        cfg.agent = Some(agent.clone());
+    }
+    cfg.save(&config_path)
+        .with_context(|| format!("save {}", config_path.display()))?;
+    Ok(selected)
 }
 
 fn read_headless_prompt(prompt_arg: String) -> Result<String> {
@@ -474,37 +510,45 @@ async fn run_app(
     agent_stderr: Option<PathBuf>,
     worktree_label: Option<String>,
     resume_session: Option<String>,
+    initial_agent: Option<SelectedAgent>,
 ) -> Result<Option<String>> {
     let config_path = config::default_config_path();
     let mut cfg = Config::load(&config_path)?;
 
-    // Supervisor loop. We start a session for the currently-configured
-    // agent; if the user invokes `/mj:agents`, the UI exits with
-    // `SwapAgent`, we run the picker again, persist, and loop.
-    let mut last_source_id: Option<String> = None;
-    // Consume resume_session on the first iteration only.
+    // Supervisor loop. New sessions always pass through the agent picker.
+    // Resumed sessions may provide the agent chosen by `mj resume`; otherwise
+    // they fall back to the configured default agent for compatibility with
+    // non-interactive resume paths.
+    // Consume resume_session and initial_agent on the first iteration only.
     let mut initial_resume = resume_session;
+    let mut initial_agent = initial_agent;
     loop {
-        let agent = match cfg.agent.clone() {
-            Some(a) => {
-                last_source_id = Some(a.source_id.clone());
-                a
-            }
-            None => {
-                let outcome = run_picker_with_registry(terminal, last_source_id.clone()).await?;
-                let Some(outcome) = outcome else {
-                    return Ok(None);
-                };
-                let selected = picker_outcome_to_selected(outcome);
-                cfg.agent = Some(selected.clone());
+        let resume = initial_resume.take();
+        let agent = if let Some(agent) = initial_agent.take() {
+            agent
+        } else if resume.is_some() {
+            cfg.agent.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no default agent configured; run `mj` once to pick an agent before resuming sessions"
+                )
+            })?
+        } else {
+            let picker_result = run_picker_with_registry(terminal, &cfg).await?;
+            apply_picker_preferences(&mut cfg, picker_result.preferences);
+            let Some(outcome) = picker_result.outcome else {
                 cfg.save(&config_path)
                     .with_context(|| format!("save {}", config_path.display()))?;
-                last_source_id = Some(selected.source_id.clone());
-                selected
+                return Ok(None);
+            };
+            let selected = picker_outcome_to_selected(outcome);
+            if cfg.agent.is_none() {
+                cfg.agent = Some(selected.clone());
             }
+            cfg.save(&config_path)
+                .with_context(|| format!("save {}", config_path.display()))?;
+            selected
         };
 
-        let resume = initial_resume.take();
         let (reason, session_id) = run_session(
             terminal,
             &agent,
@@ -516,11 +560,7 @@ async fn run_app(
         .await?;
         match reason {
             UiExitReason::Quit => return Ok(session_id),
-            UiExitReason::SwapAgent => {
-                // Drop the current agent; the next loop iteration runs
-                // the picker so the user can pick a new one. We persist
-                // only when they actually commit a choice.
-                cfg.agent = None;
+            UiExitReason::NewSession => {
                 continue;
             }
         }
@@ -529,8 +569,8 @@ async fn run_app(
 
 async fn run_picker_with_registry(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-    current_source_id: Option<String>,
-) -> Result<Option<PickerOutcome>> {
+    cfg: &Config,
+) -> Result<PickerResult> {
     let cache_path = registry::default_cache_path();
     let registry =
         match registry::load_with_cache(&cache_path, registry::CACHE_TTL, registry::REGISTRY_URL)
@@ -549,9 +589,21 @@ async fn run_picker_with_registry(
         &registry,
         &install::default_install_root(),
         &registry::current_platform(),
-        current_source_id,
+        picker_preferences_from_config(cfg),
     )
     .await
+}
+
+fn picker_preferences_from_config(cfg: &Config) -> PickerPreferences {
+    PickerPreferences {
+        default_agent: cfg.agent.as_ref().map(selected_to_picker_outcome),
+        favorite_source_ids: cfg.favorite_agents.clone(),
+    }
+}
+
+fn apply_picker_preferences(cfg: &mut Config, preferences: PickerPreferences) {
+    cfg.agent = preferences.default_agent.map(picker_outcome_to_selected);
+    cfg.favorite_agents = preferences.favorite_source_ids;
 }
 
 fn picker_outcome_to_selected(o: PickerOutcome) -> SelectedAgent {
@@ -560,6 +612,15 @@ fn picker_outcome_to_selected(o: PickerOutcome) -> SelectedAgent {
         program: o.program,
         args: o.args,
         env: o.env,
+    }
+}
+
+fn selected_to_picker_outcome(agent: &SelectedAgent) -> PickerOutcome {
+    PickerOutcome {
+        source_id: agent.source_id.clone(),
+        program: agent.program.clone(),
+        args: agent.args.clone(),
+        env: agent.env.clone(),
     }
 }
 
