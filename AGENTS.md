@@ -33,6 +33,10 @@ Use idiomatic Rust formatted by rustfmt. Prefer clear module boundaries that mat
 
 Add focused unit tests near the code under test using `#[cfg(test)] mod tests`. Follow the existing descriptive test naming style, e.g. `autocomplete_updates_matches_for_prefix`. For state-machine changes, test the event transition or input handling directly rather than relying only on manual TUI checks. Run `cargo test` and `cargo clippy --all-targets -- -D warnings` before submitting changes.
 
+## UI Safety Requirements
+
+Permission dialogs must never truncate requested permission content. Long commands, titles, descriptions, and option labels must remain fully readable through wrapping, scrolling, paging, resizing, or an equivalent explicit expansion path. This applies to both inline and fullscreen UI modes.
+
 ## Commit & Pull Request Guidelines
 
 Recent commits use concise, imperative summaries such as `rename crate to mjolnir, binary to mj`; some include PR numbers after merge. Keep commit subjects specific and lowercase where natural. Pull requests should describe the behavior change, list validation commands run, link related issues, and include screenshots or terminal recordings when UI rendering changes.

@@ -24,8 +24,8 @@ use crossterm::terminal::{
     supports_keyboard_enhancement,
 };
 use futures::StreamExt;
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::backend::{Backend, ClearType, CrosstermBackend};
+use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Widget, Wrap};
@@ -48,7 +48,7 @@ const TRANSCRIPT_SCROLL_PAGE_STEP: usize = 5;
 const TRANSCRIPT_SCROLL_WHEEL_STEP: usize = 3;
 const PROMPT_SIDE_PADDING: u16 = 1;
 pub const INLINE_CHAT_HEIGHT: u16 = 8;
-const INLINE_PERMISSION_MODAL_COOLDOWN: Duration = Duration::from_secs(2);
+const INLINE_EXPANDED_MAX_HEIGHT: u16 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiMode {
@@ -117,51 +117,6 @@ struct TranscriptCache {
 #[derive(Debug, Default)]
 struct TranscriptSink {
     emitted_entries: usize,
-}
-
-#[derive(Debug, Default)]
-struct PermissionModalCooldown {
-    pending_key: Option<String>,
-    show_at: Option<Instant>,
-}
-
-impl PermissionModalCooldown {
-    fn reset(&mut self) {
-        self.pending_key = None;
-        self.show_at = None;
-    }
-
-    fn sync(&mut self, state: &AppState, now: Instant) {
-        let pending_key = pending_permission_key(state);
-        match pending_key {
-            Some(key) if self.pending_key.as_deref() == Some(key.as_str()) => {}
-            Some(key) => {
-                self.pending_key = Some(key);
-                self.show_at = Some(now + INLINE_PERMISSION_MODAL_COOLDOWN);
-            }
-            None => self.reset(),
-        }
-    }
-
-    fn is_waiting(&mut self, state: &AppState, now: Instant) -> bool {
-        self.sync(state, now);
-        state.has_pending_permission() && !self.deadline_elapsed(now)
-    }
-
-    fn is_ready(&mut self, state: &AppState, now: Instant) -> bool {
-        self.sync(state, now);
-        self.deadline_elapsed(now)
-    }
-
-    fn deadline_elapsed(&self, now: Instant) -> bool {
-        self.show_at.is_some_and(|show_at| now >= show_at)
-    }
-}
-
-fn pending_permission_key(state: &AppState) -> Option<String> {
-    state
-        .pending_permission()
-        .map(|pending| pending.prompt.tool_call.tool_call_id.to_string())
 }
 
 impl TranscriptSink {
@@ -291,14 +246,17 @@ async fn ui_loop(
     }
     let mut transcript_scroll = TranscriptScrollState::default();
     let mut transcript_sink = TranscriptSink::default();
-    let mut permission_modal_cooldown = PermissionModalCooldown::default();
     let mut crossterm_events = EventStream::new();
+    let mut inline_height = INLINE_CHAT_HEIGHT;
     // Wake-up timer so we still get scheduled to draw when no events
     // arrive (e.g. while waiting on the agent). `Delay` keeps it from
     // burst-firing after a long busy period.
     let mut frame_tick = tokio::time::interval(FRAME_BUDGET);
     frame_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    if mode == UiMode::InlineChat {
+        sync_inline_terminal_height(terminal, &state, &mut inline_height)?;
+    }
     terminal.draw(|f| draw(f, &mut state, &mut transcript_scroll, mode))?;
     let mut last_draw = Instant::now();
     let mut dirty = false;
@@ -309,12 +267,8 @@ async fn ui_loop(
             maybe_ct = crossterm_events.next() => {
                 match maybe_ct {
                     Some(Ok(ev)) => {
-                        let waiting_for_inline_permission_modal = mode == UiMode::InlineChat
-                            && permission_modal_cooldown.is_waiting(&state, Instant::now());
-                        if !waiting_for_inline_permission_modal {
-                            let request = handle_crossterm(&mut state, cmd_tx, ev, mode);
-                            apply_terminal_request(terminal, &mut state, request)?;
-                        }
+                        let request = handle_crossterm(&mut state, cmd_tx, ev, mode);
+                        apply_terminal_request(terminal, &mut state, request)?;
                     }
                     Some(Err(e)) => {
                         state.record_status_message(
@@ -349,20 +303,13 @@ async fn ui_loop(
 
         if mode == UiMode::InlineChat {
             flush_transcript_to_scrollback(terminal, &mut transcript_sink, &state)?;
-            if permission_modal_cooldown.is_ready(&state, Instant::now()) {
-                run_inline_permission_modal(terminal, event_rx, &mut crossterm_events, &mut state)
-                    .await?;
-                permission_modal_cooldown.reset();
-                flush_transcript_to_scrollback(terminal, &mut transcript_sink, &state)?;
-                dirty = false;
-                last_draw = Instant::now();
-            }
         }
 
         if let Some(reason) = state.exit_reason {
             let _ = cmd_tx.send(UiCommand::Shutdown);
             if mode == UiMode::InlineChat {
                 flush_transcript_to_scrollback(terminal, &mut transcript_sink, &state)?;
+                sync_inline_terminal_height(terminal, &state, &mut inline_height)?;
             }
             terminal.draw(|f| draw(f, &mut state, &mut transcript_scroll, mode))?;
             if mode == UiMode::FullscreenTui {
@@ -378,6 +325,9 @@ async fn ui_loop(
         // the timer), this elapsed-time check is what actually paces
         // the redraws; the timer arm is the wake-up source when idle.
         if dirty && last_draw.elapsed() >= FRAME_BUDGET {
+            if mode == UiMode::InlineChat {
+                sync_inline_terminal_height(terminal, &state, &mut inline_height)?;
+            }
             terminal.draw(|f| draw(f, &mut state, &mut transcript_scroll, mode))?;
             dirty = false;
             last_draw = Instant::now();
@@ -429,87 +379,53 @@ fn flush_transcript_to_scrollback(
     Ok(())
 }
 
-async fn run_inline_permission_modal(
-    inline_terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    event_rx: &mut mpsc::UnboundedReceiver<UiEvent>,
-    crossterm_events: &mut EventStream,
-    state: &mut AppState,
+fn sync_inline_terminal_height(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    state: &AppState,
+    current_height: &mut u16,
 ) -> Result<()> {
-    let Some(active_permission_key) = pending_permission_key(state) else {
+    let size = terminal.size()?;
+    let desired = desired_inline_height(state, size);
+    if desired == *current_height {
         return Ok(());
-    };
+    }
 
-    execute!(inline_terminal.backend_mut(), EnterAlternateScreen)
-        .context("enter permission modal screen")?;
+    let area = terminal.get_frame().area();
+    terminal
+        .backend_mut()
+        .set_cursor_position(area.as_position())?;
+    terminal
+        .backend_mut()
+        .clear_region(ClearType::AfterCursor)?;
+
     let backend = CrosstermBackend::new(io::stdout());
-    let mut modal_terminal = Terminal::new(backend).context("permission modal terminal")?;
-    modal_terminal.clear().context("clear permission modal")?;
-
-    let modal_result: Result<()> = async {
-        modal_terminal.draw(|f| draw_permission_modal_screen(f, state))?;
-        while pending_permission_key(state).as_deref() == Some(active_permission_key.as_str())
-            && state.exit_reason.is_none()
-        {
-            tokio::select! {
-                biased;
-                maybe_ct = crossterm_events.next() => {
-                    match maybe_ct {
-                        Some(Ok(ev)) => {
-                            handle_permission_modal_event(state, ev);
-                        }
-                        Some(Err(e)) => {
-                            state.record_status_message(
-                                StatusKind::Warning,
-                                format!("input error: {e}"),
-                            );
-                        }
-                        None => break,
-                    }
-                }
-                maybe_ev = event_rx.recv(), if !state.runtime_closed => {
-                    match maybe_ev {
-                        Some(ev) => state.apply_event(ev),
-                        None => state.mark_runtime_closed(),
-                    }
-                }
-            }
-            if pending_permission_key(state).as_deref() == Some(active_permission_key.as_str()) {
-                modal_terminal.draw(|f| draw_permission_modal_screen(f, state))?;
-            }
-        }
-        Ok(())
-    }
-    .await;
-
-    let restore_result: Result<()> = (|| {
-        modal_terminal.show_cursor()?;
-        execute!(modal_terminal.backend_mut(), LeaveAlternateScreen)
-            .context("leave permission modal screen")?;
-        inline_terminal.clear().context("clear inline terminal")?;
-        let mut inline_scroll = TranscriptScrollState::default();
-        inline_terminal.draw(|f| draw(f, state, &mut inline_scroll, UiMode::InlineChat))?;
-        Ok(())
-    })();
-
-    modal_result.and(restore_result)
+    let next = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(desired),
+        },
+    )
+    .context("resize inline terminal")?;
+    *terminal = next;
+    *current_height = desired;
+    Ok(())
 }
 
-fn handle_permission_modal_event(state: &mut AppState, ev: CtEvent) {
-    let CtEvent::Key(key) = ev else {
-        return;
+fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
+    let max_height = terminal_size
+        .height
+        .saturating_sub(1)
+        .clamp(INLINE_CHAT_HEIGHT, INLINE_EXPANDED_MAX_HEIGHT);
+    let width = terminal_size.width.saturating_sub(2).max(1);
+    let desired = if let Some(pending) = state.pending_permission() {
+        permission_view_lines(pending, state.pending_permission_count(), width).len() + 1
+    } else if state.config_picker.is_some() {
+        inline_config_view_line_count(state, width)
+    } else {
+        usize::from(INLINE_CHAT_HEIGHT)
     };
-    if key.kind != KeyEventKind::Press {
-        return;
-    }
-    handle_permission_key(state, key.code);
-}
 
-fn draw_permission_modal_screen(f: &mut ratatui::Frame, state: &AppState) {
-    let area = f.area();
-    f.render_widget(Clear, area);
-    if let Some(pending) = state.pending_permission() {
-        draw_permission_modal(f, area, pending, state.pending_permission_count());
-    }
+    (desired.min(usize::from(u16::MAX)) as u16).clamp(INLINE_CHAT_HEIGHT, max_height)
 }
 
 fn handle_crossterm(
@@ -1376,13 +1292,31 @@ fn handle_permission_key(state: &mut AppState, code: KeyCode) {
             } else {
                 pending.selected -= 1;
             }
+            pending.scroll_offset = None;
         }
         KeyCode::Down | KeyCode::Char('j') => {
             pending.selected = (pending.selected + 1) % len;
+            pending.scroll_offset = None;
+        }
+        KeyCode::PageUp => {
+            let current = pending.scroll_offset.unwrap_or(0);
+            pending.scroll_offset = Some(current.saturating_sub(5));
+        }
+        KeyCode::PageDown => {
+            let current = pending.scroll_offset.unwrap_or(0);
+            pending.scroll_offset = Some(current.saturating_add(5));
+        }
+        KeyCode::Home => {
+            pending.scroll_offset = Some(0);
+        }
+        KeyCode::End => {
+            pending.scroll_offset = Some(usize::MAX);
         }
         KeyCode::Enter => {
             let pending = state.take_pending_permission().expect("checked above");
-            let PendingPermission { prompt, selected } = pending;
+            let PendingPermission {
+                prompt, selected, ..
+            } = pending;
             let decision = prompt
                 .options
                 .get(selected)
@@ -1681,6 +1615,16 @@ fn draw(
 }
 
 fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
+    if let Some(pending) = state.pending_permission() {
+        draw_inline_permission_view(f, f.area(), pending, state.pending_permission_count());
+        return;
+    }
+
+    if state.config_picker.is_some() {
+        draw_inline_config_value_picker(f, f.area(), state);
+        return;
+    }
+
     let has_config_options = !state.selectable_config_options().is_empty();
     let config_height = if has_config_options { 1 } else { 0 };
     let chunks = Layout::default()
@@ -1700,13 +1644,165 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
         draw_inline_autocomplete_popover(f, f.area(), state);
     }
 
-    if state.config_picker.is_some() {
-        draw_config_value_picker_modal(f, f.area(), state);
-    }
-
     if state.help_overlay {
         draw_help_modal(f, f.area(), UiMode::InlineChat);
     }
+}
+
+fn inline_content_rect(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y,
+        area.width.saturating_sub(2),
+        area.height,
+    )
+}
+
+fn draw_inline_permission_view(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    pending: &PendingPermission,
+    queue_len: usize,
+) {
+    f.render_widget(Clear, area);
+    let content = inline_content_rect(area);
+    if content.width == 0 || content.height < 4 {
+        return;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(content);
+
+    let lines = permission_view_lines(pending, queue_len, content.width);
+    let visible_lines =
+        visible_permission_content_lines(pending, &lines, content.width, layout[0].height);
+    f.render_widget(Paragraph::new(visible_lines), layout[0]);
+
+    f.render_widget(
+        Paragraph::new("Up/Down choose | PgUp/PgDn read | Enter to confirm | Esc cancel")
+            .style(Style::default().fg(Color::DarkGray)),
+        layout[1],
+    );
+}
+
+fn draw_inline_config_value_picker(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    f.render_widget(Clear, area);
+    let content = inline_content_rect(area);
+    if content.width == 0 || content.height < 5 {
+        return;
+    }
+
+    let Some(picker) = state.config_picker.as_ref() else {
+        return;
+    };
+    let Some(option) = state.session_config_options.get(picker.selected_option) else {
+        return;
+    };
+    let Some(choices) = config_option_choices(option) else {
+        return;
+    };
+
+    let title = format!("{} values", option.name);
+    let detail = option
+        .description
+        .clone()
+        .unwrap_or_else(|| config_option_current_value_label(option));
+    let detail_lines = wrap_text_to_width(&detail, content.width)
+        .into_iter()
+        .take(2)
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    let detail_height = detail_lines.len().max(1).min(u16::MAX as usize) as u16;
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(detail_height),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(content);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        layout[0],
+    );
+    f.render_widget(Paragraph::new(detail_lines), layout[1]);
+
+    let search_text = if picker.search_query.is_empty() {
+        "filter:".to_string()
+    } else {
+        format!("filter: {}", picker.search_query)
+    };
+    f.render_widget(
+        Paragraph::new(search_text).style(Style::default().fg(Color::DarkGray)),
+        layout[2],
+    );
+
+    let total = picker.filtered_indices.len();
+    if total == 0 {
+        f.render_widget(
+            Paragraph::new("No matches").style(Style::default().fg(Color::DarkGray)),
+            layout[3],
+        );
+    } else {
+        let visible_options = usize::from(layout[3].height);
+        let selected = picker.selected_value;
+        let start = if total <= visible_options {
+            0
+        } else {
+            let half = visible_options / 2;
+            selected.saturating_sub(half).min(total - visible_options)
+        };
+        let end = (start + visible_options).min(total);
+        let items = picker.filtered_indices[start..end]
+            .iter()
+            .enumerate()
+            .map(|(offset, &full_idx)| {
+                let absolute = start + offset;
+                let marker = if absolute == selected { ">" } else { " " };
+                let choice = &choices[full_idx];
+                let line = config_value_row_text(choice);
+                truncate_line(line, layout[3].width, marker == ">")
+            })
+            .collect::<Vec<ListItem>>();
+        f.render_widget(List::new(items), layout[3]);
+    }
+
+    let footer = if picker.search_query.is_empty() {
+        "Up/Down choose | type to filter | Enter apply | Esc cancel"
+    } else {
+        "Up/Down choose | Backspace clear | Enter apply | Esc cancel"
+    };
+    f.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        layout[4],
+    );
+}
+
+fn inline_config_view_line_count(state: &AppState, width: u16) -> usize {
+    let Some(picker) = state.config_picker.as_ref() else {
+        return usize::from(INLINE_CHAT_HEIGHT);
+    };
+    let Some(option) = state.session_config_options.get(picker.selected_option) else {
+        return usize::from(INLINE_CHAT_HEIGHT);
+    };
+    let detail = option
+        .description
+        .clone()
+        .unwrap_or_else(|| config_option_current_value_label(option));
+    let detail_rows = wrap_text_to_width(&detail, width).len().max(1);
+    let option_rows = picker.filtered_indices.len().max(1);
+    1 + detail_rows + 1 + option_rows + 1
 }
 
 fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
@@ -2736,25 +2832,7 @@ fn draw_permission_modal(
     const HORIZONTAL_PADDING: u16 = 2;
     const VERTICAL_PADDING: u16 = 1;
 
-    let title = pending
-        .prompt
-        .tool_call
-        .fields
-        .title
-        .clone()
-        .unwrap_or_else(|| pending.prompt.tool_call.tool_call_id.to_string());
-    let footer_text = "Up/Down to choose | Enter to confirm | Esc to cancel";
-    let selected = clamp_permission_selected(pending.selected, pending.prompt.options.len());
-    let longest_option_width = pending
-        .prompt
-        .options
-        .iter()
-        .map(|opt| {
-            let kind = permission_kind_label(opt.kind);
-            format!("> {} ({kind})", opt.name).width()
-        })
-        .max()
-        .unwrap_or(0);
+    let footer_text = "Up/Down choose | PgUp/PgDn read | Enter to confirm | Esc cancel";
 
     let max_width = area.width.saturating_sub(4);
     if max_width < 16 || area.height == 0 {
@@ -2765,6 +2843,17 @@ fn draw_permission_modal(
         return;
     }
 
+    let title = permission_detail_text(pending);
+    let longest_option_width = pending
+        .prompt
+        .options
+        .iter()
+        .map(|opt| {
+            let kind = permission_kind_label(opt.kind);
+            format!("> {} ({kind})", opt.name).width()
+        })
+        .max()
+        .unwrap_or(0);
     let desired_content_width = longest_option_width
         .max(title.width())
         .max(footer_text.width())
@@ -2775,20 +2864,12 @@ fn draw_permission_modal(
         .saturating_add(HORIZONTAL_PADDING * 2)
         .min(max_width);
 
-    let header_lines = wrap_text_to_width(&title, desired_content_width);
-    let option_lines = permission_option_lines(pending, selected, desired_content_width);
-
-    let header_height = header_lines.len().min(u16::MAX as usize) as u16;
-    let option_rows = option_lines
-        .iter()
-        .map(|(_, lines)| lines.len())
-        .sum::<usize>()
-        .min(u16::MAX as usize) as u16;
+    let view_lines = permission_view_lines(pending, queue_len, desired_content_width);
+    let view_rows = view_lines.len().min(u16::MAX as usize) as u16;
 
     let max_height = area.height.saturating_sub(2);
-    let height = header_height
-        .saturating_add(option_rows)
-        .saturating_add(4)
+    let height = view_rows
+        .saturating_add(3)
         .saturating_add(VERTICAL_PADDING * 2)
         .min(max_height);
     if height < 7 {
@@ -2824,36 +2905,21 @@ fn draw_permission_modal(
         return;
     }
 
-    let footer_height = 1.min(inner.height);
-    let measured_header_height = header_height.min(content.height.saturating_sub(footer_height));
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(measured_header_height),
-            Constraint::Min(1),
-            Constraint::Length(footer_height),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(content);
 
-    let header = Paragraph::new(
-        header_lines
-            .into_iter()
-            .map(|line| {
-                Line::from(Span::styled(
-                    line,
-                    Style::default().add_modifier(Modifier::BOLD),
-                ))
-            })
-            .collect::<Vec<_>>(),
+    let visible_lines = visible_permission_content_lines(
+        pending,
+        &view_lines,
+        desired_content_width,
+        layout[0].height,
     );
-    f.render_widget(header, layout[0]);
-
-    let visible_options = usize::from(layout[1].height);
-    let visible_lines = visible_permission_option_lines(&option_lines, selected, visible_options);
-    f.render_widget(Paragraph::new(visible_lines), layout[1]);
+    f.render_widget(Paragraph::new(visible_lines), layout[0]);
 
     let footer = Paragraph::new(footer_text).style(Style::default().fg(Color::DarkGray));
-    f.render_widget(footer, layout[2]);
+    f.render_widget(footer, layout[1]);
 }
 
 fn permission_option_lines(
@@ -2894,48 +2960,91 @@ fn permission_option_lines(
         .collect()
 }
 
-fn visible_permission_option_lines(
-    option_lines: &[(usize, Vec<Line<'static>>)],
-    selected: usize,
-    visible_rows: usize,
+fn permission_detail_text(pending: &PendingPermission) -> String {
+    pending
+        .prompt
+        .tool_call
+        .fields
+        .title
+        .clone()
+        .unwrap_or_else(|| pending.prompt.tool_call.tool_call_id.to_string())
+}
+
+fn permission_view_lines(
+    pending: &PendingPermission,
+    queue_len: usize,
+    width: u16,
 ) -> Vec<Line<'static>> {
+    let selected = clamp_permission_selected(pending.selected, pending.prompt.options.len());
+    let title = if queue_len > 1 {
+        format!("permission request (1 of {queue_len})")
+    } else {
+        "permission request".to_string()
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        title,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))];
+
+    lines.extend(
+        wrap_text_to_width(&permission_detail_text(pending), width)
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::White)))),
+    );
+    lines.push(Line::from(""));
+    lines.extend(
+        permission_option_lines(pending, selected, width)
+            .into_iter()
+            .flat_map(|(_, option_lines)| option_lines),
+    );
+    lines
+}
+
+fn visible_permission_content_lines(
+    pending: &PendingPermission,
+    lines: &[Line<'static>],
+    width: u16,
+    visible_rows: u16,
+) -> Vec<Line<'static>> {
+    let visible_rows = usize::from(visible_rows);
     if visible_rows == 0 {
         return Vec::new();
     }
+    let max_start = lines.len().saturating_sub(visible_rows);
+    let auto_start = selected_permission_content_row(pending, width)
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(max_start);
+    let start = pending.scroll_offset.unwrap_or(auto_start).min(max_start);
 
-    let total_rows = option_lines
+    lines
         .iter()
-        .map(|(_, lines)| lines.len())
-        .sum::<usize>();
-    let selected_start = option_lines
-        .iter()
-        .take_while(|(i, _)| *i != selected)
-        .map(|(_, lines)| lines.len())
-        .sum::<usize>();
-    let selected_rows = option_lines
-        .iter()
-        .find(|(i, _)| *i == selected)
-        .map(|(_, lines)| lines.len())
-        .unwrap_or(1);
-    let selected_end = selected_start.saturating_add(selected_rows);
-
-    let first_visible_row = if total_rows <= visible_rows {
-        0
-    } else if selected_rows > visible_rows {
-        selected_start
-    } else {
-        selected_end
-            .saturating_sub(visible_rows)
-            .min(total_rows.saturating_sub(visible_rows))
-    };
-
-    option_lines
-        .iter()
-        .flat_map(|(_, lines)| lines.iter())
-        .skip(first_visible_row)
+        .skip(start)
         .take(visible_rows)
         .cloned()
         .collect()
+}
+
+fn selected_permission_content_row(pending: &PendingPermission, width: u16) -> usize {
+    let selected = clamp_permission_selected(pending.selected, pending.prompt.options.len());
+    let detail_rows = wrap_text_to_width(&permission_detail_text(pending), width)
+        .len()
+        .max(1);
+    let option_rows_before = pending
+        .prompt
+        .options
+        .iter()
+        .take(selected)
+        .map(|opt| {
+            let kind = permission_kind_label(opt.kind);
+            wrap_prefixed_text_to_width(&format!("{} ({kind})", opt.name), width, "> ", "  ")
+                .len()
+                .max(1)
+        })
+        .sum::<usize>();
+
+    1 + detail_rows + 1 + option_rows_before
 }
 
 fn wrap_prefixed_text_to_width(
@@ -3184,7 +3293,12 @@ fn draw_config_value_picker_modal(f: &mut ratatui::Frame, area: Rect, state: &Ap
     } else {
         (total as u16).min(rows)
     };
-    let height = (desired_rows + 5).min(area.height.saturating_sub(4));
+    let max_height = if area.height <= 10 {
+        area.height
+    } else {
+        area.height.saturating_sub(4)
+    };
+    let height = (desired_rows + 5).min(max_height);
     if height < 6 {
         return;
     }
@@ -3534,6 +3648,14 @@ mod tests {
         super::handle_crossterm(state, cmd_tx, ev, UiMode::FullscreenTui)
     }
 
+    fn handle_inline_crossterm(
+        state: &mut AppState,
+        cmd_tx: &mpsc::UnboundedSender<UiCommand>,
+        ev: CtEvent,
+    ) -> TerminalRequest {
+        super::handle_crossterm(state, cmd_tx, ev, UiMode::InlineChat)
+    }
+
     fn line_text(line: &Line<'_>) -> String {
         line.spans
             .iter()
@@ -3578,6 +3700,7 @@ mod tests {
                 responder,
             },
             selected,
+            scroll_offset: None,
         }
     }
 
@@ -3871,28 +3994,6 @@ mod tests {
             .map(line_text)
             .collect();
         assert_eq!(second, vec!["second", ""]);
-    }
-
-    #[test]
-    fn permission_modal_cooldown_waits_two_seconds_per_prompt() {
-        let mut state = AppState::new();
-        let mut cooldown = PermissionModalCooldown::default();
-        let now = Instant::now();
-
-        assert!(!cooldown.is_waiting(&state, now));
-        assert!(!cooldown.is_ready(&state, now));
-
-        let pending =
-            permission_pending_with_options("run shell command", &["Allow once", "Reject"], 0);
-        state.apply_event(UiEvent::PermissionRequest(pending.prompt));
-
-        assert!(cooldown.is_waiting(&state, now));
-        assert!(!cooldown.is_ready(&state, now + INLINE_PERMISSION_MODAL_COOLDOWN / 2));
-        assert!(cooldown.is_ready(&state, now + INLINE_PERMISSION_MODAL_COOLDOWN));
-
-        cooldown.reset();
-        assert!(cooldown.is_waiting(&state, now + INLINE_PERMISSION_MODAL_COOLDOWN));
-        assert!(cooldown.is_ready(&state, now + INLINE_PERMISSION_MODAL_COOLDOWN * 2));
     }
 
     #[test]
@@ -4322,46 +4423,18 @@ mod tests {
     }
 
     #[test]
-    fn inline_chat_does_not_render_permission_modal() {
-        let pending =
-            permission_pending_with_options("run shell command", &["Allow once", "Reject"], 0);
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::PermissionRequest(pending.prompt));
-        let backend = TestBackend::new(100, INLINE_CHAT_HEIGHT);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-
-        terminal
-            .draw(|frame| draw_inline_chat(frame, &mut state))
-            .expect("draw");
-
-        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(
-            !rendered.contains("permission request"),
-            "inline renderer must not draw permission UI; rendered:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains("run shell command"),
-            "inline renderer must not draw permission UI; rendered:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains("Allow once"),
-            "inline renderer must not draw permission UI; rendered:\n{rendered}"
-        );
-    }
-
-    #[test]
-    fn inline_permission_modal_screen_is_blank_except_modal() {
+    fn inline_chat_replaces_content_with_permission_view() {
         let pending =
             permission_pending_with_options("run shell command", &["Allow once", "Reject"], 0);
         let mut state = AppState::new();
         state.agent_label = "anvil".to_string();
         state.record_user_prompt("hello".to_string());
         state.apply_event(UiEvent::PermissionRequest(pending.prompt));
-        let backend = TestBackend::new(100, 30);
+        let backend = TestBackend::new(100, INLINE_CHAT_HEIGHT);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
         terminal
-            .draw(|frame| draw_permission_modal_screen(frame, &state))
+            .draw(|frame| draw_inline_chat(frame, &mut state))
             .expect("draw");
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -4376,16 +4449,26 @@ mod tests {
         assert!(rendered.contains("Allow once"), "rendered:\n{rendered}");
         assert!(
             !rendered.contains("agent anvil"),
-            "modal screen must not render the chat header; rendered:\n{rendered}"
+            "permission view must replace the chat header; rendered:\n{rendered}"
         );
         assert!(
             !rendered.contains("prompt ("),
-            "modal screen must not render the prompt editor; rendered:\n{rendered}"
+            "permission view must replace the prompt editor; rendered:\n{rendered}"
         );
-        assert!(
-            !rendered.contains("you:"),
-            "modal screen must not render the transcript pane; rendered:\n{rendered}"
-        );
+    }
+
+    #[test]
+    fn inline_permission_view_handles_keyboard_selection() {
+        let pending =
+            permission_pending_with_options("run shell command", &["Allow once", "Reject"], 0);
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::PermissionRequest(pending.prompt));
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::Down));
+
+        let pending = state.pending_permission().expect("pending permission");
+        assert_eq!(pending.selected, 1);
     }
 
     #[test]
@@ -4780,6 +4863,114 @@ mod tests {
         let picker = state.config_picker.as_ref().expect("picker");
         assert_eq!(picker.selected_option, 1);
         assert_eq!(picker.selected_value, 0);
+    }
+
+    #[test]
+    fn inline_ctrl_digit_opens_matching_config_value_picker() {
+        let mut state = AppState::new();
+        state.session_id = Some("session-1".to_string());
+        state.session_config_options = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "model-1",
+                vec![
+                    SessionConfigSelectOption::new("model-1", "Model 1"),
+                    SessionConfigSelectOption::new("model-2", "Model 2"),
+                ],
+            ),
+            SessionConfigOption::select(
+                "mode",
+                "Mode",
+                "ask",
+                vec![
+                    SessionConfigSelectOption::new("ask", "Ask"),
+                    SessionConfigSelectOption::new("code", "Code"),
+                ],
+            ),
+        ];
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        handle_inline_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('2'), KeyModifiers::CONTROL),
+        );
+
+        let picker = state.config_picker.as_ref().expect("picker");
+        assert_eq!(picker.selected_option, 1);
+        assert_eq!(picker.selected_value, 0);
+    }
+
+    #[test]
+    fn inline_function_key_opens_matching_config_value_picker() {
+        let mut state = AppState::new();
+        state.session_id = Some("session-1".to_string());
+        state.session_config_options = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "model-1",
+                vec![
+                    SessionConfigSelectOption::new("model-1", "Model 1"),
+                    SessionConfigSelectOption::new("model-2", "Model 2"),
+                ],
+            ),
+            SessionConfigOption::select(
+                "mode",
+                "Mode",
+                "ask",
+                vec![
+                    SessionConfigSelectOption::new("ask", "Ask"),
+                    SessionConfigSelectOption::new("code", "Code"),
+                ],
+            ),
+        ];
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::F(2)));
+
+        let picker = state.config_picker.as_ref().expect("picker");
+        assert_eq!(picker.selected_option, 1);
+        assert_eq!(picker.selected_value, 0);
+    }
+
+    #[test]
+    fn inline_config_picker_renders_after_shortcut_opens_it() {
+        let mut state = AppState::new();
+        state.session_id = Some("session-1".to_string());
+        state.session_config_options = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "model-1",
+                vec![
+                    SessionConfigSelectOption::new("model-1", "Model 1"),
+                    SessionConfigSelectOption::new("model-2", "Model 2"),
+                ],
+            ),
+            SessionConfigOption::select(
+                "mode",
+                "Mode",
+                "ask",
+                vec![
+                    SessionConfigSelectOption::new("ask", "Ask"),
+                    SessionConfigSelectOption::new("code", "Code"),
+                ],
+            ),
+        ];
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::F(2)));
+
+        let backend = TestBackend::new(100, INLINE_CHAT_HEIGHT);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_inline_chat(frame, &mut state))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Mode values"), "rendered:\n{rendered}");
+        assert!(rendered.contains("Enter apply"), "rendered:\n{rendered}");
     }
 
     #[test]
