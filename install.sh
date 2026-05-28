@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_VERSION="1.0.0"
+
 OWNER="${MJOLNIR_GITHUB_OWNER:-BrokkAi}"
 INSTALL_DIR="${MJOLNIR_INSTALL_DIR:-${INSTALL_DIR:-$HOME/.local/bin}}"
 
@@ -523,7 +525,7 @@ main() {
   TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mjolnir-installer.XXXXXX")"
   trap cleanup EXIT
 
-  log "installing for ${OS_FAMILY}/${ARCH} into ${INSTALL_DIR}"
+  log "installing for ${OS_FAMILY}/${ARCH} into ${INSTALL_DIR} (script ${SCRIPT_VERSION})"
   install_bifrost
   install_mjolnir
 
