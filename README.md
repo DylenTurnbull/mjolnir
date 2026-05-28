@@ -185,7 +185,7 @@ Keyboard basics:
 - `Tab`: accept the selected slash command.
 - `Up` / `Down`: move within slash-command autocomplete or permission prompts.
 - `PageUp` / `PageDown`: scroll the transcript.
-- `?` / `F10`: show or hide the help overlay.
+- `F10`: show or hide the help overlay.
 - `F1`..`F9`: edit visible session config options.
 - `Esc`: dismiss autocomplete, clear input, or cancel a permission prompt.
 - `Ctrl-C`: cancel an in-flight prompt; when idle with an empty input, quit.

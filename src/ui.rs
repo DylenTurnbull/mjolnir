@@ -49,6 +49,7 @@ const TRANSCRIPT_SCROLL_WHEEL_STEP: usize = 3;
 const PROMPT_SIDE_PADDING: u16 = 1;
 pub const INLINE_CHAT_HEIGHT: u16 = 8;
 const INLINE_EXPANDED_MAX_HEIGHT: u16 = 20;
+const INLINE_HELP_HEIGHT: u16 = 18;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiMode {
@@ -417,7 +418,9 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
         .saturating_sub(1)
         .clamp(INLINE_CHAT_HEIGHT, INLINE_EXPANDED_MAX_HEIGHT);
     let width = terminal_size.width.saturating_sub(2).max(1);
-    let desired = if let Some(pending) = state.pending_permission() {
+    let desired = if state.help_overlay {
+        usize::from(INLINE_HELP_HEIGHT)
+    } else if let Some(pending) = state.pending_permission() {
         permission_view_lines(pending, state.pending_permission_count(), width).len() + 1
     } else if state.config_picker.is_some() {
         inline_config_view_line_count(state, width)
@@ -483,7 +486,7 @@ fn handle_crossterm(
             | (_, KeyCode::Esc) => {
                 state.exit_reason = Some(UiExitReason::Quit);
             }
-            (_, code) if should_open_help(state, key.modifiers, code) => {
+            (_, code) if should_open_help(key.modifiers, code) => {
                 state.help_overlay = true;
             }
             (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
@@ -514,7 +517,7 @@ fn handle_crossterm(
         return TerminalRequest::None;
     }
 
-    if should_open_help(state, key.modifiers, key.code) {
+    if should_open_help(key.modifiers, key.code) {
         state.help_overlay = true;
         return TerminalRequest::None;
     }
@@ -1165,7 +1168,7 @@ fn scroll_to_bottom(state: &mut AppState) {
 }
 
 fn is_help_key(modifiers: KeyModifiers, code: KeyCode) -> bool {
-    modifiers.is_empty() && matches!(code, KeyCode::Char('?') | KeyCode::F(10))
+    modifiers.is_empty() && matches!(code, KeyCode::F(10))
 }
 
 fn is_text_selection_key(modifiers: KeyModifiers, code: KeyCode) -> bool {
@@ -1203,12 +1206,8 @@ fn is_prompt_newline_key(modifiers: KeyModifiers, code: KeyCode) -> bool {
     }
 }
 
-fn should_open_help(state: &AppState, modifiers: KeyModifiers, code: KeyCode) -> bool {
-    modifiers.is_empty()
-        && (matches!(code, KeyCode::F(10))
-            || (state.input.is_empty()
-                && state.attachments.is_empty()
-                && matches!(code, KeyCode::Char('?'))))
+fn should_open_help(modifiers: KeyModifiers, code: KeyCode) -> bool {
+    modifiers.is_empty() && matches!(code, KeyCode::F(10))
 }
 
 fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>) {
@@ -2675,7 +2674,7 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &AppState, mode: UiMode
         " streaming... (Ctrl-C to cancel) ".to_string()
     } else {
         format!(
-            " prompt (Ctrl-N new session | Ctrl-O load session | Enter to send | {PROMPT_NEWLINE_HINT} for newline | Ctrl-C to quit{text_selection_hint}) "
+            " prompt (Ctrl-N new session | Ctrl-O load session | Enter to send | {PROMPT_NEWLINE_HINT} for newline | F10 help | Ctrl-C to quit{text_selection_hint}) "
         )
     };
     let style = if state.runtime_closed || state.is_streaming() {
@@ -3253,7 +3252,7 @@ fn draw_help_modal(f: &mut ratatui::Frame, area: Rect, mode: UiMode) {
             "Overlays",
             Style::default().add_modifier(Modifier::BOLD),
         )]),
-        Line::from("  ? or F10 / Tab  help toggle / accept selected slash command"),
+        Line::from("  F10 / Tab       help toggle / accept selected slash command"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "Config",
@@ -3819,24 +3818,22 @@ mod tests {
         handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Esc));
         assert!(!state.help_overlay);
 
-        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('?')));
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::F(10)));
         assert!(state.help_overlay);
 
-        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('?')));
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::F(10)));
         assert!(!state.help_overlay);
     }
 
     #[test]
-    fn question_mark_types_when_input_is_not_empty() {
+    fn question_mark_types_even_when_input_is_empty() {
         let mut state = AppState::new();
-        state.input = "why".to_string();
-        state.input_cursor = state.input.chars().count();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('?')));
 
         assert!(!state.help_overlay);
-        assert_eq!(state.input, "why?");
+        assert_eq!(state.input, "?");
     }
 
     #[test]
@@ -4419,7 +4416,37 @@ mod tests {
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(rendered.contains("Ctrl-C to quit"), "rendered:\n{rendered}");
+        assert!(rendered.contains("F10 help"), "rendered:\n{rendered}");
         assert!(!rendered.contains("F12"), "rendered:\n{rendered}");
+    }
+
+    #[test]
+    fn inline_help_overlay_expands_viewport_and_renders() {
+        let mut state = AppState::new();
+        state.help_overlay = true;
+
+        let desired = desired_inline_height(
+            &state,
+            Size {
+                width: 100,
+                height: 40,
+            },
+        );
+        assert!(
+            desired > INLINE_CHAT_HEIGHT,
+            "help overlay must request enough inline rows to render"
+        );
+
+        let backend = TestBackend::new(100, desired);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_inline_chat(frame, &mut state))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("help"), "rendered:\n{rendered}");
+        assert!(rendered.contains("General"), "rendered:\n{rendered}");
+        assert!(rendered.contains("Ctrl-N"), "rendered:\n{rendered}");
     }
 
     #[test]
