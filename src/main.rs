@@ -70,7 +70,7 @@ struct Cli {
 
     /// Resume an existing ACP session in headless mode instead of
     /// opening a new one.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     resume_session: Option<String>,
 
     /// Path to a log file. When unset, logging is disabled because the
@@ -889,6 +889,7 @@ mod tests {
         assert!(help.contains("[aliases: --log-file]"));
         assert!(help.contains("-w, --worktree [<WORKTREE>]"));
         assert!(help.contains("--fullscreen-tui"));
+        assert!(!help.contains("--resume-session"));
         assert!(help.contains("[possible values: default, acceptEdits, bypassPermissions]"));
         assert!(!help.contains("accept-edits"));
         assert!(!help.contains("bypass-permissions"));
