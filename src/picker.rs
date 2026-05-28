@@ -715,23 +715,57 @@ fn draw_list(f: &mut ratatui::Frame, area: Rect, state: &PickerState<'_>) {
         return;
     }
 
+    // Partition filtered items into favorites and others.
+    let (favorite_slots, other_slots): (Vec<Option<usize>>, Vec<Option<usize>>) = state
+        .filtered
+        .iter()
+        .map(|&i| Some(i))
+        .partition(|slot| state.item_is_favorite(&state.items[slot.unwrap()]));
+    let has_separator = !favorite_slots.is_empty() && !other_slots.is_empty();
+
+    // Build slots: favorites, optional separator, then others.
+    let mut slots = favorite_slots;
+    if has_separator {
+        slots.push(None);
+    }
+    slots.extend(other_slots);
+
+    // Map the selected filtered index to its slot position for centering.
+    let selected_item = state.filtered.get(state.selected).copied();
+    let selected_slot = slots.iter().position(|&s| s == selected_item).unwrap_or(0);
+
     let visible = inner.height as usize;
-    let total = state.filtered.len();
+    let total = slots.len();
     let start = if total <= visible {
         0
     } else {
         let half = visible / 2;
-        state.selected.saturating_sub(half).min(total - visible)
+        selected_slot.saturating_sub(half).min(total - visible)
     };
     let end = (start + visible).min(total);
 
-    let items: Vec<ListItem> = state.filtered[start..end]
+    let items: Vec<ListItem> = slots[start..end]
         .iter()
-        .enumerate()
-        .map(|(offset, &i)| {
-            let absolute = start + offset;
+        .map(|slot| {
+            if slot.is_none() {
+                let label = " other ";
+                let width = inner.width as usize;
+                let sep_line = if width >= label.len() {
+                    let extra = width - label.len();
+                    let left = extra / 2;
+                    let right = extra - left;
+                    format!("{}{}{}", "─".repeat(left), label, "─".repeat(right))
+                } else {
+                    "─ other ─".to_string()
+                };
+                return ListItem::new(sep_line).style(Style::default().fg(Color::DarkGray));
+            }
+
+            let i = slot.unwrap();
             let item = &state.items[i];
-            let marker = if absolute == state.selected { ">" } else { " " };
+            let is_selected = Some(i) == selected_item;
+
+            let marker = if is_selected { ">" } else { " " };
             let mut badges = Vec::new();
             if state.item_is_default(item) {
                 badges.push("default");
@@ -747,7 +781,7 @@ fn draw_list(f: &mut ratatui::Frame, area: Rect, state: &PickerState<'_>) {
             let label = state.item_label(item);
             let hint = state.item_hint(item);
             let line = format!("{marker} {label}{badge}  -- {hint}");
-            let style = if absolute == state.selected {
+            let style = if is_selected {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
