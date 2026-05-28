@@ -210,9 +210,8 @@ the input.
 You only need Rust when building from source or contributing.
 
 ```bash
-cargo install --path .
 cargo build --release
-./target/release/mj --cwd .
+./target/release/mj
 ```
 
 Use the same checks as CI before submitting changes:
