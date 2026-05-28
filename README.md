@@ -26,7 +26,7 @@ rhythm does not.
 
 ## Getting Started
 
-Install the latest `mj`, `anvil`, and `bifrost` release binaries:
+Install the latest `mj` and `bifrost` release binaries:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/BrokkAi/mjolnir/master/install.sh | bash

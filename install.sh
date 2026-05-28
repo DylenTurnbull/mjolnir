@@ -8,7 +8,6 @@ TMP_DIR=""
 OS_FAMILY=""
 ARCH=""
 RUST_TARGET=""
-ANVIL_OS=""
 
 log() {
   printf 'mjolnir-installer: %s\n' "$*"
@@ -25,7 +24,7 @@ die() {
 
 usage() {
   cat <<EOF
-Install the latest mjolnir, anvil, and bifrost binaries.
+Install the latest mjolnir and bifrost binaries.
 
 Usage:
   curl -fsSL https://raw.githubusercontent.com/BrokkAi/mjolnir/master/install.sh | bash
@@ -35,7 +34,6 @@ Environment:
   MJOLNIR_INSTALL_DIR      Same as INSTALL_DIR, with higher precedence.
   MJOLNIR_GITHUB_OWNER     GitHub owner to download from. Defaults to BrokkAi.
   MJOLNIR_VERSION          Optional mjolnir tag to install, for example v0.3.4.
-  ANVIL_VERSION            Optional anvil tag to install.
   BIFROST_VERSION          Optional bifrost tag to install.
   GITHUB_TOKEN             Optional token for GitHub API rate limits.
   PROFILE                  Optional shell profile to update when INSTALL_DIR is not on PATH.
@@ -93,12 +91,10 @@ detect_platform() {
   case "$uname_s" in
     Darwin)
       OS_FAMILY="macos"
-      ANVIL_OS="macos"
       RUST_TARGET="${ARCH}-apple-darwin"
       ;;
     Linux)
       OS_FAMILY="linux"
-      ANVIL_OS="linux"
       RUST_TARGET="${ARCH}-unknown-linux-gnu"
       ;;
     *)
@@ -453,18 +449,6 @@ install_from_asset() {
   esac
 }
 
-install_anvil() {
-  local -a patterns=()
-
-  if [[ "$OS_FAMILY" == "macos" ]]; then
-    patterns+=("^brokk-anvil-.*-universal-apple-darwin[.]zip$")
-  fi
-  patterns+=("^brokk-anvil-.*-${RUST_TARGET}[.]zip$")
-  patterns+=("^anvil-${ANVIL_OS}-${ARCH}$")
-
-  install_from_asset "anvil" "anvil" "anvil" "${ANVIL_VERSION:-}" "${patterns[@]}"
-}
-
 install_bifrost() {
   local -a patterns=()
 
@@ -508,7 +492,6 @@ main() {
   trap cleanup EXIT
 
   log "installing for ${OS_FAMILY}/${ARCH} into ${INSTALL_DIR}"
-  install_anvil
   install_bifrost
   install_mjolnir
 
