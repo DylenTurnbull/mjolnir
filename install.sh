@@ -184,6 +184,22 @@ checksum_url_for() {
   done < <(release_asset_urls "$release_file")
 }
 
+fetch_checksum() {
+  local release_file="$1"
+  local asset_name="$2"
+  local checksum_url
+  local checksum_file
+
+  checksum_url="$(checksum_url_for "$release_file" "$asset_name" || true)"
+  if [[ -z "$checksum_url" ]]; then
+    return 1
+  fi
+
+  checksum_file="${TMP_DIR}/${asset_name}.sha256"
+  download_file "$checksum_url" "$checksum_file"
+  awk '{print $1}' "$checksum_file" | head -n 1
+}
+
 hash_file() {
   local file="$1"
 
@@ -194,29 +210,31 @@ hash_file() {
   fi
 }
 
+verify_checksum() {
+  local expected="$1"
+  local actual="$2"
+  local label="$3"
+
+  if [[ "$expected" != "$actual" ]]; then
+    die "checksum mismatch for ${label}: expected ${expected}, got ${actual}"
+  fi
+}
+
 verify_checksum_if_present() {
   local release_file="$1"
   local asset_name="$2"
   local asset_file="$3"
-  local checksum_url
-  local checksum_file
   local expected
   local actual
 
-  checksum_url="$(checksum_url_for "$release_file" "$asset_name" || true)"
-  if [[ -z "$checksum_url" ]]; then
+  expected="$(fetch_checksum "$release_file" "$asset_name" || true)"
+  if [[ -z "$expected" ]]; then
     warn "no checksum published for ${asset_name}; skipping checksum verification"
     return 0
   fi
 
-  checksum_file="${TMP_DIR}/${asset_name}.sha256"
-  download_file "$checksum_url" "$checksum_file"
-  expected="$(awk '{print $1}' "$checksum_file" | head -n 1)"
   actual="$(hash_file "$asset_file")"
-
-  if [[ "$expected" != "$actual" ]]; then
-    die "checksum mismatch for ${asset_name}: expected ${expected}, got ${actual}"
-  fi
+  verify_checksum "$expected" "$actual" "$asset_name"
 }
 
 strip_quarantine() {
@@ -412,6 +430,9 @@ install_from_asset() {
   local asset_file
   local extract_dir
   local src
+  local dest="${INSTALL_DIR}/${bin_name}"
+  local expected
+  local actual
 
   fetch_release "$repo" "$version" "$release_file"
   tag="$(release_tag "$release_file")"
@@ -419,6 +440,17 @@ install_from_asset() {
 
   asset_url="$(select_asset "$release_file" "$label" "$tag" "$@")"
   asset_name="${asset_url##*/}"
+
+  # Skip download when the installed binary already matches the remote checksum
+  expected="$(fetch_checksum "$release_file" "$asset_name" || true)"
+  if [[ -n "$expected" && -f "$dest" ]]; then
+    actual="$(hash_file "$dest" || true)"
+    if [[ "$expected" == "$actual" ]]; then
+      log "${bin_name} ${tag} is already installed; skipping download"
+      return 0
+    fi
+  fi
+
   asset_file="${TMP_DIR}/${asset_name}"
 
   log "downloading ${label} ${tag} (${asset_name})"
