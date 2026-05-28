@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 
 OWNER="${MJOLNIR_GITHUB_OWNER:-BrokkAi}"
 INSTALL_DIR="${MJOLNIR_INSTALL_DIR:-${INSTALL_DIR:-$HOME/.local/bin}}"
@@ -200,6 +200,10 @@ fetch_checksum() {
   checksum_file="${TMP_DIR}/${asset_name}.sha256"
   download_file "$checksum_url" "$checksum_file"
   awk '{print $1}' "$checksum_file" | head -n 1
+}
+
+stored_checksum_path() {
+  printf '%s/.cache/mjolnir-installer/checksums/%s.sha256\n' "$HOME" "$1"
 }
 
 hash_file() {
@@ -443,13 +447,18 @@ install_from_asset() {
   asset_url="$(select_asset "$release_file" "$label" "$tag" "$@")"
   asset_name="${asset_url##*/}"
 
-  # Skip download when the installed binary already matches the remote checksum
+  # Skip download when the stored archive checksum matches the remote one
   expected="$(fetch_checksum "$release_file" "$asset_name" || true)"
   if [[ -n "$expected" && -f "$dest" ]]; then
-    actual="$(hash_file "$dest" || true)"
-    if [[ "$expected" == "$actual" ]]; then
-      log "${bin_name} ${tag} is already installed; skipping download"
-      return 0
+    local stored_checksum_file
+    stored_checksum_file="$(stored_checksum_path "$bin_name")"
+    if [[ -f "$stored_checksum_file" ]]; then
+      local stored
+      stored="$(cat "$stored_checksum_file")"
+      if [[ "$expected" == "$stored" ]]; then
+        log "${bin_name} ${tag} is already installed; skipping download"
+        return 0
+      fi
     fi
   fi
 
@@ -458,6 +467,12 @@ install_from_asset() {
   log "downloading ${label} ${tag} (${asset_name})"
   download_file "$asset_url" "$asset_file"
   verify_checksum_if_present "$release_file" "$asset_name" "$asset_file"
+
+  # Remember the archive checksum so we can skip next time
+  if [[ -n "$expected" ]]; then
+    mkdir -p "$(dirname "$(stored_checksum_path "$bin_name")")"
+    printf '%s\n' "$expected" > "$(stored_checksum_path "$bin_name")"
+  fi
 
   extract_dir="${TMP_DIR}/${repo}-extract"
 
