@@ -325,9 +325,12 @@ pub struct AppState {
     pub help_overlay: bool,
     /// True while mouse capture is disabled so the terminal can select text.
     pub text_selection_mode: bool,
-    /// Current working directory shown in the header so users can tell
-    /// which project this session is operating in.
-    pub cwd_label: String,
+    /// Project shown in the header so users can tell which checkout this
+    /// session belongs to without leaking nested worktree paths.
+    pub project_label: String,
+    /// Short linked-worktree name shown separately from the project when
+    /// the session runs under `.mjolnir/worktrees/`.
+    pub worktree_label: Option<String>,
     /// Holds the platform clipboard lease so copied text remains available
     /// on Linux/X11 where the owning process must stay alive.
     #[allow(dead_code)]
@@ -415,7 +418,8 @@ impl AppState {
             autocomplete: Autocomplete::default(),
             help_overlay: false,
             text_selection_mode: false,
-            cwd_label: String::new(),
+            project_label: String::new(),
+            worktree_label: None,
             clipboard_lease: None,
         }
     }

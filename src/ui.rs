@@ -59,6 +59,12 @@ pub enum UiMode {
     FullscreenTui,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderLabels {
+    pub project: String,
+    pub worktree: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalRequest {
     None,
@@ -190,7 +196,7 @@ pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
     mut event_rx: mpsc::UnboundedReceiver<UiEvent>,
-    cwd_label: String,
+    header_labels: HeaderLabels,
     initial_agent_label: Option<String>,
     history_path: Option<&Path>,
     mode: UiMode,
@@ -200,7 +206,7 @@ pub async fn run(
         terminal,
         &cmd_tx,
         &mut event_rx,
-        cwd_label,
+        header_labels,
         initial_agent_label,
         initial_history,
         mode,
@@ -231,14 +237,15 @@ async fn ui_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     cmd_tx: &mpsc::UnboundedSender<UiCommand>,
     event_rx: &mut mpsc::UnboundedReceiver<UiEvent>,
-    cwd_label: String,
+    header_labels: HeaderLabels,
     initial_agent_label: Option<String>,
     initial_history: Vec<String>,
     mode: UiMode,
 ) -> Result<(UiExitReason, Option<String>, Vec<String>)> {
     let mut state = AppState::new();
     state.set_prompt_history(initial_history);
-    state.cwd_label = cwd_label;
+    state.project_label = header_labels.project;
+    state.worktree_label = header_labels.worktree;
     if let Some(label) = initial_agent_label {
         state.agent_label = label;
     }
@@ -1844,20 +1851,38 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         ));
         spans.push(Span::raw("   "));
     }
-    let cwd_label = state.cwd_label.trim();
-    if !cwd_label.is_empty() {
+    let project_label = state.project_label.trim();
+    if !project_label.is_empty() {
         let max_width = match width {
             0..=89 => 18,
             90..=139 => 28,
             140..=179 => 40,
             _ => 56,
         };
-        spans.push(Span::styled("cwd ", Style::default().fg(Color::Gray)));
+        spans.push(Span::styled("project ", Style::default().fg(Color::Gray)));
         spans.push(Span::styled(
-            compact_middle_display(cwd_label, max_width),
+            compact_middle_display(project_label, max_width),
             Style::default().fg(Color::LightMagenta),
         ));
         spans.push(Span::raw("   "));
+    }
+    if let Some(worktree_label) = state.worktree_label.as_deref() {
+        let worktree_label = worktree_label.trim();
+        if !worktree_label.is_empty() {
+            let max_width = match width {
+                0..=89 => 12,
+                90..=139 => 18,
+                _ => 24,
+            };
+            spans.push(Span::styled("worktree ", Style::default().fg(Color::Gray)));
+            spans.push(Span::styled(
+                compact_middle_display(worktree_label, max_width),
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("   "));
+        }
     }
     if needs_live_redraw(state) {
         spans.push(Span::styled(
@@ -1879,25 +1904,21 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
             Style::default().fg(Color::Magenta),
         ),
     ]);
-    let session = state
-        .session_id
-        .as_deref()
-        .map(|session_id| short_session_label(session_id, width))
-        .unwrap_or_else(|| "no session".to_string());
-    spans.extend([
-        Span::raw("   "),
-        Span::styled("session ", Style::default().fg(Color::Gray)),
-        Span::styled(session, Style::default().fg(Color::LightYellow)),
-    ]);
-    if width >= 180
-        && let Some(title) = state.session_title.as_deref()
-    {
+    if let Some(title) = state.session_title.as_deref() {
         let title = title.trim();
         if !title.is_empty() {
-            spans.push(Span::raw(" "));
+            let max_width = match width {
+                0..=89 => 18,
+                90..=139 => 30,
+                140..=179 => 42,
+                _ => 56,
+            };
+            spans.push(Span::raw("   "));
             spans.push(Span::styled(
-                compact_middle_display(title, 42),
-                Style::default().fg(Color::White),
+                compact_middle_display(title, max_width),
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::ITALIC),
             ));
         }
     }
@@ -1946,11 +1967,6 @@ fn take_display_suffix(text: &str, max_width: usize) -> String {
         width += ch_width;
     }
     chars.into_iter().rev().collect()
-}
-
-fn short_session_label(session_id: &str, width: usize) -> String {
-    let max_width = if width < 130 { 10 } else { 12 };
-    compact_middle_display(session_id, max_width)
 }
 
 pub(crate) fn connection_state_label(state: &AppState) -> String {
@@ -3897,10 +3913,10 @@ mod tests {
     }
 
     #[test]
-    fn header_surfaces_current_working_directory() {
+    fn header_surfaces_project() {
         let mut state = AppState::new();
         state.agent_label = "anvil".to_string();
-        state.cwd_label = "/home/user/project-a".to_string();
+        state.project_label = "project-a".to_string();
         let backend = TestBackend::new(140, 1);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
@@ -3915,21 +3931,22 @@ mod tests {
         );
         assert!(rendered.contains("agent anvil"), "rendered:\n{rendered}");
         assert!(
-            rendered.contains("cwd /home/user/project-a"),
+            rendered.contains("project project-a"),
             "rendered:\n{rendered}"
         );
+        assert!(!rendered.contains("cwd"), "rendered:\n{rendered}");
         assert!(!rendered.contains("worktree"), "rendered:\n{rendered}");
     }
 
     #[test]
-    fn header_compacts_long_workspace_and_session_labels() {
+    fn header_shows_project_worktree_and_session_title_without_session_id() {
         let mut state = AppState::new();
         state.agent_label = "uvx".to_string();
-        state.cwd_label = "/Users/ryan/code/mjolnir/.mjolnir/worktrees/bold-willow".to_string();
+        state.project_label = "mjolnir".to_string();
+        state.worktree_label = Some("bold-willow".to_string());
         state.session_id = Some("48c95a78-cdbf-416a-807a-b0c5124fcc72".to_string());
-        state.session_title =
-            Some("the agent says agent uvx when using anvil, for custom commands".to_string());
-        let backend = TestBackend::new(120, 1);
+        state.session_title = Some("Review payment flow".to_string());
+        let backend = TestBackend::new(200, 1);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
         terminal
@@ -3939,15 +3956,21 @@ mod tests {
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(rendered.contains("mjolnir v"), "rendered:\n{rendered}");
         assert!(
-            rendered.contains("cwd /Users/r...trees/bold-willow"),
+            rendered.contains("project mjolnir"),
             "rendered:\n{rendered}"
         );
         assert!(
-            rendered.contains("session 48...fcc72"),
+            rendered.contains("worktree bold-willow"),
             "rendered:\n{rendered}"
         );
         assert!(
-            !rendered.contains("the agent says"),
+            !rendered.contains(".mjolnir/worktrees"),
+            "rendered:\n{rendered}"
+        );
+        assert!(!rendered.contains("session"), "rendered:\n{rendered}");
+        assert!(!rendered.contains("48c95a78"), "rendered:\n{rendered}");
+        assert!(
+            rendered.contains("Review payment flow"),
             "rendered:\n{rendered}"
         );
     }

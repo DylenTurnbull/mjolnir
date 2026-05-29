@@ -31,7 +31,7 @@ use crate::app::UiExitReason;
 use crate::config::{Config, SelectedAgent, history_path};
 use crate::picker::{PickerOutcome, PickerPreferences, PickerResult};
 use crate::session::SessionEntryJson;
-use crate::ui::UiMode;
+use crate::ui::{HeaderLabels, UiMode};
 use crate::worktree::CreatedWorktree;
 
 #[derive(Debug, Parser)]
@@ -239,12 +239,13 @@ async fn main() -> Result<()> {
 
     let (cwd, worktree) = prepare_worktree_for_arg(cwd, cli.worktree.as_deref())?;
     let worktree_label = worktree_label(worktree.as_ref());
-    let cwd_label = cwd_label(&cwd);
+    let project_label = project_label(&cwd, worktree.as_ref());
 
     let result = run_app(
         cwd,
         cli.agent_stderr,
-        cwd_label,
+        project_label,
+        worktree_label.clone(),
         None,
         None,
         ui_mode(fullscreen_tui),
@@ -286,7 +287,7 @@ async fn run_resume(args: ResumeArgs) -> Result<()> {
     };
     let (cwd, worktree) = prepare_worktree_for_arg(cwd, args.worktree.as_deref())?;
     let worktree_label = worktree_label(worktree.as_ref());
-    let cwd_label = cwd_label(&cwd);
+    let project_label = project_label(&cwd, worktree.as_ref());
 
     // `--list`: headless listing, print and exit.
     if args.list {
@@ -337,7 +338,8 @@ async fn run_resume(args: ResumeArgs) -> Result<()> {
         let result = run_app(
             cwd,
             args.agent_stderr.clone(),
-            cwd_label,
+            project_label,
+            worktree_label.clone(),
             Some(session_id.clone()),
             Some(agent),
             mode,
@@ -377,7 +379,8 @@ async fn run_resume(args: ResumeArgs) -> Result<()> {
             let result = run_app(
                 cwd,
                 args.agent_stderr,
-                cwd_label,
+                project_label,
+                worktree_label.clone(),
                 Some(entry.session_id),
                 Some(agent),
                 mode,
@@ -450,8 +453,28 @@ fn worktree_label(worktree: Option<&CreatedWorktree>) -> Option<String> {
         .map(|n| n.to_string_lossy().into_owned())
 }
 
-fn cwd_label(cwd: &std::path::Path) -> String {
-    cwd.display().to_string()
+fn project_label(cwd: &std::path::Path, worktree: Option<&CreatedWorktree>) -> String {
+    if let Some(worktree) = worktree {
+        return folder_label(&worktree.project_root);
+    }
+    if let Some(parent) = parent_above_mjolnir(cwd) {
+        return folder_label(&parent);
+    }
+    folder_label(cwd)
+}
+
+fn folder_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn parent_above_mjolnir(path: &std::path::Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == ".mjolnir"))
+        .and_then(|mjolnir_dir| mjolnir_dir.parent())
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
 }
 
 fn handle_worktree_after_tui(worktree: Option<&CreatedWorktree>) -> bool {
@@ -521,7 +544,8 @@ fn prepare_existing_worktree(cwd: &std::path::Path, name_or_path: &str) -> Resul
 async fn run_app(
     cwd: PathBuf,
     agent_stderr: Option<PathBuf>,
-    cwd_label: String,
+    project_label: String,
+    worktree_label: Option<String>,
     resume_session: Option<String>,
     initial_agent: Option<SelectedAgent>,
     mode: UiMode,
@@ -567,7 +591,8 @@ async fn run_app(
             &agent,
             cwd.clone(),
             agent_stderr.clone(),
-            cwd_label.clone(),
+            project_label.clone(),
+            worktree_label.clone(),
             resume,
             mode,
         )
@@ -715,7 +740,8 @@ async fn run_session(
     agent: &SelectedAgent,
     cwd: PathBuf,
     agent_stderr: Option<PathBuf>,
-    cwd_label: String,
+    project_label: String,
+    worktree_label: Option<String>,
     resume_session: Option<String>,
     mode: UiMode,
 ) -> Result<(UiExitReason, Option<String>)> {
@@ -758,7 +784,10 @@ async fn run_session(
         &mut terminal,
         cmd_tx,
         event_rx,
-        cwd_label,
+        HeaderLabels {
+            project: project_label,
+            worktree: worktree_label,
+        },
         agent_display_name,
         Some(&hist_path),
         mode,
@@ -867,6 +896,42 @@ mod tests {
         assert_eq!(
             agent_header_label(&agent),
             "'/usr/local/bin/my agent' --flag 'value with space'"
+        );
+    }
+
+    #[test]
+    fn project_label_uses_worktree_project_folder_name() {
+        let worktree = CreatedWorktree {
+            project_root: PathBuf::from("/Users/ryan/code/mjolnir"),
+            worktree_root: PathBuf::from("/Users/ryan/code/mjolnir/.mjolnir/worktrees/bold-willow"),
+            session_cwd: PathBuf::from(
+                "/Users/ryan/code/mjolnir/.mjolnir/worktrees/bold-willow/src",
+            ),
+            was_created: false,
+        };
+
+        assert_eq!(
+            project_label(&worktree.session_cwd, Some(&worktree)),
+            "mjolnir"
+        );
+    }
+
+    #[test]
+    fn project_label_strips_mjolnir_worktree_path_to_project_folder_name() {
+        assert_eq!(
+            project_label(
+                std::path::Path::new("/Users/ryan/code/mjolnir/.mjolnir/worktrees/bold-willow/src"),
+                None
+            ),
+            "mjolnir"
+        );
+    }
+
+    #[test]
+    fn project_label_uses_cwd_folder_name_without_worktree() {
+        assert_eq!(
+            project_label(std::path::Path::new("/Users/ryan/code/mjolnir/src"), None),
+            "src"
         );
     }
 
