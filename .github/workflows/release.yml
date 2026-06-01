@@ -80,6 +80,55 @@ jobs:
             brokk-mjolnir-*.tar.gz.sha256
           if-no-files-found: error
 
+  build-android:
+    name: Build aarch64-linux-android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27d
+
+      - name: Export Android NDK toolchain
+        shell: bash
+        run: |
+          ndk_path='${{ steps.setup-ndk.outputs.ndk-path }}'
+          echo "ANDROID_NDK_HOME=$ndk_path" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk_path" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release --locked --target aarch64-linux-android
+
+      - name: Package archive
+        shell: bash
+        run: |
+          name="brokk-mjolnir-${GITHUB_REF_NAME}-aarch64-linux-android"
+          mkdir "$name"
+          cp "target/aarch64-linux-android/release/mj" "$name/"
+          cp README.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: aarch64-linux-android
+          path: |
+            brokk-mjolnir-*.tar.gz
+            brokk-mjolnir-*.tar.gz.sha256
+          if-no-files-found: error
+
   build-windows:
     name: Build x86_64-pc-windows-msvc
     runs-on: windows-latest
@@ -161,7 +210,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [build-linux, build-linux-arm64, build-windows, build-macos]
+    needs: [build-linux, build-linux-arm64, build-android, build-windows, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
