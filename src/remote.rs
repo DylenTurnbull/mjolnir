@@ -1,19 +1,22 @@
 //! Simple remote-control server and local session registration.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::{ContentBlock, SessionUpdate, ToolCallContent};
 use anyhow::{Context, Result, anyhow};
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::StatusCode;
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, COOKIE, HeaderValue, SET_COOKIE};
 use axum::middleware::Next;
-use axum::response::{Html, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
+use qrcode::QrCode;
+use qrcode::types::Color;
 use rcgen::generate_simple_self_signed;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -25,12 +28,28 @@ use tracing::{debug, warn};
 use crate::config::SelectedAgent;
 use crate::event::{UiCommand, UiEvent};
 
-const REMOTE_CONTROL_ADDR: &str = "127.0.0.1:11921";
+const REMOTE_CONTROL_LOCAL_ADDR: &str = "127.0.0.1:11921";
+const REMOTE_CONTROL_PUBLIC_ADDR: &str = "0.0.0.0:11921";
 const REMOTE_CONTROL_UPSERT_URL: &str = "https://localhost:11921/api/sessions";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const SESSION_COOKIE_NAME: &str = "mj_remote_session";
+/// The six-digit viewer code is only ~20 bits of entropy, so the manual-unlock
+/// endpoint must be throttled or it can be brute-forced — especially once the
+/// server is bound publicly via `--hostname`. After this many consecutive
+/// failures the code path is locked for `VIEWER_CODE_LOCKOUT`; the QR/token
+/// path is unaffected, so the legitimate operator is never locked out.
+const MAX_VIEWER_CODE_ATTEMPTS: u32 = 5;
+const VIEWER_CODE_LOCKOUT: Duration = Duration::from_secs(30);
 /// A `SessionRecord` can include the full transcript history; allow room for
 /// larger snapshots while still capping request bodies to something reasonable.
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Tracks consecutive failed viewer-code attempts to rate-limit brute force.
+#[derive(Debug, Default)]
+struct CodeAuthGuard {
+    failures: u32,
+    locked_until: Option<Instant>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRecord {
@@ -61,6 +80,16 @@ pub struct QueuedPrompt {
     pub session_id: String,
     pub text: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SessionAuthRequest {
+    code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SessionAuthQuery {
+    token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,10 +139,22 @@ struct ServerPaths {
     token_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerListenConfig {
+    bind_addr: String,
+    viewer_host: String,
+}
+
 #[derive(Debug, Clone)]
 struct ServerState {
     db_path: Arc<PathBuf>,
     token: Arc<String>,
+    viewer_code: Arc<String>,
+    /// Active viewer session cookie values. Each successful unlock mints a fresh
+    /// random id so logout can revoke exactly that browser's session, and a lost
+    /// cookie does not stay valid forever like a single shared secret would.
+    sessions: Arc<Mutex<HashSet<String>>>,
+    code_guard: Arc<Mutex<CodeAuthGuard>>,
 }
 
 impl TrackerState {
@@ -493,14 +534,17 @@ fn build_client(cert_path: &Path) -> Option<reqwest::Client> {
     }
 }
 
-pub async fn run_server() -> Result<()> {
+pub async fn run_server(hostname: Option<String>) -> Result<()> {
     install_crypto_provider();
 
-    let paths = ensure_server_paths()?;
+    let listen = server_listen_config(hostname.as_deref())?;
+    let paths = ensure_server_paths(hostname.as_deref())?;
     init_db(&paths.db_path)?;
     let token = ensure_token(&paths.token_path)?;
+    let viewer_code = generate_viewer_code()?;
+    let viewer_url = remote_qr_login_url(&listen.viewer_host, &token);
 
-    let app = build_router(paths.db_path.clone(), token);
+    let app = build_router(paths.db_path.clone(), token, viewer_code.clone());
 
     let tls_config =
         axum_server::tls_rustls::RustlsConfig::from_pem_file(&paths.cert_path, &paths.key_path)
@@ -508,14 +552,50 @@ pub async fn run_server() -> Result<()> {
             .context("load remote-control TLS certificate")?;
 
     println!("Remote control listening on https://localhost:11921");
-    axum_server::bind_rustls(REMOTE_CONTROL_ADDR.parse()?, tls_config)
+    println!("{}", render_login_qr(&viewer_url)?);
+    println!("viewer code: {viewer_code}");
+
+    axum_server::bind_rustls(listen.bind_addr.parse()?, tls_config)
         .serve(app.into_make_service())
         .await
         .with_context(|| {
             format!(
-                "serve remote-control API on {REMOTE_CONTROL_ADDR} (is another `mj server` already running?)"
+                "serve remote-control API on {} (is another `mj server` already running?)",
+                listen.bind_addr
             )
         })
+}
+
+fn remote_qr_login_url(host: &str, token: &str) -> String {
+    let encoded = url::form_urlencoded::byte_serialize(token.as_bytes()).collect::<String>();
+    // Target `/auth/login` (not `/?token=`) so the server validates the token,
+    // sets the session cookie, and redirects to a clean `/`. This keeps the
+    // long-lived token out of the browser history and out of later requests.
+    format!("https://{host}:11921/auth/login?token={encoded}")
+}
+
+fn render_login_qr(url: &str) -> Result<String> {
+    let qr = QrCode::new(url.as_bytes()).context("encode remote viewer QR code")?;
+    let mut output = String::new();
+    for y in (0..qr.width()).step_by(2) {
+        for x in 0..qr.width() {
+            let top = qr[(x, y)] == Color::Dark;
+            let bottom = if y + 1 < qr.width() {
+                qr[(x, y + 1)] == Color::Dark
+            } else {
+                false
+            };
+            let ch = match (top, bottom) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            };
+            output.push(ch);
+        }
+        output.push('\n');
+    }
+    Ok(output)
 }
 
 /// Install the ring CryptoProvider so we do not depend on aws-lc-rs (which needs
@@ -525,10 +605,13 @@ fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-fn build_router(db_path: PathBuf, token: String) -> Router {
+fn build_router(db_path: PathBuf, token: String, viewer_code: String) -> Router {
     let state = ServerState {
         db_path: Arc::new(db_path),
         token: Arc::new(token),
+        viewer_code: Arc::new(viewer_code),
+        sessions: Arc::new(Mutex::new(HashSet::new())),
+        code_guard: Arc::new(Mutex::new(CodeAuthGuard::default())),
     };
 
     let protected = Router::new()
@@ -541,35 +624,76 @@ fn build_router(db_path: PathBuf, token: String) -> Router {
         )
         .route("/api/queued-prompts/claim", post(claim_queued_prompt))
         .layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&state.token),
+            state.clone(),
             require_token,
         ));
 
     Router::new()
         .route("/", get(remote_viewer))
+        .route("/auth/login", get(create_viewer_session_from_query))
+        .route(
+            "/auth/session",
+            post(create_viewer_session).delete(clear_viewer_session),
+        )
         .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
-/// Reject any request that does not carry the expected `Authorization: Bearer`
-/// token. The loopback interface is reachable by every local user, so without
-/// this any local process could read or overwrite the session registry.
+/// Reject any request that does not carry the expected credentials. The
+/// loopback interface is reachable by every local user, so without this any
+/// local process could read or overwrite the session registry.
 async fn require_token(
-    State(expected): State<Arc<String>>,
+    State(state): State<ServerState>,
     request: Request,
     next: Next,
 ) -> std::result::Result<Response, (StatusCode, String)> {
-    let provided = request
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    if token_matches(expected.as_str(), provided) {
+    if request_is_authorized(&state, &request) {
         Ok(next.run(request).await)
     } else {
         Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string()))
     }
+}
+
+fn request_is_authorized(state: &ServerState, request: &Request) -> bool {
+    let bearer = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let query_token = request.uri().query().and_then(query_token_value);
+    if token_matches(state.token.as_str(), bearer)
+        || token_matches(state.token.as_str(), query_token.as_deref())
+    {
+        return true;
+    }
+    let cookie_header = request
+        .headers()
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok());
+    let sessions = state.sessions.lock().expect("viewer sessions poisoned");
+    sessions
+        .iter()
+        .any(|session| cookie_matches(cookie_header, SESSION_COOKIE_NAME, session))
+}
+
+fn query_token_value(query: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == "token")
+        .map(|(_, value)| value.into_owned())
+}
+
+fn cookie_value<'a>(header: Option<&'a str>, name: &str) -> Option<&'a str> {
+    header?
+        .split(';')
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .find(|(cookie_name, _)| *cookie_name == name)
+        .map(|(_, value)| value)
+}
+
+fn cookie_matches(header: Option<&str>, name: &str, expected: &str) -> bool {
+    cookie_value(header, name)
+        .is_some_and(|value| constant_time_eq(expected.as_bytes(), value.as_bytes()))
 }
 
 fn token_matches(expected: &str, provided: Option<&str>) -> bool {
@@ -592,10 +716,153 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-async fn remote_viewer(State(state): State<ServerState>) -> Html<String> {
-    let token = state.token.as_ref().clone();
-    let html = include_str!("remote_viewer.html").replace("__MJ_REMOTE_TOKEN__", &token);
-    Html(html)
+async fn remote_viewer() -> Html<&'static str> {
+    Html(include_str!("remote_viewer.html"))
+}
+
+async fn create_viewer_session(
+    State(state): State<ServerState>,
+    Json(payload): Json<SessionAuthRequest>,
+) -> std::result::Result<Response, (StatusCode, String)> {
+    create_code_session_response(&state, payload.code.trim(), StatusCode::NO_CONTENT)
+}
+
+async fn create_viewer_session_from_query(
+    State(state): State<ServerState>,
+    Query(query): Query<SessionAuthQuery>,
+) -> std::result::Result<Response, (StatusCode, String)> {
+    create_session_response(&state, query.token.trim(), StatusCode::SEE_OTHER).map(
+        |mut response| {
+            response
+                .headers_mut()
+                .insert(axum::http::header::LOCATION, HeaderValue::from_static("/"));
+            response
+        },
+    )
+}
+
+fn create_session_response(
+    state: &ServerState,
+    token: &str,
+    status: StatusCode,
+) -> std::result::Result<Response, (StatusCode, String)> {
+    if !token_matches(state.token.as_str(), Some(token)) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string()));
+    }
+
+    issue_session_cookie(state, status)
+}
+
+fn create_code_session_response(
+    state: &ServerState,
+    code: &str,
+    status: StatusCode,
+) -> std::result::Result<Response, (StatusCode, String)> {
+    if viewer_code_locked(state) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many incorrect codes; wait a moment and try again".to_string(),
+        ));
+    }
+
+    if !token_matches(state.viewer_code.as_str(), Some(code)) {
+        record_viewer_code_failure(state);
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string()));
+    }
+
+    reset_viewer_code_failures(state);
+    issue_session_cookie(state, status)
+}
+
+/// Returns whether the viewer-code path is currently locked out, clearing an
+/// expired lockout so the next failure starts a fresh count.
+fn viewer_code_locked(state: &ServerState) -> bool {
+    let mut guard = state.code_guard.lock().expect("viewer code guard poisoned");
+    match guard.locked_until {
+        Some(until) if Instant::now() < until => true,
+        Some(_) => {
+            guard.locked_until = None;
+            guard.failures = 0;
+            false
+        }
+        None => false,
+    }
+}
+
+fn record_viewer_code_failure(state: &ServerState) {
+    let mut guard = state.code_guard.lock().expect("viewer code guard poisoned");
+    guard.failures = guard.failures.saturating_add(1);
+    if guard.failures >= MAX_VIEWER_CODE_ATTEMPTS {
+        guard.failures = 0;
+        guard.locked_until = Some(Instant::now() + VIEWER_CODE_LOCKOUT);
+    }
+}
+
+fn reset_viewer_code_failures(state: &ServerState) {
+    let mut guard = state.code_guard.lock().expect("viewer code guard poisoned");
+    guard.failures = 0;
+    guard.locked_until = None;
+}
+
+fn issue_session_cookie(
+    state: &ServerState,
+    status: StatusCode,
+) -> std::result::Result<Response, (StatusCode, String)> {
+    let session_id = generate_token().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to mint viewer session".to_string(),
+        )
+    })?;
+    let header = session_cookie_header(&session_id)?;
+    state
+        .sessions
+        .lock()
+        .expect("viewer sessions poisoned")
+        .insert(session_id);
+
+    let mut response = status.into_response();
+    response.headers_mut().insert(SET_COOKIE, header);
+    Ok(response)
+}
+
+async fn clear_viewer_session(
+    State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let cookie_header = headers.get(COOKIE).and_then(|value| value.to_str().ok());
+    if let Some(session_id) = cookie_value(cookie_header, SESSION_COOKIE_NAME) {
+        state
+            .sessions
+            .lock()
+            .expect("viewer sessions poisoned")
+            .remove(session_id);
+    }
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response
+        .headers_mut()
+        .insert(SET_COOKIE, clear_session_cookie_header());
+    response
+}
+
+fn session_cookie_header(value: &str) -> std::result::Result<HeaderValue, (StatusCode, String)> {
+    HeaderValue::from_str(&format!(
+        "{SESSION_COOKIE_NAME}={value}; Path=/; HttpOnly; Secure; SameSite=Strict"
+    ))
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to build session cookie".to_string(),
+        )
+    })
+}
+
+fn clear_session_cookie_header() -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"
+    ))
+    .expect("valid cleared session cookie header")
 }
 
 pub fn agent_display_label(agent: &SelectedAgent) -> String {
@@ -700,25 +967,55 @@ fn remote_control_dir() -> PathBuf {
         .join("remote-control")
 }
 
-fn ensure_server_paths() -> Result<ServerPaths> {
-    let root = remote_control_dir();
-    std::fs::create_dir_all(&root)
+fn server_listen_config(hostname: Option<&str>) -> Result<ServerListenConfig> {
+    match hostname.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(hostname) => Ok(ServerListenConfig {
+            bind_addr: REMOTE_CONTROL_PUBLIC_ADDR.to_string(),
+            viewer_host: hostname.to_string(),
+        }),
+        None => Ok(ServerListenConfig {
+            bind_addr: REMOTE_CONTROL_LOCAL_ADDR.to_string(),
+            viewer_host: "localhost".to_string(),
+        }),
+    }
+}
+
+fn ensure_server_paths(hostname: Option<&str>) -> Result<ServerPaths> {
+    ensure_server_paths_in(&remote_control_dir(), hostname)
+}
+
+fn ensure_server_paths_in(root: &Path, hostname: Option<&str>) -> Result<ServerPaths> {
+    std::fs::create_dir_all(root)
         .with_context(|| format!("create remote-control dir {}", root.display()))?;
 
+    let normalized_hostname = hostname
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("localhost");
     let cert_path = root.join("cert.pem");
     let key_path = root.join("key.pem");
-    if !cert_path.exists() || !key_path.exists() {
-        let cert = generate_simple_self_signed(vec![
+    let cert_hostname_path = root.join("cert-hostname");
+    let existing_hostname = read_token(&cert_hostname_path).unwrap_or_default();
+    let hostname_changed = existing_hostname != normalized_hostname;
+    if hostname_changed || !cert_path.exists() || !key_path.exists() {
+        let mut names = vec![
             "localhost".to_string(),
             "127.0.0.1".to_string(),
             "::1".to_string(),
-        ])
-        .context("generate localhost self-signed certificate")?;
+        ];
+        if normalized_hostname != "localhost" {
+            names.push(normalized_hostname.to_string());
+        }
+        let cert = generate_simple_self_signed(names)
+            .context("generate remote-control self-signed certificate")?;
         std::fs::write(&cert_path, cert.cert.pem())
             .with_context(|| format!("write {}", cert_path.display()))?;
         std::fs::write(&key_path, cert.key_pair.serialize_pem())
             .with_context(|| format!("write {}", key_path.display()))?;
+        std::fs::write(&cert_hostname_path, normalized_hostname)
+            .with_context(|| format!("write {}", cert_hostname_path.display()))?;
         restrict_permissions(&key_path)?;
+        restrict_permissions(&cert_hostname_path)?;
     }
 
     Ok(ServerPaths {
@@ -753,6 +1050,22 @@ fn generate_token() -> Result<String> {
     getrandom::fill(&mut bytes)
         .map_err(|error| anyhow!("generate remote-control token: {error}"))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn generate_viewer_code() -> Result<String> {
+    const RANGE: u64 = 1_000_000;
+    // Reject the unaligned tail of the u32 space so every six-digit code is
+    // equally likely; a plain `% RANGE` would bias toward lower codes.
+    let bound = (1u64 << 32) - ((1u64 << 32) % RANGE);
+    loop {
+        let mut bytes = [0u8; 4];
+        getrandom::fill(&mut bytes)
+            .map_err(|error| anyhow!("generate remote-control viewer code: {error}"))?;
+        let raw = u32::from_le_bytes(bytes) as u64;
+        if raw < bound {
+            return Ok(format!("{:06}", raw % RANGE));
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1068,6 +1381,8 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
+    use tower::util::ServiceExt;
 
     #[test]
     fn tracker_counts_user_prompts_and_agent_replies() {
@@ -1244,6 +1559,129 @@ mod tests {
     }
 
     #[test]
+    fn cookie_matches_requires_exact_session_cookie() {
+        assert!(cookie_matches(
+            Some("foo=bar; mj_remote_session=secret; theme=dark"),
+            SESSION_COOKIE_NAME,
+            "secret"
+        ));
+        assert!(!cookie_matches(
+            Some("foo=bar; mj_remote_session=wrong"),
+            SESSION_COOKIE_NAME,
+            "secret"
+        ));
+        assert!(!cookie_matches(
+            Some("foo=bar; other=secret"),
+            SESSION_COOKIE_NAME,
+            "secret"
+        ));
+        assert!(!cookie_matches(None, SESSION_COOKIE_NAME, "secret"));
+    }
+
+    #[test]
+    fn server_listen_config_defaults_to_localhost() {
+        assert_eq!(
+            server_listen_config(None).expect("config"),
+            ServerListenConfig {
+                bind_addr: REMOTE_CONTROL_LOCAL_ADDR.to_string(),
+                viewer_host: "localhost".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn server_listen_config_uses_public_hostname() {
+        assert_eq!(
+            server_listen_config(Some("example.com")).expect("config"),
+            ServerListenConfig {
+                bind_addr: REMOTE_CONTROL_PUBLIC_ADDR.to_string(),
+                viewer_host: "example.com".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn viewer_code_is_six_digits() {
+        let code = generate_viewer_code().expect("code");
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|ch| ch.is_ascii_digit()));
+    }
+
+    fn test_state() -> ServerState {
+        ServerState {
+            db_path: Arc::new(PathBuf::from("unused.sqlite3")),
+            token: Arc::new("integration-token".to_string()),
+            viewer_code: Arc::new("123456".to_string()),
+            sessions: Arc::new(Mutex::new(HashSet::new())),
+            code_guard: Arc::new(Mutex::new(CodeAuthGuard::default())),
+        }
+    }
+
+    #[test]
+    fn viewer_code_locks_out_after_repeated_failures() {
+        let state = test_state();
+
+        // Each wrong code is rejected as unauthorized until the lockout trips.
+        for _ in 0..MAX_VIEWER_CODE_ATTEMPTS {
+            let err = create_code_session_response(&state, "000000", StatusCode::NO_CONTENT)
+                .expect_err("wrong code rejected");
+            assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        }
+
+        // Once locked, further attempts are throttled — even the correct code.
+        let throttled = create_code_session_response(&state, "000000", StatusCode::NO_CONTENT)
+            .expect_err("locked out");
+        assert_eq!(throttled.0, StatusCode::TOO_MANY_REQUESTS);
+        let correct_but_locked =
+            create_code_session_response(&state, "123456", StatusCode::NO_CONTENT)
+                .expect_err("correct code still locked");
+        assert_eq!(correct_but_locked.0, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn correct_viewer_code_resets_failure_counter() {
+        let state = test_state();
+        for _ in 0..(MAX_VIEWER_CODE_ATTEMPTS - 1) {
+            let _ = create_code_session_response(&state, "000000", StatusCode::NO_CONTENT);
+        }
+        // A success before the threshold clears the counter so we never lock out.
+        create_code_session_response(&state, "123456", StatusCode::NO_CONTENT).expect("unlock");
+        assert_eq!(state.code_guard.lock().expect("guard").failures, 0);
+    }
+
+    #[test]
+    fn issuing_and_clearing_a_session_revokes_the_cookie() {
+        let state = test_state();
+        let response =
+            issue_session_cookie(&state, StatusCode::NO_CONTENT).expect("issue session cookie");
+        let set_cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .expect("set-cookie")
+            .to_str()
+            .expect("set-cookie str");
+        let value = cookie_value(Some(set_cookie), SESSION_COOKIE_NAME)
+            .expect("session cookie value")
+            .to_string();
+
+        // The freshly minted id is a tracked, valid session.
+        assert!(state.sessions.lock().expect("sessions").contains(&value));
+
+        // Logout removes exactly that id, so the cookie no longer authorizes.
+        state.sessions.lock().expect("sessions").remove(&value);
+        assert!(!state.sessions.lock().expect("sessions").contains(&value));
+    }
+
+    #[test]
+    fn issued_session_ids_are_unique_per_unlock() {
+        let state = test_state();
+        for _ in 0..3 {
+            issue_session_cookie(&state, StatusCode::NO_CONTENT).expect("issue");
+        }
+        assert_eq!(state.sessions.lock().expect("sessions").len(), 3);
+    }
+
+    #[test]
     fn ensure_token_persists_and_is_stable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let token_path = dir.path().join("token");
@@ -1252,6 +1690,37 @@ mod tests {
         assert!(!first.is_empty());
         let second = ensure_token(&token_path).expect("reload");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn remote_qr_login_url_encodes_query_token() {
+        assert_eq!(
+            remote_qr_login_url("localhost", "abc123"),
+            "https://localhost:11921/auth/login?token=abc123"
+        );
+        assert_eq!(
+            remote_qr_login_url("example.com", "a+b/c=="),
+            "https://example.com:11921/auth/login?token=a%2Bb%2Fc%3D%3D"
+        );
+    }
+
+    #[test]
+    fn ensure_server_paths_reuses_stable_cert_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = ensure_server_paths_in(dir.path(), Some("example.com")).expect("paths");
+        assert!(paths.cert_path.ends_with("cert.pem"));
+        assert!(paths.key_path.ends_with("key.pem"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cert-hostname")).expect("read hostname"),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn render_login_qr_produces_visible_blocks() {
+        let rendered = render_login_qr("https://localhost:11921/#token=test").expect("qr");
+        assert!(rendered.contains('█') || rendered.contains('▀') || rendered.contains('▄'));
+        assert!(rendered.contains('\n'));
     }
 
     #[cfg(unix)]
@@ -1286,21 +1755,11 @@ mod tests {
         let db_path = dir.path().join("sessions.sqlite3");
         init_db(&db_path).expect("init db");
         let token = "integration-token".to_string();
-        let app = build_router(db_path, token.clone());
+        let viewer_code = "123456".to_string();
+        let app = build_router(db_path, token.clone(), viewer_code.clone());
 
-        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
-            .await
-            .expect("tls config");
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let server = tokio::spawn(async move {
-            axum_server::from_tcp_rustls(listener, tls)
-                .serve(app.into_make_service())
-                .await
-        });
-
-        let client = build_client(&cert_path).expect("pinned client");
-        let base = format!("https://127.0.0.1:{port}");
+        let _client = build_client(&cert_path).expect("pinned client");
+        let base = "https://127.0.0.1:11921";
         let record = SessionRecord {
             session_id: "sess-int".to_string(),
             name: "demo".to_string(),
@@ -1314,50 +1773,262 @@ mod tests {
         };
 
         // Without the bearer token the write is rejected.
-        let unauthorized = client
-            .post(format!("{base}/api/sessions"))
-            .json(&record)
-            .send()
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("{base}/api/sessions"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&record).expect("record json"),
+                    ))
+                    .expect("request"),
+            )
             .await
             .expect("send unauthenticated");
         assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
 
         // With the token the record is accepted and then listed back.
-        let accepted = client
-            .post(format!("{base}/api/sessions"))
-            .bearer_auth(&token)
-            .json(&record)
-            .send()
+        let accepted = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("{base}/api/sessions"))
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&record).expect("record json"),
+                    ))
+                    .expect("request"),
+            )
             .await
             .expect("send authenticated");
         assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
 
-        let listed: Vec<SessionRecord> = client
-            .get(format!("{base}/sessions"))
-            .bearer_auth(&token)
-            .send()
+        let listed = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("{base}/sessions"))
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
             .await
-            .expect("list request")
-            .json()
-            .await
-            .expect("list json");
+            .expect("list request");
+        assert_eq!(listed.status(), reqwest::StatusCode::OK);
+        let listed: Vec<SessionRecord> = serde_json::from_slice(
+            &listed
+                .into_body()
+                .collect()
+                .await
+                .expect("read body")
+                .to_bytes(),
+        )
+        .expect("list json");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, "sess-int");
 
-        let viewer = client
-            .get(format!("{base}/"))
-            .send()
+        let viewer = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("{base}/?token={token}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
             .await
-            .expect("viewer request")
-            .text()
-            .await
-            .expect("viewer body");
-        assert!(viewer.contains("Remote Sessions"));
-        assert!(viewer.contains(&token));
+            .expect("viewer request");
+        assert_eq!(viewer.status(), reqwest::StatusCode::OK);
+        let viewer = String::from_utf8(
+            viewer
+                .into_body()
+                .collect()
+                .await
+                .expect("viewer body")
+                .to_bytes()
+                .to_vec(),
+        )
+        .expect("viewer utf8");
+        assert!(viewer.contains("Unlock Remote Sessions"));
+        assert!(!viewer.contains(&token));
 
-        let live_unauthorized = client
-            .get(format!("{base}/live/sessions"))
-            .send()
+        let live_listed_via_query = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("{base}/live/sessions?token={token}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("live list via query token");
+        assert_eq!(live_listed_via_query.status(), reqwest::StatusCode::OK);
+        let live_listed_via_query: Vec<SessionRecord> = serde_json::from_slice(
+            &live_listed_via_query
+                .into_body()
+                .collect()
+                .await
+                .expect("live list via query token body")
+                .to_bytes(),
+        )
+        .expect("live list via query token json");
+        assert_eq!(live_listed_via_query.len(), 1);
+
+        let bootstrap = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("{base}/auth/login?token={token}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("bootstrap login request");
+        assert_eq!(bootstrap.status(), reqwest::StatusCode::SEE_OTHER);
+        assert_eq!(
+            bootstrap
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .expect("location header"),
+            "/"
+        );
+        let bootstrap_cookie = bootstrap
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("bootstrap set-cookie header")
+            .to_str()
+            .expect("bootstrap set-cookie str")
+            .to_string();
+        assert!(bootstrap_cookie.contains(SESSION_COOKIE_NAME));
+
+        let viewer_sessions_unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("{base}/live/sessions"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("viewer sessions unauthenticated request");
+        assert_eq!(
+            viewer_sessions_unauthorized.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+
+        let auth_response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("{base}/auth/session"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&SessionAuthRequest {
+                            code: viewer_code.clone(),
+                        })
+                        .expect("auth json"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("viewer auth request");
+        assert_eq!(auth_response.status(), reqwest::StatusCode::NO_CONTENT);
+        let session_cookie = auth_response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("set-cookie header")
+            .to_str()
+            .expect("set-cookie str")
+            .to_string();
+        assert!(session_cookie.contains("HttpOnly"));
+        assert!(session_cookie.contains("Secure"));
+        assert!(session_cookie.contains("SameSite=Strict"));
+        assert!(session_cookie.contains(SESSION_COOKIE_NAME));
+        // Only the cookie value is needed to replay the session; keep it so the
+        // logout step below can prove the same cookie is revoked server-side.
+        let session_cookie_value = cookie_value(Some(&session_cookie), SESSION_COOKIE_NAME)
+            .expect("session cookie value")
+            .to_string();
+
+        let live_listed_via_cookie = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("{base}/live/sessions"))
+                    .header(axum::http::header::COOKIE, session_cookie.clone())
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("live list via cookie");
+        assert_eq!(live_listed_via_cookie.status(), reqwest::StatusCode::OK);
+        let live_listed_via_cookie: Vec<SessionRecord> = serde_json::from_slice(
+            &live_listed_via_cookie
+                .into_body()
+                .collect()
+                .await
+                .expect("live list via cookie body")
+                .to_bytes(),
+        )
+        .expect("live list via cookie json");
+        assert_eq!(live_listed_via_cookie.len(), 1);
+        assert_eq!(live_listed_via_cookie[0].session_id, "sess-int");
+
+        let logout = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("{base}/auth/session"))
+                    .header(axum::http::header::COOKIE, session_cookie.clone())
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("logout request");
+        assert_eq!(logout.status(), reqwest::StatusCode::NO_CONTENT);
+
+        // The cookie is revoked server-side: replaying the very same cookie now
+        // fails, so logout is not merely cosmetic client-side cookie clearing.
+        let live_after_logout = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("{base}/live/sessions"))
+                    .header(
+                        axum::http::header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie_value}"),
+                    )
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("live after logout request");
+        assert_eq!(
+            live_after_logout.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+
+        let live_unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("{base}/live/sessions"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("live unauthenticated request");
         assert_eq!(
@@ -1365,18 +2036,28 @@ mod tests {
             reqwest::StatusCode::UNAUTHORIZED
         );
 
-        let live_listed: Vec<SessionRecord> = client
-            .get(format!("{base}/live/sessions"))
-            .bearer_auth(&token)
-            .send()
+        let live_listed = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("{base}/live/sessions"))
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
             .await
-            .expect("live list request")
-            .json()
-            .await
-            .expect("live list json");
+            .expect("live list request");
+        assert_eq!(live_listed.status(), reqwest::StatusCode::OK);
+        let live_listed: Vec<SessionRecord> = serde_json::from_slice(
+            &live_listed
+                .into_body()
+                .collect()
+                .await
+                .expect("live list body")
+                .to_bytes(),
+        )
+        .expect("live list json");
         assert_eq!(live_listed.len(), 1);
         assert_eq!(live_listed[0].session_id, "sess-int");
-
-        server.abort();
     }
 }
