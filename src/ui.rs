@@ -9,6 +9,7 @@ use std::error::Error;
 use std::io::{self, Stdout, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::{AvailableCommandInput, StopReason, ToolCallStatus};
@@ -43,6 +44,7 @@ use crate::clipboard::{
 use crate::config;
 use crate::event::{PermissionDecision, PermissionPrompt, PromptImage, UiCommand, UiEvent};
 use crate::notifications::TerminalNotificationBackend;
+use crate::speech::{dictation_error_message, run_dictation};
 use crate::version::mjolnir_version_label;
 
 const TRANSCRIPT_SCROLL_PAGE_STEP: usize = 5;
@@ -76,6 +78,15 @@ pub struct HeaderLabels {
 enum TerminalRequest {
     None,
     ToggleTextSelectionMode,
+    StartDictation,
+    StopDictation,
+}
+
+#[derive(Debug)]
+enum DictationEvent {
+    Partial(String),
+    Level(f32),
+    Finished(std::result::Result<String, String>),
 }
 
 #[cfg(test)]
@@ -266,6 +277,8 @@ async fn ui_loop(
     let mut transcript_sink = TranscriptSink::default();
     let mut notification_backend = TerminalNotificationBackend::detect();
     let mut crossterm_events = EventStream::new();
+    let (dictation_tx, mut dictation_rx) = mpsc::unbounded_channel::<DictationEvent>();
+    let mut dictation_cancel_tx: Option<std_mpsc::Sender<()>> = None;
     let mut inline_height = INLINE_CHAT_HEIGHT;
     // Wake-up timer so we still get scheduled to draw when no events
     // arrive (e.g. while waiting on the agent). `Delay` keeps it from
@@ -287,7 +300,13 @@ async fn ui_loop(
                 match maybe_ct {
                     Some(Ok(ev)) => {
                         let request = handle_crossterm(&mut state, cmd_tx, ev, mode);
-                        apply_terminal_request(terminal, &mut state, request)?;
+                        apply_terminal_request(
+                            terminal,
+                            &mut state,
+                            request,
+                            &dictation_tx,
+                            &mut dictation_cancel_tx,
+                        )?;
                     }
                     Some(Err(e)) => {
                         state.record_status_message(
@@ -298,6 +317,24 @@ async fn ui_loop(
                     None => break,
                 }
                 dirty = true;
+            }
+            maybe_dictation = dictation_rx.recv() => {
+                match maybe_dictation {
+                    Some(DictationEvent::Partial(text)) => {
+                        update_dictation_partial(&mut state, &text);
+                        dirty = true;
+                    }
+                    Some(DictationEvent::Level(level)) => {
+                        update_dictation_level(&mut state, level);
+                        dirty = true;
+                    }
+                    Some(DictationEvent::Finished(result)) => {
+                        dictation_cancel_tx = None;
+                        finish_dictation(&mut state, result);
+                        dirty = true;
+                    }
+                    None => {}
+                }
             }
             // Use the unconditional form (no `Some(ev) = ...`) so the
             // None case (runtime dropped the sender) reaches the match
@@ -337,6 +374,7 @@ async fn ui_loop(
 
         if let Some(reason) = state.exit_reason {
             let _ = cmd_tx.send(UiCommand::Shutdown);
+            cancel_dictation_for_exit(&mut state, &mut dictation_cancel_tx);
             if mode == UiMode::InlineChat {
                 flush_transcript_to_scrollback(terminal, &mut transcript_sink, &state)?;
                 sync_inline_terminal_height(terminal, &state, &mut inline_height)?;
@@ -377,6 +415,7 @@ async fn ui_loop(
             last_draw = Instant::now();
         }
     }
+    cancel_dictation_for_exit(&mut state, &mut dictation_cancel_tx);
     if mode == UiMode::FullscreenTui {
         reset_text_selection_mode_for_exit(&mut state, |enabled| {
             set_mouse_capture(terminal, enabled)
@@ -517,13 +556,14 @@ fn repair_inline_viewport(
 }
 
 fn needs_live_redraw(state: &AppState) -> bool {
-    matches!(
-        state.connection_state,
-        ConnectionState::Launching
-            | ConnectionState::Initializing
-            | ConnectionState::Streaming
-            | ConnectionState::Cancelling
-    )
+    state.voice_input_active
+        || matches!(
+            state.connection_state,
+            ConnectionState::Launching
+                | ConnectionState::Initializing
+                | ConnectionState::Streaming
+                | ConnectionState::Cancelling
+        )
 }
 
 fn flush_transcript_to_scrollback(
@@ -854,6 +894,13 @@ fn handle_crossterm(
         (KeyModifiers::CONTROL, KeyCode::Char('y')) => {
             copy_last_agent_message(state);
         }
+        (KeyModifiers::CONTROL, KeyCode::Char('r')) => {
+            return if state.voice_input_active {
+                TerminalRequest::StopDictation
+            } else {
+                TerminalRequest::StartDictation
+            };
+        }
         (modifiers, KeyCode::Char('v'))
             if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
@@ -980,6 +1027,8 @@ fn apply_terminal_request(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut AppState,
     request: TerminalRequest,
+    dictation_tx: &mpsc::UnboundedSender<DictationEvent>,
+    dictation_cancel_tx: &mut Option<std_mpsc::Sender<()>>,
 ) -> Result<()> {
     match request {
         TerminalRequest::None => Ok(()),
@@ -992,6 +1041,14 @@ fn apply_terminal_request(
             } else {
                 "wheel scrolling enabled; press F12 to select text with the mouse"
             }));
+            Ok(())
+        }
+        TerminalRequest::StartDictation => {
+            start_dictation(state, dictation_tx, dictation_cancel_tx);
+            Ok(())
+        }
+        TerminalRequest::StopDictation => {
+            stop_dictation(state, dictation_cancel_tx);
             Ok(())
         }
     }
@@ -1055,6 +1112,24 @@ fn delete_input_range(state: &mut AppState, start: usize, end: usize, new_cursor
     state.input.drain(byte_start..byte_end);
     state.input_cursor = new_cursor.min(input_char_count(&state.input));
     true
+}
+
+fn replace_input_range(
+    state: &mut AppState,
+    start: usize,
+    end: usize,
+    text: &str,
+) -> (usize, usize) {
+    state.reset_history_navigation();
+    let len = input_char_count(&state.input);
+    let start = start.min(len);
+    let end = end.min(len).max(start);
+    let byte_start = input_byte_index_at_char(&state.input, start);
+    let byte_end = input_byte_index_at_char(&state.input, end);
+    state.input.replace_range(byte_start..byte_end, text);
+    let next_end = start + input_char_count(text);
+    state.input_cursor = next_end;
+    (start, next_end)
 }
 
 fn delete_before_cursor(state: &mut AppState) -> bool {
@@ -1554,6 +1629,117 @@ fn paste_clipboard_image(state: &mut AppState) {
         }
         Err(e) => {
             state.record_status_message(StatusKind::Warning, format!("image paste failed: {e}"));
+        }
+    }
+}
+
+fn start_dictation(
+    state: &mut AppState,
+    dictation_tx: &mpsc::UnboundedSender<DictationEvent>,
+    dictation_cancel_tx: &mut Option<std_mpsc::Sender<()>>,
+) {
+    if state.voice_input_active {
+        state.status_line = Some(StatusMessage::info("voice input is already active..."));
+        return;
+    }
+
+    state.input_paste_burst.clear();
+    state.voice_input_active = true;
+    state.voice_input_level = Some(0.0);
+    let cursor = state.input_cursor.min(input_char_count(&state.input));
+    state.voice_input_range = Some((cursor, cursor));
+    state.status_line = Some(StatusMessage::info("listening..."));
+
+    let (cancel_tx, cancel_rx) = std_mpsc::channel();
+    *dictation_cancel_tx = Some(cancel_tx);
+    let dictation_tx = dictation_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let partial_tx = dictation_tx.clone();
+        let level_tx = dictation_tx.clone();
+        let result = run_dictation(
+            move |text| {
+                let _ = partial_tx.send(DictationEvent::Partial(text));
+            },
+            move |level| {
+                let _ = level_tx.send(DictationEvent::Level(level));
+            },
+            cancel_rx,
+        )
+        .map_err(|e| dictation_error_message(&e));
+        let _ = dictation_tx.send(DictationEvent::Finished(result));
+    });
+}
+
+fn stop_dictation(state: &mut AppState, dictation_cancel_tx: &mut Option<std_mpsc::Sender<()>>) {
+    let was_active = cancel_active_dictation(state, dictation_cancel_tx);
+    if was_active {
+        state.voice_input_active = false;
+        state.voice_input_range = None;
+        state.status_line = Some(StatusMessage::info("stopped voice input"));
+        state.voice_input_level = None;
+    }
+}
+
+fn cancel_dictation_for_exit(
+    state: &mut AppState,
+    dictation_cancel_tx: &mut Option<std_mpsc::Sender<()>>,
+) {
+    if cancel_active_dictation(state, dictation_cancel_tx) {
+        state.voice_input_active = false;
+        state.voice_input_range = None;
+        state.voice_input_level = None;
+    }
+}
+
+fn cancel_active_dictation(
+    state: &AppState,
+    dictation_cancel_tx: &mut Option<std_mpsc::Sender<()>>,
+) -> bool {
+    if let Some(cancel_tx) = dictation_cancel_tx.take() {
+        let _ = cancel_tx.send(());
+    }
+    state.voice_input_active
+}
+
+fn update_dictation_partial(state: &mut AppState, text: &str) {
+    if !state.voice_input_active {
+        return;
+    }
+    let range = state
+        .voice_input_range
+        .unwrap_or((state.input_cursor, state.input_cursor));
+    state.voice_input_range = Some(replace_input_range(state, range.0, range.1, text));
+    state.scroll_input_to_bottom();
+    state.update_autocomplete();
+    state.status_line = Some(StatusMessage::info("listening..."));
+}
+
+fn update_dictation_level(state: &mut AppState, level: f32) {
+    if state.voice_input_active {
+        state.voice_input_level = Some(level.clamp(0.0, 1.0));
+    }
+}
+
+fn finish_dictation(state: &mut AppState, result: std::result::Result<String, String>) {
+    if !state.voice_input_active {
+        return;
+    }
+    state.voice_input_active = false;
+    state.voice_input_level = None;
+    match result {
+        Ok(text) => {
+            let range = state
+                .voice_input_range
+                .take()
+                .unwrap_or((state.input_cursor, state.input_cursor));
+            replace_input_range(state, range.0, range.1, &text);
+            state.scroll_input_to_bottom();
+            state.update_autocomplete();
+            state.status_line = Some(StatusMessage::info("inserted voice input"));
+        }
+        Err(message) => {
+            state.voice_input_range = None;
+            state.record_status_message(StatusKind::Warning, message);
         }
     }
 }
@@ -3433,6 +3619,17 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
+fn voice_level_meter(level: Option<f32>) -> String {
+    const METER_WIDTH: usize = 10;
+    let filled = (level.unwrap_or(0.0).clamp(0.0, 1.0) * METER_WIDTH as f32).round() as usize;
+    let filled = filled.min(METER_WIDTH);
+    format!(
+        "[{}{}]",
+        "|".repeat(filled),
+        ".".repeat(METER_WIDTH - filled)
+    )
+}
+
 fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &AppState, mode: UiMode) {
     let text_selection_hint = match mode {
         UiMode::InlineChat => String::new(),
@@ -3448,9 +3645,14 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &AppState, mode: UiMode
         " runtime closed (/new or Ctrl-N for a new session | Ctrl-C to quit) ".to_string()
     } else if state.is_streaming() {
         " streaming... (Ctrl-C to cancel) ".to_string()
+    } else if state.voice_input_active {
+        format!(
+            " 🎙 {} Ctrl-R stop ",
+            voice_level_meter(state.voice_input_level)
+        )
     } else {
         format!(
-            " prompt (Enter send | {PROMPT_NEWLINE_HINT} newline | F10 help | Ctrl-C quit{text_selection_hint}) "
+            " prompt (Enter send | {PROMPT_NEWLINE_HINT} newline | 🎙 Ctrl-R voice | F10 help | Ctrl-C quit{text_selection_hint}) "
         )
     };
     let style = if state.runtime_closed || state.is_streaming() {
@@ -3992,6 +4194,7 @@ fn draw_help_modal(f: &mut ratatui::Frame, area: Rect, mode: UiMode) {
         Line::from("  Ctrl-K/U/W       delete to end/start of line or previous word"),
         Line::from("  Ctrl-D           delete at cursor; quit when input and chips are empty"),
         Line::from("  Ctrl-C           cancel streaming; clear input/chips; quit when empty"),
+        Line::from("  🎙 Ctrl-R        start/stop macOS microphone dictation into the prompt"),
         Line::from("  Ctrl-V/Ctrl-Alt-V paste image from clipboard"),
         Line::from("  Ctrl-Y           copy last agent message to clipboard"),
         Line::from("  Esc              clear input, chips, and browsing history"),
@@ -6344,6 +6547,126 @@ mod tests {
             key_with_modifiers(KeyCode::Char('f'), KeyModifiers::CONTROL),
         );
         assert_eq!(state.input_cursor, 1);
+    }
+
+    #[test]
+    fn ctrl_r_requests_voice_dictation_start() {
+        let mut state = AppState::new();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        let request = handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+
+        assert!(state.input.is_empty());
+        assert_eq!(request, TerminalRequest::StartDictation);
+    }
+
+    #[test]
+    fn ctrl_r_requests_voice_dictation_stop_when_active() {
+        let mut state = AppState::new();
+        state.voice_input_active = true;
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        let request = handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(request, TerminalRequest::StopDictation);
+    }
+
+    #[test]
+    fn stopping_dictation_keeps_live_prompt_text() {
+        let mut state = AppState::new();
+        state.voice_input_active = true;
+        state.input = "hello".to_string();
+        state.input_cursor = state.input.chars().count();
+        state.voice_input_range = Some((0, state.input_cursor));
+        let (cancel_tx, _cancel_rx) = std_mpsc::channel();
+        let mut cancel_tx = Some(cancel_tx);
+
+        stop_dictation(&mut state, &mut cancel_tx);
+        finish_dictation(&mut state, Ok("ignored".to_string()));
+
+        assert!(!state.voice_input_active);
+        assert!(state.voice_input_range.is_none());
+        assert_eq!(state.input, "hello");
+        assert!(cancel_tx.is_none());
+    }
+
+    #[test]
+    fn exit_cancels_dictation_without_status_message() {
+        let mut state = AppState::new();
+        state.voice_input_active = true;
+        state.voice_input_level = Some(0.5);
+        state.voice_input_range = Some((0, 0));
+        let (cancel_tx, cancel_rx) = std_mpsc::channel();
+        let mut cancel_tx = Some(cancel_tx);
+
+        cancel_dictation_for_exit(&mut state, &mut cancel_tx);
+
+        assert!(!state.voice_input_active);
+        assert!(state.voice_input_range.is_none());
+        assert!(state.voice_input_level.is_none());
+        assert!(state.status_line.is_none());
+        assert!(cancel_tx.is_none());
+        assert!(cancel_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn dictation_level_updates_voice_meter_state() {
+        let mut state = AppState::new();
+        state.voice_input_active = true;
+
+        update_dictation_level(&mut state, 1.7);
+
+        assert_eq!(state.voice_input_level, Some(1.0));
+        assert_eq!(voice_level_meter(state.voice_input_level), "[||||||||||]");
+    }
+
+    #[test]
+    fn voice_level_meter_renders_empty_when_no_level_seen() {
+        assert_eq!(voice_level_meter(None), "[..........]");
+        assert_eq!(voice_level_meter(Some(0.35)), "[||||......]");
+    }
+
+    #[test]
+    fn dictation_partial_updates_prompt_text() {
+        let mut state = AppState::new();
+        state.input = "before after".to_string();
+        state.input_cursor = "before ".chars().count();
+        state.voice_input_active = true;
+        state.voice_input_range = Some((state.input_cursor, state.input_cursor));
+
+        update_dictation_partial(&mut state, "hello");
+        update_dictation_partial(&mut state, "hello world ");
+
+        assert_eq!(state.input, "before hello world after");
+        assert_eq!(state.input_cursor, "before hello world ".chars().count());
+        let status = state.status_line.expect("status");
+        assert_eq!(status.kind, StatusKind::Info);
+        assert_eq!(status.text, "listening...");
+    }
+
+    #[test]
+    fn dictation_finish_replaces_live_partial_text() {
+        let mut state = AppState::new();
+        state.input = "before after".to_string();
+        state.input_cursor = "before ".chars().count();
+        state.voice_input_active = true;
+        state.voice_input_range = Some((state.input_cursor, state.input_cursor));
+
+        update_dictation_partial(&mut state, "rough draft");
+        finish_dictation(&mut state, Ok("voice ".to_string()));
+
+        assert!(!state.voice_input_active);
+        assert_eq!(state.input, "before voice after");
+        assert_eq!(state.input_cursor, "before voice ".chars().count());
+        assert!(state.voice_input_range.is_none());
     }
 
     #[test]
