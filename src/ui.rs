@@ -292,6 +292,7 @@ async fn ui_loop(
     let mut dirty = !draw_terminal_frame(terminal, &mut state, &mut transcript_scroll, mode)?;
     let mut last_draw = Instant::now();
     let mut last_inline_repair = Instant::now();
+    let mut force_inline_repair = false;
 
     loop {
         tokio::select! {
@@ -299,6 +300,9 @@ async fn ui_loop(
             maybe_ct = crossterm_events.next() => {
                 match maybe_ct {
                     Some(Ok(ev)) => {
+                        if should_force_inline_repair_for_event(mode, &ev) {
+                            force_inline_repair = true;
+                        }
                         let request = handle_crossterm(&mut state, cmd_tx, ev, mode);
                         apply_terminal_request(
                             terminal,
@@ -388,9 +392,13 @@ async fn ui_loop(
             return Ok((reason, state.session_id.clone(), state.prompt_history()));
         }
 
-        if should_repair_inline_view(mode, &state)
-            && last_inline_repair.elapsed() >= INLINE_REPAIR_INTERVAL
-        {
+        if should_attempt_inline_repair(
+            force_inline_repair,
+            mode,
+            &state,
+            last_inline_repair.elapsed(),
+        ) {
+            force_inline_repair = false;
             sync_inline_terminal_height(terminal, &state, &mut inline_height)?;
             let repaired = repair_inline_viewport(terminal, &mut state, &mut transcript_scroll);
             let now = Instant::now();
@@ -511,6 +519,24 @@ fn draw_terminal_frame(
         }
         Err(e) => Err(e).context("draw terminal"),
     }
+}
+
+fn should_force_inline_repair_for_event(mode: UiMode, ev: &CtEvent) -> bool {
+    mode == UiMode::InlineChat && matches!(ev, CtEvent::FocusGained)
+}
+
+fn should_attempt_inline_repair(
+    force_inline_repair: bool,
+    mode: UiMode,
+    state: &AppState,
+    last_inline_repair_elapsed: Duration,
+) -> bool {
+    if force_inline_repair {
+        debug_assert_eq!(mode, UiMode::InlineChat);
+        return true;
+    }
+
+    should_repair_inline_view(mode, state) && last_inline_repair_elapsed >= INLINE_REPAIR_INTERVAL
 }
 
 fn should_repair_inline_view(mode: UiMode, state: &AppState) -> bool {
@@ -2347,12 +2373,12 @@ fn draw(
         draw_config_value_picker_modal(f, f.area(), state);
     }
 
-    if let Some(pending) = state.pending_permission() {
-        draw_permission_modal(f, f.area(), pending, state.pending_permission_count());
-    }
-
     if state.help_overlay {
         draw_help_modal(f, f.area(), mode);
+    }
+
+    if let Some(pending) = state.pending_permission() {
+        draw_permission_modal(f, f.area(), pending, state.pending_permission_count());
     }
 }
 
@@ -4849,6 +4875,45 @@ mod tests {
     }
 
     #[test]
+    fn inline_focus_gain_forces_repair_even_without_live_redraw_state() {
+        let mut state = AppState::new();
+        state.connection_state = ConnectionState::Ready;
+
+        assert!(!should_repair_inline_view(UiMode::InlineChat, &state));
+        assert!(should_force_inline_repair_for_event(
+            UiMode::InlineChat,
+            &CtEvent::FocusGained
+        ));
+        assert!(!should_force_inline_repair_for_event(
+            UiMode::FullscreenTui,
+            &CtEvent::FocusGained
+        ));
+        assert!(!should_force_inline_repair_for_event(
+            UiMode::InlineChat,
+            &CtEvent::FocusLost
+        ));
+    }
+
+    #[test]
+    fn forced_inline_repair_bypasses_live_redraw_gate_once() {
+        let mut state = AppState::new();
+        state.connection_state = ConnectionState::Ready;
+
+        assert!(should_attempt_inline_repair(
+            true,
+            UiMode::InlineChat,
+            &state,
+            Duration::ZERO
+        ));
+        assert!(!should_attempt_inline_repair(
+            false,
+            UiMode::InlineChat,
+            &state,
+            Duration::ZERO
+        ));
+    }
+
+    #[test]
     fn streaming_inline_help_overlay_keeps_repair_active_after_f10() {
         let mut state = AppState::new();
         state.record_user_prompt("hello".to_string());
@@ -5138,6 +5203,28 @@ mod tests {
         );
 
         assert_eq!(state.exit_reason, Some(UiExitReason::Quit));
+    }
+
+    #[test]
+    fn runtime_closed_quits_on_ctrl_c_even_with_pending_permission() {
+        let pending =
+            permission_pending_with_options("run shell command", &["Allow once", "Reject"], 0);
+        let mut state = AppState::new();
+        state.runtime_closed = true;
+        state.apply_event(UiEvent::PermissionRequest(pending.prompt));
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            CtEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        );
+
+        assert_eq!(state.exit_reason, Some(UiExitReason::Quit));
+        assert!(
+            state.has_pending_permission(),
+            "quit should not require dismissing the prompt"
+        );
     }
 
     #[test]
@@ -5933,6 +6020,25 @@ mod tests {
     }
 
     #[test]
+    fn permission_prompt_keeps_keyboard_priority_over_help_overlay() {
+        let pending =
+            permission_pending_with_options("run shell command", &["Allow once", "Reject"], 0);
+        let mut state = AppState::new();
+        state.help_overlay = true;
+        state.apply_event(UiEvent::PermissionRequest(pending.prompt));
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Down));
+
+        let pending = state.pending_permission().expect("pending permission");
+        assert_eq!(pending.selected, 1);
+        assert!(
+            !state.help_overlay,
+            "permission request should dismiss stale help before taking focus"
+        );
+    }
+
+    #[test]
     fn permission_modal_renders_all_short_options() {
         let pending = permission_pending_with_options(
             "run shell command",
@@ -6065,6 +6171,32 @@ mod tests {
         assert!(
             rendered.contains("> Reject (allow once)"),
             "clamped selection should be rendered; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_permission_modal_renders_above_help_overlay() {
+        let pending =
+            permission_pending_with_options("run shell command", &["Allow once", "Reject"], 0);
+        let mut state = AppState::new();
+        state.help_overlay = true;
+        state.apply_event(UiEvent::PermissionRequest(pending.prompt));
+        let mut scroll = TranscriptScrollState::default();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut state, &mut scroll, UiMode::FullscreenTui))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(
+            rendered.contains("permission request"),
+            "permission modal should remain visible above help overlay:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("run shell command"),
+            "permission details should remain visible above help overlay:\n{rendered}"
         );
     }
 
