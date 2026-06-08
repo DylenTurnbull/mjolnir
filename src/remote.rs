@@ -1,6 +1,7 @@
 //! Simple remote-control server and local session registration.
 
 use std::collections::HashSet;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -570,8 +571,9 @@ fn build_client(cert_path: &Path) -> Option<reqwest::Client> {
 pub async fn run_server(hostname: Option<String>) -> Result<()> {
     install_crypto_provider();
 
-    let listen = server_listen_config(hostname.as_deref())?;
-    let paths = ensure_server_paths(hostname.as_deref())?;
+    let requested_hostname = normalize_requested_hostname(hostname.as_deref());
+    let listen = server_listen_config(requested_hostname.as_deref())?;
+    let paths = ensure_server_paths(requested_hostname.as_deref())?;
     init_db(&paths.db_path)?;
     let token = ensure_token(&paths.token_path)?;
     let viewer_code = generate_viewer_code()?;
@@ -584,19 +586,35 @@ pub async fn run_server(hostname: Option<String>) -> Result<()> {
             .await
             .context("load remote-control TLS certificate")?;
 
-    println!("Remote control listening on https://localhost:11921");
+    let listener = bind_server_listener(&listen.bind_addr)?;
+
+    println!("Remote control listening on https://{}:11921", listen.viewer_host);
     println!("{}", render_login_qr(&viewer_url)?);
     println!("viewer code: {viewer_code}");
 
-    axum_server::bind_rustls(listen.bind_addr.parse()?, tls_config)
+    axum_server::from_tcp_rustls(listener, tls_config)
         .serve(app.into_make_service())
         .await
-        .with_context(|| {
-            format!(
-                "serve remote-control API on {} (is another `mj server` already running?)",
-                listen.bind_addr
-            )
-        })
+        .with_context(|| format!("serve remote-control API on {}", listen.bind_addr))
+}
+
+fn bind_server_listener(bind_addr: &str) -> Result<TcpListener> {
+    let listener = TcpListener::bind(bind_addr).with_context(|| {
+        format!(
+            "bind remote-control listener on {bind_addr} (is another `mj server` already running?)"
+        )
+    })?;
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("set remote-control listener on {bind_addr} to non-blocking"))?;
+    Ok(listener)
+}
+
+fn normalize_requested_hostname(hostname: Option<&str>) -> Option<String> {
+    hostname
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn remote_qr_login_url(host: &str, token: &str) -> String {
@@ -1033,7 +1051,7 @@ fn remote_control_dir() -> PathBuf {
 }
 
 fn server_listen_config(hostname: Option<&str>) -> Result<ServerListenConfig> {
-    match hostname.map(str::trim).filter(|value| !value.is_empty()) {
+    match normalize_requested_hostname(hostname).as_deref() {
         Some(hostname) => Ok(ServerListenConfig {
             bind_addr: REMOTE_CONTROL_PUBLIC_ADDR.to_string(),
             viewer_host: hostname.to_string(),
@@ -1053,10 +1071,8 @@ fn ensure_server_paths_in(root: &Path, hostname: Option<&str>) -> Result<ServerP
     std::fs::create_dir_all(root)
         .with_context(|| format!("create remote-control dir {}", root.display()))?;
 
-    let normalized_hostname = hostname
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("localhost");
+    let normalized_hostname = normalize_requested_hostname(hostname);
+    let normalized_hostname = normalized_hostname.as_deref().unwrap_or("localhost");
     let cert_path = root.join("cert.pem");
     let key_path = root.join("key.pem");
     let cert_hostname_path = root.join("cert-hostname");
@@ -1785,6 +1801,38 @@ mod tests {
     }
 
     #[test]
+    fn server_listen_config_treats_blank_hostname_as_localhost() {
+        assert_eq!(
+            server_listen_config(Some("   ")).expect("config"),
+            server_listen_config(None).expect("config")
+        );
+    }
+
+    #[test]
+    fn normalize_requested_hostname_trims_and_drops_blank_values() {
+        assert_eq!(
+            normalize_requested_hostname(Some("  example.com  ")).as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(normalize_requested_hostname(Some("   ")), None);
+        assert_eq!(normalize_requested_hostname(None), None);
+    }
+
+    #[test]
+    fn bind_server_listener_reports_address_in_use() {
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("occupy port");
+        let bind_addr = occupied.local_addr().expect("listener addr").to_string();
+
+        let err = bind_server_listener(&bind_addr).expect_err("second bind should fail");
+        let message = format!("{err:#}");
+        assert!(message.contains(&bind_addr), "unexpected error: {message}");
+        assert!(
+            message.contains("already running"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
     fn viewer_code_is_six_digits() {
         let code = generate_viewer_code().expect("code");
         assert_eq!(code.len(), 6);
@@ -1897,6 +1945,16 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("cert-hostname")).expect("read hostname"),
             "example.com"
+        );
+    }
+
+    #[test]
+    fn ensure_server_paths_treats_blank_hostname_as_localhost() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ensure_server_paths_in(dir.path(), Some("   ")).expect("paths");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cert-hostname")).expect("read hostname"),
+            "localhost"
         );
     }
 
