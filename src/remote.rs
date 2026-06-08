@@ -1,6 +1,7 @@
 //! Simple remote-control server and local session registration.
 
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,11 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
+use crossterm::{
+    cursor::MoveTo,
+    execute,
+    terminal::{Clear, ClearType},
+};
 use qrcode::QrCode;
 use qrcode::types::Color;
 use rcgen::generate_simple_self_signed;
@@ -569,6 +575,7 @@ fn build_client(cert_path: &Path) -> Option<reqwest::Client> {
 }
 
 pub async fn run_server(hostname: Option<String>) -> Result<()> {
+    clear_terminal_screen()?;
     install_crypto_provider();
 
     let requested_hostname = normalize_requested_hostname(hostname.as_deref());
@@ -611,6 +618,16 @@ fn bind_server_listener(bind_addr: &str) -> Result<TcpListener> {
         .set_nonblocking(true)
         .with_context(|| format!("set remote-control listener on {bind_addr} to non-blocking"))?;
     Ok(listener)
+}
+
+fn clear_terminal_screen() -> Result<()> {
+    let mut stdout = std::io::stdout();
+    if !stdout.is_terminal() {
+        return Ok(());
+    }
+    execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))
+        .context("clear terminal before starting remote-control server")?;
+    Ok(())
 }
 
 fn normalize_requested_hostname(hostname: Option<&str>) -> Option<String> {
