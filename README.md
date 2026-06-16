@@ -193,9 +193,9 @@ Keyboard basics:
 - `Esc`: dismiss autocomplete, clear input, or cancel a permission prompt.
 - `Ctrl-C`: cancel an in-flight prompt; when idle with an empty input, quit.
 - `Ctrl-D`: quit when the input is empty.
-- `🎙 Ctrl-R`: start/stop microphone dictation into the prompt. All platforms
-  use in-process sherpa-onnx speech recognition with the multilingual Parakeet
-  TDT v3 model (25 European languages); the model (~0.7 GB) is downloaded and
+- `🎙 Ctrl-R` (non-Android): start/stop microphone dictation into the prompt.
+  Dictation uses in-process sherpa-onnx speech recognition with Silero VAD and
+  the multilingual Parakeet TDT v3 model; the model (~0.7 GB) is downloaded and
   cached under `~/.cache/mj/voice/` on first use.
 
 On-disk files:

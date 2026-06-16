@@ -1,10 +1,10 @@
 //! Prompt dictation support.
 //!
-//! All platforms share one in-process pipeline built on the official
-//! sherpa-onnx Rust bindings: cpal microphone capture, Silero VAD speech
-//! segmentation, and the multilingual NeMo Parakeet TDT 0.6b v3 offline
-//! recognizer (25 European languages) decoded incrementally so partial
-//! results stream into the prompt while the user speaks.
+//! Non-Android platforms use an in-process, fully local pipeline built on
+//! sherpa-onnx: cpal microphone capture, Silero VAD speech segmentation, and
+//! the multilingual NeMo Parakeet TDT 0.6b v3 offline recognizer. Models are
+//! downloaded once into the user cache and then reused without any API key or
+//! network call during dictation.
 
 use anyhow::Result;
 #[cfg(target_os = "android")]
@@ -189,6 +189,7 @@ mod backend {
         if paths.is_installed() {
             return Ok(());
         }
+
         let voice_dir = paths
             .dir
             .parent()
@@ -441,7 +442,6 @@ mod backend {
                 }
             }
 
-            // Feed the VAD in fixed-size windows.
             while vad_offset + VAD_WINDOW_SIZE <= buffer.len() {
                 vad.accept_waveform(&buffer[vad_offset..vad_offset + VAD_WINDOW_SIZE]);
                 if vad.detected() {
@@ -454,21 +454,17 @@ mod backend {
                 vad_offset += VAD_WINDOW_SIZE;
             }
 
-            // Keep only a short pre-speech tail so the buffer cannot grow
-            // without bound while the user is silent.
             if !speech_started && buffer.len() > 10 * VAD_WINDOW_SIZE {
                 let keep_from = buffer.len() - 10 * VAD_WINDOW_SIZE;
                 buffer.drain(..keep_from);
                 vad_offset = vad_offset.saturating_sub(keep_from);
             }
 
-            // Decode the in-progress utterance periodically for live partials.
             if speech_started && last_interim_decode_at.elapsed() >= INTERIM_DECODE_INTERVAL {
                 interim = decode_segment(&recognizer, SAMPLE_RATE, &buffer);
                 last_interim_decode_at = Instant::now();
             }
 
-            // Finalize utterances the VAD has closed.
             while !vad.is_empty() {
                 if let Some(segment) = vad.front() {
                     let text = decode_segment(&recognizer, SAMPLE_RATE, segment.samples());
@@ -493,8 +489,6 @@ mod backend {
 
         drop(stream);
 
-        // Flush the VAD so a trailing utterance that never hit a silence
-        // boundary is still transcribed.
         if !cancelled {
             vad.flush();
             while !vad.is_empty() {
@@ -588,9 +582,9 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     use std::path::PathBuf;
 
-    /// End-to-end check of the model pipeline: downloads the real models into
-    /// the user cache (~0.7 GB, one-time), loads the recognizer and VAD, and
-    /// decodes a test wav shipped with the model archive.
+    /// End-to-end check of the local model pipeline: downloads the real models
+    /// into the user cache, loads the recognizer and VAD, and decodes a test
+    /// wav shipped with the model archive.
     #[cfg(not(target_os = "android"))]
     #[test]
     #[ignore = "downloads ~0.7 GB of models; run with: cargo test -- --ignored"]
