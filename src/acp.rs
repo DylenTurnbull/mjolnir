@@ -8,17 +8,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::{
     CancelNotification, ClientCapabilities, ContentBlock, ErrorCode, FileSystemCapabilities,
-    ImageContent, InitializeRequest, LoadSessionRequest, ModelInfo, NewSessionRequest,
-    PromptRequest, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
-    SessionModeState, SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest,
-    SetSessionModelRequest, TextContent,
+    ForkSessionRequest, ImageContent, InitializeRequest, LoadSessionRequest, ModelInfo,
+    NewSessionRequest, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionId, SessionModeState, SessionNotification,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, TextContent,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::Result;
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::event::{
@@ -304,13 +304,18 @@ where
     // Channel for permission prompts that the UI needs to answer.
     // The on_receive_request closure forwards (req, responder) here and
     // returns immediately so the JSON-RPC dispatch loop stays unblocked.
+    let active_session_id = Arc::new(Mutex::new(None::<SessionId>));
     let perm_ui_tx = ui_tx.clone();
     let notif_ui_tx = ui_tx.clone();
+    let notif_active_session_id = active_session_id.clone();
     let result = Client
         .builder()
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
-                let _ = notif_ui_tx.send(UiEvent::SessionUpdate(notification.update));
+                let active = notif_active_session_id.lock().await.clone();
+                if active.as_ref() == Some(&notification.session_id) {
+                    let _ = notif_ui_tx.send(UiEvent::SessionUpdate(notification.update));
+                }
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
@@ -339,8 +344,16 @@ where
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, |conn: ConnectionTo<Agent>| async move {
-            if let Err(e) =
-                drive_session(conn, cwd, resume_session, &ui_tx, &mut ui_rx, fatal_emitted).await
+            if let Err(e) = drive_session(
+                conn,
+                cwd,
+                resume_session,
+                &ui_tx,
+                &mut ui_rx,
+                fatal_emitted,
+                active_session_id,
+            )
+            .await
             {
                 let msg = format!("{e:#}");
                 return Err(agent_client_protocol::Error::internal_error()
@@ -364,6 +377,7 @@ async fn drive_session(
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
     fatal_emitted: Arc<AtomicBool>,
+    active_session_id: Arc<Mutex<Option<SessionId>>>,
 ) -> Result<()> {
     // Advertise our client capabilities. We do not yet implement
     // `fs/read_text_file` or `fs/write_text_file`, so we declare both as
@@ -384,15 +398,22 @@ async fn drive_session(
             return Err(anyhow::anyhow!(text));
         }
     };
+    let session_fork_supported = init_resp
+        .agent_capabilities
+        .session_capabilities
+        .fork
+        .is_some();
     let _ = ui_tx.send(UiEvent::Connected {
         agent_name: init_resp.agent_info.as_ref().map(|i| i.name.clone()),
         agent_version: init_resp.agent_info.as_ref().map(|i| i.version.clone()),
         prompt_images_supported: init_resp.agent_capabilities.prompt_capabilities.image,
+        session_fork_supported,
     });
 
-    let (session_id, initial_config, resumed) = match resume_session {
+    let (mut session_id, initial_config, resumed) = match resume_session {
         Some(existing_session_id) => {
             let session_id = SessionId::from(existing_session_id.clone());
+            *active_session_id.lock().await = Some(session_id.clone());
             match conn
                 .send_request(LoadSessionRequest::new(session_id.clone(), cwd.clone()))
                 .block_task()
@@ -412,12 +433,13 @@ async fn drive_session(
             }
         }
         None => match conn
-            .send_request(NewSessionRequest::new(cwd))
+            .send_request(NewSessionRequest::new(cwd.clone()))
             .block_task()
             .await
         {
             Ok(s) => {
                 let config = session_config_from_parts(s.config_options, s.models, s.modes);
+                *active_session_id.lock().await = Some(s.session_id.clone());
                 (s.session_id, config, false)
             }
             Err(source) => {
@@ -466,11 +488,116 @@ async fn drive_session(
                     break;
                 }
             }
+            UiCommand::ForkSession => {
+                if !session_fork_supported {
+                    let _ = ui_tx.send(UiEvent::Warning(
+                        "session fork is not supported by this agent".to_string(),
+                    ));
+                    continue;
+                }
+
+                if !drive_fork_session(
+                    &conn,
+                    cwd.clone(),
+                    &mut session_id,
+                    &mut session_config,
+                    &active_session_id,
+                    ui_tx,
+                    ui_rx,
+                )
+                .await?
+                {
+                    break;
+                }
+            }
             UiCommand::CancelPrompt => {}
             UiCommand::Shutdown => break,
         }
     }
     Ok(())
+}
+
+async fn drive_fork_session(
+    conn: &ConnectionTo<Agent>,
+    cwd: PathBuf,
+    session_id: &mut SessionId,
+    session_config: &mut SessionConfigCache,
+    active_session_id: &Arc<Mutex<Option<SessionId>>>,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
+) -> Result<bool> {
+    let source_session_id = session_id.clone();
+    let fork = fork_session(conn, &source_session_id, cwd);
+    tokio::pin!(fork);
+
+    loop {
+        tokio::select! {
+            result = &mut fork => {
+                match result {
+                    Ok((forked_session_id, forked_config)) => {
+                        *active_session_id.lock().await = Some(forked_session_id.clone());
+                        *session_id = forked_session_id;
+                        *session_config = forked_config.unwrap_or_else(|| SessionConfigCache {
+                            options: Vec::new(),
+                            targets: Vec::new(),
+                        });
+                        let _ = ui_tx.send(UiEvent::SessionStarted {
+                            session_id: session_id.to_string(),
+                            resumed: false,
+                        });
+                        let _ = ui_tx.send(UiEvent::SessionConfigOptions {
+                            options: session_config.options.clone(),
+                            targets: session_config.targets.clone(),
+                        });
+                        let _ = ui_tx.send(UiEvent::Info("session forked".to_string()));
+                    }
+                    Err(e) => {
+                        let _ = ui_tx.send(UiEvent::SessionForkFailed {
+                            message: format!("session fork failed: {e}"),
+                        });
+                    }
+                }
+                return Ok(true);
+            }
+            maybe_cmd = ui_rx.recv() => {
+                match maybe_cmd {
+                    Some(UiCommand::Shutdown) | None => {
+                        return Ok(false);
+                    }
+                    Some(UiCommand::SendPrompt { .. }) => {
+                        let _ = ui_tx.send(UiEvent::PromptFailed {
+                            message: "prompt failed: session fork already in flight".to_string(),
+                        });
+                    }
+                    Some(UiCommand::SetSessionConfigOption { .. }) => {
+                        let _ = ui_tx.send(UiEvent::Warning(
+                            "session fork already in flight".to_string(),
+                        ));
+                    }
+                    Some(UiCommand::ForkSession) => {
+                        let _ = ui_tx.send(UiEvent::Warning(
+                            "session fork already in flight".to_string(),
+                        ));
+                    }
+                    Some(UiCommand::CancelPrompt) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn fork_session(
+    conn: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    cwd: PathBuf,
+) -> std::result::Result<(SessionId, Option<SessionConfigCache>), agent_client_protocol::Error> {
+    let resp = conn
+        .send_request(ForkSessionRequest::new(session_id.clone(), cwd))
+        .block_task()
+        .await?;
+    let config = session_config_from_parts(resp.config_options, resp.models, resp.modes)
+        .map(|(options, targets)| SessionConfigCache { options, targets });
+    Ok((resp.session_id, config))
 }
 
 pub(crate) fn spawn_agent(
@@ -812,6 +939,11 @@ async fn drive_config_update(
                             "config update already in flight".to_string(),
                         ));
                     }
+                    Some(UiCommand::ForkSession) => {
+                        let _ = ui_tx.send(UiEvent::Warning(
+                            "session fork is only supported while idle".to_string(),
+                        ));
+                    }
                     Some(UiCommand::CancelPrompt) => {}
                 }
             }
@@ -898,6 +1030,11 @@ async fn drive_prompt_turn(
                             "config updates are only supported while idle".to_string(),
                         ));
                     }
+                    Some(UiCommand::ForkSession) => {
+                        let _ = ui_tx.send(UiEvent::Warning(
+                            "session fork is only supported while idle".to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -922,9 +1059,10 @@ mod tests {
     use super::*;
     use agent_client_protocol::Agent as AgentRole;
     use agent_client_protocol::schema::{
-        ContentBlock, ContentChunk, InitializeResponse, LoadSessionResponse, NewSessionResponse,
-        PromptResponse, SessionConfigId, SessionConfigValueId, SessionId, SessionNotification,
-        SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent,
+        AgentCapabilities, ContentBlock, ContentChunk, ForkSessionResponse, InitializeResponse,
+        LoadSessionResponse, NewSessionResponse, PromptResponse, SessionCapabilities,
+        SessionConfigId, SessionConfigValueId, SessionForkCapabilities, SessionId,
+        SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent,
     };
     use std::sync::{
         Arc,
@@ -1076,9 +1214,12 @@ mod tests {
                 async move |_req: agent_client_protocol::schema::InitializeRequest,
                             responder,
                             _cx| {
-                    responder.respond(InitializeResponse::new(
-                        agent_client_protocol::schema::ProtocolVersion::V1,
-                    ))
+                    responder.respond(
+                        InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
+                            .agent_capabilities(AgentCapabilities::new().session_capabilities(
+                                SessionCapabilities::new().fork(SessionForkCapabilities::new()),
+                            )),
+                    )
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -1094,6 +1235,26 @@ mod tests {
                 async move |_req: agent_client_protocol::schema::LoadSessionRequest,
                             responder,
                             _cx| { responder.respond(LoadSessionResponse::new()) },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: ForkSessionRequest,
+                            responder,
+                            cx: ConnectionTo<agent_client_protocol::Client>| {
+                    let old_session_id = req.session_id.clone();
+                    let response = responder
+                        .respond(ForkSessionResponse::new(SessionId::new("forked-session")));
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        let _ = cx.send_notification(SessionNotification::new(
+                            old_session_id,
+                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new("stale parent update")),
+                            )),
+                        ));
+                    });
+                    response
+                },
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
@@ -1146,6 +1307,46 @@ mod tests {
             )
             .on_receive_request(
                 async move |_req: SetSessionConfigOptionRequest, _responder, _cx| {
+                    futures::future::pending::<()>().await;
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(transport, |_cx| async move {
+                futures::future::pending::<()>().await;
+                Ok(())
+            })
+            .await;
+    }
+
+    async fn run_mock_agent_with_hanging_fork(stream: tokio::io::DuplexStream) {
+        let (r, w) = split(stream);
+        let transport = ByteStreams::new(w.compat_write(), r.compat());
+        let _ = AgentRole
+            .builder()
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::InitializeRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(
+                        InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
+                            .agent_capabilities(AgentCapabilities::new().session_capabilities(
+                                SessionCapabilities::new().fork(SessionForkCapabilities::new()),
+                            )),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::NewSessionRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(NewSessionResponse::new(SessionId::new("test-session")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: ForkSessionRequest, _responder, _cx| {
                     futures::future::pending::<()>().await;
                     Ok(())
                 },
@@ -1353,6 +1554,130 @@ mod tests {
                 UiEvent::Warning(_) | UiEvent::Fatal(_) => panic!("unexpected: {ev:?}"),
                 _ => {}
             }
+        }
+
+        cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
+        agent_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fork_session_switches_to_forked_session_id() {
+        let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
+
+        let agent_task = tokio::spawn(run_mock_agent(agent_side));
+
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        let client_task = tokio::spawn(drive_client(
+            client_transport,
+            std::env::temp_dir(),
+            None,
+            ui_tx,
+            cmd_rx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let mut saw_initial_session = false;
+        while !saw_initial_session {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timeout waiting for handshake")
+                .expect("channel closed");
+            match ev {
+                UiEvent::SessionStarted { session_id, .. } => {
+                    assert_eq!(session_id, "test-session");
+                    saw_initial_session = true;
+                }
+                UiEvent::Warning(_) | UiEvent::Fatal(_) => panic!("unexpected: {ev:?}"),
+                _ => {}
+            }
+        }
+
+        cmd_tx.send(UiCommand::ForkSession).expect("send fork");
+
+        let mut saw_forked_session = false;
+        let mut saw_forked_info = false;
+        while !(saw_forked_session && saw_forked_info) {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timeout waiting for fork")
+                .expect("channel closed");
+            match ev {
+                UiEvent::SessionStarted { session_id, .. } => {
+                    assert_eq!(session_id, "forked-session");
+                    saw_forked_session = true;
+                }
+                UiEvent::Info(message) => {
+                    assert_eq!(message, "session forked");
+                    saw_forked_info = true;
+                }
+                UiEvent::SessionConfigOptions { .. } => {}
+                UiEvent::Warning(_) | UiEvent::Fatal(_) => panic!("unexpected: {ev:?}"),
+                _ => {}
+            }
+        }
+        let stale_event = tokio::time::timeout(Duration::from_millis(200), ui_rx.recv()).await;
+        assert!(
+            stale_event.is_err(),
+            "stale parent-session notification was forwarded: {stale_event:?}"
+        );
+
+        cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
+        agent_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fork_session_without_capability_emits_warning() {
+        let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
+
+        let agent_task = tokio::spawn(run_mock_agent_with_hanging_config(agent_side));
+
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        let client_task = tokio::spawn(drive_client(
+            client_transport,
+            std::env::temp_dir(),
+            None,
+            ui_tx,
+            cmd_rx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let mut saw_session = false;
+        while !saw_session {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timeout waiting for handshake")
+                .expect("channel closed");
+            match ev {
+                UiEvent::SessionStarted { session_id, .. } => {
+                    assert_eq!(session_id, "test-session");
+                    saw_session = true;
+                }
+                UiEvent::Warning(_) | UiEvent::Fatal(_) => panic!("unexpected: {ev:?}"),
+                _ => {}
+            }
+        }
+
+        cmd_tx.send(UiCommand::ForkSession).expect("send fork");
+
+        let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+            .await
+            .expect("timeout waiting for fork warning")
+            .expect("channel closed");
+        match ev {
+            UiEvent::Warning(message) => {
+                assert_eq!(message, "session fork is not supported by this agent");
+            }
+            other => panic!("unexpected: {other:?}"),
         }
 
         cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
@@ -1607,6 +1932,111 @@ mod tests {
             .expect("send config update");
         cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
 
+        let join = tokio::time::timeout(Duration::from_secs(2), client_task)
+            .await
+            .expect("drive_client did not return after shutdown");
+        join.expect("client task panicked")
+            .expect("drive_client returned error");
+        agent_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_interrupts_hanging_fork() {
+        let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
+
+        let agent_task = tokio::spawn(run_mock_agent_with_hanging_fork(agent_side));
+
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        let client_task = tokio::spawn(drive_client(
+            client_transport,
+            std::env::temp_dir(),
+            None,
+            ui_tx,
+            cmd_rx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let mut saw_session = false;
+        while !saw_session {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("handshake timeout")
+                .expect("channel closed");
+            if matches!(ev, UiEvent::SessionStarted { .. }) {
+                saw_session = true;
+            }
+        }
+
+        cmd_tx.send(UiCommand::ForkSession).expect("send fork");
+        cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
+
+        let join = tokio::time::timeout(Duration::from_secs(2), client_task)
+            .await
+            .expect("drive_client did not return after shutdown");
+        join.expect("client task panicked")
+            .expect("drive_client returned error");
+        agent_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_during_fork_emits_prompt_failed() {
+        let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
+
+        let agent_task = tokio::spawn(run_mock_agent_with_hanging_fork(agent_side));
+
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        let client_task = tokio::spawn(drive_client(
+            client_transport,
+            std::env::temp_dir(),
+            None,
+            ui_tx,
+            cmd_rx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let mut saw_session = false;
+        while !saw_session {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("handshake timeout")
+                .expect("channel closed");
+            if matches!(ev, UiEvent::SessionStarted { .. }) {
+                saw_session = true;
+            }
+        }
+
+        cmd_tx.send(UiCommand::ForkSession).expect("send fork");
+        cmd_tx
+            .send(UiCommand::SendPrompt {
+                text: "hello".to_string(),
+                images: Vec::new(),
+            })
+            .expect("send prompt");
+
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timeout waiting for prompt rejection")
+                .expect("channel closed");
+            match ev {
+                UiEvent::PromptFailed { message } => {
+                    assert_eq!(message, "prompt failed: session fork already in flight");
+                    break;
+                }
+                UiEvent::Fatal(_) | UiEvent::PromptDone { .. } => panic!("unexpected: {ev:?}"),
+                _ => {}
+            }
+        }
+
+        cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
         let join = tokio::time::timeout(Duration::from_secs(2), client_task)
             .await
             .expect("drive_client did not return after shutdown");

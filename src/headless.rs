@@ -228,7 +228,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 let _ = cmd_tx.send(UiCommand::Shutdown);
                 break;
             }
-            UiEvent::PromptFailed { message } | UiEvent::Fatal(message) => {
+            UiEvent::PromptFailed { message }
+            | UiEvent::SessionForkFailed { message }
+            | UiEvent::Fatal(message) => {
                 if matches!(cfg.output_format, OutputFormat::StreamJson) {
                     emit_json(&StreamRecord::Error { message: &message })?;
                 }
@@ -244,6 +246,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     eprintln!("warning: {message}");
                 }
             }
+            UiEvent::Info(_) => {}
             // Headless runs never receive remote decisions (no UI event
             // channel is registered with the tracker).
             UiEvent::RemotePermissionDecision { .. } => {}

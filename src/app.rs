@@ -30,6 +30,7 @@ pub const QUEUED_PROMPT_PREVIEW_WIDTH: usize = 40;
 const BUILTIN_NEW_COMMAND: &str = "new";
 const BUILTIN_CLEAR_COMMAND: &str = "clear";
 const BUILTIN_LOAD_COMMAND: &str = "load";
+const BUILTIN_FORK_COMMAND: &str = "fork";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
 
 fn builtin_new_command() -> AvailableCommand {
@@ -47,12 +48,20 @@ fn builtin_load_command() -> AvailableCommand {
     AvailableCommand::new(BUILTIN_LOAD_COMMAND, "load a previous session")
 }
 
-fn install_builtin_commands(commands: &mut Vec<AvailableCommand>) {
+fn builtin_fork_command() -> AvailableCommand {
+    AvailableCommand::new(BUILTIN_FORK_COMMAND, "fork the current session")
+}
+
+fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: bool) {
     commands.retain(|command| {
         command.name != BUILTIN_NEW_COMMAND
             && command.name != BUILTIN_CLEAR_COMMAND
             && command.name != BUILTIN_LOAD_COMMAND
+            && command.name != BUILTIN_FORK_COMMAND
     });
+    if include_fork {
+        commands.insert(0, builtin_fork_command());
+    }
     commands.insert(0, builtin_load_command());
     commands.insert(0, builtin_clear_command());
     commands.insert(0, builtin_new_command());
@@ -185,8 +194,9 @@ impl ToolCallView {
 /// is derived from this state, so it doubles as the externally visible
 /// connection indicator described in PLANS.md M1.
 ///
-/// "Turn in flight" is derived from this enum via `AppState::is_streaming`
-/// — `Streaming` and `Cancelling` both count.
+/// Prompt turn state is derived from this enum via `AppState::is_streaming`.
+/// Submission gating uses `AppState::is_busy`, which also includes lifecycle
+/// operations like session fork.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
     /// Agent process is being spawned and `initialize` is in flight.
@@ -199,6 +209,8 @@ pub enum ConnectionState {
     Streaming,
     /// Cancellation was requested; awaiting the final `PromptDone`.
     Cancelling,
+    /// A `session/fork` request is in flight.
+    Forking,
     /// Runtime shut down cleanly (UI quit or agent EOF).
     Closed,
     /// Runtime ended with a fatal error.
@@ -408,6 +420,7 @@ pub struct AppState {
     pub session_config_options: Vec<SessionConfigOption>,
     pub session_config_targets: Vec<SessionConfigTarget>,
     pub prompt_images_supported: bool,
+    pub session_fork_supported: bool,
     pub transcript: Vec<Entry>,
     pub tool_calls: HashMap<String, ToolCallView>,
     /// Bumped whenever `transcript` or `tool_calls` change in a way that
@@ -601,12 +614,13 @@ impl AppState {
             current_mode: None,
             available_commands: {
                 let mut commands = Vec::new();
-                install_builtin_commands(&mut commands);
+                install_builtin_commands(&mut commands, false);
                 commands
             },
             session_config_options: Vec::new(),
             session_config_targets: Vec::new(),
             prompt_images_supported: false,
+            session_fork_supported: false,
             transcript: Vec::new(),
             tool_calls: HashMap::new(),
             transcript_revision: 0,
@@ -812,6 +826,13 @@ impl AppState {
         )
     }
 
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self.connection_state,
+            ConnectionState::Streaming | ConnectionState::Cancelling | ConnectionState::Forking
+        )
+    }
+
     pub fn active_turn_elapsed(&self) -> Option<Duration> {
         if self.is_streaming() {
             self.turn_started_at.map(|started| started.elapsed())
@@ -885,6 +906,13 @@ impl AppState {
         if self.connection_state == ConnectionState::Streaming {
             self.connection_state = ConnectionState::Cancelling;
         }
+    }
+
+    pub fn mark_forking(&mut self) {
+        self.connection_state = ConnectionState::Forking;
+        self.turn_started_at = Some(Instant::now());
+        self.last_turn_elapsed = None;
+        self.autocomplete = Autocomplete::default();
     }
 
     /// The permission prompt the UI should currently render, if any.
@@ -1238,6 +1266,7 @@ impl AppState {
         match event {
             UiEvent::Connected {
                 prompt_images_supported,
+                session_fork_supported,
                 ..
             } => {
                 // Keep the pre-filled agent_label (the configured
@@ -1245,9 +1274,14 @@ impl AppState {
                 // name over ACP, but the user wants to see which
                 // binary they wired up in config.
                 self.prompt_images_supported = prompt_images_supported;
+                self.session_fork_supported = session_fork_supported;
+                install_builtin_commands(&mut self.available_commands, session_fork_supported);
                 self.connection_state = ConnectionState::Initializing;
             }
             UiEvent::SessionStarted { session_id, .. } => {
+                if self.connection_state == ConnectionState::Forking {
+                    self.finish_turn_timer();
+                }
                 self.session_id = Some(session_id);
                 self.connection_state = ConnectionState::Ready;
             }
@@ -1307,8 +1341,19 @@ impl AppState {
                 self.record_status_message(StatusKind::Warning, surfaced);
                 self.update_autocomplete();
             }
+            UiEvent::SessionForkFailed { message } => {
+                if self.connection_state == ConnectionState::Forking {
+                    self.connection_state = ConnectionState::Ready;
+                    self.finish_turn_timer();
+                }
+                self.record_status_message(StatusKind::Warning, message);
+                self.update_autocomplete();
+            }
             UiEvent::Warning(msg) => {
                 self.record_status_message(StatusKind::Warning, msg);
+            }
+            UiEvent::Info(msg) => {
+                self.record_status_message(StatusKind::Info, msg);
             }
             UiEvent::Fatal(msg) => {
                 self.connection_state = ConnectionState::Fatal;
@@ -1433,7 +1478,7 @@ impl AppState {
             }
             SessionUpdate::AvailableCommandsUpdate(u) => {
                 self.available_commands = u.available_commands;
-                install_builtin_commands(&mut self.available_commands);
+                install_builtin_commands(&mut self.available_commands, self.session_fork_supported);
                 // The catalog changed mid-typing; rebuild the popover so
                 // a `/` already in the buffer reflects the new commands
                 // (and so a previously-empty filter can become non-empty).
@@ -2249,6 +2294,7 @@ mod tests {
             agent_name: Some("anvil".into()),
             agent_version: Some("0.1".into()),
             prompt_images_supported: false,
+            session_fork_supported: false,
         });
         assert_eq!(s.connection_state, ConnectionState::Initializing);
 
@@ -2279,6 +2325,7 @@ mod tests {
             agent_name: Some("anvil".into()),
             agent_version: None,
             prompt_images_supported: false,
+            session_fork_supported: false,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -2313,6 +2360,7 @@ mod tests {
             agent_name: Some("anvil".into()),
             agent_version: None,
             prompt_images_supported: false,
+            session_fork_supported: false,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -2351,6 +2399,7 @@ mod tests {
             agent_name: Some("anvil".into()),
             agent_version: None,
             prompt_images_supported: false,
+            session_fork_supported: false,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -2373,6 +2422,7 @@ mod tests {
             agent_name: Some("anvil".into()),
             agent_version: None,
             prompt_images_supported: false,
+            session_fork_supported: false,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -2624,6 +2674,7 @@ mod tests {
             agent_name: Some("anvil".into()),
             agent_version: None,
             prompt_images_supported: false,
+            session_fork_supported: false,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -2905,7 +2956,7 @@ mod tests {
     }
 
     #[test]
-    fn autocomplete_advertises_builtin_commands_by_default() {
+    fn autocomplete_advertises_supported_builtin_commands_by_default() {
         let mut s = AppState::new();
         s.input = "/".to_string();
         s.update_autocomplete();
@@ -2921,14 +2972,43 @@ mod tests {
     }
 
     #[test]
+    fn autocomplete_advertises_fork_after_agent_capability() {
+        let mut s = AppState::new();
+        s.apply_event(UiEvent::Connected {
+            agent_name: Some("anvil".into()),
+            agent_version: None,
+            prompt_images_supported: false,
+            session_fork_supported: true,
+        });
+        s.input = "/".to_string();
+        s.update_autocomplete();
+
+        assert!(s.autocomplete.visible);
+        let names: Vec<&str> = s
+            .autocomplete
+            .matches
+            .iter()
+            .map(|&i| s.available_commands[i].name.as_str())
+            .collect();
+        assert_eq!(names, vec!["new", "clear", "load", "fork"]);
+    }
+
+    #[test]
     fn available_command_updates_keep_builtin_commands_first() {
         let mut s = AppState::new();
+        s.apply_event(UiEvent::Connected {
+            agent_name: Some("anvil".into()),
+            agent_version: None,
+            prompt_images_supported: false,
+            session_fork_supported: true,
+        });
         s.apply_event(UiEvent::SessionUpdate(
             SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
                 cmd("review_pr"),
                 AvailableCommand::new("new", "agent-provided command"),
                 AvailableCommand::new("clear", "agent-provided command"),
                 AvailableCommand::new("load", "agent-provided command"),
+                AvailableCommand::new("fork", "agent-provided command"),
             ])),
         ));
 
@@ -2937,7 +3017,7 @@ mod tests {
             .iter()
             .map(|command| command.name.as_str())
             .collect();
-        assert_eq!(names, vec!["new", "clear", "load", "review_pr"]);
+        assert_eq!(names, vec!["new", "clear", "load", "fork", "review_pr"]);
         assert_eq!(s.available_commands[0].description, "start a new session");
         assert_eq!(
             s.available_commands[1].description,
@@ -2947,6 +3027,28 @@ mod tests {
             s.available_commands[2].description,
             "load a previous session"
         );
+        assert_eq!(
+            s.available_commands[3].description,
+            "fork the current session"
+        );
+    }
+
+    #[test]
+    fn available_command_updates_do_not_add_fork_without_capability() {
+        let mut s = AppState::new();
+        s.apply_event(UiEvent::SessionUpdate(
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                cmd("review_pr"),
+                AvailableCommand::new("fork", "agent-provided command"),
+            ])),
+        ));
+
+        let names: Vec<&str> = s
+            .available_commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["new", "clear", "load", "review_pr"]);
     }
 
     #[test]
@@ -3102,40 +3204,54 @@ mod tests {
 
     #[test]
     fn is_streaming_tracks_connection_state_across_full_turn_lifecycle() {
-        // Pins the single-source-of-truth invariant: is_streaming must
-        // mirror `ConnectionState::Streaming | Cancelling` exactly across
-        // every transition the UI gates on (input enablement, Ctrl-C
-        // routing, autocomplete visibility). If a future change touches
-        // one without the other, this test catches the drift.
+        // Pins the state helpers: is_streaming mirrors prompt-turn states,
+        // while is_busy also covers lifecycle operations such as fork.
         let mut s = AppState::new();
         seed_commands(&mut s);
 
         // Launching / Initializing / Ready: input is editable, popover
         // shows, Ctrl-C quits rather than cancelling.
         assert!(!s.is_streaming(), "Launching must not count as streaming");
+        assert!(!s.is_busy(), "Launching must not count as busy");
         s.apply_event(UiEvent::Connected {
             agent_name: Some("anvil".into()),
             agent_version: None,
             prompt_images_supported: false,
+            session_fork_supported: false,
         });
         assert!(
             !s.is_streaming(),
             "Initializing must not count as streaming"
         );
+        assert!(!s.is_busy(), "Initializing must not count as busy");
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
             resumed: false,
         });
         assert!(!s.is_streaming(), "Ready must not count as streaming");
+        assert!(!s.is_busy(), "Ready must not count as busy");
         s.input = "/cre".to_string();
         s.update_autocomplete();
         assert!(s.autocomplete.visible, "Ready: popover must be visible");
+
+        // Forking is busy for submission gating but not a prompt stream.
+        s.mark_forking();
+        assert_eq!(s.connection_state, ConnectionState::Forking);
+        assert!(!s.is_streaming(), "Forking must not count as streaming");
+        assert!(s.is_busy(), "Forking must count as busy");
+        s.apply_event(UiEvent::SessionStarted {
+            session_id: "forked-sess".into(),
+            resumed: false,
+        });
+        assert_eq!(s.connection_state, ConnectionState::Ready);
+        assert!(!s.is_busy(), "Ready after fork must not count as busy");
 
         // Streaming: input stays editable, popover remains available, Ctrl-C cancels.
         s.input.clear();
         s.record_user_prompt("hi".to_string());
         assert_eq!(s.connection_state, ConnectionState::Streaming);
         assert!(s.is_streaming(), "Streaming must count as streaming");
+        assert!(s.is_busy(), "Streaming must count as busy");
         s.input = "/cre".to_string();
         s.update_autocomplete();
         assert!(s.autocomplete.visible, "Streaming: popover must be visible");
@@ -3145,6 +3261,7 @@ mod tests {
         s.mark_cancelling();
         assert_eq!(s.connection_state, ConnectionState::Cancelling);
         assert!(s.is_streaming(), "Cancelling must still count as streaming");
+        assert!(s.is_busy(), "Cancelling must count as busy");
         s.update_autocomplete();
         assert!(
             s.autocomplete.visible,
@@ -3162,6 +3279,7 @@ mod tests {
         });
         assert_eq!(s.connection_state, ConnectionState::Ready);
         assert!(!s.is_streaming(), "Ready (after turn) must not stream");
+        assert!(!s.is_busy(), "Ready (after turn) must not be busy");
         assert!(
             s.autocomplete.visible,
             "Ready (after turn): popover must reappear"
@@ -3171,10 +3289,12 @@ mod tests {
         // is_streaming itself must report false either way.
         s.apply_event(UiEvent::Fatal("kaboom".into()));
         assert!(!s.is_streaming(), "Fatal must not count as streaming");
+        assert!(!s.is_busy(), "Fatal must not count as busy");
 
         let mut s = AppState::new();
         s.mark_runtime_closed();
         assert!(!s.is_streaming(), "Closed must not count as streaming");
+        assert!(!s.is_busy(), "Closed must not count as busy");
     }
 
     // -- Prompt history tests -------------------------------------------------
