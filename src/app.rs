@@ -14,6 +14,8 @@ use agent_client_protocol::schema::{
     SessionConfigValueId, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallStatus,
     ToolCallUpdate, ToolKind, Usage, UsageUpdate,
 };
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::clipboard::ClipboardLease;
 
@@ -29,6 +31,7 @@ pub const QUEUED_PROMPT_PREVIEW_WIDTH: usize = 40;
 const BUILTIN_NEW_COMMAND: &str = "new";
 const BUILTIN_CLEAR_COMMAND: &str = "clear";
 const BUILTIN_LOAD_COMMAND: &str = "load";
+const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
 
 fn builtin_new_command() -> AvailableCommand {
     AvailableCommand::new(BUILTIN_NEW_COMMAND, "start a new session")
@@ -251,6 +254,7 @@ pub struct TokenUsage {
     pub context_used: Option<u64>,
     pub context_size: Option<u64>,
     pub cost: Option<String>,
+    pub rate_limit: Option<String>,
 }
 
 impl TokenUsage {
@@ -262,11 +266,150 @@ impl TokenUsage {
     }
 
     fn apply_usage_update(&mut self, update: UsageUpdate) {
+        let rate_limit = claude_rate_limit_label(update.meta.as_ref());
         self.context_used = Some(update.used);
         self.context_size = Some(update.size);
         self.cost = update
             .cost
             .map(|cost| format!("{:.4} {}", cost.amount, cost.currency));
+        if let Some(rate_limit) = rate_limit {
+            self.rate_limit = Some(rate_limit);
+        }
+    }
+}
+
+fn claude_rate_limit_label(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let value = meta?.get(CLAUDE_RATE_LIMIT_META_KEY)?;
+    format_claude_rate_limit(value)
+}
+
+fn format_claude_rate_limit(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    let mut parts = Vec::new();
+
+    if let Some(status) = string_field(object, "status", "status") {
+        parts.push(status.replace('_', "-"));
+    }
+    if let Some(kind) = string_field(object, "rateLimitType", "rate_limit_type") {
+        parts.push(kind.replace('_', "-"));
+    }
+    if let Some(utilization) = number_field(object, "utilization", "utilization") {
+        // Claude SDK does not document the unit, so accept both 0..1 and 0..100.
+        let percent = if utilization <= 1.0 {
+            utilization * 100.0
+        } else {
+            utilization
+        };
+        parts.push(format!("{percent:.0}%"));
+    }
+    if let Some(retry_ms) = number_field(object, "retryAfterMs", "retry_after_ms") {
+        parts.push(format!("retry {}", compact_millis(retry_ms)));
+    } else if let Some(reset) = reset_field(object) {
+        parts.push(format!("reset {reset}"));
+    }
+    if let Some(overage) = string_field(object, "overageStatus", "overage_status") {
+        parts.push(format!("overage {}", overage.replace('_', "-")));
+    }
+
+    if parts.is_empty() {
+        Some("reported".to_string())
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn string_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    camel: &str,
+    snake: &str,
+) -> Option<&'a str> {
+    object
+        .get(camel)
+        .or_else(|| object.get(snake))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn number_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    camel: &str,
+    snake: &str,
+) -> Option<f64> {
+    object
+        .get(camel)
+        .or_else(|| object.get(snake))
+        .and_then(serde_json::Value::as_f64)
+}
+
+fn reset_field(object: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    [
+        ("resetsAt", "resets_at"),
+        ("requestsReset", "requests_reset"),
+        ("tokensReset", "tokens_reset"),
+        ("overageResetsAt", "overage_resets_at"),
+    ]
+    .into_iter()
+    .find_map(|(camel, snake)| value_field(object, camel, snake))
+}
+
+fn value_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    camel: &str,
+    snake: &str,
+) -> Option<String> {
+    object
+        .get(camel)
+        .or_else(|| object.get(snake))
+        .and_then(|value| {
+            if let Some(s) = value.as_str() {
+                (!s.is_empty()).then(|| compact_reset_label(s))
+            } else if value.is_number() {
+                numeric_reset_label(value).or_else(|| Some(value.to_string()))
+            } else {
+                None
+            }
+        })
+}
+
+fn numeric_reset_label(value: &serde_json::Value) -> Option<String> {
+    let epoch = value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| {
+            value.as_f64().and_then(|value| {
+                (value.is_finite() && value >= i64::MIN as f64 && value <= i64::MAX as f64)
+                    .then(|| value.trunc() as i64)
+            })
+        })?;
+    let seconds = if epoch.unsigned_abs() >= 1_000_000_000_000 {
+        epoch / 1000
+    } else {
+        epoch
+    };
+    OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
+        .map(|value| compact_reset_label(&value))
+}
+
+fn compact_reset_label(value: &str) -> String {
+    let value = value.strip_suffix('Z').unwrap_or(value);
+    value
+        .split_once('.')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(value)
+        .replace('T', " ")
+}
+
+fn compact_millis(value: f64) -> String {
+    let seconds = (value / 1000.0).ceil().max(0.0) as u64;
+    if seconds >= 60 {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -2309,6 +2452,78 @@ mod tests {
         assert_eq!(s.token_usage.context_used, Some(12_000));
         assert_eq!(s.token_usage.context_size, Some(128_000));
         assert_eq!(s.token_usage.cost.as_deref(), Some("0.1250 USD"));
+    }
+
+    #[test]
+    fn usage_update_records_claude_rate_limit_meta() {
+        let mut s = AppState::new();
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            CLAUDE_RATE_LIMIT_META_KEY.to_string(),
+            serde_json::json!({
+                "status": "allowed_warning",
+                "rateLimitType": "tokens",
+                "utilization": 0.85,
+                "retryAfterMs": 90_000,
+            }),
+        );
+
+        s.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(meta),
+        )));
+
+        assert_eq!(
+            s.token_usage.rate_limit.as_deref(),
+            Some("allowed-warning tokens 85% retry 1m30s")
+        );
+    }
+
+    #[test]
+    fn usage_update_formats_numeric_claude_rate_limit_reset() {
+        let mut s = AppState::new();
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            CLAUDE_RATE_LIMIT_META_KEY.to_string(),
+            serde_json::json!({
+                "status": "allowed_warning",
+                "rateLimitType": "tokens",
+                "utilization": 85,
+                "resetsAt": 1_781_706_600,
+            }),
+        );
+
+        s.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(meta),
+        )));
+
+        assert_eq!(
+            s.token_usage.rate_limit.as_deref(),
+            Some("allowed-warning tokens 85% reset 2026-06-17 14:30:00")
+        );
+    }
+
+    #[test]
+    fn usage_update_accepts_snake_case_claude_rate_limit_meta() {
+        let mut s = AppState::new();
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            CLAUDE_RATE_LIMIT_META_KEY.to_string(),
+            serde_json::json!({
+                "status": "rejected",
+                "rate_limit_type": "requests",
+                "requests_reset": "2026-06-16T12:30:00.000Z",
+                "overage_status": "disabled",
+            }),
+        );
+
+        s.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(meta),
+        )));
+
+        assert_eq!(
+            s.token_usage.rate_limit.as_deref(),
+            Some("rejected requests reset 2026-06-16 12:30:00 overage disabled")
+        );
     }
 
     #[test]
