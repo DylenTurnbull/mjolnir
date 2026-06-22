@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use agent_client_protocol::schema::{
     CancelNotification, ClientCapabilities, ContentBlock, CreateTerminalRequest,
@@ -29,6 +30,7 @@ use crate::event::{
     PermissionDecision, PermissionPrompt, PromptImage, SessionConfigTarget, TerminalOutputSnapshot,
     UiCommand, UiEvent,
 };
+use crate::install;
 use crate::paths::normalize_spawn_program;
 
 pub struct AcpRuntimeConfig {
@@ -80,6 +82,10 @@ pub enum LaunchError {
     SessionCreateFailed {
         source: agent_client_protocol::Error,
     },
+    /// uvx was requested but uv could not be installed automatically.
+    UvInstallFailed { source: String },
+    /// npx was requested but embedded Node could not be installed automatically.
+    NodeInstallFailed { source: String },
 }
 
 impl std::fmt::Display for LaunchError {
@@ -118,6 +124,16 @@ impl std::fmt::Display for LaunchError {
                 f,
                 "agent rejected session/new: {source}\n\
                  hint: verify --cwd is accessible to the agent"
+            ),
+            LaunchError::UvInstallFailed { source } => write!(
+                f,
+                "uvx is required for this agent, but mj could not install uv automatically: {source}\n\
+                 hint: install uv from https://docs.astral.sh/uv/getting-started/installation/ and relaunch mj"
+            ),
+            LaunchError::NodeInstallFailed { source } => write!(
+                f,
+                "npx is required for this agent, but mj could not install embedded Node 24 automatically: {source}\n\
+                 hint: install Node.js 24 from https://nodejs.org/en/download and relaunch mj"
             ),
         }
     }
@@ -205,10 +221,21 @@ pub async fn run(
 ) -> Result<()> {
     let fatal_emitted = Arc::new(AtomicBool::new(false));
 
+    let prepared = match prepare_agent_command(&cfg.command, &ui_tx).await {
+        Ok(prepared) => prepared,
+        Err(launch_err) => {
+            let text = launch_err.to_string();
+            emit_fatal(&ui_tx, &fatal_emitted, text.clone());
+            return Err(anyhow::anyhow!(text));
+        }
+    };
+    let mut env = prepared.env;
+    env.extend(cfg.env.clone());
+
     let (mut child, child_stdin, child_stdout) = match spawn_agent(
-        &cfg.command,
+        &prepared.command,
         &cfg.args,
-        &cfg.env,
+        &env,
         cfg.agent_stderr.as_deref(),
     ) {
         Ok(spawned) => spawned,
@@ -290,6 +317,393 @@ pub async fn run(
         emit_fatal(&ui_tx, &fatal_emitted, msg);
     }
     result
+}
+
+struct PreparedAgentCommand {
+    command: PathBuf,
+    env: HashMap<String, String>,
+}
+
+async fn prepare_agent_command(
+    command: &Path,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+) -> std::result::Result<PreparedAgentCommand, LaunchError> {
+    let command = normalize_spawn_program(command.to_path_buf());
+    if is_program_name(&command, "uvx") {
+        return prepare_uvx_command(command, ui_tx).await;
+    }
+    if is_program_name(&command, "npx") {
+        return prepare_npx_command(command, ui_tx).await;
+    }
+    Ok(PreparedAgentCommand {
+        command,
+        env: HashMap::new(),
+    })
+}
+
+async fn prepare_uvx_command(
+    command: PathBuf,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+) -> std::result::Result<PreparedAgentCommand, LaunchError> {
+    if let Some(path) = find_on_path(&command) {
+        return Ok(PreparedAgentCommand {
+            command: path,
+            env: embedded_uv_env(),
+        });
+    }
+
+    let _ = ui_tx.send(UiEvent::Info(
+        "uvx not found; installing uv for uvx-based agents".to_string(),
+    ));
+    install_uv().await?;
+    let uvx_path = embedded_uvx_path();
+    if is_executable_file(&uvx_path) {
+        let _ = ui_tx.send(UiEvent::Info("uv installed; launching agent".to_string()));
+        return Ok(PreparedAgentCommand {
+            command: uvx_path,
+            env: embedded_uv_env(),
+        });
+    }
+    Err(LaunchError::UvInstallFailed {
+        source: format!(
+            "installer completed but uvx was not found at {}",
+            embedded_uvx_path().display()
+        ),
+    })
+}
+
+async fn prepare_npx_command(
+    command: PathBuf,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+) -> std::result::Result<PreparedAgentCommand, LaunchError> {
+    if let Some(path) = find_on_path(&command) {
+        return Ok(PreparedAgentCommand {
+            command: path,
+            env: HashMap::new(),
+        });
+    }
+
+    let _ = ui_tx.send(UiEvent::Info(
+        "npx not found; installing embedded Node 24 for npx-based agents".to_string(),
+    ));
+    install_node24().await?;
+    let Some(npx_path) = embedded_npx_path() else {
+        return Err(LaunchError::NodeInstallFailed {
+            source: format!(
+                "installer completed but npx was not found under {}",
+                embedded_node_root().display()
+            ),
+        });
+    };
+    let _ = ui_tx.send(UiEvent::Info(
+        "embedded Node 24 installed; launching agent".to_string(),
+    ));
+    Ok(PreparedAgentCommand {
+        command: npx_path,
+        env: embedded_node_env(),
+    })
+}
+
+fn is_program_name(command: &Path, expected: &str) -> bool {
+    command.components().count() == 1 && command.file_stem().is_some_and(|name| name == expected)
+}
+
+fn find_on_path(command: &Path) -> Option<PathBuf> {
+    if command.components().count() != 1 {
+        return command.exists().then(|| command.to_path_buf());
+    }
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var).find_map(|dir| {
+        let candidate = dir.join(command);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let extensions = std::env::var_os("PATHEXT")
+                .map(|v| {
+                    v.to_string_lossy()
+                        .split(';')
+                        .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| {
+                    ["com", "exe", "bat", "cmd"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                });
+            for ext in extensions {
+                let mut with_ext = candidate.clone();
+                with_ext.set_extension(ext);
+                if is_executable_file(&with_ext) {
+                    return Some(with_ext);
+                }
+            }
+        }
+        None
+    })
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn embedded_uv_root() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("mj")
+        .join("runners")
+        .join("uv")
+}
+
+fn embedded_uv_bin_dir() -> PathBuf {
+    embedded_uv_root().join("bin")
+}
+
+fn embedded_uvx_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        embedded_uv_bin_dir().join("uvx.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        embedded_uv_bin_dir().join("uvx")
+    }
+}
+
+fn embedded_uv_env() -> HashMap<String, String> {
+    let root = embedded_uv_root();
+    HashMap::from([
+        (
+            "UV_CACHE_DIR".to_string(),
+            root.join("cache").display().to_string(),
+        ),
+        (
+            "UV_TOOL_DIR".to_string(),
+            root.join("tools").display().to_string(),
+        ),
+        (
+            "UV_TOOL_BIN_DIR".to_string(),
+            root.join("tool-bin").display().to_string(),
+        ),
+        (
+            "UV_PYTHON_INSTALL_DIR".to_string(),
+            root.join("python").display().to_string(),
+        ),
+        (
+            "UV_PYTHON_BIN_DIR".to_string(),
+            root.join("python-bin").display().to_string(),
+        ),
+    ])
+}
+
+async fn install_uv() -> std::result::Result<(), LaunchError> {
+    let bin_dir = embedded_uv_bin_dir();
+    tokio::fs::create_dir_all(&bin_dir)
+        .await
+        .map_err(|e| LaunchError::UvInstallFailed {
+            source: format!("failed to create {}: {e}", bin_dir.display()),
+        })?;
+    let mut cmd = uv_install_command(&bin_dir);
+    let output = tokio::time::timeout(Duration::from_secs(180), cmd.output())
+        .await
+        .map_err(|_| LaunchError::UvInstallFailed {
+            source: "installer timed out after 180 seconds".to_string(),
+        })?
+        .map_err(|e| LaunchError::UvInstallFailed {
+            source: format!("failed to start installer: {e}"),
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(LaunchError::UvInstallFailed {
+        source: command_failure_summary(&output),
+    })
+}
+
+fn uv_install_command(bin_dir: &Path) -> Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "ByPass",
+            "-Command",
+            "irm https://astral.sh/uv/install.ps1 | iex",
+        ]);
+        cmd.env("UV_UNMANAGED_INSTALL", bin_dir);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"]);
+        cmd.env("UV_UNMANAGED_INSTALL", bin_dir);
+        cmd
+    }
+}
+
+fn embedded_node_root() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("mj")
+        .join("runners")
+        .join("node")
+        .join("24")
+}
+
+#[cfg(windows)]
+fn embedded_node_bin_dir() -> Option<PathBuf> {
+    embedded_node_dir()
+}
+
+#[cfg(not(windows))]
+fn embedded_node_bin_dir() -> Option<PathBuf> {
+    embedded_node_dir().map(|dir| dir.join("bin"))
+}
+
+fn embedded_node_dir() -> Option<PathBuf> {
+    let root = embedded_node_root();
+    let entries = std::fs::read_dir(root).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir() && embedded_npx_path_in_dir(path).is_some())
+}
+
+fn embedded_npx_path() -> Option<PathBuf> {
+    embedded_node_dir().and_then(|dir| embedded_npx_path_in_dir(&dir))
+}
+
+fn embedded_npx_path_in_dir(dir: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let path = dir.join("npx.cmd");
+        is_executable_file(&path).then_some(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let path = dir.join("bin").join("npx");
+        is_executable_file(&path).then_some(path)
+    }
+}
+
+fn embedded_node_env() -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    if let Some(bin_dir) = embedded_node_bin_dir() {
+        env.insert("PATH".to_string(), prepend_to_path(&bin_dir));
+    }
+    env
+}
+
+fn prepend_to_path(dir: &Path) -> String {
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths)
+        .unwrap_or_else(|_| dir.as_os_str().to_owned())
+        .to_string_lossy()
+        .into_owned()
+}
+
+async fn install_node24() -> std::result::Result<(), LaunchError> {
+    let root = embedded_node_root();
+    let sentinel = root.join(".installed");
+    if sentinel.exists() && embedded_npx_path().is_some() {
+        return Ok(());
+    }
+    tokio::fs::create_dir_all(&root)
+        .await
+        .map_err(|e| LaunchError::NodeInstallFailed {
+            source: format!("failed to create {}: {e}", root.display()),
+        })?;
+    let archive_url = node24_archive_url().await?;
+    let (tx, _rx) = mpsc::unbounded_channel::<install::Progress>();
+    install::download_and_extract(&archive_url, &root, &tx)
+        .await
+        .map_err(|e| LaunchError::NodeInstallFailed {
+            source: e.to_string(),
+        })?;
+    if embedded_npx_path().is_none() {
+        return Err(LaunchError::NodeInstallFailed {
+            source: format!("npx not found after extracting {archive_url}"),
+        });
+    }
+    tokio::fs::write(&sentinel, archive_url)
+        .await
+        .map_err(|e| LaunchError::NodeInstallFailed {
+            source: format!("failed to write {}: {e}", sentinel.display()),
+        })?;
+    Ok(())
+}
+
+async fn node24_archive_url() -> std::result::Result<String, LaunchError> {
+    let suffix = node24_archive_suffix().ok_or_else(|| LaunchError::NodeInstallFailed {
+        source: format!(
+            "unsupported platform for embedded Node 24: {}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ),
+    })?;
+    let shasums_url = "https://nodejs.org/dist/latest-v24.x/SHASUMS256.txt";
+    let body = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent(concat!("mj/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| LaunchError::NodeInstallFailed {
+            source: format!("build http client: {e}"),
+        })?
+        .get(shasums_url)
+        .send()
+        .await
+        .map_err(|e| LaunchError::NodeInstallFailed {
+            source: format!("GET {shasums_url}: {e}"),
+        })?
+        .error_for_status()
+        .map_err(|e| LaunchError::NodeInstallFailed {
+            source: format!("GET {shasums_url}: {e}"),
+        })?
+        .text()
+        .await
+        .map_err(|e| LaunchError::NodeInstallFailed {
+            source: format!("read {shasums_url}: {e}"),
+        })?;
+    let file = body
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .find(|file| file.ends_with(suffix))
+        .ok_or_else(|| LaunchError::NodeInstallFailed {
+            source: format!("Node 24 archive matching {suffix} not listed in SHASUMS256.txt"),
+        })?;
+    Ok(format!("https://nodejs.org/dist/latest-v24.x/{file}"))
+}
+
+fn node24_archive_suffix() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("linux-x64.tar.gz"),
+        ("linux", "aarch64") => Some("linux-arm64.tar.gz"),
+        ("macos", "x86_64") => Some("darwin-x64.tar.gz"),
+        ("macos", "aarch64") => Some("darwin-arm64.tar.gz"),
+        ("windows", "x86_64") => Some("win-x64.zip"),
+        ("windows", "aarch64") => Some("win-arm64.zip"),
+        _ => None,
+    }
+}
+
+fn command_failure_summary(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = stderr
+        .trim()
+        .lines()
+        .last()
+        .or_else(|| stdout.trim().lines().last())
+        .unwrap_or("no installer output");
+    format!("installer exited with {}; {detail}", output.status)
 }
 
 /// Run the full ACP client state machine over an arbitrary transport.
@@ -3013,6 +3427,60 @@ mod tests {
             agent_stderr: None,
         };
         assert_run_reports_agent_exited(cfg).await;
+    }
+
+    #[test]
+    fn npx_program_detection_accepts_bare_npx_and_windows_extension() {
+        assert!(is_program_name(std::path::Path::new("npx"), "npx"));
+        assert!(is_program_name(std::path::Path::new("npx.cmd"), "npx"));
+        assert!(!is_program_name(
+            std::path::Path::new("/usr/bin/npx"),
+            "npx"
+        ));
+        assert!(!is_program_name(std::path::Path::new("uvx"), "npx"));
+    }
+
+    #[test]
+    fn node24_archive_suffix_matches_supported_platforms() {
+        let suffix = node24_archive_suffix();
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64" | "aarch64")
+            | ("macos", "x86_64" | "aarch64")
+            | ("windows", "x86_64" | "aarch64") => assert!(suffix.is_some()),
+            _ => assert!(suffix.is_none()),
+        }
+    }
+
+    #[test]
+    fn node_install_failure_message_points_to_manual_install_docs() {
+        let text = LaunchError::NodeInstallFailed {
+            source: "network unavailable".to_string(),
+        }
+        .to_string();
+        assert!(text.contains("npx is required"));
+        assert!(text.contains("Node.js 24"));
+        assert!(text.contains("https://nodejs.org/en/download"));
+    }
+
+    #[test]
+    fn uvx_program_detection_accepts_bare_uvx_and_windows_extension() {
+        assert!(is_program_name(std::path::Path::new("uvx"), "uvx"));
+        assert!(is_program_name(std::path::Path::new("uvx.exe"), "uvx"));
+        assert!(!is_program_name(
+            std::path::Path::new("/usr/bin/uvx"),
+            "uvx"
+        ));
+        assert!(!is_program_name(std::path::Path::new("npx"), "uvx"));
+    }
+
+    #[test]
+    fn uv_install_failure_message_points_to_manual_install_docs() {
+        let text = LaunchError::UvInstallFailed {
+            source: "network unavailable".to_string(),
+        }
+        .to_string();
+        assert!(text.contains("uvx is required"));
+        assert!(text.contains("https://docs.astral.sh/uv/getting-started/installation/"));
     }
 
     #[test]
