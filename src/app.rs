@@ -6,6 +6,7 @@
 //! this state.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::{
@@ -31,6 +32,7 @@ const BUILTIN_NEW_COMMAND: &str = "new";
 const BUILTIN_CLEAR_COMMAND: &str = "clear";
 const BUILTIN_LOAD_COMMAND: &str = "load";
 const BUILTIN_FORK_COMMAND: &str = "fork";
+const BUILTIN_EXPORT_COMMAND: &str = "export";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
 
 fn builtin_new_command() -> AvailableCommand {
@@ -55,16 +57,22 @@ fn builtin_fork_command() -> AvailableCommand {
     )
 }
 
+fn builtin_export_command() -> AvailableCommand {
+    AvailableCommand::new(BUILTIN_EXPORT_COMMAND, "export transcript to markdown")
+}
+
 fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: bool) {
     commands.retain(|command| {
         command.name != BUILTIN_NEW_COMMAND
             && command.name != BUILTIN_CLEAR_COMMAND
             && command.name != BUILTIN_LOAD_COMMAND
             && command.name != BUILTIN_FORK_COMMAND
+            && command.name != BUILTIN_EXPORT_COMMAND
     });
     if include_fork {
         commands.insert(0, builtin_fork_command());
     }
+    commands.insert(0, builtin_export_command());
     commands.insert(0, builtin_load_command());
     commands.insert(0, builtin_clear_command());
     commands.insert(0, builtin_new_command());
@@ -545,6 +553,8 @@ pub struct AppState {
     /// Short linked-worktree name shown separately from the project when
     /// the session runs under `.mjolnir/worktrees/`.
     pub worktree_label: Option<String>,
+    /// Directory where `/export` writes Markdown transcript files.
+    pub transcript_export_dir: Option<PathBuf>,
     /// Holds the platform clipboard lease so copied text remains available
     /// on Linux/X11 where the owning process must stay alive.
     #[allow(dead_code)]
@@ -693,6 +703,7 @@ impl AppState {
             text_selection_mode: false,
             project_label: String::new(),
             worktree_label: None,
+            transcript_export_dir: None,
             clipboard_lease: None,
             queued_prompts: VecDeque::new(),
         }
@@ -3195,7 +3206,7 @@ mod tests {
             .iter()
             .map(|&i| s.available_commands[i].name.as_str())
             .collect();
-        assert_eq!(names, vec!["new", "clear", "load"]);
+        assert_eq!(names, vec!["new", "clear", "load", "export"]);
     }
 
     #[test]
@@ -3217,7 +3228,7 @@ mod tests {
             .iter()
             .map(|&i| s.available_commands[i].name.as_str())
             .collect();
-        assert_eq!(names, vec!["new", "clear", "load", "fork"]);
+        assert_eq!(names, vec!["new", "clear", "load", "export", "fork"]);
     }
 
     #[test]
@@ -3244,7 +3255,10 @@ mod tests {
             .iter()
             .map(|command| command.name.as_str())
             .collect();
-        assert_eq!(names, vec!["new", "clear", "load", "fork", "review_pr"]);
+        assert_eq!(
+            names,
+            vec!["new", "clear", "load", "export", "fork", "review_pr"]
+        );
         assert_eq!(s.available_commands[0].description, "start a new session");
         assert_eq!(
             s.available_commands[1].description,
@@ -3256,6 +3270,10 @@ mod tests {
         );
         assert_eq!(
             s.available_commands[3].description,
+            "export transcript to markdown"
+        );
+        assert_eq!(
+            s.available_commands[4].description,
             "fork the current session (unstable ACP extension)"
         );
     }
@@ -3275,7 +3293,7 @@ mod tests {
             .iter()
             .map(|command| command.name.as_str())
             .collect();
-        assert_eq!(names, vec!["new", "clear", "load", "review_pr"]);
+        assert_eq!(names, vec!["new", "clear", "load", "export", "review_pr"]);
     }
 
     #[test]
