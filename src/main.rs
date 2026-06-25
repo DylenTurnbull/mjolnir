@@ -106,6 +106,16 @@ struct Cli {
     #[arg(long, env = "BROKK_TUI_AGENT_STDERR")]
     agent_stderr: Option<PathBuf>,
 
+    /// Maximum bytes for ACP filesystem text reads and writes.
+    #[arg(
+        long,
+        global = true,
+        env = "MJOLNIR_FS_MAX_TEXT_BYTES",
+        default_value_t = acp::DEFAULT_FS_TEXT_BYTES,
+        value_parser = parse_fs_max_text_bytes
+    )]
+    fs_max_text_bytes: u64,
+
     /// Skip the startup check for a newer mj release.
     #[arg(long, global = true, env = "MJOLNIR_NO_UPDATE_CHECK")]
     no_update_check: bool,
@@ -124,6 +134,19 @@ enum Commands {
     Resume(ResumeArgs),
     /// Start the local remote-control server.
     Server(ServerArgs),
+}
+
+fn parse_fs_max_text_bytes(value: &str) -> std::result::Result<u64, String> {
+    let bytes = value
+        .parse::<u64>()
+        .map_err(|e| format!("invalid filesystem text byte limit: {e}"))?;
+    if !(1..=acp::MAX_CONFIGURABLE_FS_TEXT_BYTES).contains(&bytes) {
+        return Err(format!(
+            "filesystem text byte limit must be between 1 and {}",
+            acp::MAX_CONFIGURABLE_FS_TEXT_BYTES
+        ));
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, clap::Args, Default)]
@@ -248,14 +271,16 @@ async fn main() -> Result<()> {
     };
 
     // Dispatch to subcommand if provided.
+    let fs_max_text_bytes = cli.fs_max_text_bytes;
+
     if let Some(command) = cli.command {
         return match command {
             Commands::Resume(mut args) => {
                 args.fullscreen_tui |= fullscreen_tui;
-                run_resume(args).await
+                run_resume(args, fs_max_text_bytes).await
             }
             Commands::Server(args) => {
-                remote::run_server(args.hostname, args.history_days, cwd).await
+                remote::run_server(args.hostname, args.history_days, cwd, fs_max_text_bytes).await
             }
         };
     }
@@ -267,6 +292,7 @@ async fn main() -> Result<()> {
             cwd,
             resume_session: cli.resume_session,
             agent_stderr: cli.agent_stderr,
+            fs_max_text_bytes,
             output_format: cli.output_format.into(),
             permission_mode: cli.permission_mode.into(),
         })
@@ -279,7 +305,10 @@ async fn main() -> Result<()> {
 
     let result = run_app(
         cwd,
-        cli.agent_stderr,
+        RuntimeOptions {
+            agent_stderr: cli.agent_stderr,
+            fs_max_text_bytes,
+        },
         project_label,
         worktree_label.clone(),
         None,
@@ -315,7 +344,7 @@ fn print_resume_hint(session_id: &str, worktree_label: Option<&str>) {
 
 /// Handle the `mj resume` subcommand: pick the agent to resume from, list
 /// sessions, pick one interactively, or resume directly by ID.
-async fn run_resume(args: ResumeArgs) -> Result<()> {
+async fn run_resume(args: ResumeArgs, fs_max_text_bytes: u64) -> Result<()> {
     let mode = ui_mode(args.fullscreen_tui);
     let cwd = match args.cwd.clone() {
         Some(p) => absolutize_cwd(p)?,
@@ -388,7 +417,10 @@ async fn run_resume(args: ResumeArgs) -> Result<()> {
             };
         let result = run_app(
             cwd,
-            args.agent_stderr.clone(),
+            RuntimeOptions {
+                agent_stderr: args.agent_stderr.clone(),
+                fs_max_text_bytes,
+            },
             project_label,
             worktree_label.clone(),
             Some(ResumeTarget {
@@ -445,7 +477,10 @@ async fn run_resume(args: ResumeArgs) -> Result<()> {
                 let session_title = entry.title.clone();
                 let result = run_app(
                     cwd,
-                    args.agent_stderr,
+                    RuntimeOptions {
+                        agent_stderr: args.agent_stderr,
+                        fs_max_text_bytes,
+                    },
                     project_label,
                     worktree_label.clone(),
                     Some(ResumeTarget {
@@ -615,9 +650,15 @@ fn should_open_initial_agent_picker(cfg: &Config, initial_agent: Option<&Selecte
     cfg.agent.is_none() && initial_agent.is_none()
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeOptions {
+    agent_stderr: Option<PathBuf>,
+    fs_max_text_bytes: u64,
+}
+
 async fn run_app(
     cwd: PathBuf,
-    agent_stderr: Option<PathBuf>,
+    runtime_options: RuntimeOptions,
     project_label: String,
     worktree_label: Option<String>,
     resume_target: Option<ResumeTarget>,
@@ -666,7 +707,7 @@ async fn run_app(
         let (reason, session_id, session_title) = run_session(
             &agent,
             cwd.clone(),
-            agent_stderr.clone(),
+            runtime_options.agent_stderr.clone(),
             HeaderLabels {
                 project: project_label.clone(),
                 worktree: worktree_label.clone(),
@@ -674,6 +715,7 @@ async fn run_app(
             },
             resume.as_ref().map(|target| target.session_id.clone()),
             mode,
+            runtime_options.fs_max_text_bytes,
         )
         .await?;
         match reason {
@@ -701,7 +743,7 @@ async fn run_app(
                 match run_session_picker_action_for_agent(
                     &agent,
                     cwd.clone(),
-                    agent_stderr.as_deref(),
+                    runtime_options.agent_stderr.as_deref(),
                     session_id,
                     session_title,
                 )
@@ -965,6 +1007,7 @@ async fn run_session(
     header_labels: HeaderLabels,
     resume_session: Option<String>,
     mode: UiMode,
+    fs_max_text_bytes: u64,
 ) -> Result<(UiExitReason, Option<String>, Option<String>)> {
     let mut terminal = setup_session_terminal(mode)?;
 
@@ -981,6 +1024,7 @@ async fn run_session(
         resume_session,
         env: agent.env.clone(),
         agent_stderr: agent_stderr.clone(),
+        fs_max_text_bytes,
     };
 
     // Drive the ACP runtime on its own task so the UI can own the
@@ -1430,6 +1474,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_filesystem_text_limit() {
+        let cli = Cli::try_parse_from(["mj", "--fs-max-text-bytes", "4096"]).expect("parse");
+        assert_eq!(cli.fs_max_text_bytes, 4096);
+
+        let cli = Cli::try_parse_from([
+            "mj",
+            "--fs-max-text-bytes",
+            &acp::MAX_CONFIGURABLE_FS_TEXT_BYTES.to_string(),
+        ])
+        .expect("parse max");
+        assert_eq!(cli.fs_max_text_bytes, acp::MAX_CONFIGURABLE_FS_TEXT_BYTES);
+
+        let cli = Cli::try_parse_from(["mj", "server", "--fs-max-text-bytes", "8192"])
+            .expect("parse server");
+        assert_eq!(cli.fs_max_text_bytes, 8192);
+    }
+
+    #[test]
+    fn parse_rejects_unsafe_filesystem_text_limit() {
+        let err = Cli::try_parse_from(["mj", "--fs-max-text-bytes", "0"]).expect_err("reject 0");
+        assert!(
+            err.to_string()
+                .contains("filesystem text byte limit must be between 1")
+        );
+
+        let too_large = (acp::MAX_CONFIGURABLE_FS_TEXT_BYTES + 1).to_string();
+        let err = Cli::try_parse_from(["mj", "--fs-max-text-bytes", &too_large])
+            .expect_err("reject too large");
+        assert!(
+            err.to_string()
+                .contains("filesystem text byte limit must be between 1")
+        );
+    }
+
+    #[test]
     fn parse_accepts_worktree_short_flag() {
         let cli = Cli::try_parse_from(["mj", "-w"]).expect("parse");
         assert_eq!(cli.worktree, Some(String::new()));
@@ -1528,6 +1607,7 @@ mod tests {
 
         assert!(help.contains("--debug-file <LOG_FILE>"));
         assert!(help.contains("[aliases: --log-file]"));
+        assert!(help.contains("--fs-max-text-bytes <FS_MAX_TEXT_BYTES>"));
         assert!(help.contains("-w, --worktree [<WORKTREE>]"));
         assert!(help.contains("--fullscreen-tui"));
         assert!(!help.contains("--resume-session"));
