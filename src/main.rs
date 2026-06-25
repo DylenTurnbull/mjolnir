@@ -81,6 +81,17 @@ struct Cli {
     #[arg(long)]
     cwd: Option<PathBuf>,
 
+    /// Additional absolute workspace directory to expose to the agent.
+    ///
+    /// Repeat to pass multiple directories. These expand workspace scope
+    /// for ACP file and terminal requests but do not imply trust.
+    #[arg(
+        long = "additional-directory",
+        visible_alias = "add-dir",
+        value_name = "PATH"
+    )]
+    additional_directories: Vec<PathBuf>,
+
     /// Use the legacy alternate-screen full-screen chat TUI.
     #[arg(long)]
     fullscreen_tui: bool,
@@ -185,6 +196,17 @@ struct ResumeArgs {
     #[arg(long)]
     cwd: Option<PathBuf>,
 
+    /// Additional absolute workspace directory to expose to the resumed agent.
+    ///
+    /// Repeat to pass multiple directories. These expand workspace scope
+    /// for ACP file and terminal requests but do not imply trust.
+    #[arg(
+        long = "additional-directory",
+        visible_alias = "add-dir",
+        value_name = "PATH"
+    )]
+    additional_directories: Vec<PathBuf>,
+
     /// Run the resumed ACP session in a Git worktree.
     ///
     /// With no value, creates a new linked worktree under
@@ -276,24 +298,36 @@ async fn main() -> Result<()> {
 
     // Dispatch to subcommand if provided.
     let fs_max_text_bytes = cli.fs_max_text_bytes;
+    let top_level_additional_directories = cli.additional_directories.clone();
 
     if let Some(command) = cli.command {
         return match command {
             Commands::Resume(mut args) => {
                 args.fullscreen_tui |= fullscreen_tui;
-                run_resume(args, fs_max_text_bytes).await
+                run_resume(args, fs_max_text_bytes, top_level_additional_directories).await
             }
             Commands::Server(args) => {
-                remote::run_server(args.hostname, args.history_days, cwd, fs_max_text_bytes).await
+                let workspace_roots =
+                    validate_workspace_roots(&cwd, &top_level_additional_directories)?;
+                remote::run_server(
+                    args.hostname,
+                    args.history_days,
+                    cwd,
+                    workspace_roots.additional_directories().to_vec(),
+                    fs_max_text_bytes,
+                )
+                .await
             }
         };
     }
 
     if let Some(prompt_arg) = cli.print {
+        let workspace_roots = validate_workspace_roots(&cwd, &top_level_additional_directories)?;
         let prompt = read_headless_prompt(prompt_arg)?;
         return headless::run(headless::RunConfig {
             prompt,
             cwd,
+            additional_directories: workspace_roots.additional_directories().to_vec(),
             resume_session: cli.resume_session,
             agent_stderr: cli.agent_stderr,
             fs_max_text_bytes,
@@ -304,6 +338,7 @@ async fn main() -> Result<()> {
     }
 
     let (cwd, worktree) = prepare_worktree_for_arg(cwd, cli.worktree.as_deref())?;
+    let workspace_roots = validate_workspace_roots(&cwd, &top_level_additional_directories)?;
     let worktree_label = worktree_label(worktree.as_ref());
     let project_label = project_label(&cwd);
 
@@ -311,6 +346,7 @@ async fn main() -> Result<()> {
         cwd,
         RuntimeOptions {
             agent_stderr: cli.agent_stderr,
+            additional_directories: workspace_roots.additional_directories().to_vec(),
             fs_max_text_bytes,
         },
         project_label,
@@ -327,7 +363,11 @@ async fn main() -> Result<()> {
     match &result {
         Ok(Some(session_id)) => {
             if worktree_kept {
-                print_resume_hint(session_id, worktree_label.as_deref());
+                print_resume_hint(
+                    session_id,
+                    worktree_label.as_deref(),
+                    workspace_roots.additional_directories(),
+                );
             }
         }
         Ok(None) => {}
@@ -338,23 +378,57 @@ async fn main() -> Result<()> {
 }
 
 /// Print a hint showing how to resume the session.
-fn print_resume_hint(session_id: &str, worktree_label: Option<&str>) {
+fn print_resume_hint(session_id: &str, worktree_label: Option<&str>, additional_roots: &[PathBuf]) {
+    println!(
+        "To resume: {}",
+        resume_hint_command(session_id, worktree_label, additional_roots)
+    );
+}
+
+fn resume_hint_command(
+    session_id: &str,
+    worktree_label: Option<&str>,
+    additional_roots: &[PathBuf],
+) -> String {
+    let mut command = format!("mj resume {}", shell_quote(session_id));
     if let Some(label) = worktree_label {
-        println!("To resume: mj resume {session_id} --worktree {label}");
-    } else {
-        println!("To resume: mj resume {session_id}");
+        command.push_str(" --worktree ");
+        command.push_str(&shell_quote(label));
     }
+    for root in additional_roots {
+        command.push_str(" --additional-directory ");
+        command.push_str(&shell_quote(&root.display().to_string()));
+    }
+    command
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '='))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Handle the `mj resume` subcommand: pick the agent to resume from, list
 /// sessions, pick one interactively, or resume directly by ID.
-async fn run_resume(args: ResumeArgs, fs_max_text_bytes: u64) -> Result<()> {
+async fn run_resume(
+    args: ResumeArgs,
+    fs_max_text_bytes: u64,
+    top_level_additional_directories: Vec<PathBuf>,
+) -> Result<()> {
     let mode = ui_mode(args.fullscreen_tui);
     let cwd = match args.cwd.clone() {
         Some(p) => absolutize_cwd(p)?,
         None => std::env::current_dir().context("current dir")?,
     };
+    let mut requested_additional_directories = top_level_additional_directories;
+    requested_additional_directories.extend(args.additional_directories.iter().cloned());
     let (cwd, worktree) = prepare_worktree_for_arg(cwd, args.worktree.as_deref())?;
+    let workspace_roots = validate_workspace_roots(&cwd, &requested_additional_directories)?;
+    let additional_directories = workspace_roots.additional_directories().to_vec();
     let worktree_label = worktree_label(worktree.as_ref());
     let project_label = project_label(&cwd);
 
@@ -423,6 +497,7 @@ async fn run_resume(args: ResumeArgs, fs_max_text_bytes: u64) -> Result<()> {
             cwd,
             RuntimeOptions {
                 agent_stderr: args.agent_stderr.clone(),
+                additional_directories: additional_directories.clone(),
                 fs_max_text_bytes,
             },
             project_label,
@@ -440,7 +515,11 @@ async fn run_resume(args: ResumeArgs, fs_max_text_bytes: u64) -> Result<()> {
         if let Ok(Some(resumed_id)) = &result
             && worktree_kept
         {
-            print_resume_hint(resumed_id, worktree_label.as_deref());
+            print_resume_hint(
+                resumed_id,
+                worktree_label.as_deref(),
+                workspace_roots.additional_directories(),
+            );
         }
         return result.map(|_| ());
     }
@@ -489,6 +568,7 @@ async fn run_resume(args: ResumeArgs, fs_max_text_bytes: u64) -> Result<()> {
                     cwd,
                     RuntimeOptions {
                         agent_stderr: args.agent_stderr,
+                        additional_directories: additional_directories.clone(),
                         fs_max_text_bytes,
                     },
                     project_label,
@@ -506,7 +586,11 @@ async fn run_resume(args: ResumeArgs, fs_max_text_bytes: u64) -> Result<()> {
                 if let Ok(Some(resumed_id)) = &result
                     && worktree_kept
                 {
-                    print_resume_hint(resumed_id, worktree_label.as_deref());
+                    print_resume_hint(
+                        resumed_id,
+                        worktree_label.as_deref(),
+                        workspace_roots.additional_directories(),
+                    );
                 }
                 return result.map(|_| ());
             }
@@ -569,6 +653,13 @@ fn absolutize_cwd(cwd: PathBuf) -> Result<PathBuf> {
     } else {
         Ok(std::env::current_dir().context("current dir")?.join(cwd))
     }
+}
+
+fn validate_workspace_roots(
+    cwd: &Path,
+    additional_directories: &[PathBuf],
+) -> Result<paths::WorkspaceRoots> {
+    paths::WorkspaceRoots::new(cwd, additional_directories)
 }
 
 fn worktree_label(worktree: Option<&CreatedWorktree>) -> Option<String> {
@@ -671,6 +762,7 @@ fn should_open_first_run_setup(
 #[derive(Debug, Clone)]
 struct RuntimeOptions {
     agent_stderr: Option<PathBuf>,
+    additional_directories: Vec<PathBuf>,
     fs_max_text_bytes: u64,
 }
 
@@ -755,6 +847,7 @@ async fn run_app(
             HeaderLabels {
                 project: project_label.clone(),
                 worktree: worktree_label.clone(),
+                additional_roots: runtime_options.additional_directories.len(),
                 session_title: resume.as_ref().and_then(|target| target.title.clone()),
             },
             resume.as_ref().map(|target| target.session_id.clone()),
@@ -1128,6 +1221,7 @@ async fn run_session(
         command: agent.program.clone(),
         args: agent.args.clone(),
         cwd: cwd.clone(),
+        additional_directories: runtime_options.additional_directories.clone(),
         resume_session,
         env: agent.env.clone(),
         agent_stderr: runtime_options.agent_stderr.clone(),
@@ -1909,6 +2003,96 @@ mod tests {
         } else {
             panic!("expected Resume subcommand");
         }
+    }
+
+    #[test]
+    fn parse_additional_directories_for_new_and_resume_sessions() {
+        let cli = Cli::try_parse_from([
+            "mj",
+            "--additional-directory",
+            "/tmp/one",
+            "--add-dir",
+            "/tmp/two",
+        ])
+        .expect("parse");
+        assert_eq!(
+            cli.additional_directories,
+            vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
+        );
+
+        let cli = Cli::try_parse_from([
+            "mj",
+            "resume",
+            "sess-123",
+            "--additional-directory",
+            "/tmp/extra",
+        ])
+        .expect("parse resume");
+        if let Some(Commands::Resume(args)) = cli.command {
+            assert_eq!(
+                args.additional_directories,
+                vec![PathBuf::from("/tmp/extra")]
+            );
+        } else {
+            panic!("expected Resume subcommand");
+        }
+
+        let cli = Cli::try_parse_from(["mj", "--add-dir", "/tmp/top", "resume", "sess-123"])
+            .expect("parse top-level add-dir before resume");
+        assert_eq!(cli.additional_directories, vec![PathBuf::from("/tmp/top")]);
+    }
+
+    #[test]
+    fn validate_workspace_roots_canonicalizes_and_deduplicates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = tempfile::tempdir().expect("primary");
+        let canonical = std::fs::canonicalize(temp.path()).expect("canonical");
+
+        let validated = validate_workspace_roots(
+            primary.path(),
+            &[temp.path().to_path_buf(), canonical.clone()],
+        )
+        .expect("validated");
+
+        assert_eq!(validated.additional_directories(), &[canonical]);
+    }
+
+    #[test]
+    fn validate_workspace_roots_deduplicates_additional_roots_against_cwd() {
+        let primary = tempfile::tempdir().expect("primary");
+        let validated = validate_workspace_roots(primary.path(), &[primary.path().to_path_buf()])
+            .expect("validated");
+
+        assert!(validated.additional_directories().is_empty());
+    }
+
+    #[test]
+    fn validate_workspace_roots_rejects_relative_missing_and_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = tempfile::tempdir().expect("primary");
+        let file = temp.path().join("file.txt");
+        std::fs::write(&file, "not a directory").expect("write file");
+
+        assert!(validate_workspace_roots(primary.path(), &[PathBuf::from("relative")]).is_err());
+        assert!(validate_workspace_roots(primary.path(), &[temp.path().join("missing")]).is_err());
+        assert!(validate_workspace_roots(primary.path(), &[file]).is_err());
+    }
+
+    #[test]
+    fn resume_hint_includes_worktree_and_shell_quoted_additional_roots() {
+        let command = resume_hint_command(
+            "sess-123",
+            Some("named tree"),
+            &[
+                PathBuf::from("/tmp/extra root"),
+                PathBuf::from("/tmp/quote'root"),
+            ],
+        );
+
+        assert_eq!(
+            command,
+            "mj resume sess-123 --worktree 'named tree' --additional-directory '/tmp/extra root' --additional-directory '/tmp/quote'\\''root'"
+        );
     }
 
     #[test]
