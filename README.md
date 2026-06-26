@@ -19,10 +19,9 @@ It is native and small-footprint: no Electron shell, no browser runtime, no
 agent-specific frontend.
 
 Thor is the simple path: give it the task, review the plan, then let it assign
-work to the configured ACP harness. Today `mj` defaults to the `anvil` ACP
-backend (`uvx brokk acp`) as the first Thor worker; the coordinator runtime
-already owns prompt submission and will expand to multiple concurrent ACP
-workers.
+work to configured ACP harnesses. Today `mj` defaults to the `anvil` ACP
+backend (`uvx brokk acp`) as the first Thor host. `mj` injects a local MCP
+bridge into that host session so Thor can discover and run worker ACP agents.
 
 ![Mjolnir inline chat showing streaming agent output and tool activity](docs/readme-images/default-ui.png)
 
@@ -50,15 +49,16 @@ The default `anvil` backend runs `uvx brokk acp`, so `uvx` must be available on
 
 ## Quick Start
 
-By default, `mj` starts Thor. If no backend is configured yet, Thor uses the
-bundled `anvil` ACP launch command and stores it in `~/.config/mj/config.toml`.
-The normal flow does not ask the user to choose a model or agent.
+By default, `mj` starts Thor inside the configured ACP host. If no backend is
+configured yet, Thor uses the bundled `anvil` ACP launch command and stores it
+in `~/.config/mj/config.toml`. The normal flow does not ask the user to choose
+a model or agent.
 
 ```
  mj
 +--- thor ---------------------------------------------------+
 | Ask for the work. Thor plans, routes, executes, reviews.   |
-| Default worker backend: anvil (`uvx brokk acp`)            |
+| Default Thor host: anvil (`uvx brokk acp`)                 |
 +------------------------------------------------------------+
 ```
 
@@ -70,9 +70,10 @@ backend. Use `/load` to open the session picker for the current backend.
 
 ## Thor Routing
 
-Thor is a coordinator persona with one core tool: run an assigned task through
-an ACP worker session and report status, transcript summary, tool activity,
-permission outcomes, validation, and usage.
+Thor is a coordinator persona running inside an ACP host agent. `mj` starts a
+local HTTP MCP bridge and passes that URL to the host through ACP `mcpServers`;
+the MCP tools list configured ACP workers and run assigned tasks through worker
+sessions.
 
 Initial routing policy:
 

@@ -26,6 +26,7 @@ mod text;
 mod theme;
 mod theme_picker;
 mod thor;
+mod thor_mcp;
 mod ui;
 mod version;
 mod worktree;
@@ -133,6 +134,8 @@ struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Commands {
+    #[command(hide = true)]
+    ThorMcp,
     /// Resume an existing ACP session.
     ///
     /// Lists or loads sessions from the configured Thor backend. Without a
@@ -269,6 +272,7 @@ fn should_run_startup_update_check(cli: &Cli) -> bool {
     match &cli.command {
         Some(Commands::Resume(args)) => !args.list,
         Some(Commands::Server(_)) => false,
+        Some(Commands::ThorMcp) => false,
         None => true,
     }
 }
@@ -296,6 +300,7 @@ async fn main() -> Result<()> {
 
     if let Some(command) = cli.command {
         return match command {
+            Commands::ThorMcp => thor_mcp::run_stdio().await,
             Commands::Resume(mut args) => {
                 args.fullscreen_tui |= fullscreen_tui;
                 run_resume(args, fs_max_text_bytes, top_level_additional_directories).await
@@ -1089,34 +1094,26 @@ async fn run_session(
     let (runtime_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel();
     let mut ui_event_rx = ui_event_rx;
+    let thor_mcp_server = thor_mcp::start_http(config::default_config_path())?;
 
     let runtime_cfg = acp::AcpRuntimeConfig {
         command: agent.program.clone(),
         args: agent.args.clone(),
         cwd: cwd.clone(),
         additional_directories: runtime_options.additional_directories.clone(),
+        mcp_servers: thor_mcp_server.mcp_servers(),
         resume_session,
         env: agent.env.clone(),
         agent_stderr: runtime_options.agent_stderr.clone(),
         fs_max_text_bytes: runtime_options.fs_max_text_bytes,
     };
-    let worker_label = agent_header_label(agent);
 
-    // Drive the Thor/ACP runtime on its own task so the UI can own the
+    // Drive the Thor host ACP runtime on its own task so the UI can own the
     // current task's stdio (ratatui draws through stdout while ACP
     // talks to the agent's stdout/stdin, which are separate file
     // descriptors).
     let runtime_handle = tokio::spawn(async move {
-        let result = thor::run(
-            thor::ThorRuntimeConfig {
-                thor: thor_config,
-                worker: runtime_cfg,
-                worker_label,
-            },
-            event_tx,
-            cmd_rx,
-        )
-        .await;
+        let result = acp::run(runtime_cfg, event_tx, cmd_rx).await;
         if let Err(e) = result {
             tracing::error!("runtime error: {e:#}");
         }
@@ -1125,8 +1122,8 @@ async fn run_session(
     let hist_path = history_path();
     let export_dir = transcript_export_dir();
     let config_path = config::default_config_path();
-    // Pre-fill the UI header with Thor, which owns prompt submission even
-    // though it delegates execution to the configured ACP backend.
+    // Pre-fill the UI header with Thor; the selected ACP backend hosts Thor
+    // and receives the local MCP bridge for worker delegation.
     let agent_display_name = Some("Thor".to_string());
     let tracker_project_label = header_labels.project.clone();
     let tracker_agent_label = agent_display_name
@@ -1135,7 +1132,7 @@ async fn run_session(
     let remote_tracker = remote::RemoteSessionTracker::new(
         tracker_project_label,
         tracker_agent_label,
-        Some(runtime_cmd_tx.clone()),
+        Some(cmd_tx.clone()),
         Some(ui_event_tx.clone()),
     );
 
@@ -1158,7 +1155,14 @@ async fn run_session(
     let cmd_proxy = tokio::spawn(async move {
         while let Some(command) = ui_cmd_rx.recv().await {
             cmd_tracker.observe_command(&command);
-            if runtime_cmd_tx.send(command).is_err() {
+            let runtime_command = match command {
+                UiCommand::SendPrompt { text, images } => UiCommand::SendPrompt {
+                    text: thor::host_prompt(&thor_config, &text),
+                    images,
+                },
+                other => other,
+            };
+            if runtime_cmd_tx.send(runtime_command).is_err() {
                 break;
             }
         }

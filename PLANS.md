@@ -25,8 +25,8 @@ stay harness-agnostic.
 
 The current crate is already a usable MVP:
 
-- Spawns Thor as the user-facing coordinator and delegates approved work to an
-  ACP worker process, defaulting to `anvil` on `PATH`.
+- Spawns the configured ACP backend as the Thor host, defaulting to `anvil` on
+  `PATH`, and injects a local MCP bridge into the host session.
 - Talks ACP JSON-RPC over the child process stdio.
 - Opens a new ACP session for `--cwd` or the current directory.
 - Sends text prompts and receives prompt responses.
@@ -91,13 +91,12 @@ repository:
 ## Thor coordinator direction
 
 Thor is not a subagent framework. It is a coordinator persona backed by a strong
-model and a small set of tools. At startup, Thor receives configured ACP
-harnesses, model metadata, model strength scores, pricing, quota hints, user
-preferences, and the user's prompt. It decides how to split the work, presents
-the plan for approval, then launches ACP worker sessions and monitors them until
-the task is complete. The current implementation routes submitted prompts
-through Thor, asks for plan approval, delegates to the configured ACP backend,
-and appends a Thor recap; multi-worker scheduling is the next runtime step.
+model and a small set of tools. Thor always runs inside a selected ACP host
+agent. At session startup, `mj` starts a local HTTP MCP bridge and passes that
+URL through ACP `mcpServers`; that bridge gives Thor tools to list configured
+ACP workers and run delegated prompts through them. The host model receives
+model metadata, pricing, quota hints, user preferences, and the user's prompt,
+then decides how to split the work and monitor worker sessions.
 
 The durable plan lives in
 [docs/thor-coordinator-plan.md](docs/thor-coordinator-plan.md).
@@ -365,14 +364,14 @@ in a smoke test):
 | `available_commands_update` notification | streams immediately after `session/new`; populates the slash autocomplete |
 | `loadSession`, `sessionCapabilities` (resume/fork/list/close/delete) | advertised by the agent; mjolnir now drives load/fork where implemented, with broader list/resume/delete UX still M5 territory |
 | `promptCapabilities.image`, `embeddedContext` | accepted by the agent; mjolnir still renders these `ContentBlock` variants as `[image]` / `[resource]` placeholders pending M2 |
-| `mcpCapabilities.http`, `sse` | advertised; mjolnir does not currently let the user specify `mcpServers` at `session/new` (sends none) |
+| `mcpCapabilities.http`, `sse` | advertised; mjolnir now sends the Thor HTTP MCP bridge at `session/new` for Thor host sessions |
 
 Known gaps to file as follow-ups when the matrix expands:
 
 - Session capability surfacing is partial: fork gates `/fork`, load powers the
   session picker, while resume/list/delete still need broader UX.
-- We send `session/new` without `mcpServers`. If users want to plug in
-  MCP servers via `mj`, that requires a CLI flag or config-file entry.
+- User-configured arbitrary MCP servers still need a CLI flag or config-file
+  entry; the current MCP injection is the built-in Thor ACP bridge.
 - Effort levels (`low/medium/high/xhigh/max`) come through the
   `thought_level` config category and render with the auto-titlecased
   name (`Xhigh`). Cosmetic and agent-side, not blocking.

@@ -44,7 +44,7 @@ use crate::event::{
     PermissionDecision, PermissionPrompt, SessionConfigTarget, TerminalOutputSnapshot, UiCommand,
     UiEvent,
 };
-use crate::thor::{self, ThorRuntimeConfig};
+use crate::thor;
 
 const REMOTE_CONTROL_LOCAL_ADDR: &str = "127.0.0.1:11921";
 const REMOTE_CONTROL_PUBLIC_ADDR: &str = "0.0.0.0:11921";
@@ -1320,14 +1320,14 @@ fn start_server_agent_session(
 ) -> ServerAgentSession {
     let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
     let (runtime_cmd_tx, runtime_cmd_rx) = mpsc::unbounded_channel();
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let (remote_event_tx, mut remote_event_rx) = mpsc::unbounded_channel();
-    let worker_label = agent_display_label(&agent);
     let agent_label = "Thor".to_string();
     let project_label = crate::paths::project_label_from_cwd(&cwd);
     let tracker = RemoteSessionTracker::new(
         project_label,
         agent_label,
-        Some(runtime_cmd_tx.clone()),
+        Some(command_tx.clone()),
         Some(remote_event_tx),
     );
     let runtime_cfg = AcpRuntimeConfig {
@@ -1335,26 +1335,46 @@ fn start_server_agent_session(
         args: agent.args,
         cwd,
         additional_directories,
+        mcp_servers: Vec::new(),
         resume_session: None,
         env: agent.env,
         agent_stderr: None,
         fs_max_text_bytes,
     };
-    let command_tx = runtime_cmd_tx.clone();
-    let shutdown_tx = runtime_cmd_tx;
+    let thor_mcp_server = match crate::thor_mcp::start_http(config::default_config_path()) {
+        Ok(server) => Some(server),
+        Err(error) => {
+            warn!("failed to start Thor MCP HTTP bridge: {error:#}");
+            None
+        }
+    };
+    let runtime_cfg = AcpRuntimeConfig {
+        mcp_servers: thor_mcp_server
+            .as_ref()
+            .map(|server| server.mcp_servers())
+            .unwrap_or_default(),
+        ..runtime_cfg
+    };
+    let shutdown_tx = runtime_cmd_tx.clone();
 
     let task = tokio::spawn(async move {
+        let _thor_mcp_server = thor_mcp_server;
+        let command_proxy = tokio::spawn(async move {
+            while let Some(command) = command_rx.recv().await {
+                let runtime_command = match command {
+                    UiCommand::SendPrompt { text, images } => UiCommand::SendPrompt {
+                        text: thor::host_prompt(&thor_config, &text),
+                        images,
+                    },
+                    other => other,
+                };
+                if runtime_cmd_tx.send(runtime_command).is_err() {
+                    break;
+                }
+            }
+        });
         let runtime = tokio::spawn(async move {
-            if let Err(error) = thor::run(
-                ThorRuntimeConfig {
-                    thor: thor_config,
-                    worker: runtime_cfg,
-                    worker_label,
-                },
-                runtime_event_tx,
-                runtime_cmd_rx,
-            )
-            .await
+            if let Err(error) = crate::acp::run(runtime_cfg, runtime_event_tx, runtime_cmd_rx).await
             {
                 debug!("server Thor session exited: {error:#}");
             }
@@ -1399,6 +1419,7 @@ fn start_server_agent_session(
                 }
             }
         }
+        command_proxy.abort();
         pending_permissions.clear();
         tracker.shutdown().await;
     });

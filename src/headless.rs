@@ -132,33 +132,23 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     };
 
     let project_label = crate::paths::project_label_from_cwd(&cfg.cwd);
-    let agent_label = remote::agent_display_label(&agent);
     let thor_config = app_config.thor.clone();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let thor_mcp_server = crate::thor_mcp::start_http(config_path.clone())?;
     let runtime_cfg = AcpRuntimeConfig {
         command: agent.program,
         args: agent.args,
         cwd: cfg.cwd,
         additional_directories: cfg.additional_directories,
+        mcp_servers: thor_mcp_server.mcp_servers(),
         resume_session: cfg.resume_session.clone(),
         env: agent.env,
         agent_stderr: cfg.agent_stderr,
         fs_max_text_bytes: cfg.fs_max_text_bytes,
     };
 
-    let runtime = tokio::spawn(async move {
-        crate::thor::run(
-            crate::thor::ThorRuntimeConfig {
-                thor: thor_config,
-                worker: runtime_cfg,
-                worker_label: agent_label,
-            },
-            event_tx,
-            cmd_rx,
-        )
-        .await
-    });
+    let runtime = tokio::spawn(async move { crate::acp::run(runtime_cfg, event_tx, cmd_rx).await });
     // No UI event channel: headless answers permissions by policy, so
     // remote decisions have nothing to resolve.
     let remote_tracker = remote::RemoteSessionTracker::new(
@@ -219,6 +209,10 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                         images: Vec::new(),
                     };
                     remote_tracker.observe_command(&command);
+                    let command = UiCommand::SendPrompt {
+                        text: thor::host_prompt(&thor_config, &cfg.prompt),
+                        images: Vec::new(),
+                    };
                     cmd_tx.send(command).context("send prompt to ACP runtime")?;
                 }
             }
@@ -428,14 +422,6 @@ fn permission_decision(
     tool_call: &ToolCallUpdate,
     options: &[agent_client_protocol::schema::v1::PermissionOption],
 ) -> Option<String> {
-    if is_thor_plan_approval(tool_call) {
-        return options
-            .iter()
-            .find(|option| option.option_id.to_string() == "approve")
-            .map(|option| option.option_id.to_string())
-            .or_else(|| choose_allow_option(options));
-    }
-
     let allow = match mode {
         PermissionMode::Default => false,
         PermissionMode::BypassPermissions => true,
@@ -448,11 +434,6 @@ fn permission_decision(
         return None;
     }
     choose_allow_option(options)
-}
-
-fn is_thor_plan_approval(tool_call: &ToolCallUpdate) -> bool {
-    tool_call.tool_call_id.to_string() == crate::thor::PLAN_APPROVAL_TOOL_CALL_ID
-        && matches!(tool_call.fields.kind, Some(ToolKind::Think))
 }
 
 fn choose_allow_option(
@@ -514,18 +495,20 @@ fn tool_status_label(status: ToolCallStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{
-        PermissionOption, PermissionOptionKind, ToolCallUpdateFields,
-    };
+    use agent_client_protocol::schema::v1::ToolCallUpdateFields;
 
-    fn permission_options() -> Vec<PermissionOption> {
+    fn permission_options() -> Vec<agent_client_protocol::schema::v1::PermissionOption> {
         vec![
-            PermissionOption::new(
+            agent_client_protocol::schema::v1::PermissionOption::new(
                 "approve",
                 "Approve Thor plan",
                 PermissionOptionKind::AllowOnce,
             ),
-            PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectOnce),
+            agent_client_protocol::schema::v1::PermissionOption::new(
+                "reject",
+                "Reject",
+                PermissionOptionKind::RejectOnce,
+            ),
         ]
     }
 
@@ -536,21 +519,10 @@ mod tests {
     }
 
     #[test]
-    fn default_headless_mode_auto_accepts_thor_plan_approval() {
+    fn default_headless_mode_rejects_host_think_permissions() {
         let decision = permission_decision(
             PermissionMode::Default,
-            &tool_call(crate::thor::PLAN_APPROVAL_TOOL_CALL_ID, ToolKind::Think),
-            &permission_options(),
-        );
-
-        assert_eq!(decision.as_deref(), Some("approve"));
-    }
-
-    #[test]
-    fn default_headless_mode_still_rejects_worker_think_permissions() {
-        let decision = permission_decision(
-            PermissionMode::Default,
-            &tool_call("worker-think", ToolKind::Think),
+            &tool_call("host-think", ToolKind::Think),
             &permission_options(),
         );
 

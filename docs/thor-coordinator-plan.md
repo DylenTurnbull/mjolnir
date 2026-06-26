@@ -1,21 +1,24 @@
 # Thor coordinator plan
 
-Thor is the default `mj` experience: a coordinator persona backed by a strong
-model, a catalog of configured ACP harnesses, model strength scores, pricing,
-quota hints, and one orchestration tool that can run work through ACP agents.
+Thor is the default `mj` experience: a coordinator persona running inside a
+selected ACP host agent. `mj` injects a local MCP server into that ACP session so
+Thor can list configured ACP harnesses, delegate work to them, and collect
+transcripts, permission outcomes, usage, and errors.
 
-The user-facing path is intentionally simple. The user enters a task, Thor
-chooses the worker harnesses and models, presents a plan for approval, executes
-through ACP sessions, then recaps what changed and how much each harness/model
-used.
+The user-facing path is intentionally simple. The user enters a task, the Thor
+host model chooses worker harnesses and models through the MCP bridge, presents
+a plan for approval, executes through ACP worker sessions, then recaps what
+changed and how much each harness/model used.
 
 ## UX contract
 
-- `mj` opens Thor, not an agent/model picker.
+- `mj` opens a Thor host ACP session, not an agent/model picker.
 - First run detects configured ACP harnesses and accounts, then picks sane
   defaults.
 - The normal prompt flow has no visible model picker or agent picker.
 - Thor presents an execution plan before doing work.
+- The MCP bridge is provided to the Thor host as an ACP `mcpServers` HTTP entry
+  pointing at a localhost server owned by the running `mj` process.
 - The final response includes a concise recap, validation, unresolved risks,
   and usage by harness/model when available.
 
@@ -48,10 +51,12 @@ used.
 ## Implementation phases
 
 1. Done: make Thor the startup/default UX and persist Thor preferences in config.
-2. Done: route submitted prompts through Thor before delegating to the ACP
-   worker backend.
-3. Done: require Thor plan approval through the existing permission UI.
-4. Done: add the initial `run_acp_task` equivalent inside `mj` for one worker.
+2. Done: launch Thor inside the configured ACP host and inject the local HTTP
+   MCP bridge through ACP `mcpServers`.
+3. Done: expose initial MCP tools to list ACP workers and run a prompt through
+   a selected worker.
+4. Next: validate host candidates during onboarding and let the user choose the
+   Thor host from usable ACP agents.
 5. Next: add a local model catalog cache populated from LM Arena and OpenRouter
    data.
 6. Next: support concurrent ACP worker sessions with aggregated progress and

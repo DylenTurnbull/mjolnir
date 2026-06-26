@@ -12,7 +12,7 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthenticateRequest, CancelNotification, ClientCapabilities,
     CloseSessionRequest, ContentBlock, CreateTerminalRequest, CreateTerminalResponse, ErrorCode,
     FileSystemCapabilities, ForkSessionRequest, ImageContent, Implementation, InitializeRequest,
-    KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, NewSessionRequest,
+    KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, McpServer, NewSessionRequest,
     PermissionOption, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
@@ -47,6 +47,8 @@ pub struct AcpRuntimeConfig {
     /// Additional absolute workspace roots to pass to ACP session lifecycle
     /// requests. These expand workspace scope but do not imply trust.
     pub additional_directories: Vec<PathBuf>,
+    /// MCP servers to inject into ACP session lifecycle requests.
+    pub mcp_servers: Vec<McpServer>,
     pub resume_session: Option<String>,
     /// Environment variables to inject into the spawned agent process.
     /// Used for agents that require knobs like `AUGMENT_DISABLE_AUTO_UPDATE=1`.
@@ -412,33 +414,47 @@ fn require_additional_directories(
     }
 }
 
-fn new_session_request(cwd: PathBuf, additional_directories: &[PathBuf]) -> NewSessionRequest {
-    NewSessionRequest::new(cwd).additional_directories(additional_directories.to_vec())
+fn new_session_request(
+    cwd: PathBuf,
+    additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
+) -> NewSessionRequest {
+    NewSessionRequest::new(cwd)
+        .additional_directories(additional_directories.to_vec())
+        .mcp_servers(mcp_servers.to_vec())
 }
 
 fn resume_session_request(
     session_id: SessionId,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
 ) -> ResumeSessionRequest {
     ResumeSessionRequest::new(session_id, cwd)
         .additional_directories(additional_directories.to_vec())
+        .mcp_servers(mcp_servers.to_vec())
 }
 
 fn load_session_request(
     session_id: SessionId,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
 ) -> LoadSessionRequest {
-    LoadSessionRequest::new(session_id, cwd).additional_directories(additional_directories.to_vec())
+    LoadSessionRequest::new(session_id, cwd)
+        .additional_directories(additional_directories.to_vec())
+        .mcp_servers(mcp_servers.to_vec())
 }
 
 fn fork_session_request(
     session_id: SessionId,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
 ) -> ForkSessionRequest {
-    ForkSessionRequest::new(session_id, cwd).additional_directories(additional_directories.to_vec())
+    ForkSessionRequest::new(session_id, cwd)
+        .additional_directories(additional_directories.to_vec())
+        .mcp_servers(mcp_servers.to_vec())
 }
 
 async fn resume_existing_session(
@@ -446,12 +462,14 @@ async fn resume_existing_session(
     session_id: SessionId,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
     capabilities: &AgentCapabilities,
     auth_methods: &[AuthMethod],
 ) -> std::result::Result<Option<(Vec<SessionConfigOption>, Vec<SessionConfigTarget>)>, LaunchError>
 {
     if capabilities.session_capabilities.resume.is_some() {
-        let resume_req = resume_session_request(session_id, cwd, additional_directories);
+        let resume_req =
+            resume_session_request(session_id, cwd, additional_directories, mcp_servers);
         let resumed = match conn.send_request(resume_req.clone()).block_task().await {
             Ok(s) => s,
             Err(source) => match auth_required_detail(&source) {
@@ -472,7 +490,7 @@ async fn resume_existing_session(
     }
 
     require_load_session(capabilities)?;
-    let load_req = load_session_request(session_id, cwd, additional_directories);
+    let load_req = load_session_request(session_id, cwd, additional_directories, mcp_servers);
     let loaded = match conn.send_request(load_req.clone()).block_task().await {
         Ok(s) => s,
         Err(source) => match auth_required_detail(&source) {
@@ -578,6 +596,7 @@ pub async fn run(
             transport,
             cfg.cwd.clone(),
             cfg.additional_directories.clone(),
+            cfg.mcp_servers.clone(),
             cfg.resume_session.clone(),
             ui_tx.clone(),
             ui_rx,
@@ -1055,6 +1074,7 @@ where
         transport,
         cwd,
         Vec::new(),
+        Vec::new(),
         resume_session,
         ui_tx,
         ui_rx,
@@ -1081,6 +1101,7 @@ where
         transport,
         cwd,
         additional_directories,
+        Vec::new(),
         resume_session,
         ui_tx,
         ui_rx,
@@ -1095,6 +1116,7 @@ async fn drive_client_with_fs_limit<T>(
     transport: T,
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
+    mcp_servers: Vec<McpServer>,
     resume_session: Option<String>,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     mut ui_rx: mpsc::UnboundedReceiver<UiCommand>,
@@ -1236,6 +1258,7 @@ where
                 conn,
                 cwd,
                 additional_directories,
+                mcp_servers,
                 resume_session,
                 &ui_tx,
                 &mut ui_rx,
@@ -1266,6 +1289,7 @@ async fn drive_session(
     conn: ConnectionTo<Agent>,
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
+    mcp_servers: Vec<McpServer>,
     resume_session: Option<String>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
@@ -1327,6 +1351,7 @@ async fn drive_session(
                 session_id.clone(),
                 cwd.clone(),
                 &additional_directories,
+                &mcp_servers,
                 &init_resp.agent_capabilities,
                 &init_resp.auth_methods,
             )
@@ -1346,7 +1371,11 @@ async fn drive_session(
             (session_id, initial_config, true)
         }
         None => match conn
-            .send_request(new_session_request(cwd.clone(), &additional_directories))
+            .send_request(new_session_request(
+                cwd.clone(),
+                &additional_directories,
+                &mcp_servers,
+            ))
             .block_task()
             .await
         {
@@ -1373,7 +1402,11 @@ async fn drive_session(
                         return Err(anyhow::anyhow!(text));
                     }
                     match conn
-                        .send_request(new_session_request(cwd.clone(), &additional_directories))
+                        .send_request(new_session_request(
+                            cwd.clone(),
+                            &additional_directories,
+                            &mcp_servers,
+                        ))
                         .block_task()
                         .await
                     {
@@ -1468,6 +1501,7 @@ async fn drive_session(
                     &conn,
                     cwd.clone(),
                     &additional_directories,
+                    &mcp_servers,
                     &mut session_id,
                     &mut session_config,
                     &session_state,
@@ -1537,6 +1571,7 @@ async fn drive_session(
                     target_session_id,
                     requested_cwd,
                     &additional_directories,
+                    &mcp_servers,
                     title,
                     &init_resp.agent_capabilities,
                     &init_resp.auth_methods,
@@ -1582,6 +1617,7 @@ async fn switch_existing_session(
     target_session_id: SessionId,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
     title: Option<String>,
     capabilities: &AgentCapabilities,
     auth_methods: &[AuthMethod],
@@ -1603,6 +1639,7 @@ async fn switch_existing_session(
         target_session_id.clone(),
         cwd.clone(),
         additional_directories,
+        mcp_servers,
         capabilities,
         auth_methods,
     )
@@ -1663,6 +1700,7 @@ async fn drive_fork_session(
     conn: &ConnectionTo<Agent>,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
     session_id: &mut SessionId,
     session_config: &mut SessionConfigCache,
     session_state: &RuntimeSessionState,
@@ -1675,6 +1713,7 @@ async fn drive_fork_session(
         &source_session_id,
         cwd.clone(),
         additional_directories,
+        mcp_servers,
     );
     tokio::pin!(fork);
 
@@ -1751,12 +1790,14 @@ async fn fork_session(
     session_id: &SessionId,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
 ) -> std::result::Result<(SessionId, Option<SessionConfigCache>), agent_client_protocol::Error> {
     let resp = conn
         .send_request(fork_session_request(
             session_id.clone(),
             cwd,
             additional_directories,
+            mcp_servers,
         ))
         .block_task()
         .await?;
@@ -4082,6 +4123,39 @@ mod tests {
             .await;
     }
 
+    async fn run_mock_agent_with_new_session_mcp_servers(
+        stream: tokio::io::DuplexStream,
+        expected_mcp_servers: Vec<McpServer>,
+    ) {
+        let (r, w) = split(stream);
+        let transport = ByteStreams::new(w.compat_write(), r.compat());
+        let _ = AgentRole
+            .builder()
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::v1::InitializeRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(InitializeResponse::new(ProtocolVersion::V1))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: NewSessionRequest, responder, _cx| {
+                    assert_eq!(
+                        req.mcp_servers, expected_mcp_servers,
+                        "session/new should receive requested MCP servers"
+                    );
+                    responder.respond(NewSessionResponse::new(SessionId::new("test-session")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(transport, |_cx| async move {
+                futures::future::pending::<()>().await;
+                Ok(())
+            })
+            .await;
+    }
+
     async fn run_mock_agent_with_load_additional_directories(
         stream: tokio::io::DuplexStream,
         expected_additional_directories: Vec<PathBuf>,
@@ -4944,6 +5018,45 @@ mod tests {
             ui_tx,
             cmd_rx,
             Arc::new(AtomicBool::new(false)),
+        ));
+
+        wait_for_session_started(&mut ui_rx, "test-session").await;
+        cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(5), client_task)
+            .await
+            .expect("drive_client did not finish")
+            .expect("client task")
+            .expect("drive_client");
+        agent_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drive_client_sends_mcp_servers_on_new_session() {
+        let root = tempfile::tempdir().expect("root");
+        let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
+        let mcp_servers = vec![McpServer::Stdio(
+            agent_client_protocol::schema::v1::McpServerStdio::new("thor-acp-bridge", "/tmp/mj")
+                .args(vec!["thor-mcp".to_string()]),
+        )];
+
+        let agent_task = tokio::spawn(run_mock_agent_with_new_session_mcp_servers(
+            agent_side,
+            mcp_servers.clone(),
+        ));
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+        let client_task = tokio::spawn(drive_client_with_fs_limit(
+            client_transport,
+            root.path().to_path_buf(),
+            Vec::new(),
+            mcp_servers,
+            None,
+            ui_tx,
+            cmd_rx,
+            Arc::new(AtomicBool::new(false)),
+            DEFAULT_FS_TEXT_BYTES,
         ));
 
         wait_for_session_started(&mut ui_rx, "test-session").await;
@@ -5880,6 +5993,7 @@ mod tests {
             args: Vec::new(),
             cwd: std::env::temp_dir(),
             additional_directories: Vec::new(),
+            mcp_servers: Vec::new(),
             resume_session: None,
             env: HashMap::new(),
             agent_stderr: None,
@@ -5932,6 +6046,7 @@ mod tests {
             args: Vec::new(),
             cwd: std::env::temp_dir(),
             additional_directories: Vec::new(),
+            mcp_servers: Vec::new(),
             resume_session: None,
             env: HashMap::new(),
             agent_stderr: Some(bad_stderr),
@@ -6063,6 +6178,7 @@ mod tests {
             args,
             cwd: std::env::temp_dir(),
             additional_directories: Vec::new(),
+            mcp_servers: Vec::new(),
             resume_session: None,
             env: HashMap::new(),
             agent_stderr: None,
@@ -6084,6 +6200,7 @@ mod tests {
             args,
             cwd: std::env::temp_dir(),
             additional_directories: Vec::new(),
+            mcp_servers: Vec::new(),
             resume_session: None,
             env: HashMap::new(),
             agent_stderr: None,
