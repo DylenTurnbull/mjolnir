@@ -518,6 +518,14 @@ args = ["--flag", "$HOME/data"]
             "Thor coordinator default should be visible: {body:?}"
         );
         assert!(
+            body.contains("enabled_worker_source_ids = []"),
+            "Thor worker selection should be visible: {body:?}"
+        );
+        assert!(
+            body.contains("coordinator_reasoning = \"high\""),
+            "Thor reasoning default should be visible: {body:?}"
+        );
+        assert!(
             body.contains("onboarding_complete = false"),
             "Thor onboarding marker should be visible: {body:?}"
         );
@@ -545,7 +553,9 @@ args = ["--flag", "$HOME/data"]
         let cfg = Config {
             thor: ThorConfig {
                 onboarding_complete: true,
+                enabled_worker_source_ids: vec!["anvil".to_string()],
                 coordinator_model: "anthropic/claude-example".to_string(),
+                coordinator_reasoning: crate::thor::ThorReasoning::Medium,
                 leaderboard_url: crate::thor::LM_ARENA_LEADERBOARD_URL.to_string(),
                 pricing_url: crate::thor::OPENROUTER_MODELS_URL.to_string(),
                 plan_approval: crate::thor::ThorPlanApproval::Always,
@@ -559,7 +569,12 @@ args = ["--flag", "$HOME/data"]
         assert!(body.contains("coordinator_model = \"anthropic/claude-example\""));
 
         let loaded = Config::load(&path).expect("load saved");
+        assert_eq!(loaded.thor.enabled_worker_source_ids, vec!["anvil"]);
         assert_eq!(loaded.thor.coordinator_model, "anthropic/claude-example");
+        assert_eq!(
+            loaded.thor.coordinator_reasoning,
+            crate::thor::ThorReasoning::Medium
+        );
         assert_eq!(
             loaded.thor.optimization_mode,
             crate::thor::ThorOptimizationMode::BestSolution

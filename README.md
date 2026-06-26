@@ -51,10 +51,10 @@ The default `anvil` backend runs `uvx brokk acp`, so `uvx` must be available on
 
 ## Quick Start
 
-By default, `mj` starts Thor inside the configured ACP host. If no backend is
-configured yet, Thor uses the bundled `anvil` ACP launch command and stores it
-in `~/.config/mj/config.toml`. The normal flow does not ask the user to choose
-a model or agent.
+By default, `mj` starts Thor inside the configured ACP host. On first run, setup
+asks which agents Thor may use as workers, whether Thor should act as Architect
+or Accountant, and which agent/model/reasoning level hosts Thor. The normal
+prompt flow does not ask the user to choose a model or agent.
 
 ```
  mj
@@ -64,7 +64,7 @@ a model or agent.
 +------------------------------------------------------------+
 ```
 
-Thor preferences and the configured worker backend are stored in
+Thor preferences and the configured worker set/backend are stored in
 `~/.config/mj/config.toml`.
 
 Use `/new` inside the TUI to start a fresh Thor session with the configured

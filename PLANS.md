@@ -48,8 +48,11 @@ Current command-line surface:
 
 There is no `--command` / `--agent` flag. Startup creates an `anvil` backend
 default automatically when `~/.config/mj/config.toml` has no `agent` block.
-First run shows a Thor setup screen and writes visible `[thor]` configuration.
-The previous agent picker is no longer part of the normal user path.
+First run asks the user to select agents Thor may use as workers, choose the
+Architect or Accountant persona, and pick Thor's host agent, model preference,
+and reasoning level. Those choices are written to visible `[thor]`
+configuration. The previous agent picker is no longer part of the normal user
+path.
 
 M1 hardening landed (PR #34): an explicit `ConnectionState` lifecycle drives
 the header label, a `LaunchError` enum surfaces spawn / initialize /

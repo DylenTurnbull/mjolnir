@@ -40,12 +40,25 @@ pub enum ThorOptimizationMode {
     BestSolution,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThorReasoning {
+    Low,
+    Medium,
+    #[default]
+    High,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ThorConfig {
     #[serde(default)]
     pub onboarding_complete: bool,
+    #[serde(default)]
+    pub enabled_worker_source_ids: Vec<String>,
     #[serde(default = "default_coordinator_model")]
     pub coordinator_model: String,
+    #[serde(default)]
+    pub coordinator_reasoning: ThorReasoning,
     #[serde(default = "default_leaderboard_url")]
     pub leaderboard_url: String,
     #[serde(default = "default_pricing_url")]
@@ -60,7 +73,9 @@ impl Default for ThorConfig {
     fn default() -> Self {
         Self {
             onboarding_complete: false,
+            enabled_worker_source_ids: Vec::new(),
             coordinator_model: default_coordinator_model(),
+            coordinator_reasoning: ThorReasoning::High,
             leaderboard_url: default_leaderboard_url(),
             pricing_url: default_pricing_url(),
             plan_approval: ThorPlanApproval::Always,
@@ -131,7 +146,7 @@ pub fn default_anvil_agent() -> SelectedAgent {
     }
 }
 
-pub fn worker_catalog(config: &Config) -> Vec<SelectedAgent> {
+pub fn available_worker_catalog(config: &Config) -> Vec<SelectedAgent> {
     let mut agents = Vec::new();
     if let Some(agent) = config.agent.clone() {
         agents.push(agent);
@@ -154,6 +169,30 @@ pub fn worker_catalog(config: &Config) -> Vec<SelectedAgent> {
     agents
 }
 
+pub fn worker_catalog(config: &Config) -> Vec<SelectedAgent> {
+    let agents = available_worker_catalog(config);
+    if config.thor.enabled_worker_source_ids.is_empty() {
+        return agents;
+    }
+
+    let filtered = agents
+        .iter()
+        .filter(|agent| {
+            config
+                .thor
+                .enabled_worker_source_ids
+                .iter()
+                .any(|source_id| source_id == &agent.source_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        agents
+    } else {
+        filtered
+    }
+}
+
 pub fn host_prompt(thor: &ThorConfig, user_prompt: &str) -> String {
     format!(
         "\
@@ -166,6 +205,7 @@ listing configured ACP workers and delegating prompts to them.
 Operating mode:
 - optimization: {optimization}
 - coordinator model preference: {model}
+- coordinator reasoning: {reasoning}
 - model strength source: {leaderboard}
 - pricing source: {pricing}
 
@@ -189,6 +229,7 @@ User request:
         server_name = THOR_MCP_SERVER_NAME,
         optimization = optimization_label(thor.optimization_mode),
         model = thor.coordinator_model,
+        reasoning = reasoning_label(thor.coordinator_reasoning),
         leaderboard = thor.leaderboard_url,
         pricing = thor.pricing_url,
     )
@@ -307,6 +348,14 @@ fn optimization_label(mode: ThorOptimizationMode) -> &'static str {
     }
 }
 
+fn reasoning_label(reasoning: ThorReasoning) -> &'static str {
+    match reasoning {
+        ThorReasoning::Low => "low",
+        ThorReasoning::Medium => "medium",
+        ThorReasoning::High => "high",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,8 +383,30 @@ mod tests {
         assert!(prompt.contains("running inside an ACP host agent"));
         assert!(prompt.contains(THOR_MCP_SERVER_NAME));
         assert!(prompt.contains("listing configured ACP workers"));
+        assert!(prompt.contains("coordinator reasoning: high"));
         assert!(prompt.contains("Always bake in adversarial review and correction"));
         assert!(prompt.contains("User request:\nfix the parser"));
+    }
+
+    #[test]
+    fn worker_catalog_honors_enabled_worker_source_ids() {
+        let config = Config {
+            thor: ThorConfig {
+                enabled_worker_source_ids: vec!["custom:reviewer".to_string()],
+                ..ThorConfig::default()
+            },
+            custom_agents: vec![crate::config::CustomAgent {
+                name: "reviewer".to_string(),
+                program: PathBuf::from("reviewer-acp"),
+                args: Vec::new(),
+                description: String::new(),
+            }],
+            ..Config::default()
+        };
+
+        let workers = worker_catalog(&config);
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].source_id, "custom:reviewer");
     }
 
     #[test]

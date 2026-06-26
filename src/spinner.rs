@@ -2,7 +2,7 @@
 //!
 //! A spinner style is a purely client-side visual preference, mirroring
 //! [`crate::theme::TerminalThemeKind`]: it is persisted in `config.toml`,
-//! chosen on first run, and changeable via the `/mjconfig` menu.
+//! chosen during onboarding, and changeable via the `/mjconfig` menu.
 //!
 //! Every style renders to frames of exactly [`SPINNER_WIDTH`] display columns
 //! (including its idle frame) so the prompt title never reflows when a turn
@@ -48,7 +48,7 @@ impl SpinnerStyle {
         }
     }
 
-    /// Short human description, shown in the first-run picker and `/mjconfig`.
+    /// Short human description, shown in onboarding and `/mjconfig`.
     pub fn description(self) -> &'static str {
         match self {
             Self::Pulse => "a bright dot glides across a faint row",

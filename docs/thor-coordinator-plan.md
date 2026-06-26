@@ -13,8 +13,8 @@ changed and how much each harness/model used.
 ## UX contract
 
 - `mj` opens a Thor host ACP session, not an agent/model picker.
-- First run shows the Thor coordinator configuration, then starts from sane
-  defaults.
+- First run asks the user to select Thor workers, pick Architect or Accountant,
+  and choose Thor's host agent, model preference, and reasoning level.
 - The normal prompt flow has no visible model picker or agent picker.
 - Thor presents an execution plan before doing work.
 - The MCP bridge is provided to the Thor host as an ACP `mcpServers` stdio
@@ -25,7 +25,8 @@ changed and how much each harness/model used.
 ## Initial routing rules
 
 - Thor supports optimization modes:
-  - balanced: choose capable routing without unnecessary spend.
+  - balanced: legacy/default config value; first-run onboarding presents
+    Architect and Accountant only.
   - cost/accountant: use cheaper models when the task is judged sufficiently
     simple.
   - best-solution/architect: for complex work, run two independent versions
@@ -55,8 +56,8 @@ changed and how much each harness/model used.
    through ACP `mcpServers`.
 3. Done: expose initial MCP tools to list ACP workers and run a prompt through
    a selected worker.
-4. Next: validate host candidates during onboarding and let the user choose the
-   Thor host from usable ACP agents.
+4. Done: first-run onboarding selects available Thor workers, persona, Thor
+   host, model preference, and reasoning level.
 5. Next: add a local model catalog cache populated from LM Arena and OpenRouter
    data.
 6. Next: support concurrent ACP worker sessions with aggregated progress and
