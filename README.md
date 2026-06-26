@@ -76,9 +76,10 @@ Thor is a coordinator persona running inside an ACP host agent. `mj` passes a
 stdio MCP bridge (`mj thor-mcp`) to the host through ACP `mcpServers`; the MCP
 tools validate configured ACP workers, list usable workers, and run assigned
 tasks through worker sessions. The bridge also exposes a cached model catalog
-from LM Arena/OpenRouter sources, cached quota/rate-limit signals observed from
-ACP usage metadata, and a concurrent worker runner that reports structured
-progress, tool calls, and aggregate usage.
+from LM Arena/OpenRouter sources, active quota probes for Claude SDK and Codex
+appserver integrations, cached quota/rate-limit signals observed from ACP usage
+metadata, and a concurrent worker runner that reports structured progress, tool
+calls, and aggregate usage.
 
 Initial routing policy:
 
@@ -91,7 +92,8 @@ Initial routing policy:
 - prefer Anvil for other model families when configured for the target model
 - use Claude Code and Codex subscription quota evenly and maximally before
   falling back to metered OpenRouter routing; quota is treated as known only
-  when an ACP worker reports rate-limit/usage metadata
+  when a Claude SDK/Codex appserver probe or ACP worker usage metadata reports
+  it
 - in cost/accountant mode, use cheaper models when Thor judges the task simple
   enough
 - in best-solution/architect mode, run two independent implementations with

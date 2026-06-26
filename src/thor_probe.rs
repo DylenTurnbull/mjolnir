@@ -1,12 +1,14 @@
 //! ACP validation probes and quota/capacity hints for Thor.
 
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::UsageUpdate;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::acp::{self, AcpRuntimeConfig};
@@ -37,6 +39,8 @@ pub struct AgentValidation {
 pub struct QuotaSnapshot {
     pub source_id: String,
     pub provider: QuotaProvider,
+    #[serde(default)]
+    pub probe_source: QuotaProbeSource,
     pub quota_known: bool,
     pub remaining_percent: Option<f64>,
     pub used_percent: Option<f64>,
@@ -56,12 +60,75 @@ pub enum QuotaProvider {
     Unknown,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaProbeSource {
+    ClaudeSdk,
+    CodexAppserver,
+    AgentCommand,
+    AcpUsageMetadata,
+    #[default]
+    Unknown,
+}
+
 pub async fn validate_agents(agents: &[SelectedAgent], cwd: PathBuf) -> Vec<AgentValidation> {
     let probes = agents
         .iter()
         .cloned()
         .map(|agent| validate_agent(agent, cwd.clone(), DEFAULT_PROBE_TIMEOUT));
     futures::future::join_all(probes).await
+}
+
+pub async fn refresh_configured_quota_snapshots(agents: &[SelectedAgent]) -> Vec<QuotaSnapshot> {
+    let probes = agents.iter().map(refresh_configured_quota_snapshot);
+    futures::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+pub async fn refresh_configured_quota_snapshot(agent: &SelectedAgent) -> Option<QuotaSnapshot> {
+    let (value, probe_source) = match quota_probe(agent) {
+        Some(QuotaProbe::Command { command, source }) => {
+            let output = Command::new(&command.program)
+                .args(&command.args)
+                .envs(&agent.env)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .await
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            (
+                serde_json::from_slice::<Value>(&output.stdout).ok()?,
+                source,
+            )
+        }
+        Some(QuotaProbe::Http { url, token, source }) => {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .ok()?;
+            let mut request = client.get(url);
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await.ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            (response.json::<Value>().await.ok()?, source)
+        }
+        None => return None,
+    };
+    let mut snapshot = snapshot_from_probe_json(&agent.source_id, &value)?;
+    snapshot.probe_source = probe_source;
+    snapshot.observed_at_unix = now_unix();
+    let _ = save_quota_snapshot(&snapshot);
+    Some(snapshot)
 }
 
 pub async fn validate_agent(
@@ -179,6 +246,7 @@ fn claude_quota_snapshot(source_id: &str, value: &Value) -> Option<QuotaSnapshot
     Some(QuotaSnapshot {
         source_id: source_id.to_string(),
         provider: QuotaProvider::Claude,
+        probe_source: QuotaProbeSource::AcpUsageMetadata,
         quota_known: used_percent.is_some() || reset_at_unix.is_some(),
         remaining_percent,
         used_percent,
@@ -208,6 +276,7 @@ fn generic_quota_snapshot(source_id: &str, value: &Value) -> Option<QuotaSnapsho
     Some(QuotaSnapshot {
         source_id: source_id.to_string(),
         provider,
+        probe_source: QuotaProbeSource::AcpUsageMetadata,
         quota_known: used_percent.is_some()
             || remaining_percent.is_some()
             || reset_at_unix.is_some(),
@@ -219,6 +288,153 @@ fn generic_quota_snapshot(source_id: &str, value: &Value) -> Option<QuotaSnapsho
         message,
         observed_at_unix: now_unix(),
     })
+}
+
+fn snapshot_from_probe_json(source_id: &str, value: &Value) -> Option<QuotaSnapshot> {
+    let object = value.as_object()?;
+    let provider = string_field(object, "provider", "provider")
+        .map(provider_from_str)
+        .unwrap_or_else(|| detect_quota_provider(source_id));
+    let used_percent = number_field(object, "usedPercent", "used_percent")
+        .or_else(|| number_field(object, "utilization", "utilization"))
+        .map(|used| used.round().clamp(0.0, 100.0));
+    let remaining_percent = number_field(object, "remainingPercent", "remaining_percent")
+        .map(|remaining| remaining.round().clamp(0.0, 100.0))
+        .or_else(|| used_percent.map(|used| (100.0 - used).max(0.0)));
+    let reset_at_unix = number_field(object, "resetsAt", "resets_at")
+        .or_else(|| number_field(object, "resetAt", "reset_at"))
+        .and_then(epoch_to_unix);
+    let window = string_field(object, "window", "window").map(str::to_string);
+    let available = object
+        .get("available")
+        .and_then(Value::as_bool)
+        .or_else(|| remaining_percent.map(|remaining| remaining > 0.0));
+    let message = string_field(object, "message", "message")
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            quota_message(
+                window.as_deref(),
+                used_percent,
+                remaining_percent,
+                reset_at_unix,
+            )
+        });
+
+    Some(QuotaSnapshot {
+        source_id: source_id.to_string(),
+        provider,
+        probe_source: QuotaProbeSource::Unknown,
+        quota_known: true,
+        remaining_percent,
+        used_percent,
+        reset_at_unix,
+        window,
+        available,
+        message,
+        observed_at_unix: now_unix(),
+    })
+}
+
+#[derive(Debug)]
+struct QuotaProbeCommand {
+    program: String,
+    args: Vec<String>,
+}
+
+#[derive(Debug)]
+enum QuotaProbe {
+    Command {
+        command: QuotaProbeCommand,
+        source: QuotaProbeSource,
+    },
+    Http {
+        url: String,
+        token: Option<String>,
+        source: QuotaProbeSource,
+    },
+}
+
+fn quota_probe(agent: &SelectedAgent) -> Option<QuotaProbe> {
+    per_agent_quota_probe(agent)
+        .or_else(|| claude_sdk_quota_probe(agent))
+        .or_else(|| codex_appserver_quota_probe(agent))
+}
+
+fn per_agent_quota_probe(agent: &SelectedAgent) -> Option<QuotaProbe> {
+    let env_key = quota_probe_env_key(&agent.source_id);
+    let command = std::env::var(&env_key).ok()?;
+    quota_command_from_string(&command).map(|command| QuotaProbe::Command {
+        command,
+        source: QuotaProbeSource::AgentCommand,
+    })
+}
+
+fn claude_sdk_quota_probe(agent: &SelectedAgent) -> Option<QuotaProbe> {
+    if detect_quota_provider(&agent.source_id) != QuotaProvider::Claude {
+        return None;
+    }
+    let command = std::env::var("MJ_THOR_CLAUDE_SDK_QUOTA_CMD").ok()?;
+    quota_command_from_string(&command).map(|command| QuotaProbe::Command {
+        command,
+        source: QuotaProbeSource::ClaudeSdk,
+    })
+}
+
+fn codex_appserver_quota_probe(agent: &SelectedAgent) -> Option<QuotaProbe> {
+    if detect_quota_provider(&agent.source_id) != QuotaProvider::Codex {
+        return None;
+    }
+    if let Ok(command) = std::env::var("MJ_THOR_CODEX_APPSERVER_QUOTA_CMD") {
+        return quota_command_from_string(&command).map(|command| QuotaProbe::Command {
+            command,
+            source: QuotaProbeSource::CodexAppserver,
+        });
+    }
+    let url = std::env::var("MJ_THOR_CODEX_APPSERVER_QUOTA_URL")
+        .ok()
+        .or_else(|| {
+            std::env::var("MJ_THOR_CODEX_APPSERVER_URL")
+                .ok()
+                .map(|base| format!("{}/quota", base.trim_end_matches('/')))
+        })?;
+    let token = std::env::var("MJ_THOR_CODEX_APPSERVER_TOKEN").ok();
+    Some(QuotaProbe::Http {
+        url,
+        token,
+        source: QuotaProbeSource::CodexAppserver,
+    })
+}
+
+fn quota_command_from_string(command: &str) -> Option<QuotaProbeCommand> {
+    let parts = shell_words::split(command).ok()?;
+    let (program, args) = parts.split_first()?;
+    Some(QuotaProbeCommand {
+        program: program.clone(),
+        args: args.to_vec(),
+    })
+}
+
+fn quota_probe_env_key(source_id: &str) -> String {
+    let suffix = source_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("MJ_THOR_QUOTA_PROBE_{suffix}")
+}
+
+fn provider_from_str(provider: &str) -> QuotaProvider {
+    match provider.to_ascii_lowercase().as_str() {
+        "claude" | "anthropic" | "claude_code" | "claude-code" => QuotaProvider::Claude,
+        "codex" | "openai" | "gpt" => QuotaProvider::Codex,
+        "generic" => QuotaProvider::Generic,
+        _ => QuotaProvider::Unknown,
+    }
 }
 
 fn find_quota_like_value(value: &Value) -> Option<&Value> {
@@ -419,6 +635,36 @@ mod tests {
         assert_eq!(snapshot.used_percent, Some(99.0));
         assert_eq!(snapshot.remaining_percent, Some(1.0));
         assert_eq!(snapshot.available, Some(true));
+    }
+
+    #[test]
+    fn parses_provider_probe_json_for_codex_appserver() {
+        let snapshot = snapshot_from_probe_json(
+            "codex",
+            &json!({
+                "provider": "codex",
+                "remainingPercent": 37,
+                "resetAt": 1_800_000_002,
+                "window": "daily",
+                "available": true,
+                "message": "daily: 37% remaining"
+            }),
+        )
+        .expect("snapshot");
+
+        assert_eq!(snapshot.provider, QuotaProvider::Codex);
+        assert_eq!(snapshot.remaining_percent, Some(37.0));
+        assert_eq!(snapshot.reset_at_unix, Some(1_800_000_002));
+        assert_eq!(snapshot.window.as_deref(), Some("daily"));
+        assert_eq!(snapshot.available, Some(true));
+    }
+
+    #[test]
+    fn per_agent_quota_probe_env_key_is_stable() {
+        assert_eq!(
+            quota_probe_env_key("custom:claude-code"),
+            "MJ_THOR_QUOTA_PROBE_CUSTOM_CLAUDE_CODE"
+        );
     }
 
     #[tokio::test]

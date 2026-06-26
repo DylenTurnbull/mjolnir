@@ -54,6 +54,13 @@ struct ToolCallParams {
     arguments: Value,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAgentsArgs {
+    #[serde(default)]
+    refresh_quota: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunAgentArgs {
@@ -253,6 +260,20 @@ fn tool_definitions() -> Vec<Value> {
             "description": "List ACP agents mj can launch as Thor workers, including cached quota signals when available.",
             "inputSchema": {
                 "type": "object",
+                "properties": {
+                    "refreshQuota": {
+                        "type": "boolean",
+                        "description": "When true, actively refresh quota through configured Claude SDK / Codex appserver probes before returning workers."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "thor_refresh_quota",
+            "description": "Actively refresh quota/capacity hints for configured workers through provider probes such as Claude SDK commands or Codex appserver endpoints.",
+            "inputSchema": {
+                "type": "object",
                 "properties": {},
                 "additionalProperties": false
             }
@@ -330,8 +351,20 @@ async fn call_tool(params: ToolCallParams, config_path: Option<PathBuf>) -> Resu
     match params.name.as_str() {
         "thor_list_acp_agents" => {
             let config = load_config(config_path.as_ref())?;
-            let quota = thor_probe::load_quota_snapshots().unwrap_or_default();
-            let agents = thor::worker_catalog(&config)
+            let workers = thor::worker_catalog(&config);
+            let args: ListAgentsArgs = if params.arguments.is_null() {
+                ListAgentsArgs::default()
+            } else {
+                serde_json::from_value(params.arguments)?
+            };
+            let mut quota = thor_probe::load_quota_snapshots().unwrap_or_default();
+            if args.refresh_quota {
+                let refreshed = thor_probe::refresh_configured_quota_snapshots(&workers).await;
+                if !refreshed.is_empty() {
+                    quota = thor_probe::load_quota_snapshots().unwrap_or(refreshed);
+                }
+            }
+            let agents = workers
                 .into_iter()
                 .map(|agent| AgentSummary {
                     quota: quota
@@ -345,6 +378,13 @@ async fn call_tool(params: ToolCallParams, config_path: Option<PathBuf>) -> Resu
                 })
                 .collect::<Vec<_>>();
             Ok(tool_text_result(&serde_json::to_string_pretty(&agents)?))
+        }
+        "thor_refresh_quota" => {
+            let config = load_config(config_path.as_ref())?;
+            let snapshots =
+                thor_probe::refresh_configured_quota_snapshots(&thor::worker_catalog(&config))
+                    .await;
+            Ok(tool_text_result(&serde_json::to_string_pretty(&snapshots)?))
         }
         "thor_validate_acp_agents" => {
             let config = load_config(config_path.as_ref())?;
@@ -879,6 +919,7 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "thor_get_model_catalog"));
         assert!(names.iter().any(|name| name == "thor_validate_acp_agents"));
+        assert!(names.iter().any(|name| name == "thor_refresh_quota"));
         assert!(names.iter().any(|name| name == "thor_run_acp_agents"));
     }
 

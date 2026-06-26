@@ -42,8 +42,9 @@ changed and how much each harness/model used.
 - Other model families prefer Anvil when Anvil is configured for that model.
 - Claude Code and Codex subscriptions are used evenly and maximally before
   falling back to metered OpenRouter routing, subject to remaining
-  quota/rate-limit hints reported by ACP `UsageUpdate` metadata. Unknown quota
-  remains unknown; Thor must not invent availability.
+  quota/rate-limit hints reported by active Claude SDK / Codex appserver probes
+  or ACP `UsageUpdate` metadata. Unknown quota remains unknown; Thor must not
+  invent availability.
 - Simple tasks should prefer cheaper capable models; hard tasks should prefer
   stronger models.
 - Every implemented task must include an adversarial review and correction
@@ -69,8 +70,24 @@ changed and how much each harness/model used.
    on raw worker transcript dumps.
 8. Done: validate ACP worker candidates during onboarding and expose a Thor MCP
    validation tool for re-checking configured workers.
-9. Done: detect and cache quota/rate-limit hints from ACP worker usage metadata
-   and include those hints in worker listings and run results.
+9. Done: detect and cache quota/rate-limit hints from active provider probes
+   and ACP worker usage metadata, then include those hints in worker listings
+   and run results.
+
+## Quota probes
+
+Active quota detection is provider-specific. `mj` supports:
+
+- Claude SDK command probes via `MJ_THOR_CLAUDE_SDK_QUOTA_CMD`.
+- Codex appserver HTTP probes via `MJ_THOR_CODEX_APPSERVER_QUOTA_URL`, or a
+  base `MJ_THOR_CODEX_APPSERVER_URL` whose `/quota` endpoint returns JSON.
+- Codex appserver command probes via `MJ_THOR_CODEX_APPSERVER_QUOTA_CMD`.
+- Per-agent command probes via `MJ_THOR_QUOTA_PROBE_<SOURCE_ID>`.
+
+Probe commands/endpoints must return JSON with fields such as `provider`,
+`usedPercent`, `remainingPercent`, `resetAt`, `window`, `available`, and
+`message`. ACP `UsageUpdate` rate-limit metadata is still cached as a fallback
+when provider probes are unavailable.
 
 ## Data sources
 
