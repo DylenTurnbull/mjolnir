@@ -518,6 +518,10 @@ args = ["--flag", "$HOME/data"]
             "Thor coordinator default should be visible: {body:?}"
         );
         assert!(
+            body.contains("onboarding_complete = false"),
+            "Thor onboarding marker should be visible: {body:?}"
+        );
+        assert!(
             body.contains("optimization_mode = \"balanced\""),
             "Thor optimization default should be visible: {body:?}"
         );
@@ -540,6 +544,7 @@ args = ["--flag", "$HOME/data"]
 
         let cfg = Config {
             thor: ThorConfig {
+                onboarding_complete: true,
                 coordinator_model: "anthropic/claude-example".to_string(),
                 leaderboard_url: crate::thor::LM_ARENA_LEADERBOARD_URL.to_string(),
                 pricing_url: crate::thor::OPENROUTER_MODELS_URL.to_string(),

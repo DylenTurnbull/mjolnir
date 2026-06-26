@@ -42,6 +42,8 @@ pub enum ThorOptimizationMode {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ThorConfig {
+    #[serde(default)]
+    pub onboarding_complete: bool,
     #[serde(default = "default_coordinator_model")]
     pub coordinator_model: String,
     #[serde(default = "default_leaderboard_url")]
@@ -57,6 +59,7 @@ pub struct ThorConfig {
 impl Default for ThorConfig {
     fn default() -> Self {
         Self {
+            onboarding_complete: false,
             coordinator_model: default_coordinator_model(),
             leaderboard_url: default_leaderboard_url(),
             pricing_url: default_pricing_url(),

@@ -737,12 +737,8 @@ fn prepare_existing_worktree(cwd: &std::path::Path, name_or_path: &str) -> Resul
     Ok(opened)
 }
 
-fn should_open_first_run_setup(
-    config_exists: bool,
-    cfg: &Config,
-    initial_agent: Option<&SelectedAgent>,
-) -> bool {
-    !config_exists && cfg.agent.is_none() && initial_agent.is_none()
+fn should_open_thor_onboarding(cfg: &Config, initial_agent: Option<&SelectedAgent>) -> bool {
+    !cfg.thor.onboarding_complete && initial_agent.is_none()
 }
 
 fn ensure_thor_default_agent(cfg: &mut Config) -> SelectedAgent {
@@ -793,7 +789,6 @@ async fn run_app(
     mode: UiMode,
 ) -> Result<Option<String>> {
     let config_path = config::default_config_path();
-    let config_exists = config_path.exists();
     let mut cfg = Config::load(&config_path)?;
 
     // Supervisor loop. Thor sessions use the configured backend when available
@@ -801,15 +796,14 @@ async fn run_app(
     // Consume resume_session and initial_agent on the first iteration only.
     let mut initial_resume = resume_target;
     let mut initial_agent = initial_agent;
-    let mut first_run_setup =
-        should_open_first_run_setup(config_exists, &cfg, initial_agent.as_ref());
+    let mut thor_onboarding = should_open_thor_onboarding(&cfg, initial_agent.as_ref());
     loop {
         let resume = initial_resume.take();
         let agent = if let Some(agent) = initial_agent.take() {
             agent
-        } else if first_run_setup {
-            first_run_setup = false;
-            match run_first_run_setup(&mut cfg, &config_path).await? {
+        } else if thor_onboarding {
+            thor_onboarding = false;
+            match run_thor_onboarding(&mut cfg, &config_path).await? {
                 Some(agent) => agent,
                 None => return Ok(None),
             }
@@ -882,7 +876,7 @@ async fn run_app(
     }
 }
 
-async fn run_first_run_setup(
+async fn run_thor_onboarding(
     cfg: &mut Config,
     config_path: &Path,
 ) -> Result<Option<SelectedAgent>> {
@@ -905,6 +899,7 @@ async fn run_first_run_setup(
         return Ok(None);
     };
     cfg.spinner = spinner_style;
+    cfg.thor.onboarding_complete = true;
     cfg.save(config_path)
         .with_context(|| format!("save {}", config_path.display()))?;
     Ok(Some(agent))
@@ -1525,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn first_run_setup_opens_only_for_missing_config_without_agent() {
+    fn thor_onboarding_opens_until_completed_marker_is_saved() {
         let configured = SelectedAgent {
             source_id: "claude-acp".to_string(),
             program: PathBuf::from("npx"),
@@ -1539,22 +1534,36 @@ mod tests {
             env: Default::default(),
         };
 
-        assert!(should_open_first_run_setup(false, &Config::default(), None));
-        assert!(!should_open_first_run_setup(true, &Config::default(), None));
-        assert!(!should_open_first_run_setup(
-            false,
+        assert!(should_open_thor_onboarding(&Config::default(), None));
+        assert!(
+            should_open_thor_onboarding(
+                &Config {
+                    theme: Default::default(),
+                    spinner: Default::default(),
+                    thor: Default::default(),
+                    agent: Some(configured.clone()),
+                    favorite_agents: Vec::new(),
+                    custom_agents: Vec::new(),
+                },
+                None
+            ),
+            "old configs with a silently created host still need Thor onboarding"
+        );
+        assert!(!should_open_thor_onboarding(
             &Config {
                 theme: Default::default(),
                 spinner: Default::default(),
-                thor: Default::default(),
+                thor: thor::ThorConfig {
+                    onboarding_complete: true,
+                    ..Default::default()
+                },
                 agent: Some(configured),
                 favorite_agents: Vec::new(),
                 custom_agents: Vec::new(),
             },
             None
         ));
-        assert!(!should_open_first_run_setup(
-            false,
+        assert!(!should_open_thor_onboarding(
             &Config::default(),
             Some(&initial)
         ));
