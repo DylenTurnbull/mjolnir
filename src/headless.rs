@@ -1,8 +1,8 @@
 //! Non-interactive `mj --print` runner.
 //!
 //! This reuses the same ACP runtime as the TUI and swaps the terminal UI for a
-//! small event collector. It intentionally requires an already-selected agent in
-//! `~/.config/mj/config.toml`; the interactive picker remains a TUI concern.
+//! small event collector. Thor-enabled runs default to the Anvil ACP backend
+//! when `~/.config/mj/config.toml` has no configured backend yet.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,10 +15,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::acp::{self, AcpRuntimeConfig};
+use crate::acp::AcpRuntimeConfig;
 use crate::config;
 use crate::event::{PermissionDecision, UiCommand, UiEvent, content_block_text};
 use crate::remote;
+use crate::thor;
 
 #[derive(Debug, Clone, Copy)]
 pub enum OutputFormat {
@@ -116,17 +117,23 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     }
 
     let config_path = config::default_config_path();
-    let app_config = config::Config::load(&config_path)
+    let mut app_config = config::Config::load(&config_path)
         .with_context(|| format!("load {}", config_path.display()))?;
-    let agent = app_config.agent.ok_or_else(|| {
-        anyhow!(
-            "no agent configured; run interactive `mj` once to pick an agent, or write {}",
-            config_path.display()
-        )
-    })?;
+    let agent = match app_config.agent.take() {
+        Some(agent) => agent,
+        None => {
+            let agent = thor::default_anvil_agent();
+            app_config.agent = Some(agent.clone());
+            app_config
+                .save(&config_path)
+                .with_context(|| format!("save {}", config_path.display()))?;
+            agent
+        }
+    };
 
     let project_label = crate::paths::project_label_from_cwd(&cfg.cwd);
     let agent_label = remote::agent_display_label(&agent);
+    let thor_config = app_config.thor.clone();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let runtime_cfg = AcpRuntimeConfig {
@@ -140,11 +147,26 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         fs_max_text_bytes: cfg.fs_max_text_bytes,
     };
 
-    let runtime = tokio::spawn(async move { acp::run(runtime_cfg, event_tx, cmd_rx).await });
+    let runtime = tokio::spawn(async move {
+        crate::thor::run(
+            crate::thor::ThorRuntimeConfig {
+                thor: thor_config,
+                worker: runtime_cfg,
+                worker_label: agent_label,
+            },
+            event_tx,
+            cmd_rx,
+        )
+        .await
+    });
     // No UI event channel: headless answers permissions by policy, so
     // remote decisions have nothing to resolve.
-    let remote_tracker =
-        remote::RemoteSessionTracker::new(project_label, agent_label, Some(cmd_tx.clone()), None);
+    let remote_tracker = remote::RemoteSessionTracker::new(
+        project_label,
+        "Thor".to_string(),
+        Some(cmd_tx.clone()),
+        None,
+    );
 
     let mut state = HeadlessState::default();
     let mut sent_prompt = false;
@@ -406,6 +428,14 @@ fn permission_decision(
     tool_call: &ToolCallUpdate,
     options: &[agent_client_protocol::schema::v1::PermissionOption],
 ) -> Option<String> {
+    if is_thor_plan_approval(tool_call) {
+        return options
+            .iter()
+            .find(|option| option.option_id.to_string() == "approve")
+            .map(|option| option.option_id.to_string())
+            .or_else(|| choose_allow_option(options));
+    }
+
     let allow = match mode {
         PermissionMode::Default => false,
         PermissionMode::BypassPermissions => true,
@@ -418,6 +448,11 @@ fn permission_decision(
         return None;
     }
     choose_allow_option(options)
+}
+
+fn is_thor_plan_approval(tool_call: &ToolCallUpdate) -> bool {
+    tool_call.tool_call_id.to_string() == crate::thor::PLAN_APPROVAL_TOOL_CALL_ID
+        && matches!(tool_call.fields.kind, Some(ToolKind::Think))
 }
 
 fn choose_allow_option(
@@ -473,5 +508,52 @@ fn tool_status_label(status: ToolCallStatus) -> &'static str {
         ToolCallStatus::Completed => "completed",
         ToolCallStatus::Failed => "failed",
         _ => "other",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::schema::v1::{
+        PermissionOption, PermissionOptionKind, ToolCallUpdateFields,
+    };
+
+    fn permission_options() -> Vec<PermissionOption> {
+        vec![
+            PermissionOption::new(
+                "approve",
+                "Approve Thor plan",
+                PermissionOptionKind::AllowOnce,
+            ),
+            PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectOnce),
+        ]
+    }
+
+    fn tool_call(id: &str, kind: ToolKind) -> ToolCallUpdate {
+        let mut fields = ToolCallUpdateFields::default();
+        fields.kind = Some(kind);
+        ToolCallUpdate::new(id.to_string(), fields)
+    }
+
+    #[test]
+    fn default_headless_mode_auto_accepts_thor_plan_approval() {
+        let decision = permission_decision(
+            PermissionMode::Default,
+            &tool_call(crate::thor::PLAN_APPROVAL_TOOL_CALL_ID, ToolKind::Think),
+            &permission_options(),
+        );
+
+        assert_eq!(decision.as_deref(), Some("approve"));
+    }
+
+    #[test]
+    fn default_headless_mode_still_rejects_worker_think_permissions() {
+        let decision = permission_decision(
+            PermissionMode::Default,
+            &tool_call("worker-think", ToolKind::Think),
+            &permission_options(),
+        );
+
+        assert_eq!(decision, None);
     }
 }

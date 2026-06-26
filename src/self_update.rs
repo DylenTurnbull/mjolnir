@@ -1,7 +1,7 @@
 //! Startup self-update for the `mj` binary.
 //!
-//! This intentionally updates only mjolnir itself. Agent binaries such as
-//! anvil and bifrost are installed or upgraded through the agent picker.
+//! This intentionally updates only mjolnir itself. Worker backends such as
+//! anvil are managed outside the self-updater.
 
 use std::ffi::OsString;
 use std::io::{self, Cursor, IsTerminal, Read, Write};

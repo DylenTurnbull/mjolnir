@@ -1,90 +1,22 @@
-//! Install a registry agent's binary distribution locally.
-//!
-//! Downloads the archive declared in `BinaryTarget`, extracts it under
-//! `~/.cache/mj/agents/<id>/<version>/`, and returns the launch command
-//! ready to spawn. Idempotent: once the `.installed` sentinel is present,
-//! subsequent calls only resolve paths.
+//! Download and extract runtime archives used by mj.
 
 use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::registry::BinaryTarget;
-
 /// Streaming progress event emitted while downloading.
 #[derive(Debug, Clone)]
 pub enum Progress {
-    /// Started fetching `total_bytes` (may be `None` if the server omits Content-Length).
-    Started { total_bytes: Option<u64> },
-    /// Received another chunk; `downloaded_bytes` is the cumulative count.
-    Downloaded { downloaded_bytes: u64 },
+    /// Started fetching an archive.
+    Started,
+    /// Received another archive chunk.
+    Downloaded,
     /// Download finished; extraction begins.
     Extracting,
-    /// Install complete.
-    Done,
-}
-
-/// Where extracted agents live: `$XDG_CACHE_HOME/mj/agents` (or
-/// `~/.cache/mj/agents`). One subdirectory per `<id>/<version>`.
-pub fn default_install_root() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from(".cache"))
-        .join("mj")
-        .join("agents")
-}
-
-/// Install (if needed) the binary for `agent_id` at `version` and return
-/// the resolved (program, args) launch command. Skips download+extract
-/// when the install sentinel is already present.
-///
-/// `progress_tx` receives streaming updates so a UI can show a spinner.
-/// Pass a no-op channel (`mpsc::unbounded_channel().0`) to ignore them.
-pub async fn install_or_resolve(
-    agent_id: &str,
-    version: &str,
-    target: &BinaryTarget,
-    install_root: &Path,
-    progress_tx: mpsc::UnboundedSender<Progress>,
-) -> Result<(PathBuf, Vec<String>)> {
-    let dir = install_root.join(agent_id).join(version);
-    let sentinel = dir.join(".installed");
-
-    if !sentinel.exists() {
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("create install dir {}", dir.display()))?;
-        download_and_extract(&target.archive, &dir, &progress_tx).await?;
-        std::fs::write(&sentinel, "ok")
-            .with_context(|| format!("write install sentinel {}", sentinel.display()))?;
-    }
-
-    let program = resolve_cmd_path(&dir, &target.cmd)?;
-    let _ = progress_tx.send(Progress::Done);
-    Ok((program, target.args.clone()))
-}
-
-/// Resolve `cmd` (e.g. `./codex-acp`, `./bin/agent.exe`) against the
-/// install directory. Rejects paths that escape `dir` for safety.
-fn resolve_cmd_path(dir: &Path, cmd: &str) -> Result<PathBuf> {
-    let stripped = cmd.strip_prefix("./").unwrap_or(cmd);
-    let joined = dir.join(stripped);
-    // Refuse anything that walks out of the install dir; archive entries
-    // are untrusted input.
-    let canon_dir = std::fs::canonicalize(dir)
-        .with_context(|| format!("canonicalize install dir {}", dir.display()))?;
-    let canon_cmd = std::fs::canonicalize(&joined)
-        .with_context(|| format!("locate executable {}", joined.display()))?;
-    if !canon_cmd.starts_with(&canon_dir) {
-        anyhow::bail!(
-            "executable {} resolves outside install dir {}",
-            canon_cmd.display(),
-            canon_dir.display()
-        );
-    }
-    Ok(canon_cmd)
 }
 
 pub(crate) async fn download_and_extract(
@@ -108,16 +40,14 @@ pub(crate) async fn download_and_extract(
     }
 
     let total_bytes = resp.content_length();
-    let _ = progress_tx.send(Progress::Started { total_bytes });
+    let _ = progress_tx.send(Progress::Started);
 
     let mut bytes: Vec<u8> = Vec::with_capacity(total_bytes.unwrap_or(0) as usize);
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.with_context(|| format!("read chunk from {url}"))?;
         bytes.extend_from_slice(&chunk);
-        let _ = progress_tx.send(Progress::Downloaded {
-            downloaded_bytes: bytes.len() as u64,
-        });
+        let _ = progress_tx.send(Progress::Downloaded);
     }
 
     let _ = progress_tx.send(Progress::Extracting);
@@ -206,14 +136,6 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn fake_target(archive: &str, cmd: &str) -> BinaryTarget {
-        BinaryTarget {
-            archive: archive.to_string(),
-            cmd: cmd.to_string(),
-            args: vec!["--flag".to_string()],
-        }
-    }
-
     /// Build a small tar.gz in memory containing one executable file.
     fn make_tar_gz(file_name: &str, content: &[u8]) -> Vec<u8> {
         use flate2::Compression;
@@ -257,48 +179,5 @@ mod tests {
         assert!(path.exists(), "expected {} to exist", path.display());
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("echo ok"));
-    }
-
-    #[test]
-    fn resolve_cmd_path_strips_dot_slash() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bin = dir.path().join("agent-bin");
-        std::fs::write(&bin, b"x").expect("write");
-        let resolved = resolve_cmd_path(dir.path(), "./agent-bin").expect("resolve");
-        assert_eq!(
-            std::fs::canonicalize(&resolved).expect("canon"),
-            std::fs::canonicalize(&bin).expect("canon bin")
-        );
-    }
-
-    #[test]
-    fn resolve_cmd_path_rejects_parent_traversal() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
-        // Try to escape via `..`.
-        let result = resolve_cmd_path(&dir.path().join("sub"), "../whatever");
-        assert!(result.is_err(), "expected rejection, got {result:?}");
-    }
-
-    #[tokio::test]
-    async fn install_skips_when_sentinel_present() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let install_root = dir.path();
-        let agent_dir = install_root.join("test-agent").join("1.0.0");
-        std::fs::create_dir_all(&agent_dir).expect("mkdir");
-        let bin = agent_dir.join("bin");
-        std::fs::write(&bin, b"#!/bin/sh\n").expect("write bin");
-        std::fs::write(agent_dir.join(".installed"), "ok").expect("sentinel");
-
-        let target = fake_target("https://not-used.example.com/x.tar.gz", "./bin");
-        let (tx, _rx) = mpsc::unbounded_channel::<Progress>();
-        let (program, args) = install_or_resolve("test-agent", "1.0.0", &target, install_root, tx)
-            .await
-            .expect("resolve");
-        assert_eq!(
-            std::fs::canonicalize(&program).expect("canon"),
-            std::fs::canonicalize(&bin).expect("canon bin")
-        );
-        assert_eq!(args, vec!["--flag"]);
     }
 }

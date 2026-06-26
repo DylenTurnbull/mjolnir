@@ -38,12 +38,13 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::acp::{self, AcpRuntimeConfig};
+use crate::acp::AcpRuntimeConfig;
 use crate::config::{self, SelectedAgent};
 use crate::event::{
     PermissionDecision, PermissionPrompt, SessionConfigTarget, TerminalOutputSnapshot, UiCommand,
     UiEvent,
 };
+use crate::thor::{self, ThorRuntimeConfig};
 
 const REMOTE_CONTROL_LOCAL_ADDR: &str = "127.0.0.1:11921";
 const REMOTE_CONTROL_PUBLIC_ADDR: &str = "0.0.0.0:11921";
@@ -1233,13 +1234,19 @@ pub async fn run_server(
     install_crypto_provider();
 
     let config_path = config::default_config_path();
-    let cfg = config::Config::load(&config_path)
+    let mut cfg = config::Config::load(&config_path)
         .with_context(|| format!("load {}", config_path.display()))?;
-    let agent = cfg.agent.ok_or_else(|| {
-        anyhow!(
-            "no default agent configured; run `mj` once to pick an agent before starting `mj server`"
-        )
-    })?;
+    let agent = match cfg.agent.clone() {
+        Some(agent) => agent,
+        None => {
+            let agent = thor::default_anvil_agent();
+            cfg.agent = Some(agent.clone());
+            cfg.save(&config_path)
+                .with_context(|| format!("save {}", config_path.display()))?;
+            agent
+        }
+    };
+    let thor_config = cfg.thor.clone();
 
     let requested_hostname = normalize_requested_hostname(hostname.as_deref());
     let listen = server_listen_config(requested_hostname.as_deref())?;
@@ -1276,8 +1283,13 @@ pub async fn run_server(
     let server_task = tokio::spawn(server);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let agent_session =
-        start_server_agent_session(agent, cwd, additional_directories, fs_max_text_bytes);
+    let agent_session = start_server_agent_session(
+        agent,
+        thor_config,
+        cwd,
+        additional_directories,
+        fs_max_text_bytes,
+    );
     let mut agent_session = Some(agent_session);
     let mut server_task = server_task;
     let result = tokio::select! {
@@ -1301,6 +1313,7 @@ pub async fn run_server(
 
 fn start_server_agent_session(
     agent: SelectedAgent,
+    thor_config: thor::ThorConfig,
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
     fs_max_text_bytes: u64,
@@ -1308,7 +1321,8 @@ fn start_server_agent_session(
     let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
     let (runtime_cmd_tx, runtime_cmd_rx) = mpsc::unbounded_channel();
     let (remote_event_tx, mut remote_event_rx) = mpsc::unbounded_channel();
-    let agent_label = agent_display_label(&agent);
+    let worker_label = agent_display_label(&agent);
+    let agent_label = "Thor".to_string();
     let project_label = crate::paths::project_label_from_cwd(&cwd);
     let tracker = RemoteSessionTracker::new(
         project_label,
@@ -1331,8 +1345,18 @@ fn start_server_agent_session(
 
     let task = tokio::spawn(async move {
         let runtime = tokio::spawn(async move {
-            if let Err(error) = acp::run(runtime_cfg, runtime_event_tx, runtime_cmd_rx).await {
-                debug!("server agent session exited: {error:#}");
+            if let Err(error) = thor::run(
+                ThorRuntimeConfig {
+                    thor: thor_config,
+                    worker: runtime_cfg,
+                    worker_label,
+                },
+                runtime_event_tx,
+                runtime_cmd_rx,
+            )
+            .await
+            {
+                debug!("server Thor session exited: {error:#}");
             }
         });
         tokio::pin!(runtime);

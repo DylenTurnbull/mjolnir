@@ -17,14 +17,16 @@ Relevant Brokk history:
 - The repo was briefly named `hammer`; it is now `mjolnir`, with binary `mj`.
 
 The original intent was broader than "a Brokk TUI": build a native Rust terminal
-client that speaks the Agent Client Protocol (ACP) to any conformant agent. It
-defaults to `anvil`, but the client should stay agent-agnostic.
+client whose only prompt interface is Thor, backed by Agent Client Protocol
+(ACP) worker harnesses. The default worker backend is `anvil`, but Thor should
+stay harness-agnostic.
 
 ## Current status
 
 The current crate is already a usable MVP:
 
-- Spawns an ACP agent process, defaulting to `anvil` on `PATH`.
+- Spawns Thor as the user-facing coordinator and delegates approved work to an
+  ACP worker process, defaulting to `anvil` on `PATH`.
 - Talks ACP JSON-RPC over the child process stdio.
 - Opens a new ACP session for `--cwd` or the current directory.
 - Sends text prompts and receives prompt responses.
@@ -44,13 +46,9 @@ Current command-line surface:
 - `mj --log-file /path/to/mj.log` for TUI logs.
 - `mj --agent-stderr /path/to/agent.err` for child-process stderr.
 
-There is no `--command` / `--agent` flag. The agent is chosen interactively in
-a picker on the first launch (or whenever `~/.config/mj/config.toml` is missing
-the `agent` block), and can be changed later with the in-TUI `/mj:agents`
-command. The picker is backed by the official
-[agentclientprotocol/registry](https://github.com/agentclientprotocol/registry)
-index (24h on-disk cache) with native binary install, plus the bundled `anvil`
-default and a `Custom command...` entry for arbitrary launch strings.
+There is no `--command` / `--agent` flag. Startup creates an `anvil` backend
+default automatically when `~/.config/mj/config.toml` has no `agent` block.
+The previous agent picker is no longer part of the normal user path.
 
 M1 hardening landed (PR #34): an explicit `ConnectionState` lifecycle drives
 the header label, a `LaunchError` enum surfaces spawn / initialize /
@@ -60,17 +58,19 @@ single Fatal instead of an unbounded "prompt failed" stream.
 
 ## Product goal
 
-Make `mjolnir` the best small terminal client for ACP agents:
+Make `mjolnir` the best small terminal client for Thor, an omni-agent
+coordinator that routes work across ACP harnesses:
 
-1. Agent-agnostic: works with Brokk, Codex-style agents, Claude ACP agents,
-   Gemini agents, Goose, and any other ACP-compatible server.
-2. Terminal-native: fast startup, reliable keyboard UX, readable output, and no
+1. Thor-first: users type one prompt, approve one plan, and receive one recap.
+2. Agent-agnostic underneath: works with Brokk, Codex-style agents, Claude ACP
+   agents, Gemini agents, Goose, and any other ACP-compatible server.
+3. Terminal-native: fast startup, reliable keyboard UX, readable output, and no
    GUI assumptions.
-3. Protocol-faithful: use ACP primitives directly instead of inventing
+4. Protocol-faithful: use ACP primitives directly instead of inventing
    Brokk-only control paths.
-4. Safe by default: permission prompts are clear, never auto-accepted, and do
+5. Safe by default: permission prompts are clear, never auto-accepted, and do
    not block the JSON-RPC dispatch loop.
-5. Easy to install and run: one binary, simple launch flags, sane defaults.
+6. Easy to install and run: one binary, simple launch flags, sane defaults.
 
 ## Non-goals
 
@@ -84,8 +84,42 @@ repository:
 - Building a Tauri/Svelte desktop app like the removed `brokk-foreman` plan.
 - Building an ACP registry browser with install/uninstall flows in v1.
 - Multi-repo project management.
-- Multiple concurrent ACP sessions in one UI.
+- Multiple raw ACP chat sessions in one UI. Thor may supervise multiple worker
+  sessions, but the user-facing interface should remain one coordinated flow.
 - Agent-side credential management beyond surfacing ACP auth failures clearly.
+
+## Thor coordinator direction
+
+Thor is not a subagent framework. It is a coordinator persona backed by a strong
+model and a small set of tools. At startup, Thor receives configured ACP
+harnesses, model metadata, model strength scores, pricing, quota hints, user
+preferences, and the user's prompt. It decides how to split the work, presents
+the plan for approval, then launches ACP worker sessions and monitors them until
+the task is complete. The current implementation routes submitted prompts
+through Thor, asks for plan approval, delegates to the configured ACP backend,
+and appends a Thor recap; multi-worker scheduling is the next runtime step.
+
+The durable plan lives in
+[docs/thor-coordinator-plan.md](docs/thor-coordinator-plan.md).
+
+Initial routing policy:
+
+- Thor supports balanced, cost/accountant, and best-solution/architect
+  optimization modes.
+- LM Arena leaderboard metadata ranks model strength.
+- OpenRouter model metadata supplies non-subscription pricing.
+- Claude-family models prefer Claude Code when configured.
+- GPT/OpenAI-family models prefer Codex when configured.
+- Other models prefer Anvil when configured for the target model.
+- Claude Code and Codex subscription quota is used evenly and maximally before
+  metered OpenRouter fallback.
+- Cost/accountant mode prefers cheaper capable models when Thor judges the task
+  simple enough.
+- Best-solution/architect mode runs two independent versions with different
+  model families for complex work, then Thor compares and chooses the better
+  result.
+- Every implemented task includes an adversarial review and correction cycle
+  before final recap; review uses different vendor models when capacity allows.
 
 ## Architecture
 
@@ -205,13 +239,12 @@ Deliverables:
 - Search or filter over the transcript.
 - Copy-friendly transcript output mode or an export command.
 - Session title display and clearer session metadata.
-- ✅ Interactive agent picker backed by the ACP registry with native binary
-  install, plus a hardcoded `anvil` default and a `Custom command...` entry,
-  reachable on first launch and via `/mj:agents`.
+- ✅ Startup now opens Thor and defaults to `anvil` without exposing an agent or
+  model picker.
 
 Exit criteria:
 
-- A user can start `mj`, pick an agent in the picker, carry out a few turns,
+- A user can start `mj`, get the Thor default backend, carry out a few turns,
   recover recent prompts, and copy or export useful output without leaving the
   terminal.
 

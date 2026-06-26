@@ -92,7 +92,7 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
 }
 
 /// How the UI loop ends, so `main` can decide whether to quit entirely
-/// or start a fresh session through the agent picker.
+/// or start a fresh Thor session.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum UiExitReason {
     Quit,

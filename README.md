@@ -1,7 +1,8 @@
 # mjolnir
 
-Mjolnir lets you use nearly every coding-agent harness from one fast,
-consistent, featureful Rust TUI.
+Mjolnir is becoming the terminal home for Thor: an omni-agent coordinator that
+routes coding work across ACP harnesses while keeping the user experience to one
+prompt, one plan, and one recap.
 
 Claude Code for the corporate repo. Codex for the OpenAI workflow. OpenCode or
 Goose for local and open-source setups. Amp, Cursor, Cline, Copilot, Junie,
@@ -10,17 +11,18 @@ harnesses and gives them one terminal workflow: same transcript, same tool
 cards, same permission prompts, same session resume.
 
 The harness still matters. It may own the auth your company approved, the model
-picker your team standardized on, the runtime you trust, or the policy layer
-that keeps a repo safe. Mjolnir just removes the part where choosing the right
-agent also means switching UIs, keyboard habits, and session history.
+access your team standardized on, the runtime you trust, or the policy layer
+that keeps a repo safe. Mjolnir removes the part where choosing the right
+worker also means switching UIs, keyboard habits, and session history.
 
 It is native and small-footprint: no Electron shell, no browser runtime, no
 agent-specific frontend.
 
-Each session chooses its own harness from the official
-[ACP registry](https://github.com/agentclientprotocol/registry), the `anvil`
-default (`uvx brokk acp`), or a custom command. The agent changes. The working
-rhythm does not.
+Thor is the simple path: give it the task, review the plan, then let it assign
+work to the configured ACP harness. Today `mj` defaults to the `anvil` ACP
+backend (`uvx brokk acp`) as the first Thor worker; the coordinator runtime
+already owns prompt submission and will expand to multiple concurrent ACP
+workers.
 
 ![Mjolnir inline chat showing streaming agent output and tool activity](docs/readme-images/default-ui.png)
 
@@ -43,42 +45,62 @@ wants to type `mjolnir` every time they ask an agent to look at a diff.
 mj
 ```
 
-Network access is needed the first time `mj` fetches the ACP registry unless you
-only use a custom command or an already-cached registry copy. The default
-`anvil` entry runs `uvx brokk acp`, and registry agents distributed through
-`npx` or `uvx` require the matching runtime on `PATH`.
+The default `anvil` backend runs `uvx brokk acp`, so `uvx` must be available on
+`PATH` unless you configure a different backend in `~/.config/mj/config.toml`.
 
 ## Quick Start
 
-By default, `mj` starts an interactive session with the configured default agent.
-If no usable agent is configured yet, it opens the agent picker so you can choose
-an agent from the ACP registry, the `anvil` default, or a custom ACP command.
+By default, `mj` starts Thor. If no backend is configured yet, Thor uses the
+bundled `anvil` ACP launch command and stores it in `~/.config/mj/config.toml`.
+The normal flow does not ask the user to choose a model or agent.
 
 ```
- mj | choose an agent
-+--- agents -------------------------------------------------+
-| > anvil [current]    -- uvx brokk acp                      |
-|   Claude              -- npx v0.36.1                       |
-|   Codex               -- npx v0.14.0                       |
-|   ...                                                      |
-|   Custom command...   -- type your own command             |
+ mj
++--- thor ---------------------------------------------------+
+| Ask for the work. Thor plans, routes, executes, reviews.   |
+| Default worker backend: anvil (`uvx brokk acp`)            |
 +------------------------------------------------------------+
 ```
 
-Registry agents selected through a binary-only distribution are downloaded to
-`~/.cache/mj/agents/<id>/<version>/` and reused. Picker preferences and the
-configured default agent are stored in `~/.config/mj/config.toml`.
+Thor preferences and the configured worker backend are stored in
+`~/.config/mj/config.toml`.
 
-Use `/new` inside the TUI when you want to end the current chat and choose a
-harness again. The agent picker stays open for that explicit new-session flow
-until you select an agent or cancel it. Use `/load` to open the session picker
-for the current agent.
+Use `/new` inside the TUI to start a fresh Thor session with the configured
+backend. Use `/load` to open the session picker for the current backend.
+
+## Thor Routing
+
+Thor is a coordinator persona with one core tool: run an assigned task through
+an ACP worker session and report status, transcript summary, tool activity,
+permission outcomes, validation, and usage.
+
+Initial routing policy:
+
+- support routing modes: balanced, cost/accountant, and
+  best-solution/architect
+- rank model strength from cached LM Arena leaderboard metadata
+- use OpenRouter model pricing for non-subscription cost comparisons
+- prefer Claude Code for Claude-family models when configured
+- prefer Codex for GPT/OpenAI-family models when configured
+- prefer Anvil for other model families when configured for the target model
+- use Claude Code and Codex subscription quota evenly and maximally before
+  falling back to metered OpenRouter routing
+- in cost/accountant mode, use cheaper models when Thor judges the task simple
+  enough
+- in best-solution/architect mode, run two independent implementations with
+  different model families for complex work, then have Thor compare and choose
+  the better result
+- always run an adversarial review and correction cycle before finalizing;
+  prefer different vendor models for review when capacity allows
+
+See [docs/thor-coordinator-plan.md](docs/thor-coordinator-plan.md) for the
+current implementation plan.
 
 ## Why Multiple Harnesses
 
-`mj` is not a lowest-common-denominator model picker. The point is to keep each
-agent in the harness where it is strongest while giving all of them the same
-terminal workflow.
+Thor is not a lowest-common-denominator model picker. The point is to keep each
+agent in the harness where it is strongest while giving the user one terminal
+workflow.
 
 - Use Claude Code when a company repo already depends on that auth, policy, or
   review style.
@@ -91,8 +113,8 @@ terminal workflow.
 - Use Amp, Cursor, Cline, Junie, or another registry harness when a project
   already has a preferred agent.
 
-Without `mj`, those choices usually mean several interfaces. With `mj`, they are
-different sessions in the same TUI.
+Without Thor, those choices usually mean several interfaces. With Thor, they are
+worker options behind one coordinated TUI.
 
 ## Parallel Workspaces
 
@@ -112,9 +134,8 @@ mj --worktree swift-dawn
 mj --worktree quiet-forge
 ```
 
-Each terminal can choose a different registry agent or custom command. Use one
-agent to implement, another to review, and a local harness to experiment. Resume
-a kept worktree session with:
+Each terminal can run a separate Thor session. Resume a kept worktree session
+with:
 
 ```bash
 mj resume <session-id> --worktree swift-dawn
@@ -122,17 +143,18 @@ mj resume <session-id> --worktree swift-dawn
 
 ## Resume Sessions
 
-`mj resume` opens a searchable session picker for the selected agent, so you can
-jump back into previous ACP sessions without remembering IDs.
+`mj resume` opens a searchable session picker for the configured Thor backend,
+so you can jump back into previous ACP sessions without remembering IDs.
 
 ![Mjolnir resume picker listing prior ACP sessions](docs/readme-images/session-picker.png)
 
 Useful forms:
 
-- `mj resume`: choose an agent, list its sessions, and resume one
+- `mj resume`: list sessions from the configured Thor backend and resume one
   interactively.
-- `mj resume <session-id>`: choose an agent, then resume that session ID.
-- `mj resume --list`: list sessions from the configured default agent.
+- `mj resume <session-id>`: resume that session ID from the configured Thor
+  backend.
+- `mj resume --list`: list sessions from the configured Thor backend.
 - `mj resume --list --format json`: print the session list as JSON.
 
 ## Permissions And Config
@@ -150,7 +172,7 @@ leaving the chat.
 
 ## Automation
 
-Use `--print` for one-shot prompts with the same configured ACP agent:
+Use `--print` for one-shot prompts through the same Thor coordinator path:
 
 ```bash
 mj --print "summarize the current diff"
@@ -200,10 +222,8 @@ Keyboard basics:
 
 On-disk files:
 
-- `~/.config/mj/config.toml`: picker preferences and the default selected agent
+- `~/.config/mj/config.toml`: Thor preferences and the configured backend
   (program + args + env).
-- `~/.cache/mj/registry.json`: cached registry index, refreshed every 24h.
-- `~/.cache/mj/agents/<id>/<version>/`: extracted binary distributions.
 - `<project>/.mjolnir/worktrees/`: linked Git worktrees created by
   `mj --worktree`.
 
@@ -233,7 +253,7 @@ cargo build --release
 ```
 
 The crate uses inline unit tests under `src/`. Keep runtime, UI state, event,
-rendering, registry, install, and picker concerns separated across the existing
+rendering, install, and configuration concerns separated across the existing
 modules.
 
 ## License

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::paths::{expand_home_shortcut, normalize_spawn_program};
 use crate::spinner::SpinnerStyle;
 use crate::theme::TerminalThemeKind;
+use crate::thor::ThorConfig;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Config {
@@ -19,6 +20,8 @@ pub struct Config {
     pub theme: TerminalThemeKind,
     #[serde(default, skip_serializing_if = "SpinnerStyle::is_default")]
     pub spinner: SpinnerStyle,
+    #[serde(default, skip_serializing_if = "ThorConfig::is_default")]
+    pub thor: ThorConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<SelectedAgent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -264,6 +267,7 @@ mod tests {
         let cfg = Config {
             theme: TerminalThemeKind::Light,
             spinner: SpinnerStyle::default(),
+            thor: ThorConfig::default(),
             agent: Some(SelectedAgent {
                 source_id: "claude-acp".to_string(),
                 program: PathBuf::from("/usr/local/bin/claude-acp"),
@@ -291,6 +295,7 @@ mod tests {
         let cfg = Config {
             theme: TerminalThemeKind::Dark,
             spinner: SpinnerStyle::default(),
+            thor: ThorConfig::default(),
             agent: Some(SelectedAgent {
                 source_id: "anvil".to_string(),
                 program: PathBuf::from("uvx"),
@@ -374,6 +379,7 @@ args = ["--config", "$HOME/.config/agent.toml", "${HOME}/literal"]
         let cfg = Config {
             theme: TerminalThemeKind::AnsiDark,
             spinner: SpinnerStyle::default(),
+            thor: ThorConfig::default(),
             agent: None,
             favorite_agents: Vec::new(),
             custom_agents: vec![
@@ -502,6 +508,48 @@ args = ["--flag", "$HOME/data"]
         assert!(
             !body.contains("theme"),
             "default theme should not be serialized: {body:?}"
+        );
+        assert!(
+            !body.contains("thor"),
+            "default Thor config should not be serialized: {body:?}"
+        );
+    }
+
+    #[test]
+    fn thor_config_defaults_and_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("write");
+        let cfg = Config::load(&path).expect("load default");
+        assert_eq!(
+            cfg.thor.plan_approval,
+            crate::thor::ThorPlanApproval::Always
+        );
+        assert_eq!(
+            cfg.thor.coordinator_model,
+            crate::thor::DEFAULT_COORDINATOR_MODEL
+        );
+
+        let cfg = Config {
+            thor: ThorConfig {
+                coordinator_model: "anthropic/claude-example".to_string(),
+                leaderboard_url: crate::thor::LM_ARENA_LEADERBOARD_URL.to_string(),
+                pricing_url: crate::thor::OPENROUTER_MODELS_URL.to_string(),
+                plan_approval: crate::thor::ThorPlanApproval::Always,
+                optimization_mode: crate::thor::ThorOptimizationMode::BestSolution,
+            },
+            ..Config::default()
+        };
+        cfg.save(&path).expect("save");
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert!(body.contains("[thor]"));
+        assert!(body.contains("coordinator_model = \"anthropic/claude-example\""));
+
+        let loaded = Config::load(&path).expect("load saved");
+        assert_eq!(loaded.thor.coordinator_model, "anthropic/claude-example");
+        assert_eq!(
+            loaded.thor.optimization_mode,
+            crate::thor::ThorOptimizationMode::BestSolution
         );
     }
 

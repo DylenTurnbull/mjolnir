@@ -1,9 +1,8 @@
 //! mjolnir: an interactive terminal client for any ACP-speaking agent.
 //!
-//! Starts sessions with the configured default ACP agent, falling back to the
-//! picker only when no default exists or when the user explicitly requests a
-//! new agent with `/new`. It persists global picker preferences to
-//! `~/.config/mj/config.toml`, then spawns the agent as a child process and
+//! Starts Thor-backed sessions with the configured ACP backend, defaulting to
+//! Anvil when no backend exists yet. It persists global preferences to
+//! `~/.config/mj/config.toml`, then spawns the backend as a child process and
 //! renders the session in a ratatui chat UI.
 
 mod acp;
@@ -16,8 +15,6 @@ mod install;
 mod notifications;
 mod palette;
 mod paths;
-mod picker;
-mod registry;
 mod remote;
 mod self_update;
 mod session;
@@ -28,6 +25,7 @@ mod term;
 mod text;
 mod theme;
 mod theme_picker;
+mod thor;
 mod ui;
 mod version;
 mod worktree;
@@ -40,13 +38,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::app::UiExitReason;
-use crate::config::{
-    Config, CustomAgent as ConfigCustomAgent, SelectedAgent, history_path, transcript_export_dir,
-};
+use crate::config::{Config, SelectedAgent, history_path, transcript_export_dir};
 use crate::event::{LoadSessionResult, UiCommand};
-use crate::picker::{
-    CustomAgent as PickerCustomAgent, PickerOutcome, PickerPreferences, PickerResult,
-};
 use crate::session::SessionEntryJson;
 use crate::ui::{HeaderLabels, UiMode};
 use crate::worktree::CreatedWorktree;
@@ -142,11 +135,10 @@ struct Cli {
 enum Commands {
     /// Resume an existing ACP session.
     ///
-    /// Opens the agent picker first so the session is listed or loaded
-    /// from the agent that owns it. Without a session ID, opens an
-    /// interactive session picker for the chosen agent.
+    /// Lists or loads sessions from the configured Thor backend. Without a
+    /// session ID, opens an interactive session picker for that backend.
     ///
-    /// Use `--list` to print sessions from the configured default agent
+    /// Use `--list` to print sessions from the configured Thor backend
     /// in headless mode (no TUI).
     Resume(ResumeArgs),
     /// Start the local remote-control server.
@@ -180,8 +172,8 @@ struct ServerArgs {
 
 #[derive(Debug, clap::Args)]
 struct ResumeArgs {
-    /// Session ID to resume from the chosen agent. When omitted, opens an
-    /// interactive picker that fetches the chosen agent's session list.
+    /// Session ID to resume from the configured Thor backend. When omitted,
+    /// opens an interactive picker that fetches that backend's session list.
     session_id: Option<String>,
 
     /// List available sessions and exit (headless, no TUI). Optionally
@@ -436,15 +428,13 @@ async fn run_resume(
 
     // `--list`: headless listing, print and exit.
     if args.list {
-        // Load the configured agent (same as headless mode).
+        // Load the configured Thor backend, creating the default when needed.
         let config_path = config::default_config_path();
-        let cfg = Config::load(&config_path)
+        let mut cfg = Config::load(&config_path)
             .with_context(|| format!("load {}", config_path.display()))?;
-        let agent = cfg.agent.ok_or_else(|| {
-            anyhow::anyhow!(
-                "no default agent configured; run `mj` once to pick an agent before listing sessions"
-            )
-        })?;
+        let agent = ensure_thor_default_agent(&mut cfg);
+        cfg.save(&config_path)
+            .with_context(|| format!("save {}", config_path.display()))?;
         let sessions = session::list_sessions(&agent, cwd, args.agent_stderr.as_deref()).await?;
         match args.format {
             HeadlessOutputFormat::Json | HeadlessOutputFormat::StreamJson => {
@@ -478,7 +468,7 @@ async fn run_resume(
         return Ok(());
     };
 
-    // Direct ID: launch the TUI with the chosen agent and session.
+    // Direct ID: launch the TUI with the configured Thor backend and session.
     if let Some(session_id) = args.session_id.clone() {
         // Look up the chosen session's title so the resumed header shows it
         // immediately rather than waiting for the agent's first
@@ -528,9 +518,9 @@ async fn run_resume(
 
     let mut notice = None;
     loop {
-        // Interactive picker: fetch sessions from the chosen agent first (agent is
-        // killed after listing), then set up the TUI to show the session picker,
-        // then launch the chosen session with a fresh process for the same agent.
+        // Fetch sessions from the configured Thor backend first (the backend
+        // process is killed after listing), then set up the TUI to show the
+        // session picker and launch the chosen session with a fresh process.
         eprintln!("Fetching sessions from agent...");
         let listing = session::list_sessions_with_capabilities(
             &agent,
@@ -604,18 +594,10 @@ async fn pick_agent_for_resume() -> Result<Option<SelectedAgent>> {
     let config_path = config::default_config_path();
     let mut cfg =
         Config::load(&config_path).with_context(|| format!("load {}", config_path.display()))?;
-
-    let picker_result = run_agent_picker_once(&cfg).await?;
-    apply_picker_preferences(&mut cfg, picker_result.preferences);
-    let selected = picker_result.outcome.map(picker_outcome_to_selected);
-    if cfg.agent.is_none()
-        && let Some(agent) = selected.as_ref()
-    {
-        cfg.agent = Some(agent.clone());
-    }
+    let selected = ensure_thor_default_agent(&mut cfg);
     cfg.save(&config_path)
         .with_context(|| format!("save {}", config_path.display()))?;
-    Ok(selected)
+    Ok(Some(selected))
 }
 
 fn read_headless_prompt(prompt_arg: String) -> Result<String> {
@@ -749,16 +731,18 @@ fn prepare_existing_worktree(cwd: &std::path::Path, name_or_path: &str) -> Resul
     Ok(opened)
 }
 
-fn should_open_initial_agent_picker(cfg: &Config, initial_agent: Option<&SelectedAgent>) -> bool {
-    cfg.agent.is_none() && initial_agent.is_none()
-}
-
 fn should_open_first_run_setup(
     config_exists: bool,
     cfg: &Config,
     initial_agent: Option<&SelectedAgent>,
 ) -> bool {
     !config_exists && cfg.agent.is_none() && initial_agent.is_none()
+}
+
+fn ensure_thor_default_agent(cfg: &mut Config) -> SelectedAgent {
+    cfg.agent
+        .get_or_insert_with(thor::default_anvil_agent)
+        .clone()
 }
 
 #[derive(Debug, Clone)]
@@ -806,43 +790,28 @@ async fn run_app(
     let config_exists = config_path.exists();
     let mut cfg = Config::load(&config_path)?;
 
-    // Supervisor loop. Initial sessions use the configured default agent when
-    // available. The picker is reserved for first-run setup and explicit
-    // new-session requests (`/new` / Ctrl-N), while resumed sessions may provide
-    // the agent chosen by `mj resume` or fall back to the configured default.
+    // Supervisor loop. Thor sessions use the configured backend when available
+    // and create the Anvil default otherwise.
     // Consume resume_session and initial_agent on the first iteration only.
     let mut initial_resume = resume_target;
     let mut initial_agent = initial_agent;
     let mut first_run_setup =
         should_open_first_run_setup(config_exists, &cfg, initial_agent.as_ref());
-    let mut pick_agent = should_open_initial_agent_picker(&cfg, initial_agent.as_ref());
     loop {
         let resume = initial_resume.take();
         let agent = if let Some(agent) = initial_agent.take() {
             agent
         } else if first_run_setup {
             first_run_setup = false;
-            pick_agent = false;
             match run_first_run_setup(&mut cfg, &config_path).await? {
                 Some(agent) => agent,
                 None => return Ok(None),
             }
-        } else if pick_agent {
-            pick_agent = false;
-            match run_agent_picker_and_update_config(&mut cfg, &config_path).await? {
-                Some(agent) => agent,
-                None => {
-                    cfg.save(&config_path)
-                        .with_context(|| format!("save {}", config_path.display()))?;
-                    return Ok(None);
-                }
-            }
         } else {
-            cfg.agent.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no default agent configured; run `mj` once to pick an agent before resuming sessions"
-                )
-            })?
+            let agent = ensure_thor_default_agent(&mut cfg);
+            cfg.save(&config_path)
+                .with_context(|| format!("save {}", config_path.display()))?;
+            agent
         };
 
         let session_result = run_session(
@@ -859,13 +828,14 @@ async fn run_app(
             mode,
             cfg.theme,
             cfg.spinner,
+            cfg.thor.clone(),
         )
         .await?;
         apply_session_result_to_config(&mut cfg, &session_result);
         match session_result.reason {
             UiExitReason::Quit => return Ok(session_result.session_id),
             UiExitReason::NewSession => {
-                pick_agent = true;
+                initial_agent = Some(ensure_thor_default_agent(&mut cfg));
                 continue;
             }
             UiExitReason::ClearSession => {
@@ -922,41 +892,10 @@ async fn run_first_run_setup(
         return Ok(None);
     };
     cfg.spinner = spinner_style;
+    let agent = ensure_thor_default_agent(cfg);
     cfg.save(config_path)
         .with_context(|| format!("save {}", config_path.display()))?;
-
-    let agent = run_agent_picker_and_update_config(cfg, config_path).await?;
-    if agent.is_none() {
-        cfg.save(config_path)
-            .with_context(|| format!("save {}", config_path.display()))?;
-    }
-    Ok(agent)
-}
-
-async fn run_agent_picker_and_update_config(
-    cfg: &mut Config,
-    config_path: &Path,
-) -> Result<Option<SelectedAgent>> {
-    let picker_result = run_agent_picker_once(cfg).await?;
-    let selected = apply_picker_result_to_config(cfg, picker_result);
-    if selected.is_some() {
-        cfg.save(config_path)
-            .with_context(|| format!("save {}", config_path.display()))?;
-    }
-    Ok(selected)
-}
-
-fn apply_picker_result_to_config(
-    cfg: &mut Config,
-    picker_result: PickerResult,
-) -> Option<SelectedAgent> {
-    apply_picker_preferences(cfg, picker_result.preferences);
-    let outcome = picker_result.outcome?;
-    let selected = picker_outcome_to_selected(outcome);
-    if cfg.agent.is_none() {
-        cfg.agent = Some(selected.clone());
-    }
-    Some(selected)
+    Ok(Some(agent))
 }
 
 async fn run_session_picker_action_for_agent(
@@ -1078,16 +1017,6 @@ fn session_picker_action(
     }
 }
 
-async fn run_agent_picker_once(cfg: &Config) -> Result<PickerResult> {
-    let mut terminal = ui::setup_fullscreen_terminal().context("setup terminal")?;
-    let result = run_picker_with_registry(&mut terminal, cfg).await;
-    if let Err(e) = ui::restore_fullscreen_terminal(&mut terminal) {
-        tracing::warn!("restore terminal (agent picker) failed: {e}");
-    }
-    settle_after_fullscreen_picker_restore().await;
-    result
-}
-
 async fn run_theme_picker_once(
     initial: theme::TerminalThemeKind,
 ) -> Result<Option<theme::TerminalThemeKind>> {
@@ -1137,92 +1066,6 @@ async fn settle_after_fullscreen_picker_restore() {
     tokio::time::sleep(Duration::from_millis(75)).await;
 }
 
-async fn run_picker_with_registry(
-    terminal: &mut ratatui::Terminal<crate::term::TrackedBackend<std::io::Stdout>>,
-    cfg: &Config,
-) -> Result<PickerResult> {
-    let cache_path = registry::default_cache_path();
-    let registry =
-        match registry::load_with_cache(&cache_path, registry::CACHE_TTL, registry::REGISTRY_URL)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    "registry load failed, picker will offer anvil + custom only: {e:#}"
-                );
-                registry::Registry::default()
-            }
-        };
-    picker::run_picker(
-        terminal,
-        &registry,
-        &install::default_install_root(),
-        &registry::current_platform(),
-        picker_preferences_from_config(cfg),
-        cfg.theme.palette(),
-    )
-    .await
-}
-
-fn picker_preferences_from_config(cfg: &Config) -> PickerPreferences {
-    PickerPreferences {
-        default_agent: cfg.agent.as_ref().map(selected_to_picker_outcome),
-        favorite_source_ids: cfg.favorite_agents.clone(),
-        custom_agents: cfg
-            .custom_agents
-            .iter()
-            .map(config_custom_to_picker_custom)
-            .collect(),
-    }
-}
-
-fn apply_picker_preferences(cfg: &mut Config, preferences: PickerPreferences) {
-    cfg.agent = preferences.default_agent.map(picker_outcome_to_selected);
-    cfg.favorite_agents = preferences.favorite_source_ids;
-    cfg.custom_agents = preferences
-        .custom_agents
-        .into_iter()
-        .map(picker_custom_to_config_custom)
-        .collect();
-}
-
-fn config_custom_to_picker_custom(c: &ConfigCustomAgent) -> PickerCustomAgent {
-    PickerCustomAgent {
-        name: c.name.clone(),
-        program: c.program.clone(),
-        args: c.args.clone(),
-        description: c.description.clone(),
-    }
-}
-
-fn picker_custom_to_config_custom(c: PickerCustomAgent) -> ConfigCustomAgent {
-    ConfigCustomAgent {
-        name: c.name,
-        program: c.program,
-        args: c.args,
-        description: c.description,
-    }
-}
-
-fn picker_outcome_to_selected(o: PickerOutcome) -> SelectedAgent {
-    SelectedAgent {
-        source_id: o.source_id,
-        program: o.program,
-        args: o.args,
-        env: o.env,
-    }
-}
-
-fn selected_to_picker_outcome(agent: &SelectedAgent) -> PickerOutcome {
-    PickerOutcome {
-        source_id: agent.source_id.clone(),
-        program: agent.program.clone(),
-        args: agent.args.clone(),
-        env: agent.env.clone(),
-    }
-}
-
 fn agent_header_label(agent: &SelectedAgent) -> String {
     remote::agent_display_label(agent)
 }
@@ -1237,6 +1080,7 @@ async fn run_session(
     mode: UiMode,
     mut theme_kind: theme::TerminalThemeKind,
     mut spinner_style: spinner::SpinnerStyle,
+    thor_config: thor::ThorConfig,
 ) -> Result<RunSessionResult> {
     let mut terminal = setup_session_terminal(mode)?;
 
@@ -1256,28 +1100,41 @@ async fn run_session(
         agent_stderr: runtime_options.agent_stderr.clone(),
         fs_max_text_bytes: runtime_options.fs_max_text_bytes,
     };
+    let worker_label = agent_header_label(agent);
 
-    // Drive the ACP runtime on its own task so the UI can own the
+    // Drive the Thor/ACP runtime on its own task so the UI can own the
     // current task's stdio (ratatui draws through stdout while ACP
     // talks to the agent's stdout/stdin, which are separate file
     // descriptors).
-    let acp_handle = tokio::spawn(async move {
-        if let Err(e) = acp::run(runtime_cfg, event_tx, cmd_rx).await {
-            tracing::error!("acp runtime error: {e:#}");
+    let runtime_handle = tokio::spawn(async move {
+        let result = thor::run(
+            thor::ThorRuntimeConfig {
+                thor: thor_config,
+                worker: runtime_cfg,
+                worker_label,
+            },
+            event_tx,
+            cmd_rx,
+        )
+        .await;
+        if let Err(e) = result {
+            tracing::error!("runtime error: {e:#}");
         }
     });
 
     let hist_path = history_path();
     let export_dir = transcript_export_dir();
     let config_path = config::default_config_path();
-    // Pre-fill the UI header with the configured agent identity. Registry
-    // agents use their source id so the header matches the picker/config,
-    // while custom agents show the exact command line being launched.
-    let agent_display_name = Some(agent_header_label(agent));
+    // Pre-fill the UI header with Thor, which owns prompt submission even
+    // though it delegates execution to the configured ACP backend.
+    let agent_display_name = Some("Thor".to_string());
     let tracker_project_label = header_labels.project.clone();
+    let tracker_agent_label = agent_display_name
+        .clone()
+        .unwrap_or_else(|| agent_header_label(agent));
     let remote_tracker = remote::RemoteSessionTracker::new(
         tracker_project_label,
-        agent_header_label(agent),
+        tracker_agent_label,
         Some(runtime_cmd_tx.clone()),
         Some(ui_event_tx.clone()),
     );
@@ -1441,8 +1298,8 @@ async fn run_session(
     //    child when the `Child` value is dropped during unwind.
     remote_tracker.shutdown().await;
 
-    let abort_handle = acp_handle.abort_handle();
-    match tokio::time::timeout(Duration::from_secs(2), acp_handle).await {
+    let abort_handle = runtime_handle.abort_handle();
+    match tokio::time::timeout(Duration::from_secs(2), runtime_handle).await {
         Ok(join_res) => {
             if let Err(e) = join_res {
                 tracing::warn!("acp task join: {e}");
@@ -1644,57 +1501,6 @@ mod tests {
     }
 
     #[test]
-    fn initial_agent_picker_opens_only_without_default_or_initial_agent() {
-        let configured = SelectedAgent {
-            source_id: "claude-acp".to_string(),
-            program: PathBuf::from("npx"),
-            args: vec!["-y".to_string(), "@x/claude".to_string()],
-            env: Default::default(),
-        };
-        let initial = SelectedAgent {
-            source_id: "anvil".to_string(),
-            program: PathBuf::from("uvx"),
-            args: vec!["brokk".to_string(), "acp".to_string()],
-            env: Default::default(),
-        };
-
-        assert!(should_open_initial_agent_picker(&Config::default(), None));
-        assert!(!should_open_initial_agent_picker(
-            &Config {
-                theme: Default::default(),
-                spinner: Default::default(),
-                agent: Some(configured),
-                favorite_agents: Vec::new(),
-                custom_agents: Vec::new(),
-            },
-            None
-        ));
-        assert!(!should_open_initial_agent_picker(
-            &Config::default(),
-            Some(&initial)
-        ));
-
-        // A named custom agent set as default skips the picker exactly like any
-        // other configured default; the launch reads program/args from cfg.agent.
-        let custom_default = SelectedAgent {
-            source_id: "custom:my-agent".to_string(),
-            program: PathBuf::from("/usr/local/bin/agent"),
-            args: vec!["--flag".to_string()],
-            env: Default::default(),
-        };
-        assert!(!should_open_initial_agent_picker(
-            &Config {
-                theme: Default::default(),
-                spinner: Default::default(),
-                agent: Some(custom_default),
-                favorite_agents: Vec::new(),
-                custom_agents: Vec::new(),
-            },
-            None
-        ));
-    }
-
-    #[test]
     fn first_run_setup_opens_only_for_missing_config_without_agent() {
         let configured = SelectedAgent {
             source_id: "claude-acp".to_string(),
@@ -1716,6 +1522,7 @@ mod tests {
             &Config {
                 theme: Default::default(),
                 spinner: Default::default(),
+                thor: Default::default(),
                 agent: Some(configured),
                 favorite_agents: Vec::new(),
                 custom_agents: Vec::new(),
@@ -1730,39 +1537,14 @@ mod tests {
     }
 
     #[test]
-    fn picker_result_keeps_explicit_default_while_launching_selection() {
-        let explicit_default = PickerOutcome {
-            source_id: "claude-acp".to_string(),
-            program: PathBuf::from("npx"),
-            args: vec!["-y".to_string(), "@x/claude".to_string()],
-            env: Default::default(),
-        };
-        let selected = PickerOutcome {
-            source_id: "anvil".to_string(),
-            program: PathBuf::from("uvx"),
-            args: vec!["brokk".to_string(), "acp".to_string()],
-            env: Default::default(),
-        };
+    fn thor_default_agent_prefers_anvil_without_picker() {
         let mut cfg = Config::default();
+        let agent = ensure_thor_default_agent(&mut cfg);
 
-        let launch_agent = apply_picker_result_to_config(
-            &mut cfg,
-            PickerResult {
-                outcome: Some(selected.clone()),
-                preferences: PickerPreferences {
-                    default_agent: Some(explicit_default.clone()),
-                    favorite_source_ids: Vec::new(),
-                    custom_agents: Vec::new(),
-                },
-            },
-        )
-        .expect("launch selection");
-
-        assert_eq!(launch_agent, picker_outcome_to_selected(selected));
-        assert_eq!(
-            cfg.agent.as_ref(),
-            Some(&picker_outcome_to_selected(explicit_default))
-        );
+        assert_eq!(agent.source_id, "anvil");
+        assert_eq!(agent.program, PathBuf::from("uvx"));
+        assert_eq!(agent.args, vec!["brokk", "acp"]);
+        assert_eq!(cfg.agent, Some(agent));
     }
 
     #[test]
@@ -1780,31 +1562,6 @@ mod tests {
 
         assert_eq!(cfg.theme, theme::TerminalThemeKind::AnsiLight);
         assert_eq!(cfg.spinner, spinner::SpinnerStyle::Bars);
-    }
-
-    #[test]
-    fn picker_preferences_round_trip_custom_agents() {
-        let cfg = Config {
-            theme: Default::default(),
-            spinner: Default::default(),
-            agent: None,
-            favorite_agents: Vec::new(),
-            custom_agents: vec![ConfigCustomAgent {
-                name: "my-agent".to_string(),
-                program: PathBuf::from("/usr/local/bin/agent"),
-                args: vec!["--flag".to_string()],
-                description: "test".to_string(),
-            }],
-        };
-        let prefs = picker_preferences_from_config(&cfg);
-        assert_eq!(prefs.custom_agents.len(), 1);
-        assert_eq!(prefs.custom_agents[0].name, "my-agent");
-
-        let mut roundtripped = Config::default();
-        apply_picker_preferences(&mut roundtripped, prefs);
-        assert_eq!(roundtripped.custom_agents.len(), 1);
-        assert_eq!(roundtripped.custom_agents[0].name, "my-agent");
-        assert_eq!(roundtripped.custom_agents[0].description, "test");
     }
 
     #[test]

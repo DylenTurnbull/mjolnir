@@ -96,8 +96,8 @@ configuration can run, or whether tools may bypass prompts.
 
 ## Compatibility Impact
 
-Mjolnir discovers agents through the live ACP registry. On 2026-06-25 that
-registry listed 37 agents, including `claude-acp`, `codex-acp`, `gemini`,
+Mjolnir runs Thor over the configured ACP worker backend. Across the ACP
+ecosystem, compatible workers include `claude-acp`, `codex-acp`, `gemini`,
 `opencode`, `goose`, `cursor`, `github-copilot-cli`, `qwen-code`, `kilo`, and
 many others.
 

@@ -2806,7 +2806,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         if state.runtime_closed {
             state.record_status_message(
                 StatusKind::Info,
-                "acp runtime closed; type /clear for the same agent, /new for the picker, or Ctrl-C to quit",
+                "acp runtime closed; type /clear for the same Thor worker, /new for a new Thor session, or Ctrl-C to quit",
             );
         } else if state.session_id.is_none() {
             state.record_status_message(StatusKind::Warning, "waiting for session...");
@@ -2842,7 +2842,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
     if state.runtime_closed {
         state.record_status_message(
             StatusKind::Info,
-            "acp runtime closed; type /clear for the same agent, /new for the picker, or Ctrl-C to quit",
+            "acp runtime closed; type /clear for the same Thor worker, /new for a new Thor session, or Ctrl-C to quit",
         );
         return;
     }
@@ -5418,7 +5418,7 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &AppState, mode: UiMode
         }
     };
     let title = if state.runtime_closed {
-        " runtime closed (/clear same agent | /new picker | Ctrl-C quit) ".to_string()
+        " runtime closed (/clear same Thor worker | /new Thor session | Ctrl-C quit) ".to_string()
     } else if let Some(title) = busy_prompt_title(state) {
         title
     } else if state.voice_input_active {
@@ -5969,7 +5969,7 @@ fn draw_help_modal(f: &mut ratatui::Frame, area: Rect, mode: UiMode, theme: Term
         Line::from("  F1..F9 / Ctrl-1..9 / Up/Down  edit or move inside choices"),
         Line::from(""),
         Line::from(
-            "Built-in commands: /clear keeps agent; /new opens agent picker; /load opens session picker",
+            "Built-in commands: /clear keeps Thor worker; /new starts a Thor session; /load opens session picker",
         ),
     ]);
 
@@ -7489,7 +7489,7 @@ mod tests {
         match &state.transcript[0] {
             Entry::System(text) => assert_eq!(
                 text,
-                "acp runtime closed; type /clear for the same agent, /new for the picker, or Ctrl-C to quit"
+                "acp runtime closed; type /clear for the same Thor worker, /new for a new Thor session, or Ctrl-C to quit"
             ),
             other => panic!("unexpected entry: {other:?}"),
         }
