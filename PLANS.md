@@ -92,11 +92,11 @@ repository:
 
 Thor is not a subagent framework. It is a coordinator persona backed by a strong
 model and a small set of tools. Thor always runs inside a selected ACP host
-agent. At session startup, `mj` starts a local HTTP MCP bridge and passes that
-URL through ACP `mcpServers`; that bridge gives Thor tools to list configured
-ACP workers and run delegated prompts through them. The host model receives
-model metadata, pricing, quota hints, user preferences, and the user's prompt,
-then decides how to split the work and monitor worker sessions.
+agent. At session startup, `mj` passes a stdio MCP bridge (`mj thor-mcp`)
+through ACP `mcpServers`; that bridge gives Thor tools to list configured ACP
+workers and run delegated prompts through them. The host model receives model
+metadata, pricing, quota hints, user preferences, and the user's prompt, then
+decides how to split the work and monitor worker sessions.
 
 The durable plan lives in
 [docs/thor-coordinator-plan.md](docs/thor-coordinator-plan.md).
@@ -364,7 +364,7 @@ in a smoke test):
 | `available_commands_update` notification | streams immediately after `session/new`; populates the slash autocomplete |
 | `loadSession`, `sessionCapabilities` (resume/fork/list/close/delete) | advertised by the agent; mjolnir now drives load/fork where implemented, with broader list/resume/delete UX still M5 territory |
 | `promptCapabilities.image`, `embeddedContext` | accepted by the agent; mjolnir still renders these `ContentBlock` variants as `[image]` / `[resource]` placeholders pending M2 |
-| `mcpCapabilities.http`, `sse` | advertised; mjolnir now sends the Thor HTTP MCP bridge at `session/new` for Thor host sessions |
+| `mcpCapabilities.http`, `sse` | advertised; mjolnir now sends the Thor stdio MCP bridge at `session/new` for Thor host sessions |
 
 Known gaps to file as follow-ups when the matrix expands:
 

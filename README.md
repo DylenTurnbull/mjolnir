@@ -70,9 +70,9 @@ backend. Use `/load` to open the session picker for the current backend.
 
 ## Thor Routing
 
-Thor is a coordinator persona running inside an ACP host agent. `mj` starts a
-local HTTP MCP bridge and passes that URL to the host through ACP `mcpServers`;
-the MCP tools list configured ACP workers and run assigned tasks through worker
+Thor is a coordinator persona running inside an ACP host agent. `mj` passes a
+stdio MCP bridge (`mj thor-mcp`) to the host through ACP `mcpServers`; the MCP
+tools list configured ACP workers and run assigned tasks through worker
 sessions.
 
 Initial routing policy:

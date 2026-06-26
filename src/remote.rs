@@ -1335,30 +1335,20 @@ fn start_server_agent_session(
         args: agent.args,
         cwd,
         additional_directories,
-        mcp_servers: Vec::new(),
+        mcp_servers: crate::thor_mcp::mcp_servers(config::default_config_path()).unwrap_or_else(
+            |error| {
+                warn!("failed to configure Thor MCP stdio bridge: {error:#}");
+                Vec::new()
+            },
+        ),
         resume_session: None,
         env: agent.env,
         agent_stderr: None,
         fs_max_text_bytes,
     };
-    let thor_mcp_server = match crate::thor_mcp::start_http(config::default_config_path()) {
-        Ok(server) => Some(server),
-        Err(error) => {
-            warn!("failed to start Thor MCP HTTP bridge: {error:#}");
-            None
-        }
-    };
-    let runtime_cfg = AcpRuntimeConfig {
-        mcp_servers: thor_mcp_server
-            .as_ref()
-            .map(|server| server.mcp_servers())
-            .unwrap_or_default(),
-        ..runtime_cfg
-    };
     let shutdown_tx = runtime_cmd_tx.clone();
 
     let task = tokio::spawn(async move {
-        let _thor_mcp_server = thor_mcp_server;
         let command_proxy = tokio::spawn(async move {
             while let Some(command) = command_rx.recv().await {
                 let runtime_command = match command {

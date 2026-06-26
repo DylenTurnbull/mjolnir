@@ -134,6 +134,8 @@ struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Commands {
+    #[command(hide = true)]
+    ThorMcp,
     /// Resume an existing ACP session.
     ///
     /// Lists or loads sessions from the configured Thor backend. Without a
@@ -270,6 +272,7 @@ fn should_run_startup_update_check(cli: &Cli) -> bool {
     match &cli.command {
         Some(Commands::Resume(args)) => !args.list,
         Some(Commands::Server(_)) => false,
+        Some(Commands::ThorMcp) => false,
         None => true,
     }
 }
@@ -297,6 +300,7 @@ async fn main() -> Result<()> {
 
     if let Some(command) = cli.command {
         return match command {
+            Commands::ThorMcp => thor_mcp::run_stdio().await,
             Commands::Resume(mut args) => {
                 args.fullscreen_tui |= fullscreen_tui;
                 run_resume(args, fs_max_text_bytes, top_level_additional_directories).await
@@ -1090,14 +1094,13 @@ async fn run_session(
     let (runtime_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel();
     let mut ui_event_rx = ui_event_rx;
-    let thor_mcp_server = thor_mcp::start_http(config::default_config_path())?;
 
     let runtime_cfg = acp::AcpRuntimeConfig {
         command: agent.program.clone(),
         args: agent.args.clone(),
         cwd: cwd.clone(),
         additional_directories: runtime_options.additional_directories.clone(),
-        mcp_servers: thor_mcp_server.mcp_servers(),
+        mcp_servers: thor_mcp::mcp_servers(config::default_config_path())?,
         resume_session,
         env: agent.env.clone(),
         agent_stderr: runtime_options.agent_stderr.clone(),

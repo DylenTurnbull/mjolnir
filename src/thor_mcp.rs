@@ -1,27 +1,17 @@
 //! MCP bridge exposed to the ACP host running Thor.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    HttpHeader, McpServer, McpServerHttp, PermissionOptionKind, SessionUpdate, StopReason,
+    EnvVariable, McpServer, McpServerStdio, PermissionOptionKind, SessionUpdate, StopReason,
     ToolCallUpdate, ToolKind, Usage,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use axum::extract::State;
-use axum::http::header::AUTHORIZATION;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use axum::{Json as AxumJson, Router};
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::sync::mpsc;
 
 use crate::acp::{self, AcpRuntimeConfig};
 use crate::config::{self, Config, SelectedAgent};
@@ -100,125 +90,56 @@ struct DelegatedRunResult {
     error: Option<String>,
 }
 
-#[derive(Clone)]
-struct HttpState {
-    config_path: PathBuf,
-    token: String,
+pub fn mcp_servers(config_path: PathBuf) -> Result<Vec<McpServer>> {
+    Ok(vec![stdio_mcp_server(
+        std::env::current_exe().context("resolve current mj executable")?,
+        config_path,
+    )])
 }
 
-pub struct ThorMcpHttpServer {
-    mcp_server: McpServer,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-    task: JoinHandle<()>,
-}
-
-impl ThorMcpHttpServer {
-    pub fn mcp_servers(&self) -> Vec<McpServer> {
-        vec![self.mcp_server.clone()]
-    }
-}
-
-impl Drop for ThorMcpHttpServer {
-    fn drop(&mut self) {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
-        }
-        self.task.abort();
-    }
-}
-
-pub fn start_http(config_path: PathBuf) -> Result<ThorMcpHttpServer> {
-    let token = random_token()?;
-    let listener = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
-        .context("bind Thor MCP HTTP server")?;
-    listener
-        .set_nonblocking(true)
-        .context("set Thor MCP HTTP listener nonblocking")?;
-    let addr = listener.local_addr().context("read Thor MCP HTTP addr")?;
-    let listener =
-        tokio::net::TcpListener::from_std(listener).context("create Tokio MCP listener")?;
-    let url = format!("http://{addr}/mcp");
-    let mcp_server = http_mcp_server(url, token.clone());
-    let state = Arc::new(HttpState { config_path, token });
-    let app = Router::new()
-        .route("/mcp", post(handle_http_request))
-        .with_state(state);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let task = tokio::spawn(async move {
-        let shutdown = async move {
-            let _ = shutdown_rx.await;
-        };
-        if let Err(error) = axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
-            .await
-        {
-            tracing::debug!("Thor MCP HTTP server exited: {error:#}");
-        }
-    });
-    Ok(ThorMcpHttpServer {
-        mcp_server,
-        shutdown_tx: Some(shutdown_tx),
-        task,
-    })
-}
-
-fn http_mcp_server(url: String, token: String) -> McpServer {
-    McpServer::Http(
-        McpServerHttp::new(thor::THOR_MCP_SERVER_NAME, url).headers(vec![HttpHeader::new(
-            "Authorization",
-            format!("Bearer {token}"),
-        )]),
+fn stdio_mcp_server(command: PathBuf, config_path: PathBuf) -> McpServer {
+    McpServer::Stdio(
+        McpServerStdio::new(thor::THOR_MCP_SERVER_NAME, command)
+            .args(vec!["thor-mcp".to_string()])
+            .env(vec![EnvVariable::new(
+                "MJ_THOR_CONFIG",
+                config_path.to_string_lossy().into_owned(),
+            )]),
     )
 }
 
-fn random_token() -> Result<String> {
-    let mut bytes = [0_u8; 32];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| anyhow!("generate Thor MCP HTTP token: {error}"))?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-}
+pub async fn run_stdio() -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut reader = std::io::BufReader::new(stdin.lock());
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
 
-async fn handle_http_request(
-    State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-    AxumJson(request): AxumJson<RpcRequest>,
-) -> Response {
-    if !authorized(&headers, &state.token) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    while let Some(message) = read_message(&mut reader)? {
+        let request: RpcRequest = serde_json::from_slice(&message).context("parse MCP request")?;
+        let Some(id) = request.id.clone() else {
+            continue;
+        };
+        let response = match handle_request_with_config(request, None).await {
+            Ok(result) => RpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => RpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(RpcError {
+                    code: -32000,
+                    message: "thor MCP bridge error",
+                    data: Some(Value::String(error.to_string())),
+                }),
+            },
+        };
+        write_message(&mut writer, &serde_json::to_vec(&response)?)?;
     }
-    let Some(id) = request.id.clone() else {
-        return StatusCode::ACCEPTED.into_response();
-    };
-    let response = match handle_request_with_config(request, Some(state.config_path.clone())).await
-    {
-        Ok(result) => RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(result),
-            error: None,
-        },
-        Err(error) => RpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: None,
-            error: Some(RpcError {
-                code: -32000,
-                message: "thor MCP bridge error",
-                data: Some(Value::String(error.to_string())),
-            }),
-        },
-    };
-    (StatusCode::OK, AxumJson(response)).into_response()
-}
-
-fn authorized(headers: &HeaderMap, token: &str) -> bool {
-    let Some(header) = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    header == format!("Bearer {token}")
+    Ok(())
 }
 
 async fn handle_request_with_config(
@@ -487,10 +408,35 @@ fn stop_reason_label(reason: StopReason) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
-fn _assert_runtime_sendable() {
-    fn assert_send<T: Send>() {}
-    assert_send::<Arc<AtomicBool>>();
+fn read_message(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            content_length = Some(value.trim().parse::<usize>()?);
+        }
+    }
+    let Some(len) = content_length else {
+        bail!("missing MCP Content-Length header");
+    };
+    let mut body = vec![0; len];
+    reader.read_exact(&mut body)?;
+    Ok(Some(body))
+}
+
+fn write_message(writer: &mut impl Write, body: &[u8]) -> Result<()> {
+    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
+    writer.write_all(body)?;
+    writer.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -498,17 +444,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_mcp_server_uses_local_url_and_bearer_header() {
-        let server = http_mcp_server(
-            "http://127.0.0.1:49152/mcp".to_string(),
-            "secret-token".to_string(),
-        );
-        let McpServer::Http(http) = server else {
-            panic!("expected HTTP MCP server");
+    fn stdio_mcp_server_uses_current_binary_entrypoint_shape() {
+        let server = stdio_mcp_server(PathBuf::from("/tmp/mj"), PathBuf::from("/tmp/config.toml"));
+        let McpServer::Stdio(stdio) = server else {
+            panic!("expected stdio MCP server");
         };
-        assert_eq!(http.name, thor::THOR_MCP_SERVER_NAME);
-        assert_eq!(http.url, "http://127.0.0.1:49152/mcp");
-        assert_eq!(http.headers[0].name, "Authorization");
-        assert_eq!(http.headers[0].value, "Bearer secret-token");
+        assert_eq!(stdio.name, thor::THOR_MCP_SERVER_NAME);
+        assert_eq!(stdio.command, PathBuf::from("/tmp/mj"));
+        assert_eq!(stdio.args, vec!["thor-mcp"]);
+        assert_eq!(stdio.env[0].name, "MJ_THOR_CONFIG");
+        assert_eq!(stdio.env[0].value, "/tmp/config.toml");
     }
 }

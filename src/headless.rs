@@ -135,13 +135,12 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let thor_config = app_config.thor.clone();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let thor_mcp_server = crate::thor_mcp::start_http(config_path.clone())?;
     let runtime_cfg = AcpRuntimeConfig {
         command: agent.program,
         args: agent.args,
         cwd: cfg.cwd,
         additional_directories: cfg.additional_directories,
-        mcp_servers: thor_mcp_server.mcp_servers(),
+        mcp_servers: crate::thor_mcp::mcp_servers(config_path.clone())?,
         resume_session: cfg.resume_session.clone(),
         env: agent.env,
         agent_stderr: cfg.agent_stderr,
