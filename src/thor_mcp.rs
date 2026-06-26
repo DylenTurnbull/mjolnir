@@ -348,7 +348,7 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
             UiEvent::Connected { .. }
             | UiEvent::SessionStarted { .. }
             | UiEvent::TerminalOutput(_)
-            | UiEvent::SessionConfigOptions { .. }
+            | UiEvent::SessionConfigOptions
             | UiEvent::CancelPendingPermissions
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::Warning(_)

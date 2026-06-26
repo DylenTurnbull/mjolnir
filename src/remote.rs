@@ -9,8 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, PermissionOptionKind, SessionConfigId, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionConfigValueId, SessionUpdate,
+    ContentBlock, PermissionOptionKind, SessionConfigId, SessionConfigValueId, SessionUpdate,
     ToolCallContent,
 };
 use anyhow::{Context, Result, anyhow};
@@ -99,9 +98,8 @@ pub struct SessionRecord {
     /// Permission prompts currently waiting for an answer in this session.
     #[serde(default)]
     pub pending_permissions: Vec<PendingPermissionRecord>,
-    /// Session configuration options (model, mode, thought level, ...) the
-    /// agent currently advertises, published so the remote viewer can show
-    /// the active value and queue a change.
+    /// Kept for wire compatibility with older remote viewers. Thor does not
+    /// publish host-agent model, mode, or reasoning controls here.
     #[serde(default)]
     pub session_config: Vec<SessionConfigOptionRecord>,
 }
@@ -134,86 +132,6 @@ pub struct SessionConfigChoiceRecord {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-}
-
-/// Project the parallel `options`/`targets` vectors the runtime emits into
-/// viewer-friendly records. Only `Select` options are representable; any other
-/// kind is skipped so the viewer never shows a control it cannot drive.
-fn config_option_records(
-    options: &[SessionConfigOption],
-    targets: &[SessionConfigTarget],
-) -> Vec<SessionConfigOptionRecord> {
-    options
-        .iter()
-        .zip(targets.iter())
-        .filter_map(|(option, target)| {
-            let SessionConfigKind::Select(select) = &option.kind else {
-                return None;
-            };
-            let (target_kind, config_id) = config_target_parts(target);
-            Some(SessionConfigOptionRecord {
-                target_kind,
-                config_id,
-                name: option.name.clone(),
-                description: option.description.clone(),
-                category: option.category.as_ref().map(config_category_label),
-                current_value: select.current_value.to_string(),
-                choices: select_choice_records(&select.options),
-            })
-        })
-        .collect()
-}
-
-fn select_choice_records(options: &SessionConfigSelectOptions) -> Vec<SessionConfigChoiceRecord> {
-    match options {
-        SessionConfigSelectOptions::Ungrouped(values) => values
-            .iter()
-            .map(|opt| SessionConfigChoiceRecord {
-                value: opt.value.to_string(),
-                label: opt.name.clone(),
-                description: opt.description.clone(),
-            })
-            .collect(),
-        SessionConfigSelectOptions::Grouped(groups) => groups
-            .iter()
-            .flat_map(|group| {
-                let group_name = group.name.clone();
-                group
-                    .options
-                    .iter()
-                    .map(move |opt| SessionConfigChoiceRecord {
-                        value: opt.value.to_string(),
-                        label: format!("{group_name} / {}", opt.name),
-                        description: opt.description.clone(),
-                    })
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn config_category_label(category: &SessionConfigOptionCategory) -> String {
-    use SessionConfigOptionCategory as C;
-    match category {
-        C::Mode => "mode".to_string(),
-        C::Model => "model".to_string(),
-        C::ModelConfig => "model_config".to_string(),
-        C::ThoughtLevel => "thought_level".to_string(),
-        C::Other(other) => other.clone(),
-        _ => "other".to_string(),
-    }
-}
-
-/// Split a [`SessionConfigTarget`] into the `(target_kind, config_id)` pair the
-/// viewer echoes back; [`config_target_from_parts`] is the inverse.
-fn config_target_parts(target: &SessionConfigTarget) -> (String, Option<String>) {
-    match target {
-        SessionConfigTarget::ConfigOption { config_id } => {
-            ("config_option".to_string(), Some(config_id.to_string()))
-        }
-        SessionConfigTarget::LegacyModel => ("legacy_model".to_string(), None),
-        SessionConfigTarget::LegacyMode => ("legacy_mode".to_string(), None),
-    }
 }
 
 fn config_target_from_parts(
@@ -493,8 +411,8 @@ impl TrackerState {
                 }
                 self.last_update = Some(now);
             }
-            UiEvent::SessionConfigOptions { options, targets } => {
-                self.session_config = config_option_records(options, targets);
+            UiEvent::SessionConfigOptions => {
+                self.session_config.clear();
                 self.touch();
             }
             UiEvent::SessionUpdate(update) => {
@@ -2959,9 +2877,8 @@ fn rfc3339_before(age: Duration) -> String {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        PermissionOption, SessionConfigSelect, SessionConfigSelectOption, Terminal,
-        TerminalExitStatus, TerminalId, ToolCall, ToolCallContent, ToolCallUpdate,
-        ToolCallUpdateFields,
+        PermissionOption, Terminal, TerminalExitStatus, TerminalId, ToolCall, ToolCallContent,
+        ToolCallUpdate, ToolCallUpdateFields,
     };
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
@@ -3149,22 +3066,7 @@ mod tests {
             text: "old prompt".to_string(),
             images: Vec::new(),
         });
-        state.observe_event(&UiEvent::SessionConfigOptions {
-            options: vec![SessionConfigOption::new(
-                SessionConfigId::from("model"),
-                "Model",
-                SessionConfigKind::Select(SessionConfigSelect::new(
-                    SessionConfigValueId::from("fast"),
-                    vec![SessionConfigSelectOption::new(
-                        SessionConfigValueId::from("fast"),
-                        "Fast",
-                    )],
-                )),
-            )],
-            targets: vec![SessionConfigTarget::ConfigOption {
-                config_id: SessionConfigId::from("model"),
-            }],
-        });
+        state.observe_event(&UiEvent::SessionConfigOptions);
         state.observe_event(&UiEvent::TerminalOutput(TerminalOutputSnapshot {
             terminal_id: "term-1".to_string(),
             output: "old output\n".to_string(),
@@ -3560,24 +3462,14 @@ mod tests {
     }
 
     #[test]
-    fn tracker_publishes_session_config_and_clears_on_new_session() {
+    fn tracker_hides_session_config_and_clears_on_new_session() {
         let tracker =
             RemoteSessionTracker::new_disconnected("proj".to_string(), "agent".to_string());
         tracker.observe_event(&UiEvent::SessionStarted {
             session_id: "sess-1".to_string(),
             resumed: false,
         });
-        tracker.observe_event(&UiEvent::SessionConfigOptions {
-            options: vec![SessionConfigOption::select(
-                "model",
-                "Model",
-                "gpt-5",
-                vec![SessionConfigSelectOption::new("gpt-5", "GPT-5")],
-            )],
-            targets: vec![SessionConfigTarget::ConfigOption {
-                config_id: SessionConfigId::from("model".to_string()),
-            }],
-        });
+        tracker.observe_event(&UiEvent::SessionConfigOptions);
 
         let snapshot = tracker
             .state
@@ -3585,11 +3477,10 @@ mod tests {
             .expect("state")
             .snapshot()
             .expect("snapshot");
-        assert_eq!(snapshot.session_config.len(), 1);
-        assert_eq!(snapshot.session_config[0].current_value, "gpt-5");
+        assert!(snapshot.session_config.is_empty());
 
-        // Starting a fresh session drops the previous session's config so a
-        // viewer never shows options the new agent did not advertise.
+        // Starting a fresh session keeps the remote viewer free of host-agent
+        // config controls.
         tracker.observe_event(&UiEvent::SessionStarted {
             session_id: "sess-2".to_string(),
             resumed: false,
@@ -3965,52 +3856,21 @@ mod tests {
     }
 
     #[test]
-    fn config_option_records_projects_select_options_with_targets() {
-        let options = vec![
-            SessionConfigOption::select(
-                "model",
-                "Model",
-                "gpt-5",
-                vec![
-                    SessionConfigSelectOption::new("gpt-5", "GPT-5"),
-                    SessionConfigSelectOption::new("gpt-4", "GPT-4").description("older"),
-                ],
-            )
-            .category(SessionConfigOptionCategory::Model),
-        ];
-        let targets = vec![SessionConfigTarget::ConfigOption {
-            config_id: SessionConfigId::from("model".to_string()),
-        }];
-
-        let records = config_option_records(&options, &targets);
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        assert_eq!(record.target_kind, "config_option");
-        assert_eq!(record.config_id.as_deref(), Some("model"));
-        assert_eq!(record.name, "Model");
-        assert_eq!(record.category.as_deref(), Some("model"));
-        assert_eq!(record.current_value, "gpt-5");
-        assert_eq!(record.choices.len(), 2);
-        assert_eq!(record.choices[1].value, "gpt-4");
-        assert_eq!(record.choices[1].description.as_deref(), Some("older"));
-
-        // The published pair round-trips back into the target to drive.
-        let target = config_target_from_parts(&record.target_kind, record.config_id.as_deref())
-            .expect("target reconstructs");
-        assert_eq!(target, targets[0]);
-    }
-
-    #[test]
-    fn config_target_parts_round_trip_and_reject_bad_input() {
-        for target in [
-            SessionConfigTarget::LegacyModel,
-            SessionConfigTarget::LegacyMode,
-        ] {
-            let (kind, id) = config_target_parts(&target);
-            assert_eq!(config_target_from_parts(&kind, id.as_deref()), Some(target));
-        }
-        // A config_option target is meaningless without its id, and unknown
-        // kinds are refused rather than guessed.
+    fn config_target_from_parts_accepts_legacy_stale_clients_and_rejects_bad_input() {
+        assert_eq!(
+            config_target_from_parts("legacy_model", None),
+            Some(SessionConfigTarget::LegacyModel)
+        );
+        assert_eq!(
+            config_target_from_parts("legacy_mode", None),
+            Some(SessionConfigTarget::LegacyMode)
+        );
+        assert_eq!(
+            config_target_from_parts("config_option", Some("model")),
+            Some(SessionConfigTarget::ConfigOption {
+                config_id: SessionConfigId::from("model")
+            })
+        );
         assert!(config_target_from_parts("config_option", None).is_none());
         assert!(config_target_from_parts("nonsense", Some("x")).is_none());
     }

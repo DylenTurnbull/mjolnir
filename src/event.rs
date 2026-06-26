@@ -5,8 +5,8 @@
 //! network I/O. They communicate over two unbounded mpsc channels.
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, PermissionOption, SessionConfigId, SessionConfigOption, SessionConfigValueId,
-    SessionUpdate, StopReason, TerminalExitStatus, ToolCallUpdate, Usage,
+    ContentBlock, PermissionOption, SessionConfigId, SessionConfigValueId, SessionUpdate,
+    StopReason, TerminalExitStatus, ToolCallUpdate, Usage,
 };
 use std::path::PathBuf;
 use tokio::sync::oneshot;
@@ -41,13 +41,9 @@ pub enum UiEvent {
     /// captured output or exit status changes so embedded terminal tool-call
     /// content can render live output.
     TerminalOutput(TerminalOutputSnapshot),
-    /// Session configuration options with the ACP method each option should
-    /// use when changed. Real `configOptions` use `session/set_config_option`;
-    /// legacy synthesized options use older model/mode methods.
-    SessionConfigOptions {
-        options: Vec<SessionConfigOption>,
-        targets: Vec<SessionConfigTarget>,
-    },
+    /// Host ACP session configuration changed. Thor hides these controls
+    /// because model, mode, and reasoning are coordinator routing decisions.
+    SessionConfigOptions,
     /// `session/request_permission` from the agent. The UI is expected to
     /// render a modal and answer through `responder` exactly once.
     PermissionRequest(PermissionPrompt),

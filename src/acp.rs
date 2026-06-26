@@ -1449,10 +1449,7 @@ async fn drive_session(
         resumed,
     });
     if !session_config.options.is_empty() {
-        let _ = ui_tx.send(UiEvent::SessionConfigOptions {
-            options: session_config.options.clone(),
-            targets: session_config.targets.clone(),
-        });
+        let _ = ui_tx.send(UiEvent::SessionConfigOptions);
     }
 
     while let Some(cmd) = ui_rx.recv().await {
@@ -1539,10 +1536,7 @@ async fn drive_session(
                         session_id: session_id.to_string(),
                         resumed: true,
                     });
-                    let _ = ui_tx.send(UiEvent::SessionConfigOptions {
-                        options: session_config.options.clone(),
-                        targets: session_config.targets.clone(),
-                    });
+                    let _ = ui_tx.send(UiEvent::SessionConfigOptions);
                     if let Some(title) = title {
                         let _ = ui_tx.send(UiEvent::SessionUpdate(
                             SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title(title)),
@@ -1660,10 +1654,7 @@ async fn switch_existing_session(
         session_id: target_session_id.to_string(),
         resumed: true,
     });
-    let _ = ui_tx.send(UiEvent::SessionConfigOptions {
-        options: session_config.options.clone(),
-        targets: session_config.targets.clone(),
-    });
+    let _ = ui_tx.send(UiEvent::SessionConfigOptions);
     if let Some(title) = title {
         let _ = ui_tx.send(UiEvent::SessionUpdate(SessionUpdate::SessionInfoUpdate(
             SessionInfoUpdate::new().title(title),
@@ -1739,10 +1730,7 @@ async fn drive_fork_session(
                             session_id: session_id.to_string(),
                             resumed: false,
                         });
-                        let _ = ui_tx.send(UiEvent::SessionConfigOptions {
-                            options: session_config.options.clone(),
-                            targets: session_config.targets.clone(),
-                        });
+                        let _ = ui_tx.send(UiEvent::SessionConfigOptions);
                         let _ = ui_tx.send(UiEvent::Info("session forked".to_string()));
                     }
                     Err(e) => {
@@ -3006,10 +2994,7 @@ async fn drive_config_update(
                     Ok(Some(options)) => {
                         session_config.targets = config_option_targets(&options);
                         session_config.options = options;
-                        let _ = ui_tx.send(UiEvent::SessionConfigOptions {
-                            options: session_config.options.clone(),
-                            targets: session_config.targets.clone(),
-                        });
+                        let _ = ui_tx.send(UiEvent::SessionConfigOptions);
                     }
                     Ok(None) => {
                         set_current_config_value(
@@ -3018,10 +3003,7 @@ async fn drive_config_update(
                             &target,
                             &value,
                         );
-                        let _ = ui_tx.send(UiEvent::SessionConfigOptions {
-                            options: session_config.options.clone(),
-                            targets: session_config.targets.clone(),
-                        });
+                        let _ = ui_tx.send(UiEvent::SessionConfigOptions);
                     }
                     Err(e) => {
                         let _ = ui_tx.send(UiEvent::Warning(format!(
@@ -5334,7 +5316,7 @@ mod tests {
                     assert_eq!(message, "session forked");
                     saw_forked_info = true;
                 }
-                UiEvent::SessionConfigOptions { .. } => {}
+                UiEvent::SessionConfigOptions => {}
                 UiEvent::Warning(_) | UiEvent::Fatal(_) => panic!("unexpected: {ev:?}"),
                 _ => {}
             }

@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     AvailableCommand, Diff, Plan, PlanEntry, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOptions,
-    SessionConfigValueId, SessionUpdate, StopReason, TerminalExitStatus, ToolCall, ToolCallContent,
-    ToolCallStatus, ToolCallUpdate, ToolKind, Usage, UsageUpdate,
+    SessionConfigSelect, SessionConfigSelectOptions, SessionConfigValueId, SessionUpdate,
+    StopReason, TerminalExitStatus, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    ToolKind, Usage, UsageUpdate,
 };
 use chrono::{DateTime, FixedOffset, Local, TimeZone};
 
@@ -1513,6 +1513,10 @@ impl AppState {
                     self.finish_turn_timer();
                 }
                 self.session_id = Some(session_id);
+                self.current_mode = None;
+                self.session_config_options.clear();
+                self.session_config_targets.clear();
+                self.config_picker = None;
                 self.set_connection_state(ConnectionState::Ready);
             }
             UiEvent::SessionUpdate(u) => {
@@ -1524,8 +1528,10 @@ impl AppState {
                     .insert(snapshot.terminal_id.clone(), snapshot);
                 self.apply_known_terminal_outputs();
             }
-            UiEvent::SessionConfigOptions { options, targets } => {
-                self.apply_session_config_options(options, targets);
+            UiEvent::SessionConfigOptions => {
+                self.session_config_options.clear();
+                self.session_config_targets.clear();
+                self.config_picker = None;
             }
             UiEvent::PermissionRequest(prompt) => {
                 // Append to the queue rather than replacing the current
@@ -1730,15 +1736,13 @@ impl AppState {
                 // (and so a previously-empty filter can become non-empty).
                 self.update_autocomplete();
             }
-            SessionUpdate::CurrentModeUpdate(u) => {
-                let mode = u.current_mode_id.to_string();
-                self.current_mode = Some(mode.clone());
-                self.transcript.push(Entry::System(format!("mode: {mode}")));
-                self.bump_transcript_revision();
+            SessionUpdate::CurrentModeUpdate(_) => {
+                self.current_mode = None;
             }
-            SessionUpdate::ConfigOptionUpdate(u) => {
-                let targets = config_option_targets(&u.config_options);
-                self.apply_session_config_options(u.config_options, targets);
+            SessionUpdate::ConfigOptionUpdate(_) => {
+                self.session_config_options.clear();
+                self.session_config_targets.clear();
+                self.config_picker = None;
             }
             SessionUpdate::SessionInfoUpdate(info) => {
                 if let Some(title) = info.title.value()
@@ -1765,82 +1769,6 @@ impl AppState {
         }
     }
 
-    fn refresh_config_picker(&mut self) {
-        if self.session_config_options.is_empty() {
-            self.config_picker = None;
-            return;
-        };
-        let Some((selected_option, selected_value)) = self
-            .config_picker
-            .as_ref()
-            .map(|picker| (picker.selected_option, picker.selected_value))
-        else {
-            return;
-        };
-
-        let Some(option) = self.session_config_options.get(selected_option) else {
-            self.config_picker = None;
-            return;
-        };
-        let Some(choices) = config_option_choices(option) else {
-            self.config_picker = None;
-            return;
-        };
-        if choices.is_empty() {
-            self.config_picker = None;
-            return;
-        }
-        if let Some(picker) = self.config_picker.as_mut() {
-            let query = picker.search_query.clone();
-            // Recompute filtered indices against the new choices list.
-            let haystack = query.to_lowercase();
-            let filtered: Vec<usize> = if haystack.is_empty() {
-                (0..choices.len()).collect()
-            } else {
-                choices
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, choice)| {
-                        choice.name.to_lowercase().contains(&haystack)
-                            || choice
-                                .description
-                                .as_deref()
-                                .map(|d| d.to_lowercase().contains(&haystack))
-                                .unwrap_or(false)
-                    })
-                    .map(|(i, _)| i)
-                    .collect()
-            };
-            picker.filtered_indices = filtered;
-            picker.selected_value =
-                selected_value.min(picker.filtered_indices.len().saturating_sub(1));
-        }
-    }
-
-    fn apply_session_config_options(
-        &mut self,
-        options: Vec<SessionConfigOption>,
-        targets: Vec<SessionConfigTarget>,
-    ) {
-        self.session_config_targets = if targets.len() == options.len() {
-            targets
-        } else {
-            config_option_targets(&options)
-        };
-        self.session_config_options = options;
-        self.refresh_config_picker();
-
-        if let Some(mode_option) = self.session_config_options.iter().find(|option| {
-            matches!(
-                option.category,
-                Some(SessionConfigOptionCategory::Mode | SessionConfigOptionCategory::ThoughtLevel)
-            )
-        }) && let Some(value) = config_option_current_value_id(mode_option)
-        {
-            self.current_mode = Some(value.to_string());
-        }
-    }
-
     /// Return select-style config options in agent order, together with
     /// their original index and optional `Ctrl-1..9` shortcut.
     pub fn selectable_config_options(&self) -> Vec<(usize, &SessionConfigOption, Option<char>)> {
@@ -1854,15 +1782,6 @@ impl AppState {
             })
             .collect()
     }
-}
-
-fn config_option_targets(options: &[SessionConfigOption]) -> Vec<SessionConfigTarget> {
-    options
-        .iter()
-        .map(|option| SessionConfigTarget::ConfigOption {
-            config_id: option.id.clone(),
-        })
-        .collect()
 }
 
 #[derive(PartialEq, Eq)]
@@ -2291,7 +2210,7 @@ mod tests {
     }
 
     #[test]
-    fn config_option_update_refreshes_session_state() {
+    fn host_config_option_update_is_hidden_from_thor_ui() {
         let mut s = AppState::new();
         let options = vec![
             SessionConfigOption::select(
@@ -2320,13 +2239,14 @@ mod tests {
             ConfigOptionUpdate::new(options),
         )));
 
-        assert_eq!(s.session_config_options.len(), 2);
-        assert_eq!(s.current_mode.as_deref(), Some("ask"));
+        assert!(s.session_config_options.is_empty());
+        assert!(s.current_mode.is_none());
+        assert!(s.config_picker.is_none());
         assert!(s.status_line.is_none());
     }
 
     #[test]
-    fn config_option_update_uses_thought_level_as_current_mode() {
+    fn host_thought_level_update_is_hidden_from_thor_ui() {
         let mut s = AppState::new();
         let options = vec![
             SessionConfigOption::select(
@@ -2345,7 +2265,8 @@ mod tests {
             ConfigOptionUpdate::new(options),
         )));
 
-        assert_eq!(s.current_mode.as_deref(), Some("medium"));
+        assert!(s.current_mode.is_none());
+        assert!(s.session_config_options.is_empty());
     }
 
     #[test]
@@ -2416,9 +2337,9 @@ mod tests {
     }
 
     #[test]
-    fn config_option_update_reassigns_shortcuts_and_clamps_picker_selection() {
+    fn host_config_option_update_clears_existing_picker_state() {
         let mut s = AppState::new();
-        let initial = vec![
+        s.session_config_options = vec![
             SessionConfigOption::select(
                 "model",
                 "Model",
@@ -2438,10 +2359,6 @@ mod tests {
                 ],
             ),
         ];
-        s.apply_event(UiEvent::SessionUpdate(SessionUpdate::ConfigOptionUpdate(
-            ConfigOptionUpdate::new(initial),
-        )));
-
         assert!(s.open_config_value_picker(0));
         s.config_picker_move(1);
         assert_eq!(s.config_picker.as_ref().expect("picker").selected_value, 1);
@@ -2456,11 +2373,9 @@ mod tests {
             ConfigOptionUpdate::new(updated),
         )));
 
-        let shortcuts = s.selectable_config_options();
-        assert_eq!(shortcuts.len(), 1);
-        assert_eq!(shortcuts[0].0, 0);
-        assert_eq!(shortcuts[0].2, Some('1'));
-        assert_eq!(s.config_picker.as_ref().expect("picker").selected_value, 0);
+        assert!(s.session_config_options.is_empty());
+        assert!(s.selectable_config_options().is_empty());
+        assert!(s.config_picker.is_none());
     }
 
     #[test]

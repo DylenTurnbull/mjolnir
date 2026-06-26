@@ -219,7 +219,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 apply_session_update(&mut state, update, prompt_sent, &mut collecting_turn_output);
             }
             UiEvent::TerminalOutput(_) => {}
-            UiEvent::SessionConfigOptions { .. } => {}
+            UiEvent::SessionConfigOptions => {}
             UiEvent::PermissionRequest(prompt) => {
                 let decision =
                     permission_decision(cfg.permission_mode, &prompt.tool_call, &prompt.options);

@@ -158,18 +158,12 @@ Useful forms:
 - `mj resume --list`: list sessions from the configured Thor backend.
 - `mj resume --list --format json`: print the session list as JSON.
 
-## Permissions And Config
+## Permissions
 
 Permission prompts stay in the same terminal flow and keep the requested command
 visible while you choose whether to allow, always allow, or reject it.
 
 ![Mjolnir permission prompt for a shell command](docs/readme-images/permission-request.png)
-
-Agents can expose session-specific configuration through ACP. `mj` renders those
-options as searchable terminal pickers, so model and mode changes do not require
-leaving the chat.
-
-![Mjolnir searchable model configuration picker](docs/readme-images/searchable-config-options.png)
 
 ## Automation
 

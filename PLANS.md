@@ -204,10 +204,8 @@ Deliverables:
   Today they show labelled placeholders (`[image]`, `[resource]`, `[link …]`,
   `[audio]`) — M2 should make them rich.
 - Improve tool-call rendering for diff, terminal, and structured content.
-- Render config option updates in a way that lets users understand model, mode,
-  reasoning, and other agent-provided session settings.
-- Add command support for ACP session config changes if the protocol surface and
-  advertised commands make that practical.
+- Hide host-agent session config options from the Thor UX; model, mode, and
+  reasoning selection are Thor routing decisions, not user-facing pickers.
 - ✅ Handle ACP auth-required responses with actionable UI text — shipped
   early in M1 as `LaunchError::AuthRequired`, classified at both
   `initialize` and `session/new`.
