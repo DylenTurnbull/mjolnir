@@ -13,7 +13,7 @@ changed and how much each harness/model used.
 ## UX contract
 
 - `mj` opens a Thor host ACP session, not an agent/model picker.
-- First run detects configured ACP harnesses and accounts, then picks sane
+- First run shows the Thor coordinator configuration, then starts from sane
   defaults.
 - The normal prompt flow has no visible model picker or agent picker.
 - Thor presents an execution plan before doing work.

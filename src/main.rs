@@ -27,6 +27,7 @@ mod theme;
 mod theme_picker;
 mod thor;
 mod thor_mcp;
+mod thor_setup;
 mod ui;
 mod version;
 mod worktree;
@@ -885,6 +886,13 @@ async fn run_first_run_setup(
     cfg: &mut Config,
     config_path: &Path,
 ) -> Result<Option<SelectedAgent>> {
+    let agent = ensure_thor_default_agent(cfg);
+    let Some(()) = run_thor_setup_once(cfg.theme.palette(), &cfg.thor, &agent).await? else {
+        return Ok(None);
+    };
+    cfg.save(config_path)
+        .with_context(|| format!("save {}", config_path.display()))?;
+
     let Some(theme_kind) = run_theme_picker_once(cfg.theme).await? else {
         return Ok(None);
     };
@@ -897,7 +905,6 @@ async fn run_first_run_setup(
         return Ok(None);
     };
     cfg.spinner = spinner_style;
-    let agent = ensure_thor_default_agent(cfg);
     cfg.save(config_path)
         .with_context(|| format!("save {}", config_path.display()))?;
     Ok(Some(agent))
@@ -1042,6 +1049,20 @@ async fn run_spinner_picker_once(
     let result = spinner_picker::run_spinner_picker(&mut terminal, theme, initial).await;
     if let Err(e) = ui::restore_fullscreen_terminal(&mut terminal) {
         tracing::warn!("restore terminal (spinner picker) failed: {e}");
+    }
+    settle_after_fullscreen_picker_restore().await;
+    result
+}
+
+async fn run_thor_setup_once(
+    theme: palette::TerminalTheme,
+    thor_config: &thor::ThorConfig,
+    host_agent: &SelectedAgent,
+) -> Result<Option<()>> {
+    let mut terminal = ui::setup_fullscreen_terminal().context("setup terminal")?;
+    let result = thor_setup::run_thor_setup(&mut terminal, theme, thor_config, host_agent).await;
+    if let Err(e) = ui::restore_fullscreen_terminal(&mut terminal) {
+        tracing::warn!("restore terminal (Thor setup) failed: {e}");
     }
     settle_after_fullscreen_picker_restore().await;
     result

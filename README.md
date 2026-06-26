@@ -22,6 +22,8 @@ Thor is the simple path: give it the task, review the plan, then let it assign
 work to configured ACP harnesses. Today `mj` defaults to the `anvil` ACP
 backend (`uvx brokk acp`) as the first Thor host. `mj` injects a local MCP
 bridge into that host session so Thor can discover and run worker ACP agents.
+On first run, `mj` shows the Thor coordinator configuration before starting a
+session and writes a visible `[thor]` section to `~/.config/mj/config.toml`.
 
 ![Mjolnir inline chat showing streaming agent output and tool activity](docs/readme-images/default-ui.png)
 

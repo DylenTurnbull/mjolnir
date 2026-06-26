@@ -48,6 +48,7 @@ Current command-line surface:
 
 There is no `--command` / `--agent` flag. Startup creates an `anvil` backend
 default automatically when `~/.config/mj/config.toml` has no `agent` block.
+First run shows a Thor setup screen and writes visible `[thor]` configuration.
 The previous agent picker is no longer part of the normal user path.
 
 M1 hardening landed (PR #34): an explicit `ConnectionState` lifecycle drives
@@ -358,7 +359,7 @@ in a smoke test):
 | `agentInfo` (name + version) | populated; our `Connected` event renders `Claude Agent 0.36.1` |
 | `authMethods` | `[]`; no auth-required path triggered for this configuration |
 | `session/new` with `cwd` | works; returns `sessionId`, `models`, `modes`, `configOptions` |
-| `configOptions` categories | `mode`, `model`, `thought_level` — all map to our existing `SessionConfigOptionCategory` variants and render via the inline shortcut row |
+| `configOptions` categories | advertised by some host agents, but hidden from the Thor UX because model, mode, and reasoning are Thor routing policy |
 | `available_commands_update` notification | streams immediately after `session/new`; populates the slash autocomplete |
 | `loadSession`, `sessionCapabilities` (resume/fork/list/close/delete) | advertised by the agent; mjolnir now drives load/fork where implemented, with broader list/resume/delete UX still M5 territory |
 | `promptCapabilities.image`, `embeddedContext` | accepted by the agent; mjolnir still renders these `ContentBlock` variants as `[image]` / `[resource]` placeholders pending M2 |

@@ -20,7 +20,7 @@ pub struct Config {
     pub theme: TerminalThemeKind,
     #[serde(default, skip_serializing_if = "SpinnerStyle::is_default")]
     pub spinner: SpinnerStyle,
-    #[serde(default, skip_serializing_if = "ThorConfig::is_default")]
+    #[serde(default)]
     pub thor: ThorConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<SelectedAgent>,
@@ -495,7 +495,7 @@ args = ["--flag", "$HOME/data"]
     }
 
     #[test]
-    fn empty_config_serializes_as_blank() {
+    fn default_config_serializes_visible_thor_section() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         Config::default().save(&path).expect("save");
@@ -510,8 +510,16 @@ args = ["--flag", "$HOME/data"]
             "default theme should not be serialized: {body:?}"
         );
         assert!(
-            !body.contains("thor"),
-            "default Thor config should not be serialized: {body:?}"
+            body.contains("[thor]"),
+            "Thor config should be visible: {body:?}"
+        );
+        assert!(
+            body.contains("coordinator_model = \"auto-strong\""),
+            "Thor coordinator default should be visible: {body:?}"
+        );
+        assert!(
+            body.contains("optimization_mode = \"balanced\""),
+            "Thor optimization default should be visible: {body:?}"
         );
     }
 

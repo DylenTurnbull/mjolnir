@@ -66,12 +66,6 @@ impl Default for ThorConfig {
     }
 }
 
-impl ThorConfig {
-    pub fn is_default(&self) -> bool {
-        self == &Self::default()
-    }
-}
-
 fn default_coordinator_model() -> String {
     DEFAULT_COORDINATOR_MODEL.to_string()
 }
