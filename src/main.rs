@@ -134,8 +134,6 @@ struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Commands {
-    #[command(hide = true)]
-    ThorMcp,
     /// Resume an existing ACP session.
     ///
     /// Lists or loads sessions from the configured Thor backend. Without a
@@ -272,7 +270,6 @@ fn should_run_startup_update_check(cli: &Cli) -> bool {
     match &cli.command {
         Some(Commands::Resume(args)) => !args.list,
         Some(Commands::Server(_)) => false,
-        Some(Commands::ThorMcp) => false,
         None => true,
     }
 }
@@ -300,7 +297,6 @@ async fn main() -> Result<()> {
 
     if let Some(command) = cli.command {
         return match command {
-            Commands::ThorMcp => thor_mcp::run_stdio().await,
             Commands::Resume(mut args) => {
                 args.fullscreen_tui |= fullscreen_tui;
                 run_resume(args, fs_max_text_bytes, top_level_additional_directories).await

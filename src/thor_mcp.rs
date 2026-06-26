@@ -1,6 +1,5 @@
 //! MCP bridge exposed to the ACP host running Thor.
 
-use std::io::{BufRead, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -220,40 +219,6 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
         return false;
     };
     header == format!("Bearer {token}")
-}
-
-pub async fn run_stdio() -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut reader = std::io::BufReader::new(stdin.lock());
-    let stdout = std::io::stdout();
-    let mut writer = stdout.lock();
-
-    while let Some(message) = read_message(&mut reader)? {
-        let request: RpcRequest = serde_json::from_slice(&message).context("parse MCP request")?;
-        let Some(id) = request.id.clone() else {
-            continue;
-        };
-        let response = match handle_request_with_config(request, None).await {
-            Ok(result) => RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(result),
-                error: None,
-            },
-            Err(error) => RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: None,
-                error: Some(RpcError {
-                    code: -32000,
-                    message: "thor MCP bridge error",
-                    data: Some(Value::String(error.to_string())),
-                }),
-            },
-        };
-        write_message(&mut writer, &serde_json::to_vec(&response)?)?;
-    }
-    Ok(())
 }
 
 async fn handle_request_with_config(
@@ -520,37 +485,6 @@ fn stop_reason_label(reason: StopReason) -> &'static str {
         StopReason::Cancelled => "cancelled",
         _ => "other",
     }
-}
-
-fn read_message(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
-    let mut content_length = None;
-    loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line)?;
-        if read == 0 {
-            return Ok(None);
-        }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-            content_length = Some(value.trim().parse::<usize>()?);
-        }
-    }
-    let Some(len) = content_length else {
-        bail!("missing MCP Content-Length header");
-    };
-    let mut body = vec![0; len];
-    reader.read_exact(&mut body)?;
-    Ok(Some(body))
-}
-
-fn write_message(writer: &mut impl Write, body: &[u8]) -> Result<()> {
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
-    writer.write_all(body)?;
-    writer.flush()?;
-    Ok(())
 }
 
 #[allow(dead_code)]

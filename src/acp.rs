@@ -5036,9 +5036,15 @@ mod tests {
         let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
         let (cr, cw) = split(client_side);
         let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
-        let mcp_servers = vec![McpServer::Stdio(
-            agent_client_protocol::schema::v1::McpServerStdio::new("thor-acp-bridge", "/tmp/mj")
-                .args(vec!["thor-mcp".to_string()]),
+        let mcp_servers = vec![McpServer::Http(
+            agent_client_protocol::schema::v1::McpServerHttp::new(
+                "thor-acp-bridge",
+                "http://127.0.0.1:49152/mcp",
+            )
+            .headers(vec![agent_client_protocol::schema::v1::HttpHeader::new(
+                "Authorization",
+                "Bearer test-token",
+            )]),
         )];
 
         let agent_task = tokio::spawn(run_mock_agent_with_new_session_mcp_servers(
