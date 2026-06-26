@@ -58,12 +58,12 @@ changed and how much each harness/model used.
    a selected worker.
 4. Done: first-run onboarding selects available Thor workers, persona, Thor
    host, model preference, and reasoning level.
-5. Next: add a local model catalog cache populated from LM Arena and OpenRouter
-   data.
-6. Next: support concurrent ACP worker sessions with aggregated progress and
-   usage.
-7. Next: replace raw worker transcripts with richer Thor progress views while
-   preserving the single coordinated chat.
+5. Done: add a local model catalog cache populated from LM Arena and OpenRouter
+   data when Thor requests a refresh.
+6. Done: support concurrent ACP worker sessions with aggregated progress and
+   usage through the Thor MCP bridge.
+7. Done: return structured worker progress/tool/usage views instead of relying
+   on raw worker transcript dumps.
 
 ## Data sources
 

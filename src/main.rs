@@ -26,6 +26,7 @@ mod text;
 mod theme;
 mod theme_picker;
 mod thor;
+mod thor_catalog;
 mod thor_mcp;
 mod thor_setup;
 mod ui;

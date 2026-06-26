@@ -105,6 +105,11 @@ decides how to split the work and monitor worker sessions.
 The durable plan lives in
 [docs/thor-coordinator-plan.md](docs/thor-coordinator-plan.md).
 
+The Thor MCP bridge now exposes configured workers, a cached model catalog
+backed by LM Arena/OpenRouter refreshes, single-worker delegation, and
+concurrent multi-worker delegation with structured progress and aggregate
+usage.
+
 Initial routing policy:
 
 - Thor supports balanced, cost/accountant, and best-solution/architect

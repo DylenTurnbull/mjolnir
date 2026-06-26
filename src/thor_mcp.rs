@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
     EnvVariable, McpServer, McpServerStdio, PermissionOptionKind, SessionUpdate, StopReason,
-    ToolCallUpdate, ToolKind, Usage,
+    ToolCall, ToolCallStatus, ToolCallUpdate, ToolKind, Usage, UsageUpdate,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,7 @@ use crate::acp::{self, AcpRuntimeConfig};
 use crate::config::{self, Config, SelectedAgent};
 use crate::event::{PermissionDecision, UiCommand, UiEvent, content_block_text};
 use crate::thor;
+use crate::thor_catalog::{self, CatalogRequest};
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -55,6 +56,25 @@ struct ToolCallParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunAgentArgs {
+    #[serde(default)]
+    job_id: Option<String>,
+    source_id: String,
+    prompt: String,
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    permission_mode: BridgePermissionMode,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunAgentBatchArgs {
+    jobs: Vec<RunAgentJob>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunAgentJob {
+    id: Option<String>,
     source_id: String,
     prompt: String,
     cwd: Option<PathBuf>,
@@ -82,12 +102,71 @@ struct AgentSummary {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DelegatedRunResult {
+    job_id: Option<String>,
     source_id: String,
+    final_text: String,
     text: String,
     stop_reason: String,
     usage: Option<Usage>,
+    context_usage: Option<ContextUsageSummary>,
+    tool_calls: Vec<ToolSummary>,
+    progress: Vec<ProgressEvent>,
     permissions: Vec<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchRunResult {
+    jobs: Vec<DelegatedRunResult>,
+    aggregate_usage: UsageAggregate,
+    progress: Vec<BatchProgressEvent>,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageAggregate {
+    jobs: usize,
+    jobs_with_usage: usize,
+    total_tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    thought_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextUsageSummary {
+    used: u64,
+    size: u64,
+    cost: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolSummary {
+    id: String,
+    title: String,
+    kind: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgressEvent {
+    sequence: usize,
+    kind: String,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchProgressEvent {
+    sequence: usize,
+    job_id: Option<String>,
+    source_id: String,
+    kind: String,
+    detail: String,
 }
 
 pub fn mcp_servers(config_path: PathBuf) -> Result<Vec<McpServer>> {
@@ -177,7 +256,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "thor_run_acp_agent",
-            "description": "Run a prompt on a configured ACP worker and return its transcript, usage, and permission summary.",
+            "description": "Run a prompt on one configured ACP worker and return final text, structured progress, tool calls, usage, and permission summary.",
             "inputSchema": {
                 "type": "object",
                 "required": ["sourceId", "prompt"],
@@ -189,6 +268,46 @@ fn tool_definitions() -> Vec<Value> {
                         "type": "string",
                         "enum": ["reject", "accept_edits", "bypass"]
                     }
+                }
+            }
+        }),
+        json!({
+            "name": "thor_run_acp_agents",
+            "description": "Run multiple configured ACP worker prompts concurrently and return per-worker results plus aggregate usage/progress.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["jobs"],
+                "properties": {
+                    "jobs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "required": ["sourceId", "prompt"],
+                            "properties": {
+                                "id": { "type": "string" },
+                                "sourceId": { "type": "string" },
+                                "prompt": { "type": "string" },
+                                "cwd": { "type": "string" },
+                                "permissionMode": {
+                                    "type": "string",
+                                    "enum": ["reject", "accept_edits", "bypass"]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+        json!({
+            "name": "thor_get_model_catalog",
+            "description": "Return Thor's cached model strength/pricing catalog, refreshing LM Arena/OpenRouter metadata when requested.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "refresh": { "type": "boolean" },
+                    "maxAgeSeconds": { "type": "integer", "minimum": 0 }
                 }
             }
         }),
@@ -213,6 +332,21 @@ async fn call_tool(params: ToolCallParams, config_path: Option<PathBuf>) -> Resu
             let args: RunAgentArgs = serde_json::from_value(params.arguments)?;
             let result = run_agent(args, config_path.as_ref()).await?;
             Ok(tool_text_result(&serde_json::to_string_pretty(&result)?))
+        }
+        "thor_run_acp_agents" => {
+            let args: RunAgentBatchArgs = serde_json::from_value(params.arguments)?;
+            let result = run_agent_batch(args, config_path.as_ref()).await?;
+            Ok(tool_text_result(&serde_json::to_string_pretty(&result)?))
+        }
+        "thor_get_model_catalog" => {
+            let config = load_config(config_path.as_ref())?;
+            let request: CatalogRequest = if params.arguments.is_null() {
+                CatalogRequest::default()
+            } else {
+                serde_json::from_value(params.arguments)?
+            };
+            let catalog = thor_catalog::load_or_refresh_catalog(&config.thor, request).await?;
+            Ok(tool_text_result(&serde_json::to_string_pretty(&catalog)?))
         }
         name => bail!("unknown Thor MCP tool {name}"),
     }
@@ -249,8 +383,73 @@ async fn run_agent(
     run_agent_prompt(agent, args).await
 }
 
+async fn run_agent_batch(
+    args: RunAgentBatchArgs,
+    config_path: Option<&PathBuf>,
+) -> Result<BatchRunResult> {
+    if args.jobs.is_empty() {
+        bail!("empty delegated job list");
+    }
+    if args.jobs.len() > 8 {
+        bail!("too many delegated jobs: max 8");
+    }
+
+    let config_path = config_path.cloned();
+    let futures = args.jobs.into_iter().map(|job| {
+        let config_path = config_path.clone();
+        async move {
+            let job_id = job.id.clone();
+            let source_id = job.source_id.clone();
+            let result = run_agent(job.into(), config_path.as_ref()).await;
+            (job_id, source_id, result)
+        }
+    });
+    let completed = futures::future::join_all(futures).await;
+
+    let mut progress = Vec::new();
+    let mut jobs = Vec::new();
+    for (idx, (job_id, source_id, result)) in completed.into_iter().enumerate() {
+        progress.push(BatchProgressEvent {
+            sequence: idx + 1,
+            job_id: job_id.clone(),
+            source_id: source_id.clone(),
+            kind: "worker_finished".to_string(),
+            detail: match &result {
+                Ok(result) => format!("{} stopped with {}", result.source_id, result.stop_reason),
+                Err(error) => format!("{source_id} failed: {error}"),
+            },
+        });
+        match result {
+            Ok(result) => jobs.push(result),
+            Err(error) => jobs.push(DelegatedRunResult {
+                job_id,
+                source_id,
+                final_text: String::new(),
+                text: String::new(),
+                stop_reason: "error".to_string(),
+                usage: None,
+                context_usage: None,
+                tool_calls: Vec::new(),
+                progress: vec![ProgressEvent {
+                    sequence: 1,
+                    kind: "error".to_string(),
+                    detail: error.to_string(),
+                }],
+                permissions: Vec::new(),
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+
+    Ok(BatchRunResult {
+        aggregate_usage: aggregate_usage(&jobs),
+        jobs,
+        progress,
+    })
+}
+
 async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<DelegatedRunResult> {
-    let cwd = match args.cwd {
+    let cwd = match args.cwd.clone() {
         Some(cwd) => cwd,
         None => std::env::current_dir().context("current dir")?,
     };
@@ -275,44 +474,65 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
     let mut prompt_sent = false;
     let mut stop_reason = None;
     let mut usage = None;
+    let mut context_usage = None;
     let mut error = None;
     let mut permissions = Vec::new();
+    let mut tool_calls = Vec::<ToolSummary>::new();
+    let mut progress = Vec::<ProgressEvent>::new();
 
     while let Some(event) = event_rx.recv().await {
         match event {
             UiEvent::SessionStarted { .. } if !prompt_sent => {
                 prompt_sent = true;
+                push_progress(&mut progress, "session_started", "worker session ready");
                 cmd_tx
                     .send(UiCommand::SendPrompt {
                         text: args.prompt.clone(),
                         images: Vec::new(),
                     })
                     .context("send delegated prompt")?;
+                push_progress(&mut progress, "prompt_sent", "delegated prompt sent");
             }
-            UiEvent::SessionUpdate(SessionUpdate::UserMessageChunk(_))
-            | UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(_))
-                if prompt_sent =>
-            {
+            UiEvent::SessionUpdate(SessionUpdate::UserMessageChunk(_)) if prompt_sent => {
                 collecting_turn_output = true;
+            }
+            UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(chunk)) if prompt_sent => {
+                collecting_turn_output = true;
+                push_progress(
+                    &mut progress,
+                    "agent_thought",
+                    preview(&content_block_text(&chunk.content), 160),
+                );
             }
             UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(chunk))
                 if collecting_turn_output =>
             {
-                final_text.push_str(&content_block_text(&chunk.content));
+                let text = content_block_text(&chunk.content);
+                final_text.push_str(&text);
+                push_progress(&mut progress, "agent_message", preview(&text, 160));
             }
             UiEvent::SessionUpdate(SessionUpdate::ToolCall(tool_call)) => {
-                permissions.push(format!("tool: {}", tool_call.title));
+                push_progress(
+                    &mut progress,
+                    "tool_call",
+                    format!("{} ({})", tool_call.title, tool_kind_label(tool_call.kind)),
+                );
+                upsert_tool_call_summary(&mut tool_calls, &tool_call);
                 if prompt_sent {
                     collecting_turn_output = true;
                 }
             }
             UiEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(update)) => {
+                upsert_tool_update_summary(&mut tool_calls, &update);
                 if let Some(title) = update.fields.title {
-                    permissions.push(format!("tool update: {title}"));
+                    push_progress(&mut progress, "tool_update", title);
                 }
                 if prompt_sent {
                     collecting_turn_output = true;
                 }
+            }
+            UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(update)) => {
+                context_usage = Some(context_usage_summary(update));
             }
             UiEvent::PermissionRequest(prompt) => {
                 let decision =
@@ -326,6 +546,19 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
                         "cancelled"
                     }
                 ));
+                push_progress(
+                    &mut progress,
+                    "permission",
+                    format!(
+                        "{} {}",
+                        prompt.tool_call.tool_call_id,
+                        if decision.is_some() {
+                            "accepted"
+                        } else {
+                            "rejected"
+                        }
+                    ),
+                );
                 let _ = prompt.responder.send(match decision {
                     Some(option_id) => PermissionDecision::Selected(option_id),
                     None => PermissionDecision::Cancelled,
@@ -337,11 +570,17 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
             } => {
                 stop_reason = Some(reason);
                 usage = prompt_usage;
+                push_progress(
+                    &mut progress,
+                    "prompt_done",
+                    stop_reason_label(reason).to_string(),
+                );
                 break;
             }
             UiEvent::PromptFailed { message }
             | UiEvent::SessionForkFailed { message }
             | UiEvent::Fatal(message) => {
+                push_progress(&mut progress, "error", message.clone());
                 error = Some(message);
                 break;
             }
@@ -360,14 +599,128 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
     let _ = cmd_tx.send(UiCommand::Shutdown);
     let _ = tokio::time::timeout(Duration::from_secs(2), runtime).await;
     let reason = stop_reason.unwrap_or(StopReason::Cancelled);
+    let text = final_text.clone();
     Ok(DelegatedRunResult {
+        job_id: args.job_id,
         source_id,
-        text: final_text,
+        final_text,
+        text,
         stop_reason: stop_reason_label(reason).to_string(),
         usage,
+        context_usage,
+        tool_calls,
+        progress,
         permissions,
         error,
     })
+}
+
+impl From<RunAgentJob> for RunAgentArgs {
+    fn from(job: RunAgentJob) -> Self {
+        Self {
+            job_id: job.id,
+            source_id: job.source_id,
+            prompt: job.prompt,
+            cwd: job.cwd,
+            permission_mode: job.permission_mode,
+        }
+    }
+}
+
+fn push_progress(
+    progress: &mut Vec<ProgressEvent>,
+    kind: impl Into<String>,
+    detail: impl Into<String>,
+) {
+    progress.push(ProgressEvent {
+        sequence: progress.len() + 1,
+        kind: kind.into(),
+        detail: detail.into(),
+    });
+}
+
+fn context_usage_summary(update: UsageUpdate) -> ContextUsageSummary {
+    ContextUsageSummary {
+        used: update.used,
+        size: update.size,
+        cost: update
+            .cost
+            .map(|cost| format!("{:.4} {}", cost.amount, cost.currency)),
+    }
+}
+
+fn aggregate_usage(jobs: &[DelegatedRunResult]) -> UsageAggregate {
+    let mut aggregate = UsageAggregate {
+        jobs: jobs.len(),
+        ..UsageAggregate::default()
+    };
+    for usage in jobs.iter().filter_map(|job| job.usage.as_ref()) {
+        aggregate.jobs_with_usage += 1;
+        aggregate.total_tokens = aggregate.total_tokens.saturating_add(usage.total_tokens);
+        aggregate.input_tokens = aggregate.input_tokens.saturating_add(usage.input_tokens);
+        aggregate.output_tokens = aggregate.output_tokens.saturating_add(usage.output_tokens);
+        aggregate.thought_tokens = aggregate
+            .thought_tokens
+            .saturating_add(usage.thought_tokens.unwrap_or_default());
+    }
+    aggregate
+}
+
+fn upsert_tool_call_summary(tool_calls: &mut Vec<ToolSummary>, tool_call: &ToolCall) {
+    let id = tool_call.tool_call_id.to_string();
+    if let Some(existing) = tool_calls.iter_mut().find(|tool| tool.id == id) {
+        existing.title = tool_call.title.clone();
+        existing.kind = Some(tool_kind_label(tool_call.kind).to_string());
+        existing.status = Some(tool_status_label(tool_call.status).to_string());
+        return;
+    }
+    tool_calls.push(ToolSummary {
+        id,
+        title: tool_call.title.clone(),
+        kind: Some(tool_kind_label(tool_call.kind).to_string()),
+        status: Some(tool_status_label(tool_call.status).to_string()),
+    });
+}
+
+fn upsert_tool_update_summary(tool_calls: &mut Vec<ToolSummary>, update: &ToolCallUpdate) {
+    let id = update.tool_call_id.to_string();
+    if let Some(existing) = tool_calls.iter_mut().find(|tool| tool.id == id) {
+        if let Some(title) = update.fields.title.as_ref() {
+            existing.title = title.clone();
+        }
+        if let Some(kind) = update.fields.kind {
+            existing.kind = Some(tool_kind_label(kind).to_string());
+        }
+        if let Some(status) = update.fields.status {
+            existing.status = Some(tool_status_label(status).to_string());
+        }
+        return;
+    }
+    tool_calls.push(ToolSummary {
+        id,
+        title: update
+            .fields
+            .title
+            .clone()
+            .unwrap_or_else(|| "tool call".to_string()),
+        kind: update
+            .fields
+            .kind
+            .map(|kind| tool_kind_label(kind).to_string()),
+        status: update
+            .fields
+            .status
+            .map(|status| tool_status_label(status).to_string()),
+    });
+}
+
+fn preview(text: &str, max_chars: usize) -> String {
+    let mut preview = text.replace('\n', " ");
+    if preview.chars().count() > max_chars {
+        preview = preview.chars().take(max_chars).collect::<String>();
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn permission_decision(
@@ -404,6 +757,32 @@ fn stop_reason_label(reason: StopReason) -> &'static str {
         StopReason::MaxTurnRequests => "max_turn_requests",
         StopReason::Refusal => "refusal",
         StopReason::Cancelled => "cancelled",
+        _ => "other",
+    }
+}
+
+fn tool_kind_label(kind: ToolKind) -> &'static str {
+    match kind {
+        ToolKind::Read => "read",
+        ToolKind::Edit => "edit",
+        ToolKind::Delete => "delete",
+        ToolKind::Move => "move",
+        ToolKind::Search => "search",
+        ToolKind::Execute => "execute",
+        ToolKind::Think => "think",
+        ToolKind::Fetch => "fetch",
+        ToolKind::SwitchMode => "switch_mode",
+        ToolKind::Other => "other",
+        _ => "other",
+    }
+}
+
+fn tool_status_label(status: ToolCallStatus) -> &'static str {
+    match status {
+        ToolCallStatus::Pending => "pending",
+        ToolCallStatus::InProgress => "in_progress",
+        ToolCallStatus::Completed => "completed",
+        ToolCallStatus::Failed => "failed",
         _ => "other",
     }
 }
@@ -454,5 +833,55 @@ mod tests {
         assert_eq!(stdio.args, vec!["thor-mcp"]);
         assert_eq!(stdio.env[0].name, "MJ_THOR_CONFIG");
         assert_eq!(stdio.env[0].value, "/tmp/config.toml");
+    }
+
+    #[test]
+    fn tool_definitions_include_catalog_and_batch_runner() {
+        let names = tool_definitions()
+            .into_iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "thor_get_model_catalog"));
+        assert!(names.iter().any(|name| name == "thor_run_acp_agents"));
+    }
+
+    #[test]
+    fn aggregate_usage_sums_completed_worker_usage() {
+        let jobs = vec![
+            DelegatedRunResult {
+                job_id: Some("a".to_string()),
+                source_id: "claude".to_string(),
+                final_text: String::new(),
+                text: String::new(),
+                stop_reason: "end_turn".to_string(),
+                usage: Some(Usage::new(10, 4, 6)),
+                context_usage: None,
+                tool_calls: Vec::new(),
+                progress: Vec::new(),
+                permissions: Vec::new(),
+                error: None,
+            },
+            DelegatedRunResult {
+                job_id: Some("b".to_string()),
+                source_id: "codex".to_string(),
+                final_text: String::new(),
+                text: String::new(),
+                stop_reason: "error".to_string(),
+                usage: None,
+                context_usage: None,
+                tool_calls: Vec::new(),
+                progress: Vec::new(),
+                permissions: Vec::new(),
+                error: Some("failed".to_string()),
+            },
+        ];
+
+        let aggregate = aggregate_usage(&jobs);
+        assert_eq!(aggregate.jobs, 2);
+        assert_eq!(aggregate.jobs_with_usage, 1);
+        assert_eq!(aggregate.total_tokens, 10);
+        assert_eq!(aggregate.input_tokens, 4);
+        assert_eq!(aggregate.output_tokens, 6);
     }
 }

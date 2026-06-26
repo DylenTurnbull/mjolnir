@@ -75,7 +75,9 @@ backend. Use `/load` to open the session picker for the current backend.
 Thor is a coordinator persona running inside an ACP host agent. `mj` passes a
 stdio MCP bridge (`mj thor-mcp`) to the host through ACP `mcpServers`; the MCP
 tools list configured ACP workers and run assigned tasks through worker
-sessions.
+sessions. The bridge also exposes a cached model catalog from LM
+Arena/OpenRouter sources and a concurrent worker runner that reports structured
+progress, tool calls, and aggregate usage.
 
 Initial routing policy:
 
