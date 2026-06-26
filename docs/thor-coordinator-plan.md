@@ -42,9 +42,9 @@ changed and how much each harness/model used.
 - Other model families prefer Anvil when Anvil is configured for that model.
 - Claude Code and Codex subscriptions are used evenly and maximally before
   falling back to metered OpenRouter routing, subject to remaining
-  quota/rate-limit hints reported by active Claude SDK / Codex appserver probes
-  or ACP `UsageUpdate` metadata. Unknown quota remains unknown; Thor must not
-  invent availability.
+  quota/rate-limit hints returned by direct Claude Code `/usage` and Codex
+  appserver `account/rateLimits/read` queries. Unknown quota remains unknown;
+  Thor must not invent availability.
 - Simple tasks should prefer cheaper capable models; hard tasks should prefer
   stronger models.
 - Every implemented task must include an adversarial review and correction
@@ -70,24 +70,23 @@ changed and how much each harness/model used.
    on raw worker transcript dumps.
 8. Done: validate ACP worker candidates during onboarding and expose a Thor MCP
    validation tool for re-checking configured workers.
-9. Done: detect and cache quota/rate-limit hints from active provider probes
-   and ACP worker usage metadata, then include those hints in worker listings
-   and run results.
+9. Done: detect and cache quota/rate-limit hints from direct provider queries,
+   then include those hints in worker listings.
 
-## Quota probes
+## Quota reads
 
-Active quota detection is provider-specific. `mj` supports:
+Active quota detection is provider-specific and intentionally narrow:
 
-- Claude SDK command probes via `MJ_THOR_CLAUDE_SDK_QUOTA_CMD`.
-- Codex appserver HTTP probes via `MJ_THOR_CODEX_APPSERVER_QUOTA_URL`, or a
-  base `MJ_THOR_CODEX_APPSERVER_URL` whose `/quota` endpoint returns JSON.
-- Codex appserver command probes via `MJ_THOR_CODEX_APPSERVER_QUOTA_CMD`.
-- Per-agent command probes via `MJ_THOR_QUOTA_PROBE_<SOURCE_ID>`.
+- Claude Code: `mj` runs the installed Claude CLI with
+  `claude -p /usage --output-format json` and parses the synthetic,
+  zero-token usage result into session/week quota windows.
+- Codex: `mj` starts the installed `codex app-server` over stdio and sends the
+  direct JSON-RPC request `account/rateLimits/read`, then maps the returned
+  primary/secondary limit windows into Thor quota snapshots.
 
-Probe commands/endpoints must return JSON with fields such as `provider`,
-`usedPercent`, `remainingPercent`, `resetAt`, `window`, `available`, and
-`message`. ACP `UsageUpdate` rate-limit metadata is still cached as a fallback
-when provider probes are unavailable.
+Thor quota does not use ACP metadata, stream rate-limit events, generic command
+probes, or placeholder HTTP endpoints. If a direct provider query is not
+available for a worker, quota remains unknown.
 
 ## Data sources
 

@@ -1,13 +1,13 @@
-//! ACP validation probes and quota/capacity hints for Thor.
+//! ACP validation probes and direct quota/capacity reads for Thor.
 
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use agent_client_protocol::schema::v1::UsageUpdate;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -15,7 +15,6 @@ use crate::acp::{self, AcpRuntimeConfig};
 use crate::config::SelectedAgent;
 use crate::event::{UiCommand, UiEvent};
 
-const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,17 +55,14 @@ pub struct QuotaSnapshot {
 pub enum QuotaProvider {
     Claude,
     Codex,
-    Generic,
     Unknown,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaProbeSource {
-    ClaudeSdk,
+    ClaudeUsageCommand,
     CodexAppserver,
-    AgentCommand,
-    AcpUsageMetadata,
     #[default]
     Unknown,
 }
@@ -88,47 +84,16 @@ pub async fn refresh_configured_quota_snapshots(agents: &[SelectedAgent]) -> Vec
         .collect()
 }
 
-pub async fn refresh_configured_quota_snapshot(agent: &SelectedAgent) -> Option<QuotaSnapshot> {
-    let (value, probe_source) = match quota_probe(agent) {
-        Some(QuotaProbe::Command { command, source }) => {
-            let output = Command::new(&command.program)
-                .args(&command.args)
-                .envs(&agent.env)
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .await
-                .ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            (
-                serde_json::from_slice::<Value>(&output.stdout).ok()?,
-                source,
-            )
-        }
-        Some(QuotaProbe::Http { url, token, source }) => {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .ok()?;
-            let mut request = client.get(url);
-            if let Some(token) = token {
-                request = request.bearer_auth(token);
-            }
-            let response = request.send().await.ok()?;
-            if !response.status().is_success() {
-                return None;
-            }
-            (response.json::<Value>().await.ok()?, source)
-        }
-        None => return None,
+pub async fn refresh_configured_quota_snapshot(agent: &SelectedAgent) -> Vec<QuotaSnapshot> {
+    let snapshots = match detect_quota_provider(&agent.source_id) {
+        QuotaProvider::Claude => refresh_claude_usage(agent).await,
+        QuotaProvider::Codex => refresh_codex_appserver_usage(agent).await,
+        QuotaProvider::Unknown => Vec::new(),
     };
-    let mut snapshot = snapshot_from_probe_json(&agent.source_id, &value)?;
-    snapshot.probe_source = probe_source;
-    snapshot.observed_at_unix = now_unix();
-    let _ = save_quota_snapshot(&snapshot);
-    Some(snapshot)
+    for snapshot in &snapshots {
+        let _ = save_quota_snapshot(snapshot);
+    }
+    snapshots
 }
 
 pub async fn validate_agent(
@@ -214,248 +179,333 @@ pub async fn validate_agent(
     validation
 }
 
-pub fn quota_from_usage_update(source_id: &str, update: &UsageUpdate) -> Option<QuotaSnapshot> {
-    let meta = update.meta.as_ref()?;
-    if let Some(value) = meta.get(CLAUDE_RATE_LIMIT_META_KEY) {
-        return claude_quota_snapshot(source_id, value);
-    }
-
-    find_quota_like_value(&Value::Object(meta.clone()))
-        .and_then(|value| generic_quota_snapshot(source_id, value))
+async fn refresh_claude_usage(agent: &SelectedAgent) -> Vec<QuotaSnapshot> {
+    let program = provider_program(agent, "claude");
+    let command = async {
+        let output = Command::new(program)
+            .args(["-p", "/usage", "--output-format", "json"])
+            .envs(&agent.env)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let value = serde_json::from_slice::<Value>(&output.stdout).ok()?;
+        let text = claude_usage_text(&value)?;
+        Some(claude_usage_snapshots(&agent.source_id, &text))
+    };
+    tokio::time::timeout(DEFAULT_PROBE_TIMEOUT, command)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
 
-fn claude_quota_snapshot(source_id: &str, value: &Value) -> Option<QuotaSnapshot> {
-    let object = value.as_object()?;
-    let used_percent = number_field(object, "utilization", "utilization")
-        .map(|used| used.round().clamp(0.0, 100.0));
-    let remaining_percent = used_percent.map(|used| (100.0 - used).max(0.0));
-    let reset_at_unix = number_field(object, "resetsAt", "resets_at")
-        .or_else(|| number_field(object, "overageResetsAt", "overage_resets_at"))
-        .and_then(epoch_to_unix);
-    let window = string_field(object, "rateLimitType", "rate_limit_type")
-        .map(rate_limit_window_label)
-        .map(str::to_string);
-    let available = remaining_percent.map(|remaining| remaining > 0.0);
-    let message = quota_message(
-        window.as_deref(),
-        used_percent,
-        remaining_percent,
-        reset_at_unix,
-    );
+async fn refresh_codex_appserver_usage(agent: &SelectedAgent) -> Vec<QuotaSnapshot> {
+    let program = provider_program(agent, "codex");
+    let command = async {
+        let mut child = Command::new(program)
+            .arg("app-server")
+            .envs(&agent.env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
+        write_json_line(
+            &mut stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "mj-thor-quota",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": {},
+                    "protocolVersion": "0.1.0",
+                }
+            }),
+        )
+        .await
+        .ok()?;
+        write_json_line(
+            &mut stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "account/rateLimits/read"
+            }),
+        )
+        .await
+        .ok()?;
+        let mut lines = BufReader::new(stdout).lines();
+        while let Some(line) = lines.next_line().await.ok()? {
+            let value = serde_json::from_str::<Value>(&line).ok()?;
+            if value.get("id").and_then(Value::as_u64) != Some(2) {
+                continue;
+            }
+            let result = value.get("result")?;
+            let snapshots = codex_rate_limit_snapshots(&agent.source_id, result);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Some(snapshots);
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        None
+    };
+    tokio::time::timeout(DEFAULT_PROBE_TIMEOUT, command)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
 
+async fn write_json_line(stdin: &mut tokio::process::ChildStdin, value: Value) -> Result<()> {
+    stdin
+        .write_all(serde_json::to_string(&value)?.as_bytes())
+        .await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+fn provider_program(agent: &SelectedAgent, fallback: &'static str) -> PathBuf {
+    let program_name = agent
+        .program
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if program_name.contains(fallback) {
+        agent.program.clone()
+    } else {
+        PathBuf::from(fallback)
+    }
+}
+
+fn claude_usage_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("result"))
+            .and_then(claude_usage_text)
+            .or_else(|| items.iter().find_map(claude_usage_text)),
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("result") {
+                return object
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            object
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_array)
+                .and_then(|content| {
+                    content.iter().find_map(|block| {
+                        block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                })
+        }
+        _ => None,
+    }
+}
+
+fn claude_usage_snapshots(source_id: &str, text: &str) -> Vec<QuotaSnapshot> {
+    text.lines()
+        .filter_map(|line| claude_usage_snapshot(source_id, line))
+        .collect()
+}
+
+fn claude_usage_snapshot(source_id: &str, line: &str) -> Option<QuotaSnapshot> {
+    let (window, detail) = line.split_once(':')?;
+    let window = window.trim();
+    if !window.starts_with("Current ") {
+        return None;
+    }
+    let used_percent = percent_before(detail, "% used")?;
+    let remaining_percent = (100.0 - used_percent).max(0.0);
     Some(QuotaSnapshot {
         source_id: source_id.to_string(),
         provider: QuotaProvider::Claude,
-        probe_source: QuotaProbeSource::AcpUsageMetadata,
-        quota_known: used_percent.is_some() || reset_at_unix.is_some(),
-        remaining_percent,
-        used_percent,
-        reset_at_unix,
-        window,
-        available,
-        message,
-        observed_at_unix: now_unix(),
-    })
-}
-
-fn generic_quota_snapshot(source_id: &str, value: &Value) -> Option<QuotaSnapshot> {
-    let object = value.as_object()?;
-    let used_percent = number_field(object, "usedPercent", "used_percent")
-        .or_else(|| number_field(object, "utilization", "utilization"))
-        .map(|used| used.round().clamp(0.0, 100.0));
-    let remaining_percent = number_field(object, "remainingPercent", "remaining_percent")
-        .map(|remaining| remaining.round().clamp(0.0, 100.0))
-        .or_else(|| used_percent.map(|used| (100.0 - used).max(0.0)));
-    let reset_at_unix = number_field(object, "resetsAt", "resets_at")
-        .or_else(|| number_field(object, "resetAt", "reset_at"))
-        .and_then(epoch_to_unix);
-    let available = remaining_percent.map(|remaining| remaining > 0.0);
-    let provider = detect_quota_provider(source_id);
-    let message = quota_message(None, used_percent, remaining_percent, reset_at_unix);
-
-    Some(QuotaSnapshot {
-        source_id: source_id.to_string(),
-        provider,
-        probe_source: QuotaProbeSource::AcpUsageMetadata,
-        quota_known: used_percent.is_some()
-            || remaining_percent.is_some()
-            || reset_at_unix.is_some(),
-        remaining_percent,
-        used_percent,
-        reset_at_unix,
-        window: None,
-        available,
-        message,
-        observed_at_unix: now_unix(),
-    })
-}
-
-fn snapshot_from_probe_json(source_id: &str, value: &Value) -> Option<QuotaSnapshot> {
-    let object = value.as_object()?;
-    let provider = string_field(object, "provider", "provider")
-        .map(provider_from_str)
-        .unwrap_or_else(|| detect_quota_provider(source_id));
-    let used_percent = number_field(object, "usedPercent", "used_percent")
-        .or_else(|| number_field(object, "utilization", "utilization"))
-        .map(|used| used.round().clamp(0.0, 100.0));
-    let remaining_percent = number_field(object, "remainingPercent", "remaining_percent")
-        .map(|remaining| remaining.round().clamp(0.0, 100.0))
-        .or_else(|| used_percent.map(|used| (100.0 - used).max(0.0)));
-    let reset_at_unix = number_field(object, "resetsAt", "resets_at")
-        .or_else(|| number_field(object, "resetAt", "reset_at"))
-        .and_then(epoch_to_unix);
-    let window = string_field(object, "window", "window").map(str::to_string);
-    let available = object
-        .get("available")
-        .and_then(Value::as_bool)
-        .or_else(|| remaining_percent.map(|remaining| remaining > 0.0));
-    let message = string_field(object, "message", "message")
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            quota_message(
-                window.as_deref(),
-                used_percent,
-                remaining_percent,
-                reset_at_unix,
-            )
-        });
-
-    Some(QuotaSnapshot {
-        source_id: source_id.to_string(),
-        provider,
-        probe_source: QuotaProbeSource::Unknown,
+        probe_source: QuotaProbeSource::ClaudeUsageCommand,
         quota_known: true,
-        remaining_percent,
-        used_percent,
-        reset_at_unix,
-        window,
-        available,
-        message,
+        remaining_percent: Some(remaining_percent),
+        used_percent: Some(used_percent),
+        reset_at_unix: None,
+        window: Some(window.to_string()),
+        available: Some(remaining_percent > 0.0),
+        message: line.trim().to_string(),
         observed_at_unix: now_unix(),
     })
 }
 
-#[derive(Debug)]
-struct QuotaProbeCommand {
-    program: String,
-    args: Vec<String>,
-}
-
-#[derive(Debug)]
-enum QuotaProbe {
-    Command {
-        command: QuotaProbeCommand,
-        source: QuotaProbeSource,
-    },
-    Http {
-        url: String,
-        token: Option<String>,
-        source: QuotaProbeSource,
-    },
-}
-
-fn quota_probe(agent: &SelectedAgent) -> Option<QuotaProbe> {
-    per_agent_quota_probe(agent)
-        .or_else(|| claude_sdk_quota_probe(agent))
-        .or_else(|| codex_appserver_quota_probe(agent))
-}
-
-fn per_agent_quota_probe(agent: &SelectedAgent) -> Option<QuotaProbe> {
-    let env_key = quota_probe_env_key(&agent.source_id);
-    let command = std::env::var(&env_key).ok()?;
-    quota_command_from_string(&command).map(|command| QuotaProbe::Command {
-        command,
-        source: QuotaProbeSource::AgentCommand,
-    })
-}
-
-fn claude_sdk_quota_probe(agent: &SelectedAgent) -> Option<QuotaProbe> {
-    if detect_quota_provider(&agent.source_id) != QuotaProvider::Claude {
-        return None;
-    }
-    let command = std::env::var("MJ_THOR_CLAUDE_SDK_QUOTA_CMD").ok()?;
-    quota_command_from_string(&command).map(|command| QuotaProbe::Command {
-        command,
-        source: QuotaProbeSource::ClaudeSdk,
-    })
-}
-
-fn codex_appserver_quota_probe(agent: &SelectedAgent) -> Option<QuotaProbe> {
-    if detect_quota_provider(&agent.source_id) != QuotaProvider::Codex {
-        return None;
-    }
-    if let Ok(command) = std::env::var("MJ_THOR_CODEX_APPSERVER_QUOTA_CMD") {
-        return quota_command_from_string(&command).map(|command| QuotaProbe::Command {
-            command,
-            source: QuotaProbeSource::CodexAppserver,
-        });
-    }
-    let url = std::env::var("MJ_THOR_CODEX_APPSERVER_QUOTA_URL")
+fn percent_before(text: &str, marker: &str) -> Option<f64> {
+    let idx = text.find(marker)?;
+    let prefix = &text[..idx];
+    let number = prefix
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .rfind(|part| !part.is_empty())?;
+    number
+        .parse::<f64>()
         .ok()
-        .or_else(|| {
-            std::env::var("MJ_THOR_CODEX_APPSERVER_URL")
-                .ok()
-                .map(|base| format!("{}/quota", base.trim_end_matches('/')))
-        })?;
-    let token = std::env::var("MJ_THOR_CODEX_APPSERVER_TOKEN").ok();
-    Some(QuotaProbe::Http {
-        url,
-        token,
-        source: QuotaProbeSource::CodexAppserver,
-    })
+        .map(|value| value.clamp(0.0, 100.0))
 }
 
-fn quota_command_from_string(command: &str) -> Option<QuotaProbeCommand> {
-    let parts = shell_words::split(command).ok()?;
-    let (program, args) = parts.split_first()?;
-    Some(QuotaProbeCommand {
-        program: program.clone(),
-        args: args.to_vec(),
-    })
-}
-
-fn quota_probe_env_key(source_id: &str) -> String {
-    let suffix = source_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    format!("MJ_THOR_QUOTA_PROBE_{suffix}")
-}
-
-fn provider_from_str(provider: &str) -> QuotaProvider {
-    match provider.to_ascii_lowercase().as_str() {
-        "claude" | "anthropic" | "claude_code" | "claude-code" => QuotaProvider::Claude,
-        "codex" | "openai" | "gpt" => QuotaProvider::Codex,
-        "generic" => QuotaProvider::Generic,
-        _ => QuotaProvider::Unknown,
+fn codex_rate_limit_snapshots(source_id: &str, result: &Value) -> Vec<QuotaSnapshot> {
+    let mut snapshots = Vec::new();
+    if let Some(rate_limits) = result.get("rateLimits") {
+        snapshots.extend(codex_snapshot_windows(source_id, rate_limits, None));
     }
+    if let Some(by_limit) = result.get("rateLimitsByLimitId").and_then(Value::as_object) {
+        for (limit_id, value) in by_limit {
+            if limit_id == "codex" {
+                continue;
+            }
+            snapshots.extend(codex_snapshot_windows(
+                source_id,
+                value,
+                Some(limit_id.as_str()),
+            ));
+        }
+    }
+    snapshots
 }
 
-fn find_quota_like_value(value: &Value) -> Option<&Value> {
-    match value {
-        Value::Object(object) => {
-            for (key, value) in object {
-                let lower = key.to_ascii_lowercase();
-                if lower.contains("quota")
-                    || lower.contains("ratelimit")
-                    || lower.contains("rate_limit")
-                {
-                    return Some(value);
-                }
-                if let Some(found) = find_quota_like_value(value) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        Value::Array(values) => values.iter().find_map(find_quota_like_value),
-        _ => None,
+fn codex_snapshot_windows(
+    source_id: &str,
+    snapshot: &Value,
+    limit_id: Option<&str>,
+) -> Vec<QuotaSnapshot> {
+    let mut snapshots = Vec::new();
+    if let Some(primary) = snapshot.get("primary")
+        && let Some(snapshot) =
+            codex_window_snapshot(source_id, snapshot, primary, limit_id, "primary")
+    {
+        snapshots.push(snapshot);
+    }
+    if let Some(secondary) = snapshot.get("secondary")
+        && let Some(snapshot) =
+            codex_window_snapshot(source_id, snapshot, secondary, limit_id, "secondary")
+    {
+        snapshots.push(snapshot);
+    }
+    if let Some(individual) = snapshot.get("individualLimit")
+        && let Some(snapshot) = codex_individual_limit_snapshot(source_id, snapshot, individual)
+    {
+        snapshots.push(snapshot);
+    }
+    snapshots
+}
+
+fn codex_window_snapshot(
+    source_id: &str,
+    root: &Value,
+    window: &Value,
+    explicit_limit_id: Option<&str>,
+    window_kind: &str,
+) -> Option<QuotaSnapshot> {
+    let used_percent = window
+        .get("usedPercent")
+        .and_then(number_value)
+        .map(|used| used.round().clamp(0.0, 100.0))?;
+    let remaining_percent = (100.0 - used_percent).max(0.0);
+    let reset_at_unix = window
+        .get("resetsAt")
+        .and_then(number_value)
+        .and_then(epoch_to_unix);
+    let duration = window.get("windowDurationMins").and_then(number_value);
+    let limit_name = root
+        .get("limitName")
+        .and_then(Value::as_str)
+        .or(explicit_limit_id);
+    let window_label = codex_window_label(window_kind, duration, limit_name);
+    let reached = root
+        .get("rateLimitReachedType")
+        .is_some_and(|value| !value.is_null());
+    Some(QuotaSnapshot {
+        source_id: source_id.to_string(),
+        provider: QuotaProvider::Codex,
+        probe_source: QuotaProbeSource::CodexAppserver,
+        quota_known: true,
+        remaining_percent: Some(remaining_percent),
+        used_percent: Some(used_percent),
+        reset_at_unix,
+        window: Some(window_label.clone()),
+        available: Some(remaining_percent > 0.0 && !reached),
+        message: quota_message(
+            Some(&window_label),
+            Some(used_percent),
+            Some(remaining_percent),
+            reset_at_unix,
+        ),
+        observed_at_unix: now_unix(),
+    })
+}
+
+fn codex_individual_limit_snapshot(
+    source_id: &str,
+    root: &Value,
+    individual: &Value,
+) -> Option<QuotaSnapshot> {
+    let remaining_percent = individual
+        .get("remainingPercent")
+        .and_then(number_value)
+        .map(|remaining| remaining.round().clamp(0.0, 100.0))?;
+    let used_percent = Some((100.0 - remaining_percent).max(0.0));
+    let reset_at_unix = individual
+        .get("resetsAt")
+        .and_then(number_value)
+        .and_then(epoch_to_unix);
+    let label = root
+        .get("limitName")
+        .and_then(Value::as_str)
+        .unwrap_or("Individual limit")
+        .to_string();
+    Some(QuotaSnapshot {
+        source_id: source_id.to_string(),
+        provider: QuotaProvider::Codex,
+        probe_source: QuotaProbeSource::CodexAppserver,
+        quota_known: true,
+        remaining_percent: Some(remaining_percent),
+        used_percent,
+        reset_at_unix,
+        window: Some(label.clone()),
+        available: Some(remaining_percent > 0.0),
+        message: quota_message(
+            Some(&label),
+            used_percent,
+            Some(remaining_percent),
+            reset_at_unix,
+        ),
+        observed_at_unix: now_unix(),
+    })
+}
+
+fn codex_window_label(kind: &str, duration_mins: Option<f64>, limit_name: Option<&str>) -> String {
+    let base = match (kind, duration_mins.map(|duration| duration.round() as u64)) {
+        ("primary", Some(300)) => "Current session".to_string(),
+        ("secondary", Some(10_080)) => "Current week".to_string(),
+        ("primary", Some(duration)) => format!("{duration}m window"),
+        ("secondary", Some(duration)) => format!("{duration}m secondary window"),
+        ("primary", None) => "Primary window".to_string(),
+        ("secondary", None) => "Secondary window".to_string(),
+        _ => "Usage window".to_string(),
+    };
+    match limit_name {
+        Some(limit_name) if !limit_name.trim().is_empty() => format!("{base} ({limit_name})"),
+        _ => base,
     }
 }
 
@@ -466,7 +516,7 @@ fn detect_quota_provider(source_id: &str) -> QuotaProvider {
     } else if lower.contains("codex") || lower.contains("openai") || lower.contains("gpt") {
         QuotaProvider::Codex
     } else {
-        QuotaProvider::Generic
+        QuotaProvider::Unknown
     }
 }
 
@@ -494,35 +544,6 @@ fn quota_message(
     } else {
         parts.join(" · ")
     }
-}
-
-fn rate_limit_window_label(kind: &str) -> &'static str {
-    match kind {
-        "five_hour" => "Current session",
-        "seven_day" => "Current week (all models)",
-        "seven_day_opus" => "Current week (Opus)",
-        "seven_day_sonnet" => "Current week (Sonnet)",
-        "overage" => "Extra usage",
-        _ => "Usage limit",
-    }
-}
-
-fn string_field<'a>(
-    object: &'a serde_json::Map<String, Value>,
-    camel: &str,
-    snake: &str,
-) -> Option<&'a str> {
-    object
-        .get(camel)
-        .or_else(|| object.get(snake))
-        .and_then(Value::as_str)
-}
-
-fn number_field(object: &serde_json::Map<String, Value>, camel: &str, snake: &str) -> Option<f64> {
-    object
-        .get(camel)
-        .or_else(|| object.get(snake))
-        .and_then(number_value)
 }
 
 fn number_value(value: &Value) -> Option<f64> {
@@ -589,82 +610,106 @@ fn quota_cache_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::UsageUpdate;
     use serde_json::json;
     use std::collections::HashMap;
 
     #[test]
-    fn extracts_claude_quota_from_usage_meta() {
-        let mut meta = serde_json::Map::new();
-        meta.insert(
-            CLAUDE_RATE_LIMIT_META_KEY.to_string(),
-            json!({
-                "rateLimitType": "five_hour",
-                "utilization": 72.3,
-                "resetsAt": 1_800_000_000
-            }),
+    fn parses_claude_usage_command_output() {
+        let snapshots = claude_usage_snapshots(
+            "claude-code",
+            "You are currently using your subscription\n\nCurrent session: 3% used · resets Jun 26 at 3:50pm (Europe/Paris)\nCurrent week (all models): 6% used · resets Jul 2 at 1am (Europe/Paris)\nCurrent week (Sonnet only): 0% used",
         );
 
-        let snapshot =
-            quota_from_usage_update("claude-code", &UsageUpdate::new(10, 100).meta(meta))
-                .expect("quota");
-
+        assert_eq!(snapshots.len(), 3);
+        let snapshot = &snapshots[0];
         assert_eq!(snapshot.provider, QuotaProvider::Claude);
+        assert_eq!(snapshot.probe_source, QuotaProbeSource::ClaudeUsageCommand);
         assert_eq!(snapshot.window.as_deref(), Some("Current session"));
-        assert_eq!(snapshot.used_percent, Some(72.0));
-        assert_eq!(snapshot.remaining_percent, Some(28.0));
-        assert_eq!(snapshot.reset_at_unix, Some(1_800_000_000));
+        assert_eq!(snapshot.used_percent, Some(3.0));
+        assert_eq!(snapshot.remaining_percent, Some(97.0));
         assert_eq!(snapshot.available, Some(true));
     }
 
     #[test]
-    fn extracts_generic_nested_quota_signal() {
-        let mut meta = serde_json::Map::new();
-        meta.insert(
-            "_codex/rateLimit".to_string(),
-            json!({
-                "usedPercent": 99,
-                "resetAt": 1_800_000_001
-            }),
+    fn extracts_result_text_from_claude_json_output() {
+        let value = json!([
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        { "type": "text", "text": "fallback" }
+                    ]
+                }
+            },
+            {
+                "type": "result",
+                "result": "Current session: 4% used"
+            }
+        ]);
+
+        assert_eq!(
+            claude_usage_text(&value).as_deref(),
+            Some("Current session: 4% used")
         );
-
-        let snapshot =
-            quota_from_usage_update("codex", &UsageUpdate::new(10, 100).meta(meta)).expect("quota");
-
-        assert_eq!(snapshot.provider, QuotaProvider::Codex);
-        assert_eq!(snapshot.used_percent, Some(99.0));
-        assert_eq!(snapshot.remaining_percent, Some(1.0));
-        assert_eq!(snapshot.available, Some(true));
     }
 
     #[test]
-    fn parses_provider_probe_json_for_codex_appserver() {
-        let snapshot = snapshot_from_probe_json(
+    fn parses_codex_appserver_rate_limit_response() {
+        let snapshots = codex_rate_limit_snapshots(
             "codex",
             &json!({
-                "provider": "codex",
-                "remainingPercent": 37,
-                "resetAt": 1_800_000_002,
-                "window": "daily",
-                "available": true,
-                "message": "daily: 37% remaining"
+                "rateLimits": {
+                    "limitId": "codex",
+                    "limitName": null,
+                    "primary": {
+                        "usedPercent": 4,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1_800_000_002
+                    },
+                    "secondary": {
+                        "usedPercent": 24,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1_800_000_003
+                    },
+                    "credits": {
+                        "hasCredits": false,
+                        "unlimited": false,
+                        "balance": "0"
+                    },
+                    "individualLimit": null,
+                    "planType": "pro",
+                    "rateLimitReachedType": null
+                },
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "limitId": "codex",
+                        "limitName": null,
+                        "primary": {
+                            "usedPercent": 4,
+                            "windowDurationMins": 300,
+                            "resetsAt": 1_800_000_002
+                        },
+                        "secondary": null,
+                        "credits": null,
+                        "individualLimit": null,
+                        "planType": "pro",
+                        "rateLimitReachedType": null
+                    }
+                },
+                "rateLimitResetCredits": {
+                    "availableCount": 2
+                }
             }),
-        )
-        .expect("snapshot");
-
-        assert_eq!(snapshot.provider, QuotaProvider::Codex);
-        assert_eq!(snapshot.remaining_percent, Some(37.0));
-        assert_eq!(snapshot.reset_at_unix, Some(1_800_000_002));
-        assert_eq!(snapshot.window.as_deref(), Some("daily"));
-        assert_eq!(snapshot.available, Some(true));
-    }
-
-    #[test]
-    fn per_agent_quota_probe_env_key_is_stable() {
-        assert_eq!(
-            quota_probe_env_key("custom:claude-code"),
-            "MJ_THOR_QUOTA_PROBE_CUSTOM_CLAUDE_CODE"
         );
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].provider, QuotaProvider::Codex);
+        assert_eq!(snapshots[0].probe_source, QuotaProbeSource::CodexAppserver);
+        assert_eq!(snapshots[0].window.as_deref(), Some("Current session"));
+        assert_eq!(snapshots[0].used_percent, Some(4.0));
+        assert_eq!(snapshots[0].remaining_percent, Some(96.0));
+        assert_eq!(snapshots[0].reset_at_unix, Some(1_800_000_002));
+        assert_eq!(snapshots[1].window.as_deref(), Some("Current week"));
     }
 
     #[tokio::test]

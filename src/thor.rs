@@ -218,9 +218,10 @@ Policy:
 - Use `thor_validate_acp_agents` before relying on a worker set that has not
   been validated in this session.
 - Before assigning work, call `thor_refresh_quota` or
-  `thor_list_acp_agents` with `refreshQuota: true` so mj can query configured
-  Claude SDK and Codex appserver quota probes. Treat returned quota data and
-  worker-run usage metadata as the source of truth for subscription capacity.
+  `thor_list_acp_agents` with `refreshQuota: true` so mj can query provider
+  quota directly through Claude Code `/usage` and Codex appserver
+  `account/rateLimits/read`. Treat only returned direct quota data as
+  subscription capacity.
   Prefer known available Claude Code/Codex quota before metered OpenRouter
   routes; avoid exhausted workers.
 - Use `thor_run_acp_agents` when work should happen in parallel, including

@@ -16,6 +16,13 @@ use crate::config::SelectedAgent;
 use crate::palette::TerminalTheme;
 use crate::term::TrackedBackend;
 use crate::thor::{ThorConfig, ThorOptimizationMode, ThorReasoning};
+use crate::thor_probe::AgentValidation;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThorSetupAgent {
+    pub agent: SelectedAgent,
+    pub validation: Option<AgentValidation>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThorSetupSelection {
@@ -110,7 +117,7 @@ const REASONING_OPTIONS: [(ThorReasoning, &str, &str); 3] = [
 
 #[derive(Debug, Clone)]
 struct ThorSetupState {
-    agents: Vec<SelectedAgent>,
+    agents: Vec<ThorSetupAgent>,
     step: SetupStep,
     cursor: usize,
     selected_workers: Vec<bool>,
@@ -123,35 +130,41 @@ struct ThorSetupState {
 impl ThorSetupState {
     fn new(
         thor_config: &ThorConfig,
-        agents: &[SelectedAgent],
+        agents: &[ThorSetupAgent],
         initial_host: &SelectedAgent,
     ) -> Self {
         let agents = if agents.is_empty() {
-            vec![crate::thor::default_anvil_agent()]
+            vec![ThorSetupAgent {
+                agent: crate::thor::default_anvil_agent(),
+                validation: None,
+            }]
         } else {
             agents.to_vec()
         };
+        let has_usable_agent = agents.iter().any(setup_agent_is_usable);
         let mut selected_workers = agents
             .iter()
-            .map(|agent| {
-                thor_config.enabled_worker_source_ids.is_empty()
+            .map(|setup_agent| {
+                let selected_by_config = thor_config.enabled_worker_source_ids.is_empty()
                     || thor_config
                         .enabled_worker_source_ids
                         .iter()
-                        .any(|source_id| source_id == &agent.source_id)
+                        .any(|source_id| source_id == &setup_agent.agent.source_id);
+                selected_by_config && (!has_usable_agent || setup_agent_is_usable(setup_agent))
             })
             .collect::<Vec<_>>();
         if !selected_workers.iter().any(|selected| *selected) {
-            selected_workers[0] = true;
+            let idx = agents.iter().position(setup_agent_is_usable).unwrap_or(0);
+            selected_workers[idx] = true;
         }
 
         let host_source_id = if agents
             .iter()
-            .any(|agent| agent.source_id == initial_host.source_id)
+            .any(|setup_agent| setup_agent.agent.source_id == initial_host.source_id)
         {
             initial_host.source_id.clone()
         } else {
-            agents[0].source_id.clone()
+            agents[0].agent.source_id.clone()
         };
         let optimization_mode = match thor_config.optimization_mode {
             ThorOptimizationMode::Cost => ThorOptimizationMode::Cost,
@@ -186,6 +199,9 @@ impl ThorSetupState {
 
     fn toggle_current_worker(&mut self) {
         if self.step != SetupStep::Workers || self.agents.is_empty() {
+            return;
+        }
+        if self.has_usable_agent() && !self.current_worker_is_usable() {
             return;
         }
         self.selected_workers[self.cursor] = !self.selected_workers[self.cursor];
@@ -294,7 +310,7 @@ impl ThorSetupState {
             .iter()
             .zip(self.selected_workers.iter())
             .filter(|(_, selected)| **selected)
-            .map(|(agent, _)| agent.source_id.clone())
+            .map(|(setup_agent, _)| setup_agent.agent.source_id.clone())
             .collect()
     }
 
@@ -310,6 +326,17 @@ impl ThorSetupState {
             self.host_source_id = source_id.clone();
         }
     }
+
+    fn has_usable_agent(&self) -> bool {
+        self.agents.iter().any(setup_agent_is_usable)
+    }
+
+    fn current_worker_is_usable(&self) -> bool {
+        self.agents
+            .get(self.cursor)
+            .map(setup_agent_is_usable)
+            .unwrap_or(false)
+    }
 }
 
 /// Run Thor setup until the user confirms or cancels with Esc/Ctrl-C.
@@ -317,7 +344,7 @@ pub async fn run_thor_setup(
     terminal: &mut Terminal<TrackedBackend<Stdout>>,
     theme: TerminalTheme,
     thor_config: &ThorConfig,
-    agents: &[SelectedAgent],
+    agents: &[ThorSetupAgent],
     initial_host: &SelectedAgent,
 ) -> Result<Option<ThorSetupSelection>> {
     let mut state = ThorSetupState::new(thor_config, agents, initial_host);
@@ -475,17 +502,24 @@ fn worker_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'st
         .agents
         .iter()
         .enumerate()
-        .map(|(idx, agent)| {
+        .map(|(idx, setup_agent)| {
+            let agent = &setup_agent.agent;
             let checked = if state.selected_workers[idx] {
                 "[x]"
             } else {
                 "[ ]"
+            };
+            let status_style = if setup_agent_is_usable(setup_agent) {
+                Style::default().fg(theme.primary)
+            } else {
+                Style::default().fg(theme.warning)
             };
             selectable_row(
                 idx == state.cursor,
                 vec![
                     Span::raw(format!("{checked} ")),
                     Span::styled(host_agent_label(agent), Style::default().fg(theme.text)),
+                    Span::styled(format!("  {}", validation_label(setup_agent)), status_style),
                     Span::styled(
                         format!("  {}", command_label(agent)),
                         Style::default().fg(theme.muted),
@@ -532,13 +566,15 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
             let agent = state
                 .agents
                 .iter()
-                .find(|agent| &agent.source_id == source_id)?;
+                .find(|setup_agent| &setup_agent.agent.source_id == source_id)?
+                .agent
+                .clone();
             Some(selectable_row(
                 idx == state.cursor,
                 vec![
-                    Span::styled(host_agent_label(agent), Style::default().fg(theme.text)),
+                    Span::styled(host_agent_label(&agent), Style::default().fg(theme.text)),
                     Span::styled(
-                        format!("  {}", command_label(agent)),
+                        format!("  {}", command_label(&agent)),
                         Style::default().fg(theme.muted),
                     ),
                 ],
@@ -678,6 +714,46 @@ fn command_label(agent: &SelectedAgent) -> String {
     parts.join(" ")
 }
 
+fn setup_agent_is_usable(setup_agent: &ThorSetupAgent) -> bool {
+    setup_agent
+        .validation
+        .as_ref()
+        .map(|validation| validation.usable)
+        .unwrap_or(true)
+}
+
+fn validation_label(setup_agent: &ThorSetupAgent) -> String {
+    match &setup_agent.validation {
+        Some(validation) if validation.usable => match (
+            validation.agent_name.as_deref(),
+            validation.agent_version.as_deref(),
+        ) {
+            (Some(name), Some(version)) => format!("ready: {name} {version}"),
+            (Some(name), None) => format!("ready: {name}"),
+            _ => "ready".to_string(),
+        },
+        Some(validation) => {
+            let reason = validation
+                .error
+                .as_deref()
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or("ACP session did not start");
+            format!("unavailable: {}", truncate_label(reason, 64))
+        }
+        None => "not checked".to_string(),
+    }
+}
+
+fn truncate_label(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,10 +770,41 @@ mod tests {
         }
     }
 
+    fn setup_agents(agents: &[SelectedAgent]) -> Vec<ThorSetupAgent> {
+        agents
+            .iter()
+            .cloned()
+            .map(|agent| ThorSetupAgent {
+                agent,
+                validation: None,
+            })
+            .collect()
+    }
+
+    fn setup_agent_with_validation(source_id: &str, usable: bool) -> ThorSetupAgent {
+        ThorSetupAgent {
+            agent: agent(source_id),
+            validation: Some(AgentValidation {
+                source_id: source_id.to_string(),
+                usable,
+                agent_name: None,
+                agent_version: None,
+                session_started: usable,
+                config_advertised: false,
+                prompt_images_supported: false,
+                session_fork_supported: false,
+                error: (!usable).then(|| "missing key".to_string()),
+                elapsed_ms: 10,
+                checked_at_unix: 1,
+            }),
+        }
+    }
+
     #[test]
     fn worker_step_toggles_available_workers_but_keeps_one() {
-        let agents = vec![agent("claude"), agent("codex")];
-        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &agents[0]);
+        let raw_agents = vec![agent("claude"), agent("codex")];
+        let agents = setup_agents(&raw_agents);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
 
         state.toggle_current_worker();
         assert_eq!(state.enabled_source_ids(), vec!["codex"]);
@@ -709,8 +816,9 @@ mod tests {
 
     #[test]
     fn persona_step_maps_architect_and_accountant() {
-        let agents = vec![agent("anvil")];
-        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &agents[0]);
+        let raw_agents = vec![agent("anvil")];
+        let agents = setup_agents(&raw_agents);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
 
         state.set_step(SetupStep::Persona);
         state.cursor = 0;
@@ -725,7 +833,8 @@ mod tests {
 
     #[test]
     fn confirm_returns_full_selection() {
-        let agents = vec![agent("claude"), agent("codex")];
+        let raw_agents = vec![agent("claude"), agent("codex")];
+        let agents = setup_agents(&raw_agents);
         let mut cfg = ThorConfig {
             enabled_worker_source_ids: vec!["codex".to_string()],
             coordinator_model: "gpt-strong".to_string(),
@@ -733,7 +842,7 @@ mod tests {
             ..ThorConfig::default()
         };
         cfg.optimization_mode = ThorOptimizationMode::Cost;
-        let mut state = ThorSetupState::new(&cfg, &agents, &agents[1]);
+        let mut state = ThorSetupState::new(&cfg, &agents, &raw_agents[1]);
         state.set_step(SetupStep::Confirm);
 
         let selection = state.advance().expect("selection");
@@ -746,8 +855,9 @@ mod tests {
 
     #[test]
     fn enter_on_confirm_finishes() {
-        let agents = vec![agent("anvil")];
-        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &agents[0]);
+        let raw_agents = vec![agent("anvil")];
+        let agents = setup_agents(&raw_agents);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
         state.set_step(SetupStep::Confirm);
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
 
@@ -760,10 +870,39 @@ mod tests {
 
     #[test]
     fn escape_cancels() {
-        let agents = vec![agent("anvil")];
-        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &agents[0]);
+        let raw_agents = vec![agent("anvil")];
+        let agents = setup_agents(&raw_agents);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
 
         assert_eq!(handle_event(&mut state, CtEvent::Key(key)), Some(None));
+    }
+
+    #[test]
+    fn unusable_workers_are_not_preselected_when_usable_worker_exists() {
+        let agents = vec![
+            setup_agent_with_validation("claude", false),
+            setup_agent_with_validation("codex", true),
+        ];
+        let initial_host = agents[0].agent.clone();
+        let state = ThorSetupState::new(&ThorConfig::default(), &agents, &initial_host);
+
+        assert_eq!(state.enabled_source_ids(), vec!["codex"]);
+        assert_eq!(state.host_source_id, "codex");
+    }
+
+    #[test]
+    fn toggling_unusable_worker_is_ignored_when_usable_worker_exists() {
+        let agents = vec![
+            setup_agent_with_validation("claude", false),
+            setup_agent_with_validation("codex", true),
+        ];
+        let initial_host = agents[1].agent.clone();
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &initial_host);
+
+        state.cursor = 0;
+        state.toggle_current_worker();
+
+        assert_eq!(state.enabled_source_ids(), vec!["codex"]);
     }
 }

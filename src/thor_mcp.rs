@@ -257,13 +257,13 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "thor_list_acp_agents",
-            "description": "List ACP agents mj can launch as Thor workers, including cached quota signals when available.",
+            "description": "List ACP agents mj can launch as Thor workers, including cached direct provider quota signals when available.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "refreshQuota": {
                         "type": "boolean",
-                        "description": "When true, actively refresh quota through configured Claude SDK / Codex appserver probes before returning workers."
+                        "description": "When true, actively refresh quota through direct Claude Code /usage and Codex appserver account/rateLimits/read queries before returning workers."
                     }
                 },
                 "additionalProperties": false
@@ -271,7 +271,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "thor_refresh_quota",
-            "description": "Actively refresh quota/capacity hints for configured workers through provider probes such as Claude SDK commands or Codex appserver endpoints.",
+            "description": "Actively refresh quota/capacity hints for configured workers through direct provider queries: Claude Code /usage and Codex appserver account/rateLimits/read.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -543,7 +543,7 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
     let mut stop_reason = None;
     let mut usage = None;
     let mut context_usage = None;
-    let mut quota = Vec::<QuotaSnapshot>::new();
+    let quota = Vec::<QuotaSnapshot>::new();
     let mut error = None;
     let mut permissions = Vec::new();
     let mut tool_calls = Vec::<ToolSummary>::new();
@@ -601,11 +601,6 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
                 }
             }
             UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(update)) => {
-                if let Some(snapshot) = thor_probe::quota_from_usage_update(&source_id, &update) {
-                    let _ = thor_probe::save_quota_snapshot(&snapshot);
-                    push_progress(&mut progress, "quota", snapshot.message.clone());
-                    quota.push(snapshot);
-                }
                 context_usage = Some(context_usage_summary(update));
             }
             UiEvent::PermissionRequest(prompt) => {

@@ -885,33 +885,30 @@ async fn run_thor_onboarding(
 ) -> Result<Option<SelectedAgent>> {
     let available_agents = thor::available_worker_catalog(cfg);
     let validations = thor_probe::validate_agents(&available_agents, cwd).await;
-    let usable_source_ids = validations
+    let setup_agents = available_agents
         .iter()
-        .filter(|validation| validation.usable)
-        .map(|validation| validation.source_id.as_str())
+        .map(|agent| thor_setup::ThorSetupAgent {
+            agent: agent.clone(),
+            validation: validations
+                .iter()
+                .find(|validation| validation.source_id == agent.source_id)
+                .cloned(),
+        })
         .collect::<Vec<_>>();
-    let setup_agents = if usable_source_ids.is_empty() {
-        vec![thor::default_anvil_agent()]
-    } else {
-        available_agents
-            .iter()
-            .filter(|agent| {
-                usable_source_ids
-                    .iter()
-                    .any(|source_id| *source_id == agent.source_id)
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-    };
     let initial_host = cfg
         .agent
         .clone()
         .filter(|agent| {
             setup_agents
                 .iter()
-                .any(|candidate| candidate.source_id == agent.source_id)
+                .any(|candidate| candidate.agent.source_id == agent.source_id)
         })
-        .unwrap_or_else(|| setup_agents[0].clone());
+        .unwrap_or_else(|| {
+            setup_agents
+                .first()
+                .map(|candidate| candidate.agent.clone())
+                .unwrap_or_else(thor::default_anvil_agent)
+        });
     let Some(selection) =
         run_thor_setup_once(cfg.theme.palette(), &cfg.thor, &setup_agents, &initial_host).await?
     else {
@@ -923,8 +920,8 @@ async fn run_thor_onboarding(
     cfg.thor.coordinator_reasoning = selection.coordinator_reasoning;
     let agent = setup_agents
         .iter()
-        .find(|agent| agent.source_id == selection.host_source_id)
-        .cloned()
+        .find(|setup_agent| setup_agent.agent.source_id == selection.host_source_id)
+        .map(|setup_agent| setup_agent.agent.clone())
         .unwrap_or_else(thor::default_anvil_agent);
     cfg.agent = Some(agent.clone());
     cfg.save(config_path)
@@ -1070,7 +1067,7 @@ fn session_picker_action(
 async fn run_thor_setup_once(
     theme: palette::TerminalTheme,
     thor_config: &thor::ThorConfig,
-    agents: &[SelectedAgent],
+    agents: &[thor_setup::ThorSetupAgent],
     host_agent: &SelectedAgent,
 ) -> Result<Option<thor_setup::ThorSetupSelection>> {
     let mut terminal = ui::setup_fullscreen_terminal().context("setup terminal")?;
