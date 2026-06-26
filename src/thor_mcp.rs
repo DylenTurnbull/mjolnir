@@ -18,6 +18,7 @@ use crate::config::{self, Config, SelectedAgent};
 use crate::event::{PermissionDecision, UiCommand, UiEvent, content_block_text};
 use crate::thor;
 use crate::thor_catalog::{self, CatalogRequest};
+use crate::thor_probe::{self, QuotaSnapshot};
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -97,6 +98,7 @@ struct AgentSummary {
     source_id: String,
     command: String,
     args: Vec<String>,
+    quota: Vec<QuotaSnapshot>,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,6 +111,7 @@ struct DelegatedRunResult {
     stop_reason: String,
     usage: Option<Usage>,
     context_usage: Option<ContextUsageSummary>,
+    quota: Vec<QuotaSnapshot>,
     tool_calls: Vec<ToolSummary>,
     progress: Vec<ProgressEvent>,
     permissions: Vec<String>,
@@ -247,7 +250,16 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "thor_list_acp_agents",
-            "description": "List ACP agents mj can launch as Thor workers.",
+            "description": "List ACP agents mj can launch as Thor workers, including cached quota signals when available.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "thor_validate_acp_agents",
+            "description": "Launch configured ACP workers and report which ones initialize and open a session successfully.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -318,15 +330,30 @@ async fn call_tool(params: ToolCallParams, config_path: Option<PathBuf>) -> Resu
     match params.name.as_str() {
         "thor_list_acp_agents" => {
             let config = load_config(config_path.as_ref())?;
+            let quota = thor_probe::load_quota_snapshots().unwrap_or_default();
             let agents = thor::worker_catalog(&config)
                 .into_iter()
                 .map(|agent| AgentSummary {
+                    quota: quota
+                        .iter()
+                        .filter(|snapshot| snapshot.source_id == agent.source_id)
+                        .cloned()
+                        .collect(),
                     source_id: agent.source_id,
                     command: agent.program.to_string_lossy().into_owned(),
                     args: agent.args,
                 })
                 .collect::<Vec<_>>();
             Ok(tool_text_result(&serde_json::to_string_pretty(&agents)?))
+        }
+        "thor_validate_acp_agents" => {
+            let config = load_config(config_path.as_ref())?;
+            let cwd = std::env::current_dir().context("current dir")?;
+            let validations =
+                thor_probe::validate_agents(&thor::worker_catalog(&config), cwd).await;
+            Ok(tool_text_result(&serde_json::to_string_pretty(
+                &validations,
+            )?))
         }
         "thor_run_acp_agent" => {
             let args: RunAgentArgs = serde_json::from_value(params.arguments)?;
@@ -429,6 +456,7 @@ async fn run_agent_batch(
                 stop_reason: "error".to_string(),
                 usage: None,
                 context_usage: None,
+                quota: Vec::new(),
                 tool_calls: Vec::new(),
                 progress: vec![ProgressEvent {
                     sequence: 1,
@@ -475,6 +503,7 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
     let mut stop_reason = None;
     let mut usage = None;
     let mut context_usage = None;
+    let mut quota = Vec::<QuotaSnapshot>::new();
     let mut error = None;
     let mut permissions = Vec::new();
     let mut tool_calls = Vec::<ToolSummary>::new();
@@ -532,6 +561,11 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
                 }
             }
             UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(update)) => {
+                if let Some(snapshot) = thor_probe::quota_from_usage_update(&source_id, &update) {
+                    let _ = thor_probe::save_quota_snapshot(&snapshot);
+                    push_progress(&mut progress, "quota", snapshot.message.clone());
+                    quota.push(snapshot);
+                }
                 context_usage = Some(context_usage_summary(update));
             }
             UiEvent::PermissionRequest(prompt) => {
@@ -608,6 +642,7 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
         stop_reason: stop_reason_label(reason).to_string(),
         usage,
         context_usage,
+        quota,
         tool_calls,
         progress,
         permissions,
@@ -843,6 +878,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(names.iter().any(|name| name == "thor_get_model_catalog"));
+        assert!(names.iter().any(|name| name == "thor_validate_acp_agents"));
         assert!(names.iter().any(|name| name == "thor_run_acp_agents"));
     }
 
@@ -857,6 +893,7 @@ mod tests {
                 stop_reason: "end_turn".to_string(),
                 usage: Some(Usage::new(10, 4, 6)),
                 context_usage: None,
+                quota: Vec::new(),
                 tool_calls: Vec::new(),
                 progress: Vec::new(),
                 permissions: Vec::new(),
@@ -870,6 +907,7 @@ mod tests {
                 stop_reason: "error".to_string(),
                 usage: None,
                 context_usage: None,
+                quota: Vec::new(),
                 tool_calls: Vec::new(),
                 progress: Vec::new(),
                 permissions: Vec::new(),

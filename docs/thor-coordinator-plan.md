@@ -15,6 +15,8 @@ changed and how much each harness/model used.
 - `mj` opens a Thor host ACP session, not an agent/model picker.
 - First run asks the user to select Thor workers, pick Architect or Accountant,
   and choose Thor's host agent, model preference, and reasoning level.
+- Before first-run setup offers workers, `mj` validates configured ACP agents by
+  launching each candidate and waiting for initialize plus `session/new`.
 - The normal prompt flow has no visible model picker or agent picker.
 - Thor presents an execution plan before doing work.
 - The MCP bridge is provided to the Thor host as an ACP `mcpServers` stdio
@@ -40,7 +42,8 @@ changed and how much each harness/model used.
 - Other model families prefer Anvil when Anvil is configured for that model.
 - Claude Code and Codex subscriptions are used evenly and maximally before
   falling back to metered OpenRouter routing, subject to remaining
-  quota/rate-limit hints.
+  quota/rate-limit hints reported by ACP `UsageUpdate` metadata. Unknown quota
+  remains unknown; Thor must not invent availability.
 - Simple tasks should prefer cheaper capable models; hard tasks should prefer
   stronger models.
 - Every implemented task must include an adversarial review and correction
@@ -64,6 +67,10 @@ changed and how much each harness/model used.
    usage through the Thor MCP bridge.
 7. Done: return structured worker progress/tool/usage views instead of relying
    on raw worker transcript dumps.
+8. Done: validate ACP worker candidates during onboarding and expose a Thor MCP
+   validation tool for re-checking configured workers.
+9. Done: detect and cache quota/rate-limit hints from ACP worker usage metadata
+   and include those hints in worker listings and run results.
 
 ## Data sources
 

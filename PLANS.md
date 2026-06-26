@@ -105,10 +105,11 @@ decides how to split the work and monitor worker sessions.
 The durable plan lives in
 [docs/thor-coordinator-plan.md](docs/thor-coordinator-plan.md).
 
-The Thor MCP bridge now exposes configured workers, a cached model catalog
-backed by LM Arena/OpenRouter refreshes, single-worker delegation, and
-concurrent multi-worker delegation with structured progress and aggregate
-usage.
+The Thor MCP bridge now exposes configured workers, real ACP worker validation,
+a cached model catalog backed by LM Arena/OpenRouter refreshes, cached
+quota/rate-limit hints observed from ACP usage metadata, single-worker
+delegation, and concurrent multi-worker delegation with structured progress and
+aggregate usage.
 
 Initial routing policy:
 
@@ -120,7 +121,8 @@ Initial routing policy:
 - GPT/OpenAI-family models prefer Codex when configured.
 - Other models prefer Anvil when configured for the target model.
 - Claude Code and Codex subscription quota is used evenly and maximally before
-  metered OpenRouter fallback.
+  metered OpenRouter fallback when ACP workers report quota/rate-limit
+  metadata; unknown quota remains explicit.
 - Cost/accountant mode prefers cheaper capable models when Thor judges the task
   simple enough.
 - Best-solution/architect mode runs two independent versions with different

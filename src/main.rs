@@ -28,6 +28,7 @@ mod theme_picker;
 mod thor;
 mod thor_catalog;
 mod thor_mcp;
+mod thor_probe;
 mod thor_setup;
 mod ui;
 mod version;
@@ -804,7 +805,7 @@ async fn run_app(
             agent
         } else if thor_onboarding {
             thor_onboarding = false;
-            match run_thor_onboarding(&mut cfg, &config_path).await? {
+            match run_thor_onboarding(&mut cfg, &config_path, cwd.clone()).await? {
                 Some(agent) => agent,
                 None => return Ok(None),
             }
@@ -880,16 +881,39 @@ async fn run_app(
 async fn run_thor_onboarding(
     cfg: &mut Config,
     config_path: &Path,
+    cwd: PathBuf,
 ) -> Result<Option<SelectedAgent>> {
     let available_agents = thor::available_worker_catalog(cfg);
-    let initial_host = cfg.agent.clone().unwrap_or_else(thor::default_anvil_agent);
-    let Some(selection) = run_thor_setup_once(
-        cfg.theme.palette(),
-        &cfg.thor,
-        &available_agents,
-        &initial_host,
-    )
-    .await?
+    let validations = thor_probe::validate_agents(&available_agents, cwd).await;
+    let usable_source_ids = validations
+        .iter()
+        .filter(|validation| validation.usable)
+        .map(|validation| validation.source_id.as_str())
+        .collect::<Vec<_>>();
+    let setup_agents = if usable_source_ids.is_empty() {
+        vec![thor::default_anvil_agent()]
+    } else {
+        available_agents
+            .iter()
+            .filter(|agent| {
+                usable_source_ids
+                    .iter()
+                    .any(|source_id| *source_id == agent.source_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let initial_host = cfg
+        .agent
+        .clone()
+        .filter(|agent| {
+            setup_agents
+                .iter()
+                .any(|candidate| candidate.source_id == agent.source_id)
+        })
+        .unwrap_or_else(|| setup_agents[0].clone());
+    let Some(selection) =
+        run_thor_setup_once(cfg.theme.palette(), &cfg.thor, &setup_agents, &initial_host).await?
     else {
         return Ok(None);
     };
@@ -897,7 +921,7 @@ async fn run_thor_onboarding(
     cfg.thor.optimization_mode = selection.optimization_mode;
     cfg.thor.coordinator_model = selection.coordinator_model;
     cfg.thor.coordinator_reasoning = selection.coordinator_reasoning;
-    let agent = available_agents
+    let agent = setup_agents
         .iter()
         .find(|agent| agent.source_id == selection.host_source_id)
         .cloned()

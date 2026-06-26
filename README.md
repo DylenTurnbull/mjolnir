@@ -74,9 +74,10 @@ backend. Use `/load` to open the session picker for the current backend.
 
 Thor is a coordinator persona running inside an ACP host agent. `mj` passes a
 stdio MCP bridge (`mj thor-mcp`) to the host through ACP `mcpServers`; the MCP
-tools list configured ACP workers and run assigned tasks through worker
-sessions. The bridge also exposes a cached model catalog from LM
-Arena/OpenRouter sources and a concurrent worker runner that reports structured
+tools validate configured ACP workers, list usable workers, and run assigned
+tasks through worker sessions. The bridge also exposes a cached model catalog
+from LM Arena/OpenRouter sources, cached quota/rate-limit signals observed from
+ACP usage metadata, and a concurrent worker runner that reports structured
 progress, tool calls, and aggregate usage.
 
 Initial routing policy:
@@ -89,7 +90,8 @@ Initial routing policy:
 - prefer Codex for GPT/OpenAI-family models when configured
 - prefer Anvil for other model families when configured for the target model
 - use Claude Code and Codex subscription quota evenly and maximally before
-  falling back to metered OpenRouter routing
+  falling back to metered OpenRouter routing; quota is treated as known only
+  when an ACP worker reports rate-limit/usage metadata
 - in cost/accountant mode, use cheaper models when Thor judges the task simple
   enough
 - in best-solution/architect mode, run two independent implementations with
