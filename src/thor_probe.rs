@@ -5,6 +5,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -336,6 +337,7 @@ fn claude_usage_snapshot(source_id: &str, line: &str) -> Option<QuotaSnapshot> {
     }
     let used_percent = percent_before(detail, "% used")?;
     let remaining_percent = (100.0 - used_percent).max(0.0);
+    let reset_at_unix = claude_reset_at_unix(detail);
     Some(QuotaSnapshot {
         source_id: source_id.to_string(),
         provider: QuotaProvider::Claude,
@@ -343,7 +345,7 @@ fn claude_usage_snapshot(source_id: &str, line: &str) -> Option<QuotaSnapshot> {
         quota_known: true,
         remaining_percent: Some(remaining_percent),
         used_percent: Some(used_percent),
-        reset_at_unix: None,
+        reset_at_unix,
         window: Some(window.to_string()),
         available: Some(remaining_percent > 0.0),
         message: line.trim().to_string(),
@@ -361,6 +363,78 @@ fn percent_before(text: &str, marker: &str) -> Option<f64> {
         .parse::<f64>()
         .ok()
         .map(|value| value.clamp(0.0, 100.0))
+}
+
+fn claude_reset_at_unix(text: &str) -> Option<u64> {
+    parse_claude_reset_at_unix(text, Local::now())
+}
+
+fn parse_claude_reset_at_unix(text: &str, now: DateTime<Local>) -> Option<u64> {
+    let reset = text.split_once("resets ")?.1;
+    let reset = reset.split(" (").next().unwrap_or(reset).trim();
+    let (date, time) = reset.split_once(" at ")?;
+    let mut date_parts = date.split_whitespace();
+    let month = month_number(date_parts.next()?)?;
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    let (hour, minute) = parse_clock_time(time)?;
+    let current_year = now.year();
+
+    [current_year, current_year + 1]
+        .into_iter()
+        .filter_map(|year| local_epoch_seconds(year, month, day, hour, minute))
+        .find(|candidate| *candidate >= now.timestamp().max(0) as u64)
+}
+
+fn month_number(month: &str) -> Option<u32> {
+    match month.to_ascii_lowercase().as_str() {
+        "jan" | "january" => Some(1),
+        "feb" | "february" => Some(2),
+        "mar" | "march" => Some(3),
+        "apr" | "april" => Some(4),
+        "may" => Some(5),
+        "jun" | "june" => Some(6),
+        "jul" | "july" => Some(7),
+        "aug" | "august" => Some(8),
+        "sep" | "sept" | "september" => Some(9),
+        "oct" | "october" => Some(10),
+        "nov" | "november" => Some(11),
+        "dec" | "december" => Some(12),
+        _ => None,
+    }
+}
+
+fn parse_clock_time(time: &str) -> Option<(u32, u32)> {
+    let time = time.trim().to_ascii_lowercase();
+    let (time, is_pm) = if let Some(time) = time.strip_suffix("am") {
+        (time.trim(), false)
+    } else if let Some(time) = time.strip_suffix("pm") {
+        (time.trim(), true)
+    } else {
+        return None;
+    };
+    let (hour, minute) = match time.split_once(':') {
+        Some((hour, minute)) => (hour.parse::<u32>().ok()?, minute.parse::<u32>().ok()?),
+        None => (time.parse::<u32>().ok()?, 0),
+    };
+    if hour == 0 || hour > 12 || minute > 59 {
+        return None;
+    }
+    let hour = match (hour, is_pm) {
+        (12, false) => 0,
+        (12, true) => 12,
+        (hour, false) => hour,
+        (hour, true) => hour + 12,
+    };
+    Some((hour, minute))
+}
+
+fn local_epoch_seconds(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> Option<u64> {
+    let timestamp = match Local.with_ymd_and_hms(year, month, day, hour, minute, 0) {
+        LocalResult::Single(value) => value.timestamp(),
+        LocalResult::Ambiguous(a, b) => a.timestamp().min(b.timestamp()),
+        LocalResult::None => return None,
+    };
+    u64::try_from(timestamp).ok()
 }
 
 fn codex_rate_limit_snapshots(source_id: &str, result: &Value) -> Vec<QuotaSnapshot> {
@@ -627,7 +701,38 @@ mod tests {
         assert_eq!(snapshot.window.as_deref(), Some("Current session"));
         assert_eq!(snapshot.used_percent, Some(3.0));
         assert_eq!(snapshot.remaining_percent, Some(97.0));
+        assert!(snapshot.reset_at_unix.is_some());
         assert_eq!(snapshot.available, Some(true));
+    }
+
+    #[test]
+    fn parses_claude_reset_times_against_local_year() {
+        let now = match Local.with_ymd_and_hms(2026, 6, 26, 10, 0, 0) {
+            LocalResult::Single(value) => value,
+            LocalResult::Ambiguous(value, _) => value,
+            LocalResult::None => panic!("valid local test time"),
+        };
+        let expected = local_epoch_seconds(2026, 6, 26, 15, 50).expect("expected timestamp");
+
+        assert_eq!(
+            parse_claude_reset_at_unix("3% used · resets Jun 26 at 3:50pm (Europe/Paris)", now),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn rolls_claude_reset_times_into_next_year_when_needed() {
+        let now = match Local.with_ymd_and_hms(2026, 12, 31, 23, 0, 0) {
+            LocalResult::Single(value) => value,
+            LocalResult::Ambiguous(value, _) => value,
+            LocalResult::None => panic!("valid local test time"),
+        };
+        let expected = local_epoch_seconds(2027, 1, 1, 1, 0).expect("expected timestamp");
+
+        assert_eq!(
+            parse_claude_reset_at_unix("6% used · resets Jan 1 at 1am (Europe/Paris)", now),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -708,6 +813,50 @@ mod tests {
         assert_eq!(snapshots[0].window.as_deref(), Some("Current session"));
         assert_eq!(snapshots[0].used_percent, Some(4.0));
         assert_eq!(snapshots[0].remaining_percent, Some(96.0));
+        assert_eq!(snapshots[0].reset_at_unix, Some(1_800_000_002));
+        assert_eq!(snapshots[1].window.as_deref(), Some("Current week"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_codex_appserver_reads_rate_limits_over_stdio() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex = temp.path().join("codex");
+        std::fs::write(
+            &codex,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"ok":true}}'
+      ;;
+    *'"method":"account/rateLimits/read"'*)
+      printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":null,"primary":{"usedPercent":5,"windowDurationMins":300,"resetsAt":1800000002},"secondary":{"usedPercent":25,"windowDurationMins":10080,"resetsAt":1800000003},"credits":null,"individualLimit":null,"planType":"pro","rateLimitReachedType":null},"rateLimitsByLimitId":null,"rateLimitResetCredits":null}}'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write fake codex");
+        let mut permissions = std::fs::metadata(&codex).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&codex, permissions).expect("chmod fake codex");
+        let agent = SelectedAgent {
+            source_id: "custom:codex".to_string(),
+            program: codex,
+            args: Vec::new(),
+            env: HashMap::new(),
+        };
+
+        let snapshots = refresh_codex_appserver_usage(&agent).await;
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].provider, QuotaProvider::Codex);
+        assert_eq!(snapshots[0].probe_source, QuotaProbeSource::CodexAppserver);
+        assert_eq!(snapshots[0].used_percent, Some(5.0));
+        assert_eq!(snapshots[0].remaining_percent, Some(95.0));
         assert_eq!(snapshots[0].reset_at_unix, Some(1_800_000_002));
         assert_eq!(snapshots[1].window.as_deref(), Some("Current week"));
     }

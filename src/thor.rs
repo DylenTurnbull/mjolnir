@@ -215,8 +215,9 @@ Policy:
   user explicitly asks.
 - Start routing decisions by calling `thor_get_model_catalog`; refresh it when
   cached pricing/strength data is stale or missing.
-- Use `thor_validate_acp_agents` before relying on a worker set that has not
-  been validated in this session.
+- Use `thor_validate_acp_agents`, or `thor_list_acp_agents` with `validate:
+  true`, before relying on a worker set that has not been validated in this
+  session.
 - Before assigning work, call `thor_refresh_quota` or
   `thor_list_acp_agents` with `refreshQuota: true` so mj can query provider
   quota directly through Claude Code `/usage` and Codex appserver

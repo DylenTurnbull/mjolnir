@@ -77,8 +77,9 @@ stdio MCP bridge (`mj thor-mcp`) to the host through ACP `mcpServers`; the MCP
 tools validate configured ACP workers, list usable workers, and run assigned
 tasks through worker sessions. The bridge also exposes a cached model catalog
 from LM Arena/OpenRouter sources, direct quota reads through Claude Code
-`/usage` and Codex appserver `account/rateLimits/read`, and a concurrent worker
-runner that reports structured progress, tool calls, and aggregate usage.
+`/usage` and Codex appserver `account/rateLimits/read`, optional real ACP
+validation on the worker inventory, and a concurrent worker runner that reports
+structured progress, tool calls, and aggregate usage.
 
 Initial routing policy:
 

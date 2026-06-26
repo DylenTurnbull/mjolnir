@@ -108,7 +108,8 @@ The durable plan lives in
 The Thor MCP bridge now exposes configured workers, real ACP worker validation,
 a cached model catalog backed by LM Arena/OpenRouter refreshes, direct quota
 reads through Claude Code `/usage` and Codex appserver
-`account/rateLimits/read`, single-worker delegation, and
+`account/rateLimits/read`, optional validation on worker inventory,
+single-worker delegation, and
 concurrent multi-worker delegation with structured progress and aggregate
 usage.
 

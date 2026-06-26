@@ -18,7 +18,7 @@ use crate::config::{self, Config, SelectedAgent};
 use crate::event::{PermissionDecision, UiCommand, UiEvent, content_block_text};
 use crate::thor;
 use crate::thor_catalog::{self, CatalogRequest};
-use crate::thor_probe::{self, QuotaSnapshot};
+use crate::thor_probe::{self, AgentValidation, QuotaSnapshot};
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -59,6 +59,8 @@ struct ToolCallParams {
 struct ListAgentsArgs {
     #[serde(default)]
     refresh_quota: bool,
+    #[serde(default)]
+    validate: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +108,7 @@ struct AgentSummary {
     command: String,
     args: Vec<String>,
     quota: Vec<QuotaSnapshot>,
+    validation: Option<AgentValidation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -264,6 +267,10 @@ fn tool_definitions() -> Vec<Value> {
                     "refreshQuota": {
                         "type": "boolean",
                         "description": "When true, actively refresh quota through direct Claude Code /usage and Codex appserver account/rateLimits/read queries before returning workers."
+                    },
+                    "validate": {
+                        "type": "boolean",
+                        "description": "When true, launch each worker and verify it completes ACP initialize plus session startup before returning workers."
                     }
                 },
                 "additionalProperties": false
@@ -364,6 +371,12 @@ async fn call_tool(params: ToolCallParams, config_path: Option<PathBuf>) -> Resu
                     quota = thor_probe::load_quota_snapshots().unwrap_or(refreshed);
                 }
             }
+            let validations = if args.validate {
+                let cwd = std::env::current_dir().context("current dir")?;
+                thor_probe::validate_agents(&workers, cwd).await
+            } else {
+                Vec::new()
+            };
             let agents = workers
                 .into_iter()
                 .map(|agent| AgentSummary {
@@ -372,6 +385,10 @@ async fn call_tool(params: ToolCallParams, config_path: Option<PathBuf>) -> Resu
                         .filter(|snapshot| snapshot.source_id == agent.source_id)
                         .cloned()
                         .collect(),
+                    validation: validations
+                        .iter()
+                        .find(|validation| validation.source_id == agent.source_id)
+                        .cloned(),
                     source_id: agent.source_id,
                     command: agent.program.to_string_lossy().into_owned(),
                     args: agent.args,
@@ -907,8 +924,9 @@ mod tests {
 
     #[test]
     fn tool_definitions_include_catalog_and_batch_runner() {
-        let names = tool_definitions()
-            .into_iter()
+        let tools = tool_definitions();
+        let names = tools
+            .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
             .collect::<Vec<_>>();
 
@@ -916,6 +934,15 @@ mod tests {
         assert!(names.iter().any(|name| name == "thor_validate_acp_agents"));
         assert!(names.iter().any(|name| name == "thor_refresh_quota"));
         assert!(names.iter().any(|name| name == "thor_run_acp_agents"));
+        let list_tool = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("thor_list_acp_agents"))
+            .expect("list tool");
+        assert!(
+            list_tool
+                .pointer("/inputSchema/properties/validate")
+                .is_some()
+        );
     }
 
     #[test]

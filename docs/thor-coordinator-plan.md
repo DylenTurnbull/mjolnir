@@ -68,8 +68,9 @@ changed and how much each harness/model used.
    usage through the Thor MCP bridge.
 7. Done: return structured worker progress/tool/usage views instead of relying
    on raw worker transcript dumps.
-8. Done: validate ACP worker candidates during onboarding and expose a Thor MCP
-   validation tool for re-checking configured workers.
+8. Done: validate ACP worker candidates during onboarding and expose Thor MCP
+   validation through both `thor_validate_acp_agents` and
+   `thor_list_acp_agents` with `validate: true`.
 9. Done: detect and cache quota/rate-limit hints from direct provider queries,
    then include those hints in worker listings.
 
