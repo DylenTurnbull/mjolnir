@@ -455,6 +455,10 @@ Fixed in this PR:
 - [x] Replaced primary setup action labels like `Add from ACP registry` and
   `Add ACP command` with end-user wording: `Add agent from registry` and
   `Add custom command`.
+- [x] Made the setup summary step-aware. While selecting a registry entry it
+  shows `Will add`, `Runs`, and `Setup` as separate lines before anything is
+  persisted; while adding a custom command it states that `mj` will validate the
+  command before Thor uses it.
 - [x] Manually smoke-tested the 80-column no-working-agent first-run path with a
   temporary home and stripped `PATH`:
   `HOME=/tmp/mj-thor-smoke-home-4 XDG_CONFIG_HOME=/tmp/mj-thor-smoke-home-4/config XDG_CACHE_HOME=/tmp/mj-thor-smoke-home-4/cache PATH=/usr/bin:/bin target/debug/mj --cwd .`.
@@ -482,8 +486,8 @@ Still not production-grade:
    available.
 3. **The guided setup path still needs a full end-to-end polish pass.** The
    first screen now has a readiness summary and retry action, but the setup flow
-   still needs manual tuning for copy, action ordering, and failure recovery
-   across more real terminal sizes and success/failure combinations.
+   still needs manual tuning for action ordering and failure recovery across
+   more real terminal sizes and success/failure combinations.
 4. **The setup UI has only been manually smoked for one terminal scenario.**
    Unit tests cover state transitions, list windowing, and small/large render
    output; manual smoke now covers the no-working-agent 80-column path and a

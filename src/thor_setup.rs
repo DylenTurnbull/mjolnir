@@ -876,6 +876,14 @@ fn disabled_row(spans: Vec<Span<'static>>, theme: TerminalTheme) -> ListItem<'st
 }
 
 fn summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static>> {
+    match state.step {
+        SetupStep::Registry => registry_summary_lines(state, theme),
+        SetupStep::CustomName | SetupStep::CustomCommand => custom_summary_lines(state, theme),
+        SetupStep::Host | SetupStep::Confirm => default_summary_lines(state, theme),
+    }
+}
+
+fn default_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static>> {
     vec![
         detail_line("Ready to use", ready_agent_summary(state), theme),
         detail_line("Run Thor in", host_summary(state), theme),
@@ -888,6 +896,54 @@ fn summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'stat
             theme,
         ),
     ]
+}
+
+fn registry_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static>> {
+    let Some(registry_agent) = state.registry_agents.get(state.cursor) else {
+        return vec![detail_line(
+            "Registry",
+            "no entries loaded; go back and add a custom command".to_string(),
+            theme,
+        )];
+    };
+    let setup = if registry_agent.setup_hint.trim().is_empty() {
+        "open provider docs if setup is required".to_string()
+    } else {
+        registry_agent.setup_hint.clone()
+    };
+    vec![
+        detail_line("Will add", registry_agent.name.clone(), theme),
+        detail_line("Runs", truncate_label(&registry_agent.command, 72), theme),
+        detail_line("Setup", truncate_label(&setup, 72), theme),
+    ]
+}
+
+fn custom_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static>> {
+    vec![
+        detail_line("Custom agent", custom_name_summary(state), theme),
+        detail_line("Runs", custom_command_summary(state), theme),
+        detail_line(
+            "After add",
+            "mj will validate it before Thor uses it".to_string(),
+            theme,
+        ),
+    ]
+}
+
+fn custom_name_summary(state: &ThorSetupState) -> String {
+    if state.custom_name.trim().is_empty() {
+        "choose a short name".to_string()
+    } else {
+        state.custom_name.trim().to_string()
+    }
+}
+
+fn custom_command_summary(state: &ThorSetupState) -> String {
+    if state.custom_command.trim().is_empty() {
+        "enter the command that starts this agent".to_string()
+    } else {
+        truncate_label(state.custom_command.trim(), 72)
+    }
 }
 
 fn ready_agent_summary(state: &ThorSetupState) -> String {
@@ -1352,6 +1408,62 @@ mod tests {
         assert!(rendered.contains("Work style: architect; model choices stay automatic"));
         assert!(!rendered.contains("auto-strong"));
         assert!(!rendered.contains("custom:claude-code"));
+    }
+
+    #[test]
+    fn registry_summary_shows_command_and_setup_before_add() {
+        let agents = vec![setup_agent_with_validation("anvil", false)];
+        let registry_agents = vec![registry_agent("gemini")];
+        let initial_host = agents[0].agent.clone();
+        let mut state = ThorSetupState::new(
+            &ThorConfig::default(),
+            &agents,
+            &registry_agents,
+            &initial_host,
+        );
+        state.set_step(SetupStep::Registry);
+
+        let summary = summary_lines(&state, crate::theme::TerminalThemeKind::Dark.palette());
+        let rendered = summary
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Will add: gemini"));
+        assert!(rendered.contains("Runs: npx -y gemini"));
+        assert!(rendered.contains("Setup: requires Node.js/npm"));
+    }
+
+    #[test]
+    fn custom_summary_says_validation_happens_after_add() {
+        let raw_agents = vec![agent("anvil")];
+        let agents = setup_agents(&raw_agents);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &raw_agents[0]);
+        state.set_step(SetupStep::CustomCommand);
+        state.custom_name = "Local Agent".to_string();
+        state.custom_command = "local-agent acp".to_string();
+
+        let summary = summary_lines(&state, crate::theme::TerminalThemeKind::Dark.palette());
+        let rendered = summary
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Custom agent: Local Agent"));
+        assert!(rendered.contains("Runs: local-agent acp"));
+        assert!(rendered.contains("After add: mj will validate it before Thor uses it"));
     }
 
     #[test]
