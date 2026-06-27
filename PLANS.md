@@ -237,9 +237,9 @@ Deliverables:
 - ✅ Handle ACP auth-required responses with actionable UI text — shipped
   early in M1 as `LaunchError::AuthRequired`, classified at both
   `initialize` and `session/new`.
-- Track compatibility quirks discovered with at least two non-Brokk ACP
-  agents — partial: `@agentclientprotocol/claude-agent-acp` 0.36.1 done
-  (see Compatibility section below), one more (Gemini or Goose) to go.
+- ✅ Track compatibility quirks discovered with at least two non-Brokk ACP
+  agents — `@agentclientprotocol/claude-agent-acp` 0.36.1 and OpenCode
+  1.17.11 are recorded in the Compatibility section below.
 - Explore session rewind as an ACP extension paired with Anvil. The current
   proposal is documented in [docs/session-rewind-extension.md](docs/session-rewind-extension.md):
   model rewind as fork-from-checkpoint using `session/fork` `_meta`, not as
@@ -519,10 +519,49 @@ testing): `session/prompt` round-trip, tool-call permission flow,
 prompt cancellation against a live agent, agent-initiated errors mid-
 turn.
 
+### OpenCode 1.17.11 — 2026-06-27
+
+Source: ACP registry entry `opencode`, version `1.17.11`, from
+`https://github.com/anomalyco/opencode` / `https://opencode.ai`. The local
+machine already had `/Users/ryansvihla/.opencode/bin/opencode` installed, so
+the smoke used the installed binary instead of fetching third-party code.
+
+Launch:
+
+```text
+/Users/ryansvihla/.opencode/bin/opencode acp
+```
+
+Verified at the protocol layer through `thor_probe::validate_agent`, not a full
+interactive prompt round-trip, to avoid burning model tokens:
+
+| Feature | Result |
+| --- | --- |
+| `initialize` handshake (ACP v1) | works; `Connected` event received |
+| `agentInfo` (name + version) | populated as `OpenCode 1.17.11` |
+| `session/new` with repo cwd | works; validation reached `SessionStarted` |
+| `promptCapabilities.image` | advertised as supported |
+| session fork capability | advertised as supported |
+| config options | none observed during this smoke |
+| validation runtime | completed in about 760 ms on this machine |
+
+Known gaps:
+
+- The smoke did not inspect OpenCode-specific config options because none were
+  advertised before validation completed.
+- The smoke used an already-installed local binary. Registry installation and
+  first-run auth/setup behavior still need separate UX validation.
+
+Not yet exercised: `session/prompt`, tool-call permission flow, cancellation,
+live model/auth failures, and transcript rendering from a real OpenCode turn.
+
 ### Next targets
 
 - Gemini CLI (auth-required path test).
 - Goose (self-hosted, no auth dance).
+- Gemini CLI registry command is `npx -y @google/gemini-cli@0.49.0 --acp`,
+  but the live smoke was not run because executing freshly fetched `npx` code
+  needs explicit user approval.
 
 Each future entry should follow the same shape: source / launch
 command / verified table / known gaps / not-yet-exercised.
