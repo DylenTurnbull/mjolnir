@@ -13,9 +13,10 @@ changed and how much each harness/model used.
 ## UX contract
 
 - `mj` opens a Thor host ACP session, not an agent/model picker.
-- First run is a Thor setup wizard, not an advanced picker. It asks where Thor
-  should run, uses saved defaults for work style/model preference/reasoning,
-  and makes configured ACP servers available to Thor after validation.
+- First run is a Thor setup wizard, not an advanced picker. It asks for work
+  style, which ready agents Thor may use, and where Thor should run. Model
+  preference and reasoning stay saved Thor defaults rather than user-facing
+  picker controls.
 - Before first-run setup marks a worker usable, `mj` validates configured ACP
   servers by launching each candidate and waiting for initialize plus
   `session/new`.

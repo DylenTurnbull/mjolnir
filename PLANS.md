@@ -393,8 +393,10 @@ Required end-user setup behavior before production:
   not just a disabled row.
 - The UI must not require understanding ACP, quota backends, source IDs, or raw
   package names unless the user opens an advanced/custom command path.
-- The success path must feel like: choose where Thor runs, optionally add/fix an
-  agent, start Thor. It must not feel like curating an internal worker list.
+- The success path must feel like: choose work style, choose which ready agents
+  Thor may use, choose where Thor runs, optionally add/fix an agent, start Thor.
+  It must not expose raw routing internals, quotas, source IDs, or model picker
+  controls.
 - Manual smoke must verify the setup flow with no configured agents, one broken
   default, at least one registry add, and one successful configured agent.
 
@@ -403,9 +405,10 @@ Fixed in this PR:
 - [x] Replaced the old "Thor is the only prompt path." headline with first-run
   copy that explains Thor as the coordinator and says choices can be changed
   later.
-- [x] Removed the first-run "select workers" step. All configured/installed
-  agents that validate successfully are available to Thor automatically; the
-  user no longer curates internal worker toggles during onboarding.
+- [x] Replaced the old advanced worker/model/reasoning picker with a simple
+  ready-agent selection step. The user chooses which validated agents Thor may
+  use and which ready agent hosts Thor, without seeing source IDs, quota
+  backends, model picker controls, or reasoning controls.
 - [x] Stopped seeding first-run candidates from the full ACP registry.
   Onboarding now validates configured/custom/default agents only, so first
   launch no longer probes uninstalled registry packages.
@@ -416,8 +419,8 @@ Fixed in this PR:
 - [x] Replaced "persona" step copy with "work style" copy that explains the
   architect/accountant tradeoff in user-facing terms.
 - [x] Collapsed first run from host/work-style/model/reasoning/confirm to
-  host/confirm; work style, model preference, and reasoning now use the saved
-  Thor defaults and can be changed later.
+  work-style/agents/confirm; model preference and reasoning now use saved Thor
+  defaults and stay out of the onboarding path.
 - [x] Replaced the dead-end "needs setup" validation label with inferred user
   actions such as `install <program>` or `sign in or add key`.
 - [x] Added an onboarding recovery path to add a custom ACP command, persist it

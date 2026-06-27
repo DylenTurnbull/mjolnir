@@ -226,7 +226,7 @@ impl ThorSetupState {
             }
             SetupStep::CustomName => {
                 if self.custom_name.trim().is_empty() {
-                    self.notice = Some("Enter a short name for this ACP agent.".to_string());
+                    self.notice = Some("Enter a short name for this agent.".to_string());
                 } else {
                     self.notice = None;
                     self.set_step(SetupStep::CustomCommand);
@@ -783,10 +783,7 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
     if state.registry_agents.is_empty() {
         rows.push(disabled_row(
             vec![
-                Span::styled(
-                    "Agent registry".to_string(),
-                    Style::default().fg(theme.muted),
-                ),
+                Span::styled("Known agents".to_string(), Style::default().fg(theme.muted)),
                 Span::styled(
                     "  unavailable; add a custom command instead".to_string(),
                     Style::default().fg(theme.muted),
