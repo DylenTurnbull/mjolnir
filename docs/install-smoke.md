@@ -9,8 +9,8 @@ in `PLANS.md`.
 
 - `bash -n install.sh` and `./install.sh --self-test` can be run locally before
   release. The self-test covers release metadata parsing, checksum URL lookup,
-  and Linux/macOS asset selection without network access. It is a guardrail, not
-  a replacement for the fresh-machine smoke below.
+  and Linux/macOS `mj` plus `bifrost` asset selection without network access.
+  It is a guardrail, not a replacement for the fresh-machine smoke below.
 - Start from a user account that has not installed `mj`, `mjolnir`, or
   `bifrost` before.
 - Use a clean install directory, for example:

@@ -308,14 +308,15 @@ Deliverables:
 - ✅ Keep `mj` independent of Brokk's installer for v1. Revisit only if Brokk
   product packaging explicitly owns Thor distribution.
 - ✅ The installer has a no-network self-test for release metadata parsing,
-  checksum lookup, and Linux/macOS asset selection.
+  checksum lookup, and Linux/macOS `mj` plus `bifrost` asset selection.
 
 Exit criteria:
 
 - Fresh machine install path works for at least macOS aarch64 and Linux x86_64.
   The release workflow and installer support this, and the installer now has a
-  no-network asset-selection self-test; a fresh-machine smoke pass still needs
-  to be recorded before calling distribution production-grade. Use
+  no-network `mj` plus `bifrost` asset-selection self-test; a fresh-machine
+  smoke pass still needs to be recorded before calling distribution
+  production-grade. Use
   [docs/install-smoke.md](docs/install-smoke.md) for the exact evidence to
   collect; tracked in
   [#249](https://github.com/BrokkAi/mjolnir/issues/249).

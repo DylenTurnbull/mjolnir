@@ -556,7 +556,10 @@ run_self_test() {
     { "browser_download_url": "https://example.com/brokk-mjolnir-v9.9.9-x86_64-unknown-linux-gnu.tar.gz.sha256" },
     { "browser_download_url": "https://example.com/brokk-mjolnir-v9.9.9-universal-apple-darwin.tar.gz" },
     { "browser_download_url": "https://example.com/brokk-mjolnir-v9.9.9-universal-apple-darwin.tar.gz.sha256" },
-    { "browser_download_url": "https://example.com/bifrost-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" }
+    { "browser_download_url": "https://example.com/bifrost-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" },
+    { "browser_download_url": "https://example.com/bifrost-v9.9.9-x86_64-unknown-linux-gnu.tar.gz.sha256" },
+    { "browser_download_url": "https://example.com/bifrost-v9.9.9-universal-apple-darwin.tar.gz" },
+    { "browser_download_url": "https://example.com/bifrost-v9.9.9-universal-apple-darwin.tar.gz.sha256" }
   ]
 }
 EOF
@@ -569,12 +572,22 @@ EOF
   assert_eq "$selected" "https://example.com/brokk-mjolnir-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" "linux mjolnir asset"
   checksum_url="$(checksum_url_for "$release_file" "${selected##*/}")"
   assert_eq "$checksum_url" "https://example.com/brokk-mjolnir-v9.9.9-x86_64-unknown-linux-gnu.tar.gz.sha256" "linux checksum"
+  selected="$(select_asset "$release_file" "bifrost" "v9.9.9" "^bifrost-.*-${RUST_TARGET}[.]tar[.]gz$")"
+  assert_eq "$selected" "https://example.com/bifrost-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" "linux bifrost asset"
+  checksum_url="$(checksum_url_for "$release_file" "${selected##*/}")"
+  assert_eq "$checksum_url" "https://example.com/bifrost-v9.9.9-x86_64-unknown-linux-gnu.tar.gz.sha256" "linux bifrost checksum"
 
   OS_FAMILY="macos"
   ARCH="aarch64"
   RUST_TARGET="aarch64-apple-darwin"
   selected="$(select_asset "$release_file" "mjolnir" "v9.9.9" "^brokk-mjolnir-.*-universal-apple-darwin[.]tar[.]gz$" "^brokk-mjolnir-.*-${RUST_TARGET}[.]tar[.]gz$")"
   assert_eq "$selected" "https://example.com/brokk-mjolnir-v9.9.9-universal-apple-darwin.tar.gz" "macos universal mjolnir asset"
+  checksum_url="$(checksum_url_for "$release_file" "${selected##*/}")"
+  assert_eq "$checksum_url" "https://example.com/brokk-mjolnir-v9.9.9-universal-apple-darwin.tar.gz.sha256" "macos mjolnir checksum"
+  selected="$(select_asset "$release_file" "bifrost" "v9.9.9" "^bifrost-.*-universal-apple-darwin[.]tar[.]gz$" "^bifrost-.*-${RUST_TARGET}[.]tar[.]gz$")"
+  assert_eq "$selected" "https://example.com/bifrost-v9.9.9-universal-apple-darwin.tar.gz" "macos universal bifrost asset"
+  checksum_url="$(checksum_url_for "$release_file" "${selected##*/}")"
+  assert_eq "$checksum_url" "https://example.com/bifrost-v9.9.9-universal-apple-darwin.tar.gz.sha256" "macos bifrost checksum"
 
   log "self-test passed"
 }
