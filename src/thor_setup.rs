@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::Terminal;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
@@ -38,9 +38,8 @@ pub struct ThorSetupSelection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupStep {
-    Workers,
-    Persona,
     Host,
+    Persona,
     Model,
     Reasoning,
     Confirm,
@@ -49,23 +48,21 @@ enum SetupStep {
 impl SetupStep {
     fn title(self) -> &'static str {
         match self {
-            Self::Workers => "select workers",
-            Self::Persona => "pick persona",
-            Self::Host => "pick Thor host",
-            Self::Model => "pick Thor model",
-            Self::Reasoning => "pick reasoning",
-            Self::Confirm => "confirm",
+            Self::Host => "choose Thor",
+            Self::Persona => "work style",
+            Self::Model => "model preference",
+            Self::Reasoning => "planning depth",
+            Self::Confirm => "start",
         }
     }
 
     fn index(self) -> usize {
         match self {
-            Self::Workers => 0,
+            Self::Host => 0,
             Self::Persona => 1,
-            Self::Host => 2,
-            Self::Model => 3,
-            Self::Reasoning => 4,
-            Self::Confirm => 5,
+            Self::Model => 2,
+            Self::Reasoning => 3,
+            Self::Confirm => 4,
         }
     }
 }
@@ -148,29 +145,22 @@ impl ThorSetupState {
             agents.to_vec()
         };
         let has_usable_agent = agents.iter().any(setup_agent_is_usable);
-        let mut selected_workers = agents
+        let selected_workers = agents
             .iter()
-            .map(|setup_agent| {
-                let selected_by_config = thor_config.enabled_worker_source_ids.is_empty()
-                    || thor_config
-                        .enabled_worker_source_ids
-                        .iter()
-                        .any(|source_id| source_id == &setup_agent.agent.source_id);
-                selected_by_config && (!has_usable_agent || setup_agent_is_usable(setup_agent))
-            })
+            .map(|setup_agent| !has_usable_agent || setup_agent_is_usable(setup_agent))
             .collect::<Vec<_>>();
-        if !selected_workers.iter().any(|selected| *selected) {
-            let idx = agents.iter().position(setup_agent_is_usable).unwrap_or(0);
-            selected_workers[idx] = true;
-        }
 
-        let host_source_id = if agents
-            .iter()
-            .any(|setup_agent| setup_agent.agent.source_id == initial_host.source_id)
-        {
+        let host_source_id = if agents.iter().any(|setup_agent| {
+            setup_agent.agent.source_id == initial_host.source_id
+                && (!has_usable_agent || setup_agent_is_usable(setup_agent))
+        }) {
             initial_host.source_id.clone()
         } else {
-            agents[0].agent.source_id.clone()
+            agents
+                .iter()
+                .find(|setup_agent| !has_usable_agent || setup_agent_is_usable(setup_agent))
+                .map(|setup_agent| setup_agent.agent.source_id.clone())
+                .unwrap_or_else(|| agents[0].agent.source_id.clone())
         };
         let optimization_mode = match thor_config.optimization_mode {
             ThorOptimizationMode::Cost => ThorOptimizationMode::Cost,
@@ -179,7 +169,7 @@ impl ThorSetupState {
 
         let mut state = Self {
             agents,
-            step: SetupStep::Workers,
+            step: SetupStep::Host,
             cursor: 0,
             selected_workers,
             optimization_mode,
@@ -187,9 +177,7 @@ impl ThorSetupState {
             coordinator_model: thor_config.coordinator_model.clone(),
             coordinator_reasoning: thor_config.coordinator_reasoning,
         };
-        if let Some(idx) = state.selected_workers.iter().position(|selected| *selected) {
-            state.cursor = idx;
-        }
+        state.cursor = state.default_cursor_for(SetupStep::Host);
         state.ensure_host_is_enabled();
         state
     }
@@ -203,31 +191,16 @@ impl ThorSetupState {
         self.cursor = (self.cursor as i32 + delta).rem_euclid(len as i32) as usize;
     }
 
-    fn toggle_current_worker(&mut self) {
-        if self.step != SetupStep::Workers || self.agents.is_empty() {
-            return;
-        }
-        if self.has_usable_agent() && !self.current_worker_is_usable() {
-            return;
-        }
-        self.selected_workers[self.cursor] = !self.selected_workers[self.cursor];
-        if !self.selected_workers.iter().any(|selected| *selected) {
-            self.selected_workers[self.cursor] = true;
-        }
-        self.ensure_host_is_enabled();
-    }
-
     fn advance(&mut self) -> Option<ThorSetupSelection> {
         match self.step {
-            SetupStep::Workers => self.set_step(SetupStep::Persona),
-            SetupStep::Persona => {
-                self.optimization_mode = persona_mode_for_cursor(self.cursor);
-                self.set_step(SetupStep::Host);
-            }
             SetupStep::Host => {
                 if let Some(source_id) = self.enabled_source_ids().get(self.cursor) {
                     self.host_source_id = source_id.clone();
                 }
+                self.set_step(SetupStep::Persona);
+            }
+            SetupStep::Persona => {
+                self.optimization_mode = persona_mode_for_cursor(self.cursor);
                 self.set_step(SetupStep::Model);
             }
             SetupStep::Model => {
@@ -245,9 +218,8 @@ impl ThorSetupState {
 
     fn back(&mut self) {
         match self.step {
-            SetupStep::Workers => {}
-            SetupStep::Persona => self.set_step(SetupStep::Workers),
-            SetupStep::Host => self.set_step(SetupStep::Persona),
+            SetupStep::Host => {}
+            SetupStep::Persona => self.set_step(SetupStep::Host),
             SetupStep::Model => self.set_step(SetupStep::Host),
             SetupStep::Reasoning => self.set_step(SetupStep::Model),
             SetupStep::Confirm => self.set_step(SetupStep::Reasoning),
@@ -271,10 +243,10 @@ impl ThorSetupState {
 
     fn default_cursor_for(&self, step: SetupStep) -> usize {
         match step {
-            SetupStep::Workers => self
-                .selected_workers
+            SetupStep::Host => self
+                .enabled_source_ids()
                 .iter()
-                .position(|selected| *selected)
+                .position(|source_id| source_id == &self.host_source_id)
                 .unwrap_or(0),
             SetupStep::Persona => {
                 if self.optimization_mode == ThorOptimizationMode::Cost {
@@ -283,11 +255,6 @@ impl ThorSetupState {
                     0
                 }
             }
-            SetupStep::Host => self
-                .enabled_source_ids()
-                .iter()
-                .position(|source_id| source_id == &self.host_source_id)
-                .unwrap_or(0),
             SetupStep::Model => MODEL_OPTIONS
                 .iter()
                 .position(|option| option.value == self.coordinator_model)
@@ -302,9 +269,8 @@ impl ThorSetupState {
 
     fn current_len(&self) -> usize {
         match self.step {
-            SetupStep::Workers => self.agents.len(),
-            SetupStep::Persona => 2,
             SetupStep::Host => self.enabled_source_ids().len(),
+            SetupStep::Persona => 2,
             SetupStep::Model => MODEL_OPTIONS.len(),
             SetupStep::Reasoning => REASONING_OPTIONS.len(),
             SetupStep::Confirm => 1,
@@ -331,17 +297,6 @@ impl ThorSetupState {
         if let Some(source_id) = enabled.first() {
             self.host_source_id = source_id.clone();
         }
-    }
-
-    fn has_usable_agent(&self) -> bool {
-        self.agents.iter().any(setup_agent_is_usable)
-    }
-
-    fn current_worker_is_usable(&self) -> bool {
-        self.agents
-            .get(self.cursor)
-            .map(setup_agent_is_usable)
-            .unwrap_or(false)
     }
 }
 
@@ -400,19 +355,16 @@ fn handle_event(state: &mut ThorSetupState, ev: CtEvent) -> Option<Option<ThorSe
             state.back();
             None
         }
-        KeyCode::Char(' ') => {
-            state.toggle_current_worker();
-            None
-        }
+        KeyCode::Char(' ') => None,
         KeyCode::Enter | KeyCode::Right => state.advance().map(Some),
         _ => None,
     }
 }
 
 fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
-    let area = crate::term::centered_rect(f.area(), 80, 24);
+    let area = setup_rect(f.area());
     let block = Block::default()
-        .title(" Thor setup ")
+        .title(" Set up Thor ")
         .borders(Borders::ALL)
         .style(Style::default().fg(theme.text));
     let inner = block.inner(area);
@@ -421,7 +373,7 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Length(2),
             Constraint::Min(10),
             Constraint::Length(4),
@@ -431,12 +383,13 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
 
     let title = Paragraph::new(vec![
         Line::from(vec![Span::styled(
-            "Thor is the only prompt path.",
+            "Thor coordinates your coding agents.",
             Style::default()
                 .fg(theme.primary)
                 .add_modifier(Modifier::BOLD),
         )]),
-        Line::from("Set who Thor can use, how Thor thinks, and where Thor runs."),
+        Line::from("Pick how Thor starts. You can change these choices later in config."),
+        Line::from("Installed and configured agents are available for Thor to delegate work."),
     ])
     .style(Style::default().fg(theme.text));
     f.render_widget(title, layout[0]);
@@ -444,13 +397,13 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
     f.render_widget(progress_line(state, theme), layout[1]);
 
     let content = match state.step {
-        SetupStep::Workers => worker_rows(state, theme),
-        SetupStep::Persona => persona_rows(state, theme),
         SetupStep::Host => host_rows(state, theme),
+        SetupStep::Persona => persona_rows(state, theme),
         SetupStep::Model => model_rows(state, theme),
         SetupStep::Reasoning => reasoning_rows(state, theme),
         SetupStep::Confirm => confirm_rows(state, theme),
     };
+    let content = visible_rows(content, state.cursor, layout[2].height as usize);
     f.render_widget(List::new(content), layout[2]);
 
     let summary = Paragraph::new(summary_lines(state, theme))
@@ -459,7 +412,6 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
     f.render_widget(summary, layout[3]);
 
     let footer_text = match state.step {
-        SetupStep::Workers => "Space toggles  |  Enter continues  |  Esc quits",
         SetupStep::Confirm => "Enter starts Thor  |  Backspace edits  |  Esc quits",
         _ => "Enter selects  |  Backspace edits  |  Esc quits",
     };
@@ -469,9 +421,8 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
 
 fn progress_line(state: &ThorSetupState, theme: TerminalTheme) -> Paragraph<'static> {
     let steps = [
-        SetupStep::Workers,
-        SetupStep::Persona,
         SetupStep::Host,
+        SetupStep::Persona,
         SetupStep::Model,
         SetupStep::Reasoning,
         SetupStep::Confirm,
@@ -503,45 +454,32 @@ fn progress_line(state: &ThorSetupState, theme: TerminalTheme) -> Paragraph<'sta
     Paragraph::new(Line::from(spans))
 }
 
-fn worker_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'static>> {
-    state
-        .agents
-        .iter()
-        .enumerate()
-        .map(|(idx, setup_agent)| {
-            let agent = &setup_agent.agent;
-            let checked = if state.selected_workers[idx] {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            let status_style = if setup_agent_is_usable(setup_agent) {
-                Style::default().fg(theme.primary)
-            } else {
-                Style::default().fg(theme.warning)
-            };
-            selectable_row(
-                idx == state.cursor,
-                vec![
-                    Span::raw(format!("{checked} ")),
-                    Span::styled(
-                        setup_agent_label(setup_agent),
-                        Style::default().fg(theme.text),
-                    ),
-                    Span::styled(format!("  {}", validation_label(setup_agent)), status_style),
-                    Span::styled(
-                        format!("  {}", quota_backend_label(setup_agent.quota_backend)),
-                        Style::default().fg(theme.muted),
-                    ),
-                    Span::styled(
-                        format!("  {}", command_label(agent)),
-                        Style::default().fg(theme.muted),
-                    ),
-                ],
-                theme,
-            )
-        })
-        .collect()
+fn setup_rect(area: Rect) -> Rect {
+    let width = area
+        .width
+        .saturating_mul(9)
+        .saturating_div(10)
+        .clamp(72, 112);
+    let height = area
+        .height
+        .saturating_mul(9)
+        .saturating_div(10)
+        .clamp(24, 36);
+    crate::term::centered_rect(area, width, height)
+}
+
+fn visible_rows(
+    rows: Vec<ListItem<'static>>,
+    cursor: usize,
+    viewport_height: usize,
+) -> Vec<ListItem<'static>> {
+    if rows.is_empty() || viewport_height == 0 || rows.len() <= viewport_height {
+        return rows;
+    }
+    let half = viewport_height / 2;
+    let max_start = rows.len().saturating_sub(viewport_height);
+    let start = cursor.saturating_sub(half).min(max_start);
+    rows.into_iter().skip(start).take(viewport_height).collect()
 }
 
 fn persona_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'static>> {
@@ -588,7 +526,15 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
                         Style::default().fg(theme.text),
                     ),
                     Span::styled(
-                        format!("  {}", command_label(&setup_agent.agent)),
+                        format!("  {}", host_status_label(setup_agent)),
+                        if setup_agent_is_usable(setup_agent) {
+                            Style::default().fg(theme.primary)
+                        } else {
+                            Style::default().fg(theme.warning)
+                        },
+                    ),
+                    Span::styled(
+                        format!("  {}", setup_agent_description(setup_agent)),
                         Style::default().fg(theme.muted),
                     ),
                 ],
@@ -669,12 +615,16 @@ fn selectable_row(
 
 fn summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static>> {
     vec![
-        detail_line("Workers", state.enabled_source_ids().join(", "), theme),
-        detail_line("Persona", persona_label(state.optimization_mode), theme),
-        detail_line("Thor host", state.host_source_id.clone(), theme),
-        detail_line("Thor model", state.coordinator_model.clone(), theme),
         detail_line(
-            "Reasoning",
+            "Available agents",
+            state.enabled_source_ids().join(", "),
+            theme,
+        ),
+        detail_line("Work style", persona_label(state.optimization_mode), theme),
+        detail_line("Thor runs in", state.host_source_id.clone(), theme),
+        detail_line("Model preference", state.coordinator_model.clone(), theme),
+        detail_line(
+            "Planning depth",
             reasoning_label(state.coordinator_reasoning),
             theme,
         ),
@@ -730,18 +680,18 @@ fn setup_agent_label(setup_agent: &ThorSetupAgent) -> String {
     }
 }
 
-fn quota_backend_label(backend: ThorQuotaBackend) -> &'static str {
-    match backend {
-        ThorQuotaBackend::ClaudeCli => "quota: claude",
-        ThorQuotaBackend::CodexAppserver => "quota: codex",
-        ThorQuotaBackend::None => "quota: none",
-    }
-}
-
 fn command_label(agent: &SelectedAgent) -> String {
     let mut parts = vec![agent.program.to_string_lossy().into_owned()];
     parts.extend(agent.args.iter().cloned());
     parts.join(" ")
+}
+
+fn setup_agent_description(setup_agent: &ThorSetupAgent) -> String {
+    if !setup_agent.description.trim().is_empty() {
+        truncate_label(&setup_agent.description, 72)
+    } else {
+        command_label(&setup_agent.agent)
+    }
 }
 
 fn setup_agent_is_usable(setup_agent: &ThorSetupAgent) -> bool {
@@ -752,25 +702,11 @@ fn setup_agent_is_usable(setup_agent: &ThorSetupAgent) -> bool {
         .unwrap_or(true)
 }
 
-fn validation_label(setup_agent: &ThorSetupAgent) -> String {
+fn host_status_label(setup_agent: &ThorSetupAgent) -> String {
     match &setup_agent.validation {
-        Some(validation) if validation.usable => match (
-            validation.agent_name.as_deref(),
-            validation.agent_version.as_deref(),
-        ) {
-            (Some(name), Some(version)) => format!("ready: {name} {version}"),
-            (Some(name), None) => format!("ready: {name}"),
-            _ => "ready".to_string(),
-        },
-        Some(validation) => {
-            let reason = validation
-                .error
-                .as_deref()
-                .filter(|message| !message.trim().is_empty())
-                .unwrap_or("ACP session did not start");
-            format!("unavailable: {}", truncate_label(reason, 64))
-        }
-        None => "not checked".to_string(),
+        Some(validation) if validation.usable => "ready".to_string(),
+        Some(_) => "needs setup".to_string(),
+        None => "available".to_string(),
     }
 }
 
@@ -837,17 +773,13 @@ mod tests {
     }
 
     #[test]
-    fn worker_step_toggles_available_workers_but_keeps_one() {
+    fn available_agents_are_enabled_without_worker_step() {
         let raw_agents = vec![agent("claude"), agent("codex")];
         let agents = setup_agents(&raw_agents);
-        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
+        let state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
 
-        state.toggle_current_worker();
-        assert_eq!(state.enabled_source_ids(), vec!["codex"]);
-
-        state.move_selection(1);
-        state.toggle_current_worker();
-        assert_eq!(state.enabled_source_ids(), vec!["codex"]);
+        assert_eq!(state.step, SetupStep::Host);
+        assert_eq!(state.enabled_source_ids(), vec!["claude", "codex"]);
     }
 
     #[test]
@@ -882,7 +814,7 @@ mod tests {
         state.set_step(SetupStep::Confirm);
 
         let selection = state.advance().expect("selection");
-        assert_eq!(selection.enabled_worker_source_ids, vec!["codex"]);
+        assert_eq!(selection.enabled_worker_source_ids, vec!["claude", "codex"]);
         assert_eq!(selection.host_source_id, "codex");
         assert_eq!(selection.optimization_mode, ThorOptimizationMode::Cost);
         assert_eq!(selection.coordinator_model, "gpt-strong");
@@ -928,17 +860,13 @@ mod tests {
     }
 
     #[test]
-    fn toggling_unusable_worker_is_ignored_when_usable_worker_exists() {
-        let agents = vec![
-            setup_agent_with_validation("claude", false),
-            setup_agent_with_validation("codex", true),
-        ];
-        let initial_host = agents[1].agent.clone();
-        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &initial_host);
+    fn visible_rows_follow_cursor_for_long_lists() {
+        let rows = (0..10)
+            .map(|idx| ListItem::new(Line::from(format!("row {idx}"))))
+            .collect::<Vec<_>>();
 
-        state.cursor = 0;
-        state.toggle_current_worker();
+        let window = visible_rows(rows, 8, 4);
 
-        assert_eq!(state.enabled_source_ids(), vec!["codex"]);
+        assert_eq!(window.len(), 4);
     }
 }

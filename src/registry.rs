@@ -1,4 +1,5 @@
 //! ACP registry loading and Thor setup resolution.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,6 @@ pub struct Agent {
     pub id: String,
     pub name: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub version: String,
     #[serde(default)]
     pub description: String,
@@ -34,7 +34,6 @@ pub struct Distribution {
     #[serde(default)]
     pub uvx: Option<UvxPackage>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub binary: Option<HashMap<String, BinaryTarget>>,
 }
 
@@ -57,7 +56,6 @@ pub struct UvxPackage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct BinaryTarget {
     pub archive: String,
     pub cmd: String,
@@ -149,6 +147,7 @@ impl Registry {
     }
 }
 
+#[allow(dead_code)]
 pub fn default_cache_path() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from(".cache"))

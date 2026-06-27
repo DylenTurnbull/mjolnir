@@ -983,22 +983,6 @@ async fn thor_onboarding_servers(cfg: &Config) -> Vec<ConfiguredAcpServer> {
     for server in thor::configured_acp_servers(cfg) {
         push_unique_server(&mut servers, server);
     }
-    match registry::load_with_cache(
-        &registry::default_cache_path(),
-        registry::CACHE_TTL,
-        registry::REGISTRY_URL,
-    )
-    .await
-    {
-        Ok(registry) => {
-            for server in registry.configured_servers() {
-                push_unique_server(&mut servers, server);
-            }
-        }
-        Err(error) => {
-            tracing::warn!("ACP registry load failed during Thor onboarding: {error:#}");
-        }
-    }
     for custom in &cfg.custom_agents {
         push_unique_server(
             &mut servers,
@@ -1734,6 +1718,42 @@ mod tests {
         assert_eq!(agent.program, PathBuf::from("uvx"));
         assert_eq!(agent.args, vec!["brokk", "acp"]);
         assert_eq!(cfg.agent, Some(agent));
+    }
+
+    #[tokio::test]
+    async fn thor_onboarding_servers_do_not_seed_full_registry() {
+        let cfg = Config {
+            theme: Default::default(),
+            spinner: Default::default(),
+            thor: thor::ThorConfig {
+                configured_acp_servers: vec![ConfiguredAcpServer {
+                    source_id: "claude-acp".to_string(),
+                    name: "Claude".to_string(),
+                    program: PathBuf::from("npx"),
+                    args: vec!["-y".to_string(), "@x/claude".to_string()],
+                    env: Default::default(),
+                    description: String::new(),
+                    quota_backend: ThorQuotaBackend::ClaudeCli,
+                }],
+                ..Default::default()
+            },
+            agent: None,
+            favorite_agents: Vec::new(),
+            custom_agents: vec![config::CustomAgent {
+                name: "local".to_string(),
+                program: PathBuf::from("local-acp"),
+                args: Vec::new(),
+                description: "Local ACP".to_string(),
+            }],
+        };
+
+        let source_ids = thor_onboarding_servers(&cfg)
+            .await
+            .into_iter()
+            .map(|server| server.source_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(source_ids, vec!["claude-acp", "custom:local", "anvil"]);
     }
 
     #[test]
