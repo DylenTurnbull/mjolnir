@@ -396,6 +396,9 @@ Fixed in this PR:
   in long or mostly broken setup lists.
 - [x] Added provider-specific failed-row guidance for Anvil, Claude ACP, Codex
   ACP, `npx`, and `uvx` failures, including clearer install/sign-in next steps.
+- [x] Fixed the all-broken state so failed candidates remain visible but are not
+  internally treated as available Thor workers; the summary now says no Thor
+  host is ready instead of naming a failed host.
 
 Still not production-grade:
 
@@ -407,11 +410,7 @@ Still not production-grade:
    Rows now offer provider-specific actions for Anvil, Claude, Codex, `npx`,
    and `uvx`, but production UX should use registry/auth metadata for exact
    commands and links when available.
-3. **Empty and broken states need real user-facing recovery.** If no usable
-   Thor host validates, setup can now add a custom ACP command, but it should
-   also drive the user through installing/signing into the default path with
-   exact steps.
-4. **The setup UI has not been manually smoke-tested in multiple terminal sizes.**
+3. **The setup UI has not been manually smoke-tested in multiple terminal sizes.**
    Unit tests cover state transitions and list windowing; visual polish still
    needs an interactive pass.
 

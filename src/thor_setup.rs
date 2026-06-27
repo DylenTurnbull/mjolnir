@@ -131,23 +131,19 @@ impl ThorSetupState {
         } else {
             agents.to_vec()
         };
-        let has_usable_agent = agents.iter().any(setup_agent_is_usable);
-        let selected_workers = agents
-            .iter()
-            .map(|setup_agent| !has_usable_agent || setup_agent_is_usable(setup_agent))
-            .collect::<Vec<_>>();
+        let selected_workers = agents.iter().map(setup_agent_is_usable).collect::<Vec<_>>();
 
         let host_source_id = if agents.iter().any(|setup_agent| {
             setup_agent.agent.source_id == initial_host.source_id
-                && (!has_usable_agent || setup_agent_is_usable(setup_agent))
+                && setup_agent_is_usable(setup_agent)
         }) {
             initial_host.source_id.clone()
         } else {
             agents
                 .iter()
-                .find(|setup_agent| !has_usable_agent || setup_agent_is_usable(setup_agent))
+                .find(|setup_agent| setup_agent_is_usable(setup_agent))
                 .map(|setup_agent| setup_agent.agent.source_id.clone())
-                .unwrap_or_else(|| agents[0].agent.source_id.clone())
+                .unwrap_or_default()
         };
         let optimization_mode = match thor_config.optimization_mode {
             ThorOptimizationMode::Cost => ThorOptimizationMode::Cost,
@@ -800,7 +796,7 @@ fn disabled_row(spans: Vec<Span<'static>>, theme: TerminalTheme) -> ListItem<'st
 fn summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static>> {
     vec![
         detail_line("Available agents", enabled_summary(state), theme),
-        detail_line("Thor runs in", state.host_source_id.clone(), theme),
+        detail_line("Thor runs in", host_summary(state), theme),
         detail_line(
             "Defaults",
             format!(
@@ -820,6 +816,18 @@ fn enabled_summary(state: &ThorSetupState) -> String {
         "none ready; add or fix an ACP command".to_string()
     } else {
         enabled.join(", ")
+    }
+}
+
+fn host_summary(state: &ThorSetupState) -> String {
+    if state
+        .host_choices()
+        .iter()
+        .any(|choice| matches!(choice, HostChoice::Agent(source_id) if source_id == &state.host_source_id))
+    {
+        state.host_source_id.clone()
+    } else {
+        "none ready yet".to_string()
     }
 }
 
@@ -1203,6 +1211,23 @@ mod tests {
 
         assert_eq!(state.enabled_source_ids(), vec!["codex"]);
         assert_eq!(state.host_source_id, "codex");
+    }
+
+    #[test]
+    fn no_usable_workers_are_not_treated_as_available() {
+        let agents = vec![
+            setup_agent_with_validation("claude", false),
+            setup_agent_with_validation("codex", false),
+        ];
+        let initial_host = agents[0].agent.clone();
+        let state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &initial_host);
+
+        assert!(state.enabled_source_ids().is_empty());
+        assert_eq!(host_summary(&state), "none ready yet");
+        assert!(matches!(
+            state.host_choices().first(),
+            Some(HostChoice::AddCustom)
+        ));
     }
 
     #[test]

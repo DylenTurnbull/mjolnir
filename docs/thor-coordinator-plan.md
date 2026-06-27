@@ -90,10 +90,10 @@ changed and how much each harness/model used.
     path. Registry entries can also be added from setup without probing the full
     registry, and their website/repository links are preserved on configured
     servers. Failed rows have provider-specific guidance for Anvil, Claude ACP,
-    Codex ACP, `npx`, and `uvx`. Remaining: replace inferred setup labels with
-    richer metadata-driven exact commands/links where possible, handle default
-    empty/broken states as guided recovery, and manually smoke-test the setup UI
-    across terminal sizes.
+    Codex ACP, `npx`, and `uvx`. All-broken candidate sets no longer mark
+    failed agents as available workers. Remaining: replace inferred setup labels
+    with richer metadata-driven exact commands/links where possible and manually
+    smoke-test the setup UI across terminal sizes.
 
 ## Quota reads
 
