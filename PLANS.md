@@ -54,15 +54,16 @@ agents that validate successfully are made available to Thor automatically and
 written to visible `[thor]` configuration. The previous agent picker is no
 longer part of the normal user path.
 
-The remaining startup gap is onboarding quality. This is a release blocker, not
-polish. The current first-run flow validates candidates and avoids the old
-model/agent picker, but it still feels like a developer validation screen rather
-than an end-user setup wizard. It now lets a user add a custom ACP command or
-registry-backed ACP server from setup and reruns validation before Thor uses it,
-but the user still has to understand too much about ACP commands, installed
-programs, auth state, and what to do after a failed check. Exact install/auth
-guidance beyond available registry links and the first provider-specific cases,
-plus manual visual smoke, are required before this is production-grade.
+The remaining startup gap is onboarding quality. This is the top release
+blocker, not polish. The current first-run flow validates candidates and avoids
+the old model/agent picker, but it is still unacceptable as an end-user
+experience: it feels like a developer validation screen instead of a guided
+setup wizard. It now lets a user add a custom ACP command or registry-backed ACP
+server from setup and reruns validation before Thor uses it, but the user still
+has to understand too much about ACP commands, installed programs, auth state,
+and what to do after a failed check. Exact install/auth guidance beyond
+available registry links and the first provider-specific cases, plus manual
+visual smoke, are required before this is production-grade.
 
 M1 hardening landed (PR #34): an explicit `ConnectionState` lifecycle drives
 the header label, a `LaunchError` enum surfaces spawn / initialize /
@@ -329,11 +330,11 @@ Near-term:
   resource text fallbacks; structured tool-call output for diff/terminal).
 - Compatibility smoke tests against more non-Brokk ACP agents (one done in
   M1; see the Compatibility section).
-- Production-grade Thor first-run onboarding: the current setup process is
-  still too rough for end users. Add/configure ACP agents from setup is
-  implemented for custom ACP commands and registry-backed entries; richer
-  registry/auth guidance, a more guided setup/retry flow, and manual visual
-  smoke across terminal sizes remain.
+- Production-grade Thor first-run onboarding: the current setup process is the
+  top product blocker and still unacceptable for end users. Add/configure ACP
+  agents from setup is implemented for custom ACP commands and registry-backed
+  entries; richer registry/auth guidance, a more guided setup/retry flow, and
+  manual visual smoke across terminal sizes remain.
 
 (M1 closed: fatal/error rendering, child-process cleanup, transcript
 scrolling.)
@@ -363,10 +364,10 @@ The first-run Thor setup screen (`src/thor_setup.rs`) must be end-user-quality
 before it ships. The flow is the first product impression, so implementation
 concepts must not leak into the setup path.
 
-Current assessment: the flow is still not production-grade and is still a poor
-first-run experience for end users. It is no longer the old advanced picker, but
-it remains too much like a validation list and not enough like a guided setup
-wizard. A new user can now add a custom ACP command or registry-backed ACP
+Current assessment: the flow is still not production-grade and is currently a
+bad first-run experience for end users. It is no longer the old advanced picker,
+but it remains too much like a validation list and not enough like a guided
+setup wizard. A new user can now add a custom ACP command or registry-backed ACP
 server from onboarding and have it validated before Thor uses it, but failed
 rows can still land on broad install/auth messages when the registry does not
 provide exact setup instructions. The user should not have to infer whether they
@@ -446,6 +447,12 @@ Fixed in this PR:
   Verified the rebuilt binary opens the new `Set up Thor` flow, not the old
   worker/model picker; shows no-ready guidance; defaults to `Add ACP command`;
   keeps `Retry checks` visible; and exits cleanly with Esc.
+- [x] Manually smoke-tested an 80-column configured-but-broken path with a
+  temporary macOS config under `/tmp/mj-thor-success-smoke/Library/Application Support/mj/config.toml`
+  pointing at a local OpenCode ACP wrapper. OpenCode could not validate in that
+  isolated setup, but the failure rows now render compactly as `agent exited /
+  Check auth/config, then retry` and `timeout / Retry after install/auth is
+  ready`, with `Add ACP command` and `Retry checks` still reachable.
 
 Still not production-grade:
 
@@ -464,9 +471,9 @@ Still not production-grade:
    across more real terminal sizes and success/failure combinations.
 4. **The setup UI has only been manually smoked for one terminal scenario.**
    Unit tests cover state transitions, list windowing, and small/large render
-   output; manual smoke now covers the no-working-agent 80-column path, but
-   still needs at least one successful configured agent and one registry-add
-   flow.
+   output; manual smoke now covers the no-working-agent 80-column path and a
+   configured-but-broken 80-column path, but still needs at least one successful
+   configured agent and one registry-add flow.
 
 ## Risks and open questions
 

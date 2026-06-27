@@ -1024,7 +1024,13 @@ fn validation_action_label(setup_agent: &ThorSetupAgent, validation: &AgentValid
     {
         return auth_action_label(setup_agent);
     }
-    format!("setup needed: {}", truncate_label(error, 48))
+    if lower.contains("exited unexpectedly") || lower.contains("exit status") {
+        "agent exited".to_string()
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "timeout".to_string()
+    } else {
+        "setup needed".to_string()
+    }
 }
 
 fn validation_detail_label(setup_agent: &ThorSetupAgent, validation: &AgentValidation) -> String {
@@ -1051,7 +1057,13 @@ fn validation_detail_label(setup_agent: &ThorSetupAgent, validation: &AgentValid
     {
         return with_setup_url(auth_detail_label(setup_agent), setup_agent);
     }
-    format!("Last error: {}", truncate_label(error, 72))
+    if lower.contains("exited unexpectedly") || lower.contains("exit status") {
+        return "Check auth/config, then retry".to_string();
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return "Retry after install/auth is ready".to_string();
+    }
+    format!("Last error: {}", truncate_label(error, 56))
 }
 
 fn with_setup_url(detail: String, setup_agent: &ThorSetupAgent) -> String {
@@ -1385,6 +1397,34 @@ mod tests {
         assert_eq!(
             compact_setup_url_label(&setup_agent).as_deref(),
             Some("BrokkAi/brokk")
+        );
+    }
+
+    #[test]
+    fn validation_error_compacts_unexpected_exit_guidance() {
+        let setup_agent = setup_agent_with_error(
+            "opencode",
+            Some("agent process exited unexpectedly: exit status 1".to_string()),
+        );
+
+        assert_eq!(host_status_label(&setup_agent), "agent exited");
+        assert_eq!(
+            setup_agent_description(&setup_agent),
+            "Check auth/config, then retry"
+        );
+    }
+
+    #[test]
+    fn validation_error_compacts_timeout_guidance() {
+        let setup_agent = setup_agent_with_error(
+            "anvil",
+            Some("ACP validation timed out after 8s".to_string()),
+        );
+
+        assert_eq!(host_status_label(&setup_agent), "timeout");
+        assert_eq!(
+            setup_agent_description(&setup_agent),
+            "Retry after install/auth is ready"
         );
     }
 
