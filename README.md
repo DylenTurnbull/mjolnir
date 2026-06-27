@@ -64,7 +64,7 @@ prompt flow does not ask the user to choose a model or agent.
 +------------------------------------------------------------+
 ```
 
-Thor preferences and the configured worker set/backend are stored in
+Thor preferences, configured ACP servers, and quota backend metadata are stored in
 `~/.config/mj/config.toml`.
 
 Use `/new` inside the TUI to start a fresh Thor session with the configured
@@ -72,14 +72,25 @@ backend. Use `/load` to open the session picker for the current backend.
 
 ## Thor Routing
 
-Thor is a coordinator persona running inside an ACP host agent. `mj` passes a
-stdio MCP bridge (`mj thor-mcp`) to the host through ACP `mcpServers`; the MCP
-tools validate configured ACP workers, list usable workers, and run assigned
-tasks through worker sessions. The bridge also exposes a cached model catalog
-from LM Arena/OpenRouter sources, direct quota reads through Claude Code
-`/usage` and Codex appserver `account/rateLimits/read`, optional real ACP
-validation on the worker inventory, and a concurrent worker runner that reports
-structured progress, tool calls, and aggregate usage.
+Thor is a coordinator persona running inside an ACP host agent. Onboarding
+retrieves ACP server definitions from the ACP registry, lets the user choose
+which servers Thor may use, and persists those configured server instances.
+Thor only sees configured ACP servers, not every registry possibility and not
+locally installed provider CLIs by themselves.
+
+`mj` passes a stdio MCP bridge (`mj thor-mcp`) to the host through ACP
+`mcpServers`; the MCP tools validate configured ACP workers, list usable
+workers, and run assigned tasks through worker sessions. The bridge also exposes
+a cached model catalog from LM Arena/OpenRouter sources, optional real ACP
+validation on the configured worker inventory, and a concurrent worker runner
+that reports structured progress, tool calls, and aggregate usage.
+
+Quota is separate from ACP discovery/validation. A configured Claude-backed ACP
+server can have a `claude-cli` quota backend, which reads the installed Claude
+CLI with `/usage`. A configured Codex-backed ACP server can have a
+`codex-appserver` quota backend, which reads installed Codex appserver rate
+limits. If no configured ACP server declares that backend, the provider CLI is
+not exposed to Thor as a worker.
 
 Initial routing policy:
 

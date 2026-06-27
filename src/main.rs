@@ -15,6 +15,7 @@ mod install;
 mod notifications;
 mod palette;
 mod paths;
+mod registry;
 mod remote;
 mod self_update;
 mod session;
@@ -42,7 +43,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::app::UiExitReason;
-use crate::config::{Config, SelectedAgent, history_path, transcript_export_dir};
+use crate::config::{
+    Config, ConfiguredAcpServer, SelectedAgent, ThorQuotaBackend, history_path,
+    transcript_export_dir,
+};
 use crate::event::{LoadSessionResult, UiCommand};
 use crate::session::SessionEntryJson;
 use crate::ui::{HeaderLabels, UiMode};
@@ -883,16 +887,28 @@ async fn run_thor_onboarding(
     config_path: &Path,
     cwd: PathBuf,
 ) -> Result<Option<SelectedAgent>> {
-    let available_agents = thor::available_worker_catalog(cfg);
+    let available_servers = thor_onboarding_servers(cfg).await;
+    let available_agents = available_servers
+        .iter()
+        .map(ConfiguredAcpServer::selected_agent)
+        .collect::<Vec<_>>();
     let validations = thor_probe::validate_agents(&available_agents, cwd).await;
     let setup_agents = available_agents
         .iter()
-        .map(|agent| thor_setup::ThorSetupAgent {
-            agent: agent.clone(),
-            validation: validations
+        .filter_map(|agent| {
+            let server = available_servers
                 .iter()
-                .find(|validation| validation.source_id == agent.source_id)
-                .cloned(),
+                .find(|server| server.source_id == agent.source_id)?;
+            Some(thor_setup::ThorSetupAgent {
+                agent: agent.clone(),
+                name: server.name.clone(),
+                description: server.description.clone(),
+                quota_backend: server.quota_backend,
+                validation: validations
+                    .iter()
+                    .find(|validation| validation.source_id == agent.source_id)
+                    .cloned(),
+            })
         })
         .collect::<Vec<_>>();
     let initial_host = cfg
@@ -915,6 +931,22 @@ async fn run_thor_onboarding(
         return Ok(None);
     };
     cfg.thor.enabled_worker_source_ids = selection.enabled_worker_source_ids;
+    cfg.thor.configured_acp_servers = setup_agents
+        .iter()
+        .filter(|setup_agent| {
+            cfg.thor
+                .enabled_worker_source_ids
+                .iter()
+                .any(|source_id| source_id == &setup_agent.agent.source_id)
+                || setup_agent.agent.source_id == selection.host_source_id
+        })
+        .filter_map(|setup_agent| {
+            available_servers
+                .iter()
+                .find(|server| server.source_id == setup_agent.agent.source_id)
+                .cloned()
+        })
+        .collect();
     cfg.thor.optimization_mode = selection.optimization_mode;
     cfg.thor.coordinator_model = selection.coordinator_model;
     cfg.thor.coordinator_reasoning = selection.coordinator_reasoning;
@@ -943,6 +975,55 @@ async fn run_thor_onboarding(
     cfg.save(config_path)
         .with_context(|| format!("save {}", config_path.display()))?;
     Ok(Some(agent))
+}
+
+async fn thor_onboarding_servers(cfg: &Config) -> Vec<ConfiguredAcpServer> {
+    let mut servers = Vec::new();
+    for server in thor::configured_acp_servers(cfg) {
+        push_unique_server(&mut servers, server);
+    }
+    match registry::load_with_cache(
+        &registry::default_cache_path(),
+        registry::CACHE_TTL,
+        registry::REGISTRY_URL,
+    )
+    .await
+    {
+        Ok(registry) => {
+            for server in registry.configured_servers() {
+                push_unique_server(&mut servers, server);
+            }
+        }
+        Err(error) => {
+            tracing::warn!("ACP registry load failed during Thor onboarding: {error:#}");
+        }
+    }
+    for custom in &cfg.custom_agents {
+        push_unique_server(
+            &mut servers,
+            ConfiguredAcpServer {
+                source_id: format!("{}{}", config::CUSTOM_AGENT_SOURCE_PREFIX, custom.name),
+                name: custom.name.clone(),
+                program: custom.program.clone(),
+                args: custom.args.clone(),
+                env: Default::default(),
+                description: custom.description.clone(),
+                quota_backend: ThorQuotaBackend::None,
+            },
+        );
+    }
+    push_unique_server(&mut servers, thor::default_anvil_server());
+    servers
+}
+
+fn push_unique_server(servers: &mut Vec<ConfiguredAcpServer>, server: ConfiguredAcpServer) {
+    if servers
+        .iter()
+        .any(|existing| existing.source_id == server.source_id)
+    {
+        return;
+    }
+    servers.push(server);
 }
 
 async fn run_session_picker_action_for_agent(

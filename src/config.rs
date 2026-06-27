@@ -14,6 +14,47 @@ use crate::spinner::SpinnerStyle;
 use crate::theme::TerminalThemeKind;
 use crate::thor::ThorConfig;
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThorQuotaBackend {
+    #[default]
+    None,
+    ClaudeCli,
+    CodexAppserver,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConfiguredAcpServer {
+    pub source_id: String,
+    pub name: String,
+    pub program: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "ThorQuotaBackend::is_none")]
+    pub quota_backend: ThorQuotaBackend,
+}
+
+impl ThorQuotaBackend {
+    pub fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+}
+
+impl ConfiguredAcpServer {
+    pub fn selected_agent(&self) -> SelectedAgent {
+        SelectedAgent {
+            source_id: self.source_id.clone(),
+            program: self.program.clone(),
+            args: self.args.clone(),
+            env: self.env.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Config {
     #[serde(default, skip_serializing_if = "TerminalThemeKind::is_default")]
@@ -111,6 +152,15 @@ impl Config {
                     .collect();
             }
             agent.program = normalize_spawn_program(agent.program.clone());
+        }
+        for server in self.thor.configured_acp_servers.iter_mut() {
+            server.program = expand_home_shortcut(&server.program.to_string_lossy());
+            server.program = normalize_spawn_program(server.program.clone());
+            server.args = server
+                .args
+                .iter()
+                .map(|arg| expand_home_shortcut(arg).to_string_lossy().into_owned())
+                .collect();
         }
         for custom in self.custom_agents.iter_mut() {
             custom.program = expand_home_shortcut(&custom.program.to_string_lossy());
@@ -553,6 +603,18 @@ args = ["--flag", "$HOME/data"]
         let cfg = Config {
             thor: ThorConfig {
                 onboarding_complete: true,
+                configured_acp_servers: vec![ConfiguredAcpServer {
+                    source_id: "claude-acp".to_string(),
+                    name: "Claude".to_string(),
+                    program: PathBuf::from("npx"),
+                    args: vec![
+                        "-y".to_string(),
+                        "@agentclientprotocol/claude-agent-acp@0.36.1".to_string(),
+                    ],
+                    env: HashMap::new(),
+                    description: "Claude ACP".to_string(),
+                    quota_backend: ThorQuotaBackend::ClaudeCli,
+                }],
                 enabled_worker_source_ids: vec!["anvil".to_string()],
                 coordinator_model: "anthropic/claude-example".to_string(),
                 coordinator_reasoning: crate::thor::ThorReasoning::Medium,
@@ -567,6 +629,7 @@ args = ["--flag", "$HOME/data"]
         let body = std::fs::read_to_string(&path).expect("read");
         assert!(body.contains("[thor]"));
         assert!(body.contains("coordinator_model = \"anthropic/claude-example\""));
+        assert!(body.contains("quota_backend = \"claude-cli\""));
 
         let loaded = Config::load(&path).expect("load saved");
         assert_eq!(loaded.thor.enabled_worker_source_ids, vec!["anvil"]);

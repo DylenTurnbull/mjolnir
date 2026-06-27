@@ -10,7 +10,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CUSTOM_AGENT_SOURCE_PREFIX, Config, SelectedAgent};
+use crate::config::{
+    CUSTOM_AGENT_SOURCE_PREFIX, Config, ConfiguredAcpServer, SelectedAgent, ThorQuotaBackend,
+};
 
 pub const DEFAULT_COORDINATOR_MODEL: &str = "auto-strong";
 pub const LM_ARENA_LEADERBOARD_URL: &str =
@@ -54,6 +56,8 @@ pub struct ThorConfig {
     #[serde(default)]
     pub onboarding_complete: bool,
     #[serde(default)]
+    pub configured_acp_servers: Vec<ConfiguredAcpServer>,
+    #[serde(default)]
     pub enabled_worker_source_ids: Vec<String>,
     #[serde(default = "default_coordinator_model")]
     pub coordinator_model: String,
@@ -73,6 +77,7 @@ impl Default for ThorConfig {
     fn default() -> Self {
         Self {
             onboarding_complete: false,
+            configured_acp_servers: Vec::new(),
             enabled_worker_source_ids: Vec::new(),
             coordinator_model: default_coordinator_model(),
             coordinator_reasoning: ThorReasoning::High,
@@ -146,27 +151,75 @@ pub fn default_anvil_agent() -> SelectedAgent {
     }
 }
 
+pub fn default_anvil_server() -> ConfiguredAcpServer {
+    let agent = default_anvil_agent();
+    ConfiguredAcpServer {
+        source_id: agent.source_id,
+        name: "Anvil".to_string(),
+        program: agent.program,
+        args: agent.args,
+        env: agent.env,
+        description: "Brokk ACP server via uvx".to_string(),
+        quota_backend: ThorQuotaBackend::None,
+    }
+}
+
 pub fn available_worker_catalog(config: &Config) -> Vec<SelectedAgent> {
+    configured_acp_servers(config)
+        .into_iter()
+        .map(|server| server.selected_agent())
+        .collect()
+}
+
+pub fn configured_acp_servers(config: &Config) -> Vec<ConfiguredAcpServer> {
+    if !config.thor.configured_acp_servers.is_empty() {
+        return config.thor.configured_acp_servers.clone();
+    }
     let mut agents = Vec::new();
     if let Some(agent) = config.agent.clone() {
-        agents.push(agent);
+        agents.push(configured_from_selected(
+            agent,
+            "Configured agent".to_string(),
+            String::new(),
+            ThorQuotaBackend::None,
+        ));
     }
     for custom in &config.custom_agents {
         let source_id = format!("{CUSTOM_AGENT_SOURCE_PREFIX}{}", custom.name);
         if agents.iter().any(|agent| agent.source_id == source_id) {
             continue;
         }
-        agents.push(SelectedAgent {
+        agents.push(ConfiguredAcpServer {
             source_id,
+            name: custom.name.clone(),
             program: custom.program.clone(),
             args: custom.args.clone(),
             env: HashMap::new(),
+            description: custom.description.clone(),
+            quota_backend: ThorQuotaBackend::None,
         });
     }
     if !agents.iter().any(|agent| agent.source_id == "anvil") {
-        agents.push(default_anvil_agent());
+        agents.push(default_anvil_server());
     }
     agents
+}
+
+fn configured_from_selected(
+    agent: SelectedAgent,
+    name: String,
+    description: String,
+    quota_backend: ThorQuotaBackend,
+) -> ConfiguredAcpServer {
+    ConfiguredAcpServer {
+        source_id: agent.source_id,
+        name,
+        program: agent.program,
+        args: agent.args,
+        env: agent.env,
+        description,
+        quota_backend,
+    }
 }
 
 pub fn worker_catalog(config: &Config) -> Vec<SelectedAgent> {
@@ -427,6 +480,37 @@ mod tests {
         let workers = worker_catalog(&config);
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].source_id, "custom:reviewer");
+    }
+
+    #[test]
+    fn configured_acp_servers_are_worker_source_of_truth() {
+        let config = Config {
+            thor: ThorConfig {
+                configured_acp_servers: vec![ConfiguredAcpServer {
+                    source_id: "claude-acp".to_string(),
+                    name: "Claude".to_string(),
+                    program: PathBuf::from("npx"),
+                    args: vec!["@agentclientprotocol/claude-agent-acp".to_string()],
+                    env: HashMap::new(),
+                    description: String::new(),
+                    quota_backend: ThorQuotaBackend::ClaudeCli,
+                }],
+                ..ThorConfig::default()
+            },
+            agent: Some(default_anvil_agent()),
+            custom_agents: vec![crate::config::CustomAgent {
+                name: "reviewer".to_string(),
+                program: PathBuf::from("reviewer-acp"),
+                args: Vec::new(),
+                description: String::new(),
+            }],
+            ..Config::default()
+        };
+
+        let workers = worker_catalog(&config);
+
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].source_id, "claude-acp");
     }
 
     #[test]

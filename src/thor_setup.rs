@@ -12,7 +12,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
-use crate::config::SelectedAgent;
+use crate::config::{SelectedAgent, ThorQuotaBackend};
 use crate::palette::TerminalTheme;
 use crate::term::TrackedBackend;
 use crate::thor::{ThorConfig, ThorOptimizationMode, ThorReasoning};
@@ -21,6 +21,9 @@ use crate::thor_probe::AgentValidation;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThorSetupAgent {
     pub agent: SelectedAgent,
+    pub name: String,
+    pub description: String,
+    pub quota_backend: ThorQuotaBackend,
     pub validation: Option<AgentValidation>,
 }
 
@@ -136,6 +139,9 @@ impl ThorSetupState {
         let agents = if agents.is_empty() {
             vec![ThorSetupAgent {
                 agent: crate::thor::default_anvil_agent(),
+                name: "Anvil".to_string(),
+                description: "Brokk ACP server via uvx".to_string(),
+                quota_backend: ThorQuotaBackend::None,
                 validation: None,
             }]
         } else {
@@ -518,8 +524,15 @@ fn worker_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'st
                 idx == state.cursor,
                 vec![
                     Span::raw(format!("{checked} ")),
-                    Span::styled(host_agent_label(agent), Style::default().fg(theme.text)),
+                    Span::styled(
+                        setup_agent_label(setup_agent),
+                        Style::default().fg(theme.text),
+                    ),
                     Span::styled(format!("  {}", validation_label(setup_agent)), status_style),
+                    Span::styled(
+                        format!("  {}", quota_backend_label(setup_agent.quota_backend)),
+                        Style::default().fg(theme.muted),
+                    ),
                     Span::styled(
                         format!("  {}", command_label(agent)),
                         Style::default().fg(theme.muted),
@@ -563,18 +576,19 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
         .iter()
         .enumerate()
         .filter_map(|(idx, source_id)| {
-            let agent = state
+            let setup_agent = state
                 .agents
                 .iter()
-                .find(|setup_agent| &setup_agent.agent.source_id == source_id)?
-                .agent
-                .clone();
+                .find(|setup_agent| &setup_agent.agent.source_id == source_id)?;
             Some(selectable_row(
                 idx == state.cursor,
                 vec![
-                    Span::styled(host_agent_label(&agent), Style::default().fg(theme.text)),
                     Span::styled(
-                        format!("  {}", command_label(&agent)),
+                        setup_agent_label(setup_agent),
+                        Style::default().fg(theme.text),
+                    ),
+                    Span::styled(
+                        format!("  {}", command_label(&setup_agent.agent)),
                         Style::default().fg(theme.muted),
                     ),
                 ],
@@ -708,6 +722,22 @@ fn host_agent_label(agent: &SelectedAgent) -> String {
     }
 }
 
+fn setup_agent_label(setup_agent: &ThorSetupAgent) -> String {
+    if setup_agent.name.trim().is_empty() {
+        host_agent_label(&setup_agent.agent)
+    } else {
+        setup_agent.name.clone()
+    }
+}
+
+fn quota_backend_label(backend: ThorQuotaBackend) -> &'static str {
+    match backend {
+        ThorQuotaBackend::ClaudeCli => "quota: claude",
+        ThorQuotaBackend::CodexAppserver => "quota: codex",
+        ThorQuotaBackend::None => "quota: none",
+    }
+}
+
 fn command_label(agent: &SelectedAgent) -> String {
     let mut parts = vec![agent.program.to_string_lossy().into_owned()];
     parts.extend(agent.args.iter().cloned());
@@ -776,6 +806,9 @@ mod tests {
             .cloned()
             .map(|agent| ThorSetupAgent {
                 agent,
+                name: String::new(),
+                description: String::new(),
+                quota_backend: ThorQuotaBackend::None,
                 validation: None,
             })
             .collect()
@@ -784,6 +817,9 @@ mod tests {
     fn setup_agent_with_validation(source_id: &str, usable: bool) -> ThorSetupAgent {
         ThorSetupAgent {
             agent: agent(source_id),
+            name: source_id.to_string(),
+            description: String::new(),
+            quota_backend: ThorQuotaBackend::None,
             validation: Some(AgentValidation {
                 source_id: source_id.to_string(),
                 usable,

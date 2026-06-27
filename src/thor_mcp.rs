@@ -111,8 +111,10 @@ enum BridgePermissionMode {
 #[serde(rename_all = "camelCase")]
 struct AgentSummary {
     source_id: String,
+    name: String,
     command: String,
     args: Vec<String>,
+    quota_backend: config::ThorQuotaBackend,
     quota: Vec<QuotaSnapshot>,
     validation: Option<AgentValidation>,
 }
@@ -392,6 +394,7 @@ async fn call_tool(params: ToolCallParams, config_path: Option<PathBuf>) -> Resu
     match params.name.as_str() {
         "thor_list_acp_agents" => {
             let config = load_config(config_path.as_ref())?;
+            let configured_workers = thor::configured_acp_servers(&config);
             let workers = thor::worker_catalog(&config);
             let args: ListAgentsArgs = if params.arguments.is_null() {
                 ListAgentsArgs::default()
@@ -400,7 +403,8 @@ async fn call_tool(params: ToolCallParams, config_path: Option<PathBuf>) -> Resu
             };
             let mut quota = thor_probe::load_quota_snapshots().unwrap_or_default();
             if args.refresh_quota {
-                let refreshed = thor_probe::refresh_configured_quota_snapshots(&workers).await;
+                let refreshed =
+                    thor_probe::refresh_configured_quota_snapshots(&configured_workers).await;
                 if !refreshed.is_empty() {
                     quota = refreshed;
                 }
@@ -414,6 +418,16 @@ async fn call_tool(params: ToolCallParams, config_path: Option<PathBuf>) -> Resu
             let agents = workers
                 .into_iter()
                 .map(|agent| AgentSummary {
+                    name: configured_workers
+                        .iter()
+                        .find(|server| server.source_id == agent.source_id)
+                        .map(|server| server.name.clone())
+                        .unwrap_or_else(|| agent.source_id.clone()),
+                    quota_backend: configured_workers
+                        .iter()
+                        .find(|server| server.source_id == agent.source_id)
+                        .map(|server| server.quota_backend)
+                        .unwrap_or(config::ThorQuotaBackend::None),
                     quota: quota
                         .iter()
                         .filter(|snapshot| snapshot.source_id == agent.source_id)
@@ -432,9 +446,10 @@ async fn call_tool(params: ToolCallParams, config_path: Option<PathBuf>) -> Resu
         }
         "thor_refresh_quota" => {
             let config = load_config(config_path.as_ref())?;
-            let snapshots =
-                thor_probe::refresh_configured_quota_snapshots(&thor::worker_catalog(&config))
-                    .await;
+            let snapshots = thor_probe::refresh_configured_quota_snapshots(
+                &thor::configured_acp_servers(&config),
+            )
+            .await;
             Ok(tool_text_result(&serde_json::to_string_pretty(&snapshots)?))
         }
         "thor_validate_acp_agents" => {

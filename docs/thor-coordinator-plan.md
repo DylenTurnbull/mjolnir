@@ -13,10 +13,16 @@ changed and how much each harness/model used.
 ## UX contract
 
 - `mj` opens a Thor host ACP session, not an agent/model picker.
-- First run asks the user to select Thor workers, pick Architect or Accountant,
-  and choose Thor's host agent, model preference, and reasoning level.
-- Before first-run setup offers workers, `mj` validates configured ACP agents by
-  launching each candidate and waiting for initialize plus `session/new`.
+- First run retrieves ACP server definitions from the ACP registry, asks the
+  user which ACP servers to configure for Thor, then asks the user to pick
+  Architect or Accountant and choose Thor's host agent, model preference, and
+  reasoning level.
+- Before first-run setup marks a worker usable, `mj` validates configured ACP
+  servers by launching each candidate and waiting for initialize plus
+  `session/new`.
+- The registry/setup layer is the source of available ACP server types.
+  Thor's runtime worker inventory is the persisted configured ACP server set,
+  not the full registry and not locally installed provider CLIs.
 - The normal prompt flow has no visible model picker or agent picker.
 - Thor presents an execution plan before doing work.
 - The MCP bridge is provided to the Thor host as an ACP `mcpServers` stdio
@@ -73,6 +79,9 @@ changed and how much each harness/model used.
    `thor_list_acp_agents` with `validate: true`.
 9. Done: detect and cache quota/rate-limit hints from direct provider queries,
    then include those hints in worker listings.
+10. Done: separate ACP server setup from quota probing. Registry entries and
+    configured custom servers produce persisted ACP server instances; quota
+    probes only run when a configured server declares a provider quota backend.
 
 ## Quota reads
 
@@ -86,8 +95,9 @@ Active quota detection is provider-specific and intentionally narrow:
   primary/secondary limit windows into Thor quota snapshots.
 
 Thor quota does not use ACP metadata, stream rate-limit events, generic command
-probes, or placeholder HTTP endpoints. If a direct provider query is not
-available for a worker, quota remains unknown.
+probes, or placeholder HTTP endpoints. It also does not discover or configure
+workers. If a configured ACP server does not declare a direct provider quota
+backend, quota remains unknown even if a provider CLI happens to be installed.
 
 ## Data sources
 

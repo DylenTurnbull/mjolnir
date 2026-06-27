@@ -13,7 +13,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::acp::{self, AcpRuntimeConfig};
-use crate::config::SelectedAgent;
+use crate::config::{ConfiguredAcpServer, SelectedAgent, ThorQuotaBackend};
 use crate::event::{UiCommand, UiEvent};
 
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -76,8 +76,10 @@ pub async fn validate_agents(agents: &[SelectedAgent], cwd: PathBuf) -> Vec<Agen
     futures::future::join_all(probes).await
 }
 
-pub async fn refresh_configured_quota_snapshots(agents: &[SelectedAgent]) -> Vec<QuotaSnapshot> {
-    let probes = agents.iter().map(refresh_configured_quota_snapshot);
+pub async fn refresh_configured_quota_snapshots(
+    servers: &[ConfiguredAcpServer],
+) -> Vec<QuotaSnapshot> {
+    let probes = servers.iter().map(refresh_configured_quota_snapshot);
     futures::future::join_all(probes)
         .await
         .into_iter()
@@ -85,11 +87,11 @@ pub async fn refresh_configured_quota_snapshots(agents: &[SelectedAgent]) -> Vec
         .collect()
 }
 
-pub async fn refresh_configured_quota_snapshot(agent: &SelectedAgent) -> Vec<QuotaSnapshot> {
-    let snapshots = match detect_quota_provider(agent) {
-        QuotaProvider::Claude => refresh_claude_usage(agent).await,
-        QuotaProvider::Codex => refresh_codex_appserver_usage(agent).await,
-        QuotaProvider::Unknown => Vec::new(),
+pub async fn refresh_configured_quota_snapshot(server: &ConfiguredAcpServer) -> Vec<QuotaSnapshot> {
+    let snapshots = match server.quota_backend {
+        ThorQuotaBackend::ClaudeCli => refresh_claude_usage(server).await,
+        ThorQuotaBackend::CodexAppserver => refresh_codex_appserver_usage(server).await,
+        ThorQuotaBackend::None => Vec::new(),
     };
     for snapshot in &snapshots {
         let _ = save_quota_snapshot(snapshot);
@@ -180,15 +182,12 @@ pub async fn validate_agent(
     validation
 }
 
-async fn refresh_claude_usage(agent: &SelectedAgent) -> Vec<QuotaSnapshot> {
-    let Some(program) = provider_program(agent, "claude") else {
-        return Vec::new();
-    };
+async fn refresh_claude_usage(server: &ConfiguredAcpServer) -> Vec<QuotaSnapshot> {
     let command = async {
-        let mut command = Command::new(program);
+        let mut command = Command::new("claude");
         command
             .args(["-p", "/usage", "--output-format", "json"])
-            .envs(&agent.env)
+            .envs(&server.env)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
@@ -198,7 +197,7 @@ async fn refresh_claude_usage(agent: &SelectedAgent) -> Vec<QuotaSnapshot> {
         }
         let value = serde_json::from_slice::<Value>(&output.stdout).ok()?;
         let text = claude_usage_text(&value)?;
-        Some(claude_usage_snapshots(&agent.source_id, &text))
+        Some(claude_usage_snapshots(&server.source_id, &text))
     };
     tokio::time::timeout(DEFAULT_PROBE_TIMEOUT, command)
         .await
@@ -207,15 +206,12 @@ async fn refresh_claude_usage(agent: &SelectedAgent) -> Vec<QuotaSnapshot> {
         .unwrap_or_default()
 }
 
-async fn refresh_codex_appserver_usage(agent: &SelectedAgent) -> Vec<QuotaSnapshot> {
-    let Some(program) = provider_program(agent, "codex") else {
-        return Vec::new();
-    };
+async fn refresh_codex_appserver_usage(server: &ConfiguredAcpServer) -> Vec<QuotaSnapshot> {
     let command = async {
-        let mut command = Command::new(program);
+        let mut command = Command::new("codex");
         command
             .arg("app-server")
-            .envs(&agent.env)
+            .envs(&server.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -258,7 +254,7 @@ async fn refresh_codex_appserver_usage(agent: &SelectedAgent) -> Vec<QuotaSnapsh
                 continue;
             }
             let result = value.get("result")?;
-            let snapshots = codex_rate_limit_snapshots(&agent.source_id, result);
+            let snapshots = codex_rate_limit_snapshots(&server.source_id, result);
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Some(snapshots);
@@ -281,20 +277,6 @@ async fn write_json_line(stdin: &mut tokio::process::ChildStdin, value: Value) -
     stdin.write_all(b"\n").await?;
     stdin.flush().await?;
     Ok(())
-}
-
-fn provider_program(agent: &SelectedAgent, fallback: &'static str) -> Option<PathBuf> {
-    let program_name = agent
-        .program
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if program_name.contains(fallback) {
-        Some(agent.program.clone())
-    } else {
-        None
-    }
 }
 
 fn claude_usage_text(value: &Value) -> Option<String> {
@@ -588,27 +570,6 @@ fn codex_window_label(kind: &str, duration_mins: Option<f64>, limit_name: Option
     }
 }
 
-fn detect_quota_provider(agent: &SelectedAgent) -> QuotaProvider {
-    let source_id = agent.source_id.to_ascii_lowercase();
-    let program = agent
-        .program
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if source_id.contains("claude") && program.contains("claude") {
-        QuotaProvider::Claude
-    } else if (source_id.contains("codex")
-        || source_id.contains("openai")
-        || source_id.contains("gpt"))
-        && program.contains("codex")
-    {
-        QuotaProvider::Codex
-    } else {
-        QuotaProvider::Unknown
-    }
-}
-
 fn quota_message(
     window: Option<&str>,
     used_percent: Option<f64>,
@@ -850,11 +811,15 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":nul
         let mut permissions = std::fs::metadata(&codex).expect("metadata").permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&codex, permissions).expect("chmod fake codex");
-        let agent = SelectedAgent {
-            source_id: "custom:codex".to_string(),
-            program: codex,
+        let path = std::env::join_paths([temp.path()]).expect("join path");
+        let agent = ConfiguredAcpServer {
+            source_id: "codex-acp".to_string(),
+            name: "Codex".to_string(),
+            program: PathBuf::from("npx"),
             args: Vec::new(),
-            env: HashMap::new(),
+            env: HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]),
+            description: String::new(),
+            quota_backend: ThorQuotaBackend::CodexAppserver,
         };
 
         let snapshots = refresh_codex_appserver_usage(&agent).await;
@@ -869,12 +834,15 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":nul
     }
 
     #[tokio::test]
-    async fn quota_probe_does_not_fall_back_to_bare_provider_binary() {
-        let agent = SelectedAgent {
+    async fn quota_probe_uses_only_configured_backend_metadata() {
+        let agent = ConfiguredAcpServer {
             source_id: "custom:codex".to_string(),
+            name: "custom codex".to_string(),
             program: PathBuf::from("agent-wrapper"),
             args: Vec::new(),
             env: HashMap::new(),
+            description: String::new(),
+            quota_backend: ThorQuotaBackend::None,
         };
 
         let snapshots = refresh_configured_quota_snapshot(&agent).await;
