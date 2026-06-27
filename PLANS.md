@@ -303,7 +303,8 @@ Exit criteria:
   The release workflow and installer support this; a fresh-machine smoke pass
   still needs to be recorded before calling distribution production-grade. Use
   [docs/install-smoke.md](docs/install-smoke.md) for the exact evidence to
-  collect.
+  collect; tracked in
+  [#249](https://github.com/BrokkAi/mjolnir/issues/249).
 - `mj --version` and `mj --cwd .` work after install.
 
 ### M5: Optional client capabilities
@@ -532,12 +533,14 @@ Still not production-grade:
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, and local
    provider setup profiles are shown, but the registry itself does not
-   currently expose exact auth/install steps for every agent.
+   currently expose exact auth/install steps for every agent. Tracked in
+   [#250](https://github.com/BrokkAi/mjolnir/issues/250).
 2. **Validation feedback is still partly inferred, not registry-metadata-driven.**
    Rows now offer provider-specific actions for Anvil, Claude, Codex, Gemini,
    OpenCode, Goose, Cursor, GitHub Copilot, `npx`, and `uvx`, but production UX
    should use registry/auth metadata for exact commands and links when
-   available.
+   available. Tracked in
+   [#250](https://github.com/BrokkAi/mjolnir/issues/250).
 3. **The current onboarding process still needs production UX validation.**
    The setup flow now starts with architect/accountant mode, exposes selected
    worker agents, and lets the user choose Thor's host without the old model
@@ -662,7 +665,8 @@ live model/auth failures, and transcript rendering from a real OpenCode turn.
 - Goose (self-hosted, no auth dance).
 - Gemini CLI registry command is `npx -y @google/gemini-cli@0.49.0 --acp`,
   but the live smoke was not run because executing freshly fetched `npx` code
-  needs explicit user approval.
+  needs explicit user approval. Tracked in
+  [#251](https://github.com/BrokkAi/mjolnir/issues/251).
 
 Each future entry should follow the same shape: source / launch
 command / verified table / known gaps / not-yet-exercised.
