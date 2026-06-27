@@ -399,6 +399,8 @@ Fixed in this PR:
 - [x] Fixed the all-broken state so failed candidates remain visible but are not
   internally treated as available Thor workers; the summary now says no Thor
   host is ready instead of naming a failed host.
+- [x] Added automated render coverage for Thor setup at small and large terminal
+  sizes, including the registry/custom recovery rows and no-ready-host summary.
 
 Still not production-grade:
 
@@ -411,8 +413,8 @@ Still not production-grade:
    and `uvx`, but production UX should use registry/auth metadata for exact
    commands and links when available.
 3. **The setup UI has not been manually smoke-tested in multiple terminal sizes.**
-   Unit tests cover state transitions and list windowing; visual polish still
-   needs an interactive pass.
+   Unit tests cover state transitions, list windowing, and small/large render
+   output; visual polish still needs an interactive pass.
 
 ## Risks and open questions
 

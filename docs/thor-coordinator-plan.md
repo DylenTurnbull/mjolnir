@@ -91,9 +91,10 @@ changed and how much each harness/model used.
     registry, and their website/repository links are preserved on configured
     servers. Failed rows have provider-specific guidance for Anvil, Claude ACP,
     Codex ACP, `npx`, and `uvx`. All-broken candidate sets no longer mark
-    failed agents as available workers. Remaining: replace inferred setup labels
-    with richer metadata-driven exact commands/links where possible and manually
-    smoke-test the setup UI across terminal sizes.
+    failed agents as available workers. Small and large setup render tests cover
+    the recovery rows and no-ready-host summary. Remaining: replace inferred
+    setup labels with richer metadata-driven exact commands/links where
+    possible and manually smoke-test the setup UI across terminal sizes.
 
 ## Quota reads
 

@@ -1053,6 +1053,7 @@ fn truncate_label(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+    use ratatui::backend::TestBackend;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -1399,5 +1400,45 @@ mod tests {
         state.cursor = state.host_choices().len() - 1;
 
         assert_eq!(host_selected_row_index(&state), 3);
+    }
+
+    #[test]
+    fn setup_screen_renders_recovery_paths_across_terminal_sizes() {
+        let agents = vec![
+            setup_agent_with_validation("claude", false),
+            setup_agent_with_validation("codex", false),
+        ];
+        let registry_agents = vec![registry_agent("gemini")];
+        let initial_host = agents[0].agent.clone();
+        let state = ThorSetupState::new(
+            &ThorConfig::default(),
+            &agents,
+            &registry_agents,
+            &initial_host,
+        );
+
+        for (width, height) in [(72, 24), (120, 36)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|f| draw(f, &state, crate::theme::TerminalThemeKind::Dark.palette()))
+                .expect("draw setup");
+            let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+            assert!(rendered.contains("Set up Thor"));
+            assert!(rendered.contains("Add from ACP registry"));
+            assert!(rendered.contains("Add ACP command"));
+            assert!(rendered.contains("none ready"));
+        }
+    }
+
+    fn buffer_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buffer.area().height)
+            .map(|y| {
+                (0..buffer.area().width)
+                    .map(|x| buffer.cell((x, y)).expect("cell").symbol())
+                    .collect()
+            })
+            .collect()
     }
 }
