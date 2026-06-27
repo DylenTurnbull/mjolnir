@@ -204,7 +204,7 @@ struct ServerArgs {
 #[command(group(
     clap::ArgGroup::new("target")
         .required(true)
-        .args(["command", "configured_source_id"])
+        .args(["command", "configured_source_id", "all_configured"])
 ))]
 struct AcpSmokeArgs {
     /// ACP server launch command to validate, quoted as one shell-style string.
@@ -214,6 +214,10 @@ struct AcpSmokeArgs {
     /// Validate a persisted Thor ACP server by source id.
     #[arg(long, value_name = "SOURCE_ID")]
     configured_source_id: Option<String>,
+
+    /// Validate every persisted Thor ACP server.
+    #[arg(long)]
+    all_configured: bool,
 
     /// Label to write into the smoke result when using `--command`.
     #[arg(long, default_value = "acp-smoke")]
@@ -443,32 +447,51 @@ async fn run_acp_smoke(args: AcpSmokeArgs, default_cwd: PathBuf) -> Result<()> {
         Some(cwd) => absolutize_cwd(cwd.clone())?,
         None => default_cwd,
     };
-    let agent = selected_agent_for_acp_smoke(&args)?;
-    let validation =
-        thor_probe::validate_agent(agent, cwd, Duration::from_secs(args.timeout_seconds)).await;
-    print_acp_smoke_result(&validation, args.format)?;
-    if !validation.usable {
+    let agents = selected_agents_for_acp_smoke(&args)?;
+    let timeout = Duration::from_secs(args.timeout_seconds);
+    let validations = futures::future::join_all(
+        agents
+            .into_iter()
+            .map(|agent| thor_probe::validate_agent(agent, cwd.clone(), timeout)),
+    )
+    .await;
+    print_acp_smoke_results(&validations, args.format)?;
+    let failed = validations
+        .iter()
+        .filter(|validation| !validation.usable)
+        .map(|validation| {
+            format!(
+                "{}: {}",
+                validation.source_id,
+                validation
+                    .error
+                    .as_deref()
+                    .unwrap_or("agent did not reach session/new")
+            )
+        })
+        .collect::<Vec<_>>();
+    if !failed.is_empty() {
         anyhow::bail!(
-            "ACP smoke failed for {}: {}",
-            validation.source_id,
-            validation
-                .error
-                .as_deref()
-                .unwrap_or("agent did not reach session/new")
+            "ACP smoke failed for {} configured server(s): {}",
+            failed.len(),
+            failed.join("; ")
         );
     }
     Ok(())
 }
 
-fn selected_agent_for_acp_smoke(args: &AcpSmokeArgs) -> Result<SelectedAgent> {
+fn selected_agents_for_acp_smoke(args: &AcpSmokeArgs) -> Result<Vec<SelectedAgent>> {
+    if args.all_configured {
+        return configured_acp_smoke_agents();
+    }
     if let Some(source_id) = &args.configured_source_id {
-        return configured_acp_smoke_agent(source_id);
+        return configured_acp_smoke_agent(source_id).map(|agent| vec![agent]);
     }
     let command = args
         .command
         .as_deref()
-        .context("ACP smoke requires --command or --configured-source-id")?;
-    selected_agent_from_command(args.source_id.clone(), command)
+        .context("ACP smoke requires --command, --configured-source-id, or --all-configured")?;
+    selected_agent_from_command(args.source_id.clone(), command).map(|agent| vec![agent])
 }
 
 fn configured_acp_smoke_agent(source_id: &str) -> Result<SelectedAgent> {
@@ -500,6 +523,23 @@ fn configured_acp_smoke_agent(source_id: &str) -> Result<SelectedAgent> {
         })
 }
 
+fn configured_acp_smoke_agents() -> Result<Vec<SelectedAgent>> {
+    let config_path = config::default_config_path();
+    let cfg =
+        Config::load(&config_path).with_context(|| format!("load {}", config_path.display()))?;
+    let servers = thor::configured_acp_servers(&cfg);
+    if servers.is_empty() {
+        anyhow::bail!(
+            "no Thor ACP servers are configured in {}",
+            config_path.display()
+        );
+    }
+    Ok(servers
+        .iter()
+        .map(ConfiguredAcpServer::selected_agent)
+        .collect())
+}
+
 fn selected_agent_from_command(source_id: String, command: &str) -> Result<SelectedAgent> {
     let words = shell_words::split(command).context("parse ACP smoke command")?;
     let Some((program, args)) = words.split_first() else {
@@ -513,48 +553,61 @@ fn selected_agent_from_command(source_id: String, command: &str) -> Result<Selec
     })
 }
 
-fn print_acp_smoke_result(
-    validation: &thor_probe::AgentValidation,
+fn print_acp_smoke_results(
+    validations: &[thor_probe::AgentValidation],
     format: HeadlessOutputFormat,
 ) -> Result<()> {
     match format {
         HeadlessOutputFormat::Json | HeadlessOutputFormat::StreamJson => {
-            println!("{}", serde_json::to_string_pretty(validation)?);
+            if let [validation] = validations {
+                println!("{}", serde_json::to_string_pretty(validation)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(validations)?);
+            }
         }
         HeadlessOutputFormat::Text => {
-            println!("source: {}", validation.source_id);
-            println!(
-                "status: {}",
-                if validation.usable {
-                    "usable"
-                } else {
-                    "not usable"
+            for (index, validation) in validations.iter().enumerate() {
+                if index > 0 {
+                    println!();
                 }
-            );
-            if let Some(name) = &validation.agent_name {
-                if let Some(version) = &validation.agent_version {
-                    println!("agent: {name} {version}");
-                } else {
-                    println!("agent: {name}");
-                }
-            }
-            println!("session/new: {}", yes_no(validation.session_started));
-            println!("config options: {}", yes_no(validation.config_advertised));
-            println!(
-                "image prompts: {}",
-                yes_no(validation.prompt_images_supported)
-            );
-            println!(
-                "session fork: {}",
-                yes_no(validation.session_fork_supported)
-            );
-            println!("elapsed: {}ms", validation.elapsed_ms);
-            if let Some(error) = &validation.error {
-                println!("error: {error}");
+                print_acp_smoke_text_result(validation);
             }
         }
     }
     Ok(())
+}
+
+fn print_acp_smoke_text_result(validation: &thor_probe::AgentValidation) {
+    println!("source: {}", validation.source_id);
+    println!(
+        "status: {}",
+        if validation.usable {
+            "usable"
+        } else {
+            "not usable"
+        }
+    );
+    if let Some(name) = &validation.agent_name {
+        if let Some(version) = &validation.agent_version {
+            println!("agent: {name} {version}");
+        } else {
+            println!("agent: {name}");
+        }
+    }
+    println!("session/new: {}", yes_no(validation.session_started));
+    println!("config options: {}", yes_no(validation.config_advertised));
+    println!(
+        "image prompts: {}",
+        yes_no(validation.prompt_images_supported)
+    );
+    println!(
+        "session fork: {}",
+        yes_no(validation.session_fork_supported)
+    );
+    println!("elapsed: {}ms", validation.elapsed_ms);
+    if let Some(error) = &validation.error {
+        println!("error: {error}");
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -2802,6 +2855,7 @@ mod tests {
                     Some("npx -y @example/acp --flag 'two words'")
                 );
                 assert!(args.configured_source_id.is_none());
+                assert!(!args.all_configured);
                 assert_eq!(args.source_id, "example");
                 assert_eq!(args.cwd, Some(PathBuf::from("/tmp/agent-cwd")));
                 assert_eq!(args.timeout_seconds, 12);
@@ -2842,6 +2896,23 @@ mod tests {
             Some(Commands::AcpSmoke(args)) => {
                 assert!(args.command.is_none());
                 assert_eq!(args.configured_source_id.as_deref(), Some("opencode"));
+                assert!(!args.all_configured);
+                assert!(matches!(args.format, HeadlessOutputFormat::Json));
+            }
+            _ => panic!("expected AcpSmoke subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_acp_smoke_subcommand_with_all_configured() {
+        let cli = Cli::try_parse_from(["mj", "acp-smoke", "--all-configured", "--format", "json"])
+            .expect("parse");
+
+        match cli.command {
+            Some(Commands::AcpSmoke(args)) => {
+                assert!(args.command.is_none());
+                assert!(args.configured_source_id.is_none());
+                assert!(args.all_configured);
                 assert!(matches!(args.format, HeadlessOutputFormat::Json));
             }
             _ => panic!("expected AcpSmoke subcommand"),
@@ -2864,6 +2935,7 @@ mod tests {
             "opencode acp",
             "--configured-source-id",
             "opencode",
+            "--all-configured",
         ])
         .expect_err("reject multiple targets");
 
