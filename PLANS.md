@@ -703,7 +703,9 @@ pass. The smoke starts the ACP server, validates initialize plus
 `session/prompt` unless `--prompt <text>` is supplied. Add `--format json` when
 preserving machine-readable evidence. Use `--prompt` or `--cancel-after-ms`
 only when token spend is acceptable or when testing a deterministic mock ACP
-agent.
+agent. Use the top-level `--agent-stderr <path>` before `acp-smoke` when a
+server exits before initialize and the JSON result needs subprocess stderr for
+diagnosis.
 
 ### `@agentclientprotocol/claude-agent-acp` 0.36.1 — 2026-05-20
 
@@ -823,6 +825,12 @@ Known gaps:
 - This was a configured-server smoke, not a registry install/setup test.
 - The smoke did not send a model prompt or exercise Codex auth/rate-limit
   failure recovery.
+- Re-check on 2026-06-28 with
+  `mj --agent-stderr /tmp/mj-codex-acp-smoke.err acp-smoke --configured-source-id "custom:codex alt" --format json`
+  failed during `initialize`: the wrapper reported `Codex process has exited
+  with code 1`. The stderr capture path now works for this diagnostic, but this
+  local configured Codex server should not be treated as currently validated
+  until its underlying Codex process starts cleanly again.
 
 Not yet exercised: `session/prompt`, tool-call permission flow, cancellation,
 live model/auth failures, and transcript rendering from a real Codex ACP turn.

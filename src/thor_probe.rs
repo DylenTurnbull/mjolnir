@@ -127,6 +127,18 @@ pub async fn validate_agent_with_prompt_and_cancel(
     prompt: Option<String>,
     cancel_after: Option<Duration>,
 ) -> AgentValidation {
+    validate_agent_with_prompt_cancel_and_stderr(agent, cwd, timeout, prompt, cancel_after, None)
+        .await
+}
+
+pub async fn validate_agent_with_prompt_cancel_and_stderr(
+    agent: SelectedAgent,
+    cwd: PathBuf,
+    timeout: Duration,
+    prompt: Option<String>,
+    cancel_after: Option<Duration>,
+    agent_stderr: Option<PathBuf>,
+) -> AgentValidation {
     let started_at = Instant::now();
     let source_id = agent.source_id.clone();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -139,7 +151,7 @@ pub async fn validate_agent_with_prompt_and_cancel(
         mcp_servers: Vec::new(),
         resume_session: None,
         env: agent.env,
-        agent_stderr: None,
+        agent_stderr,
         fs_max_text_bytes: acp::DEFAULT_FS_TEXT_BYTES,
     };
     let runtime = tokio::spawn(acp::run(runtime_cfg, event_tx, cmd_rx));
@@ -937,6 +949,56 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":nul
     }
 
     #[tokio::test]
+    async fn validation_can_capture_agent_stderr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join(if cfg!(windows) {
+            "mock_stderr_acp.py"
+        } else {
+            "mock-stderr-acp"
+        });
+        std::fs::write(&script, stderr_then_exit_mock_acp_script()).expect("write mock acp");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).expect("chmod");
+        }
+
+        let mut args = Vec::new();
+        let program = if cfg!(windows) {
+            args.push(script.display().to_string());
+            PathBuf::from("python")
+        } else {
+            script
+        };
+        let stderr_path = dir.path().join("agent.err");
+        let agent = SelectedAgent {
+            source_id: "mock-stderr".to_string(),
+            program,
+            args,
+            env: HashMap::new(),
+        };
+
+        let validation = validate_agent_with_prompt_cancel_and_stderr(
+            agent,
+            std::env::current_dir().expect("cwd"),
+            Duration::from_secs(1),
+            None,
+            None,
+            Some(stderr_path.clone()),
+        )
+        .await;
+
+        assert!(!validation.usable);
+        assert!(
+            std::fs::read_to_string(stderr_path)
+                .expect("stderr file")
+                .contains("mock stderr before exit")
+        );
+    }
+
+    #[tokio::test]
     async fn validation_with_prompt_records_prompt_completion() {
         let dir = tempfile::tempdir().expect("tempdir");
         let script = dir.path().join(if cfg!(windows) {
@@ -1069,6 +1131,16 @@ while True:
         result = {}
     if "id" in message:
         write_message({"jsonrpc": "2.0", "id": message["id"], "result": result})
+"#
+    }
+
+    fn stderr_then_exit_mock_acp_script() -> &'static str {
+        r#"#!/usr/bin/env python3
+import sys
+
+sys.stderr.write("mock stderr before exit\n")
+sys.stderr.flush()
+sys.exit(1)
 "#
     }
 

@@ -380,11 +380,12 @@ async fn main() -> Result<()> {
     // Dispatch to subcommand if provided.
     let fs_max_text_bytes = cli.fs_max_text_bytes;
     let top_level_additional_directories = cli.additional_directories.clone();
+    let top_level_agent_stderr = cli.agent_stderr.clone();
 
     if let Some(command) = cli.command {
         return match command {
             Commands::ThorMcp => thor_mcp::run_stdio().await,
-            Commands::AcpSmoke(args) => run_acp_smoke(args, cwd).await,
+            Commands::AcpSmoke(args) => run_acp_smoke(args, cwd, top_level_agent_stderr).await,
             Commands::Resume(mut args) => {
                 args.fullscreen_tui |= fullscreen_tui;
                 run_resume(args, fs_max_text_bytes, top_level_additional_directories).await
@@ -460,7 +461,11 @@ async fn main() -> Result<()> {
     result.map(|_| ())
 }
 
-async fn run_acp_smoke(args: AcpSmokeArgs, default_cwd: PathBuf) -> Result<()> {
+async fn run_acp_smoke(
+    args: AcpSmokeArgs,
+    default_cwd: PathBuf,
+    agent_stderr: Option<PathBuf>,
+) -> Result<()> {
     if args.list_configured && args.prompt.is_some() {
         anyhow::bail!("--prompt cannot be used with --list-configured");
     }
@@ -481,12 +486,13 @@ async fn run_acp_smoke(args: AcpSmokeArgs, default_cwd: PathBuf) -> Result<()> {
     let timeout = Duration::from_secs(args.timeout_seconds);
     let cancel_after = args.cancel_after_ms.map(Duration::from_millis);
     let validations = futures::future::join_all(agents.into_iter().map(|agent| {
-        thor_probe::validate_agent_with_prompt_and_cancel(
+        thor_probe::validate_agent_with_prompt_cancel_and_stderr(
             agent,
             cwd.clone(),
             timeout,
             args.prompt.clone(),
             cancel_after,
+            agent_stderr.clone(),
         )
     }))
     .await;
@@ -2982,6 +2988,8 @@ mod tests {
             "mj",
             "--cwd",
             "/tmp/project",
+            "--agent-stderr",
+            "/tmp/agent.err",
             "acp-smoke",
             "--command",
             "npx -y @example/acp --flag 'two words'",
@@ -3001,6 +3009,7 @@ mod tests {
         .expect("parse");
 
         assert_eq!(cli.cwd, Some(PathBuf::from("/tmp/project")));
+        assert_eq!(cli.agent_stderr, Some(PathBuf::from("/tmp/agent.err")));
         match cli.command {
             Some(Commands::AcpSmoke(args)) => {
                 assert_eq!(
