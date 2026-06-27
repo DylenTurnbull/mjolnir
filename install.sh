@@ -30,6 +30,7 @@ Install the latest mjolnir and bifrost binaries.
 
 Usage:
   curl -fsSL https://raw.githubusercontent.com/BrokkAi/mjolnir/master/install.sh | bash
+  ./install.sh --self-test
 
 Environment:
   INSTALL_DIR              Install directory. Defaults to ~/.local/bin.
@@ -40,6 +41,16 @@ Environment:
   GITHUB_TOKEN             Optional token for GitHub API rate limits.
   PROFILE                  Optional shell profile to update when INSTALL_DIR is not on PATH.
 EOF
+}
+
+assert_eq() {
+  local actual="$1"
+  local expected="$2"
+  local label="$3"
+
+  if [[ "$actual" != "$expected" ]]; then
+    die "self-test failed for ${label}: expected ${expected}, got ${actual}"
+  fi
 }
 
 cleanup() {
@@ -529,9 +540,52 @@ install_mjolnir() {
   install_from_asset "mjolnir" "mjolnir" "mj" "${MJOLNIR_VERSION:-}" "${patterns[@]}"
 }
 
+run_self_test() {
+  local release_file
+  local selected
+  local checksum_url
+
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mjolnir-installer-test.XXXXXX")"
+  trap cleanup EXIT
+  release_file="${TMP_DIR}/release.json"
+  cat >"$release_file" <<'EOF'
+{
+  "tag_name": "v9.9.9",
+  "assets": [
+    { "browser_download_url": "https://example.com/brokk-mjolnir-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" },
+    { "browser_download_url": "https://example.com/brokk-mjolnir-v9.9.9-x86_64-unknown-linux-gnu.tar.gz.sha256" },
+    { "browser_download_url": "https://example.com/brokk-mjolnir-v9.9.9-universal-apple-darwin.tar.gz" },
+    { "browser_download_url": "https://example.com/brokk-mjolnir-v9.9.9-universal-apple-darwin.tar.gz.sha256" },
+    { "browser_download_url": "https://example.com/bifrost-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" }
+  ]
+}
+EOF
+
+  assert_eq "$(release_tag "$release_file")" "v9.9.9" "release tag"
+  OS_FAMILY="linux"
+  ARCH="x86_64"
+  RUST_TARGET="x86_64-unknown-linux-gnu"
+  selected="$(select_asset "$release_file" "mjolnir" "v9.9.9" "^brokk-mjolnir-.*-${RUST_TARGET}[.]tar[.]gz$")"
+  assert_eq "$selected" "https://example.com/brokk-mjolnir-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" "linux mjolnir asset"
+  checksum_url="$(checksum_url_for "$release_file" "${selected##*/}")"
+  assert_eq "$checksum_url" "https://example.com/brokk-mjolnir-v9.9.9-x86_64-unknown-linux-gnu.tar.gz.sha256" "linux checksum"
+
+  OS_FAMILY="macos"
+  ARCH="aarch64"
+  RUST_TARGET="aarch64-apple-darwin"
+  selected="$(select_asset "$release_file" "mjolnir" "v9.9.9" "^brokk-mjolnir-.*-universal-apple-darwin[.]tar[.]gz$" "^brokk-mjolnir-.*-${RUST_TARGET}[.]tar[.]gz$")"
+  assert_eq "$selected" "https://example.com/brokk-mjolnir-v9.9.9-universal-apple-darwin.tar.gz" "macos universal mjolnir asset"
+
+  log "self-test passed"
+}
+
 main() {
   if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
+    exit 0
+  fi
+  if [[ "${1:-}" == "--self-test" ]]; then
+    run_self_test
     exit 0
   fi
 
