@@ -23,6 +23,7 @@ pub struct ThorSetupAgent {
     pub agent: SelectedAgent,
     pub name: String,
     pub description: String,
+    pub setup_hint: String,
     pub setup_url: String,
     pub quota_backend: ThorQuotaBackend,
     pub validation: Option<AgentValidation>,
@@ -131,6 +132,7 @@ impl ThorSetupState {
                 agent: crate::thor::default_anvil_agent(),
                 name: "Anvil".to_string(),
                 description: "Brokk agent via uv".to_string(),
+                setup_hint: "install uv; Brokk/Anvil signs in when required".to_string(),
                 setup_url: "https://github.com/BrokkAi/brokk".to_string(),
                 quota_backend: ThorQuotaBackend::None,
                 validation: None,
@@ -1249,10 +1251,7 @@ fn validation_action_label(setup_agent: &ThorSetupAgent, validation: &AgentValid
 
 fn validation_detail_label(setup_agent: &ThorSetupAgent, validation: &AgentValidation) -> String {
     let Some(error) = validation.error.as_deref() else {
-        return format!(
-            "Command: {}",
-            truncate_label(&command_label(&setup_agent.agent), 72)
-        );
+        return setup_hint_or_command_detail(setup_agent);
     };
     let lower = error.to_ascii_lowercase();
     if lower.contains("not found")
@@ -1277,7 +1276,24 @@ fn validation_detail_label(setup_agent: &ThorSetupAgent, validation: &AgentValid
     if lower.contains("timed out") || lower.contains("timeout") {
         return with_setup_url(generic_timeout_detail_label(setup_agent), setup_agent);
     }
+    if !setup_agent.setup_hint.trim().is_empty() {
+        return with_setup_url(setup_hint_retry_detail(setup_agent), setup_agent);
+    }
     format!("Last error: {}", truncate_label(error, 56))
+}
+
+fn setup_hint_or_command_detail(setup_agent: &ThorSetupAgent) -> String {
+    if !setup_agent.setup_hint.trim().is_empty() {
+        return with_setup_url(setup_hint_retry_detail(setup_agent), setup_agent);
+    }
+    format!(
+        "Command: {}",
+        truncate_label(&command_label(&setup_agent.agent), 72)
+    )
+}
+
+fn setup_hint_retry_detail(setup_agent: &ThorSetupAgent) -> String {
+    format!("{}; retry", truncate_label(&setup_agent.setup_hint, 56))
 }
 
 fn with_setup_url(detail: String, setup_agent: &ThorSetupAgent) -> String {
@@ -1365,6 +1381,7 @@ fn generic_failure_action_label(setup_agent: &ThorSetupAgent) -> String {
 fn generic_failure_detail_label(setup_agent: &ThorSetupAgent) -> String {
     match setup_agent.agent.source_id.as_str() {
         "opencode" | "goose" | "cursor" | "github-copilot-cli" => auth_detail_label(setup_agent),
+        _ if !setup_agent.setup_hint.trim().is_empty() => setup_hint_retry_detail(setup_agent),
         _ => "Check auth/config, then retry".to_string(),
     }
 }
@@ -1379,6 +1396,7 @@ fn generic_timeout_action_label(setup_agent: &ThorSetupAgent) -> String {
 fn generic_timeout_detail_label(setup_agent: &ThorSetupAgent) -> String {
     match setup_agent.agent.source_id.as_str() {
         "opencode" | "goose" | "cursor" | "github-copilot-cli" => auth_detail_label(setup_agent),
+        _ if !setup_agent.setup_hint.trim().is_empty() => setup_hint_retry_detail(setup_agent),
         _ => "Retry after install/auth is ready".to_string(),
     }
 }
@@ -1432,6 +1450,7 @@ mod tests {
                 agent,
                 name: String::new(),
                 description: String::new(),
+                setup_hint: String::new(),
                 setup_url: String::new(),
                 quota_backend: ThorQuotaBackend::None,
                 validation: None,
@@ -1448,6 +1467,7 @@ mod tests {
             agent: agent(source_id),
             name: source_id.to_string(),
             description: String::new(),
+            setup_hint: String::new(),
             setup_url: String::new(),
             quota_backend: ThorQuotaBackend::None,
             validation: Some(AgentValidation {
@@ -1784,12 +1804,26 @@ mod tests {
 
     #[test]
     fn validation_error_compacts_unexpected_exit_guidance() {
+        let mut setup_agent = setup_agent_with_error(
+            "unknown-agent",
+            Some("agent process exited unexpectedly: exit status 1".to_string()),
+        );
+        setup_agent.setup_hint = "install Unknown Agent; sign in if prompted".to_string();
+
+        assert_eq!(host_status_label(&setup_agent), "agent exited");
+        assert_eq!(
+            setup_agent_description(&setup_agent),
+            "install Unknown Agent; sign in if prompted; retry"
+        );
+    }
+
+    #[test]
+    fn validation_error_without_setup_hint_keeps_generic_recovery_guidance() {
         let setup_agent = setup_agent_with_error(
             "unknown-agent",
             Some("agent process exited unexpectedly: exit status 1".to_string()),
         );
 
-        assert_eq!(host_status_label(&setup_agent), "agent exited");
         assert_eq!(
             setup_agent_description(&setup_agent),
             "Check auth/config, then retry"

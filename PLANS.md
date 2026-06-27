@@ -554,6 +554,10 @@ Fixed in this PR:
   style, agent selection, known-agent add, installed-agent command, recovery,
   and confirmation steps each tell the user the next action without relying
   only on footer shortcuts.
+- [x] Threaded inferred setup hints into configured-agent validation rows, so
+  unclassified exits, timeouts, and no-detail failures can still show the
+  concrete install/auth expectation before `Retry checks` instead of falling
+  straight back to generic `Check auth/config` copy.
 
 Still not production-grade:
 
@@ -567,7 +571,8 @@ Still not production-grade:
    Rows now offer provider-specific actions for Anvil, Claude, Codex, Gemini,
    OpenCode, Goose, Cursor, GitHub Copilot, `npx`, and `uvx`, but production UX
    should use registry/auth metadata for exact commands and links when
-   available. Tracked in
+   available. Inferred setup hints now carry into generic validation failures,
+   but exact upstream metadata is still the target. Tracked in
    [#250](https://github.com/BrokkAi/mjolnir/issues/250).
 3. **The current onboarding process still needs production UX validation.**
    The setup flow now starts with architect/accountant mode, exposes selected

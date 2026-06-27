@@ -917,6 +917,7 @@ async fn run_thor_onboarding(
                     agent: agent.clone(),
                     name: server.name.clone(),
                     description: server.description.clone(),
+                    setup_hint: registry_setup_hint(server),
                     setup_url: server.setup_url.clone(),
                     quota_backend: server.quota_backend,
                     validation: validations

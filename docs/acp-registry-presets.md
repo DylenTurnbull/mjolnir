@@ -72,7 +72,8 @@ Useful future registry metadata:
 ## Implementation Order
 
 1. Keep registry entries out of worker inventory until selected and persisted.
-2. Show launch command plus inferred setup hints in onboarding.
+2. Show launch command plus inferred setup hints in onboarding, including
+   configured-agent validation failures when the exact error is not classifiable.
 3. Use local provider setup profiles for known agents until the registry
    exposes exact install/auth metadata.
 4. Add exact metadata when the registry provides it.

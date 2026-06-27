@@ -114,7 +114,8 @@ changed and how much each harness/model used.
     now include explicit next-action guidance for work style, agent selection,
     known-agent add, installed-agent command, recovery, and confirmation paths.
     Local provider setup profiles fill known auth/install gaps until the
-    upstream registry exposes exact metadata.
+    upstream registry exposes exact metadata, and those inferred hints are also
+    used for generic configured-agent validation failures.
     Remaining: continue polishing the guided setup progression, replace
     remaining inferred setup labels with registry-provided exact commands/links
     where possible, and manually smoke-test the setup UI across terminal sizes.
