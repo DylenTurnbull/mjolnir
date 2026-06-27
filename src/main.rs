@@ -1210,13 +1210,19 @@ async fn run_session(
 
     let cmd_tracker = remote_tracker.clone();
     let cmd_proxy = tokio::spawn(async move {
+        let mut sent_thor_preamble = false;
         while let Some(command) = ui_cmd_rx.recv().await {
             cmd_tracker.observe_command(&command);
             let runtime_command = match command {
-                UiCommand::SendPrompt { text, images } => UiCommand::SendPrompt {
-                    text: thor::host_prompt(&thor_config, &text),
-                    images,
-                },
+                UiCommand::SendPrompt { text, images } => {
+                    let text = if sent_thor_preamble {
+                        text
+                    } else {
+                        sent_thor_preamble = true;
+                        thor::host_prompt(&thor_config, &text)
+                    };
+                    UiCommand::SendPrompt { text, images }
+                }
                 other => other,
             };
             if runtime_cmd_tx.send(runtime_command).is_err() {

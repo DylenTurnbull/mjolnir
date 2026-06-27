@@ -227,6 +227,9 @@ Policy:
   routes; avoid exhausted workers.
 - Use `thor_run_acp_agents` when work should happen in parallel, including
   architect-mode alternate implementations and adversarial reviews.
+- Delegated worker tools only allow `reject` or `accept_edits` permission
+  modes and only run inside mj's current workspace. Do not request bypassed
+  permissions or arbitrary filesystem roots.
 - Present a concise plan before doing work unless the user has configured plan
   approval to skip it.
 - For cost/accountant mode, use cheaper models when the task is sufficiently

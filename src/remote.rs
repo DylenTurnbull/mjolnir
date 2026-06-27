@@ -1201,13 +1201,20 @@ pub async fn run_server(
     let server_task = tokio::spawn(server);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let agent_session = start_server_agent_session(
+    let agent_session = match start_server_agent_session(
         agent,
         thor_config,
         cwd,
         additional_directories,
         fs_max_text_bytes,
-    );
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            server_handle.graceful_shutdown(Some(Duration::from_secs(2)));
+            let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+            return Err(error);
+        }
+    };
     let mut agent_session = Some(agent_session);
     let mut server_task = server_task;
     let result = tokio::select! {
@@ -1235,7 +1242,7 @@ fn start_server_agent_session(
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
     fs_max_text_bytes: u64,
-) -> ServerAgentSession {
+) -> Result<ServerAgentSession> {
     let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
     let (runtime_cmd_tx, runtime_cmd_rx) = mpsc::unbounded_channel();
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
@@ -1253,12 +1260,7 @@ fn start_server_agent_session(
         args: agent.args,
         cwd,
         additional_directories,
-        mcp_servers: crate::thor_mcp::mcp_servers(config::default_config_path()).unwrap_or_else(
-            |error| {
-                warn!("failed to configure Thor MCP stdio bridge: {error:#}");
-                Vec::new()
-            },
-        ),
+        mcp_servers: crate::thor_mcp::mcp_servers(config::default_config_path())?,
         resume_session: None,
         env: agent.env,
         agent_stderr: None,
@@ -1268,12 +1270,22 @@ fn start_server_agent_session(
 
     let task = tokio::spawn(async move {
         let command_proxy = tokio::spawn(async move {
+            let mut sent_thor_preamble = false;
             while let Some(command) = command_rx.recv().await {
                 let runtime_command = match command {
-                    UiCommand::SendPrompt { text, images } => UiCommand::SendPrompt {
-                        text: thor::host_prompt(&thor_config, &text),
-                        images,
-                    },
+                    UiCommand::SendPrompt { text, images } => {
+                        let text = if sent_thor_preamble {
+                            text
+                        } else {
+                            sent_thor_preamble = true;
+                            thor::host_prompt(&thor_config, &text)
+                        };
+                        UiCommand::SendPrompt { text, images }
+                    }
+                    UiCommand::SetSessionConfigOption { .. } => {
+                        debug!("dropping remote host config change while Thor is active");
+                        continue;
+                    }
                     other => other,
                 };
                 if runtime_cmd_tx.send(runtime_command).is_err() {
@@ -1332,7 +1344,7 @@ fn start_server_agent_session(
         tracker.shutdown().await;
     });
 
-    ServerAgentSession { command_tx, task }
+    Ok(ServerAgentSession { command_tx, task })
 }
 
 impl ServerAgentSession {

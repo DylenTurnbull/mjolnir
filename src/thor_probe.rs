@@ -86,7 +86,7 @@ pub async fn refresh_configured_quota_snapshots(agents: &[SelectedAgent]) -> Vec
 }
 
 pub async fn refresh_configured_quota_snapshot(agent: &SelectedAgent) -> Vec<QuotaSnapshot> {
-    let snapshots = match detect_quota_provider(&agent.source_id) {
+    let snapshots = match detect_quota_provider(agent) {
         QuotaProvider::Claude => refresh_claude_usage(agent).await,
         QuotaProvider::Codex => refresh_codex_appserver_usage(agent).await,
         QuotaProvider::Unknown => Vec::new(),
@@ -181,16 +181,18 @@ pub async fn validate_agent(
 }
 
 async fn refresh_claude_usage(agent: &SelectedAgent) -> Vec<QuotaSnapshot> {
-    let program = provider_program(agent, "claude");
+    let Some(program) = provider_program(agent, "claude") else {
+        return Vec::new();
+    };
     let command = async {
-        let output = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(["-p", "/usage", "--output-format", "json"])
             .envs(&agent.env)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
-            .output()
-            .await
-            .ok()?;
+            .kill_on_drop(true);
+        let output = command.output().await.ok()?;
         if !output.status.success() {
             return None;
         }
@@ -206,16 +208,19 @@ async fn refresh_claude_usage(agent: &SelectedAgent) -> Vec<QuotaSnapshot> {
 }
 
 async fn refresh_codex_appserver_usage(agent: &SelectedAgent) -> Vec<QuotaSnapshot> {
-    let program = provider_program(agent, "codex");
+    let Some(program) = provider_program(agent, "codex") else {
+        return Vec::new();
+    };
     let command = async {
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .arg("app-server")
             .envs(&agent.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+            .kill_on_drop(true);
+        let mut child = command.spawn().ok()?;
         let mut stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
         write_json_line(
@@ -278,7 +283,7 @@ async fn write_json_line(stdin: &mut tokio::process::ChildStdin, value: Value) -
     Ok(())
 }
 
-fn provider_program(agent: &SelectedAgent, fallback: &'static str) -> PathBuf {
+fn provider_program(agent: &SelectedAgent, fallback: &'static str) -> Option<PathBuf> {
     let program_name = agent
         .program
         .file_stem()
@@ -286,9 +291,9 @@ fn provider_program(agent: &SelectedAgent, fallback: &'static str) -> PathBuf {
         .unwrap_or_default()
         .to_ascii_lowercase();
     if program_name.contains(fallback) {
-        agent.program.clone()
+        Some(agent.program.clone())
     } else {
-        PathBuf::from(fallback)
+        None
     }
 }
 
@@ -583,11 +588,21 @@ fn codex_window_label(kind: &str, duration_mins: Option<f64>, limit_name: Option
     }
 }
 
-fn detect_quota_provider(source_id: &str) -> QuotaProvider {
-    let lower = source_id.to_ascii_lowercase();
-    if lower.contains("claude") {
+fn detect_quota_provider(agent: &SelectedAgent) -> QuotaProvider {
+    let source_id = agent.source_id.to_ascii_lowercase();
+    let program = agent
+        .program
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if source_id.contains("claude") && program.contains("claude") {
         QuotaProvider::Claude
-    } else if lower.contains("codex") || lower.contains("openai") || lower.contains("gpt") {
+    } else if (source_id.contains("codex")
+        || source_id.contains("openai")
+        || source_id.contains("gpt"))
+        && program.contains("codex")
+    {
         QuotaProvider::Codex
     } else {
         QuotaProvider::Unknown
@@ -851,6 +866,20 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":nul
         assert_eq!(snapshots[0].remaining_percent, Some(95.0));
         assert_eq!(snapshots[0].reset_at_unix, Some(1_800_000_002));
         assert_eq!(snapshots[1].window.as_deref(), Some("Current week"));
+    }
+
+    #[tokio::test]
+    async fn quota_probe_does_not_fall_back_to_bare_provider_binary() {
+        let agent = SelectedAgent {
+            source_id: "custom:codex".to_string(),
+            program: PathBuf::from("agent-wrapper"),
+            args: Vec::new(),
+            env: HashMap::new(),
+        };
+
+        let snapshots = refresh_configured_quota_snapshot(&agent).await;
+
+        assert!(snapshots.is_empty());
     }
 
     #[tokio::test]

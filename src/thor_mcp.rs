@@ -20,6 +20,9 @@ use crate::thor;
 use crate::thor_catalog::{self, CatalogRequest};
 use crate::thor_probe::{self, AgentValidation, QuotaSnapshot};
 
+const DEFAULT_WORKER_TIMEOUT: Duration = Duration::from_secs(900);
+const MAX_WORKER_TIMEOUT_SECONDS: u64 = 7_200;
+
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
     id: Option<Value>,
@@ -72,6 +75,8 @@ struct RunAgentArgs {
     prompt: String,
     cwd: Option<PathBuf>,
     #[serde(default)]
+    timeout_seconds: Option<u64>,
+    #[serde(default)]
     permission_mode: BridgePermissionMode,
 }
 
@@ -89,6 +94,8 @@ struct RunAgentJob {
     prompt: String,
     cwd: Option<PathBuf>,
     #[serde(default)]
+    timeout_seconds: Option<u64>,
+    #[serde(default)]
     permission_mode: BridgePermissionMode,
 }
 
@@ -98,7 +105,6 @@ enum BridgePermissionMode {
     #[default]
     Reject,
     AcceptEdits,
-    Bypass,
 }
 
 #[derive(Debug, Serialize)]
@@ -207,7 +213,23 @@ pub async fn run_stdio() -> Result<()> {
     let mut writer = stdout.lock();
 
     while let Some(message) = read_message(&mut reader)? {
-        let request: RpcRequest = serde_json::from_slice(&message).context("parse MCP request")?;
+        let request: RpcRequest = match serde_json::from_slice(&message) {
+            Ok(request) => request,
+            Err(error) => {
+                let response = RpcResponse {
+                    jsonrpc: "2.0",
+                    id: Value::Null,
+                    result: None,
+                    error: Some(RpcError {
+                        code: -32700,
+                        message: "parse error",
+                        data: Some(Value::String(error.to_string())),
+                    }),
+                };
+                write_message(&mut writer, &serde_json::to_vec(&response)?)?;
+                continue;
+            }
+        };
         let Some(id) = request.id.clone() else {
             continue;
         };
@@ -304,9 +326,15 @@ fn tool_definitions() -> Vec<Value> {
                     "sourceId": { "type": "string" },
                     "prompt": { "type": "string" },
                     "cwd": { "type": "string" },
+                    "timeoutSeconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 7200,
+                        "description": "Overall deadline for the delegated worker run. Defaults to 900 seconds."
+                    },
                     "permissionMode": {
                         "type": "string",
-                        "enum": ["reject", "accept_edits", "bypass"]
+                        "enum": ["reject", "accept_edits"]
                     }
                 }
             }
@@ -330,9 +358,15 @@ fn tool_definitions() -> Vec<Value> {
                                 "sourceId": { "type": "string" },
                                 "prompt": { "type": "string" },
                                 "cwd": { "type": "string" },
+                                "timeoutSeconds": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 7200,
+                                    "description": "Overall deadline for this delegated worker run. Defaults to 900 seconds."
+                                },
                                 "permissionMode": {
                                     "type": "string",
-                                    "enum": ["reject", "accept_edits", "bypass"]
+                                    "enum": ["reject", "accept_edits"]
                                 }
                             }
                         }
@@ -368,7 +402,7 @@ async fn call_tool(params: ToolCallParams, config_path: Option<PathBuf>) -> Resu
             if args.refresh_quota {
                 let refreshed = thor_probe::refresh_configured_quota_snapshots(&workers).await;
                 if !refreshed.is_empty() {
-                    quota = thor_probe::load_quota_snapshots().unwrap_or(refreshed);
+                    quota = refreshed;
                 }
             }
             let validations = if args.validate {
@@ -534,10 +568,9 @@ async fn run_agent_batch(
 }
 
 async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<DelegatedRunResult> {
-    let cwd = match args.cwd.clone() {
-        Some(cwd) => cwd,
-        None => std::env::current_dir().context("current dir")?,
-    };
+    let cwd = delegated_cwd(args.cwd.as_ref())?;
+    let worker_timeout = worker_timeout(args.timeout_seconds);
+    let deadline = tokio::time::Instant::now() + worker_timeout;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let source_id = agent.source_id.clone();
@@ -558,6 +591,7 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
     let mut collecting_turn_output = false;
     let mut prompt_sent = false;
     let mut stop_reason = None;
+    let mut stop_reason_text = None;
     let mut usage = None;
     let mut context_usage = None;
     let quota = Vec::<QuotaSnapshot>::new();
@@ -566,7 +600,31 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
     let mut tool_calls = Vec::<ToolSummary>::new();
     let mut progress = Vec::<ProgressEvent>::new();
 
-    while let Some(event) = event_rx.recv().await {
+    loop {
+        let event = match tokio::time::timeout_at(deadline, event_rx.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                if error.is_none() && stop_reason.is_none() {
+                    stop_reason_text = Some("worker_closed".to_string());
+                    push_progress(
+                        &mut progress,
+                        "worker_closed",
+                        "worker event channel closed",
+                    );
+                }
+                break;
+            }
+            Err(_) => {
+                let message = format!(
+                    "delegated worker timed out after {}s",
+                    worker_timeout.as_secs()
+                );
+                stop_reason_text = Some("timeout".to_string());
+                push_progress(&mut progress, "timeout", message.clone());
+                error = Some(message);
+                break;
+            }
+        };
         match event {
             UiEvent::SessionStarted { .. } if !prompt_sent => {
                 prompt_sent = true;
@@ -684,14 +742,19 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
 
     let _ = cmd_tx.send(UiCommand::Shutdown);
     let _ = tokio::time::timeout(Duration::from_secs(2), runtime).await;
-    let reason = stop_reason.unwrap_or(StopReason::Cancelled);
+    let reason = stop_reason_text.unwrap_or_else(|| {
+        stop_reason
+            .map(stop_reason_label)
+            .unwrap_or("worker_closed")
+            .to_string()
+    });
     let text = final_text.clone();
     Ok(DelegatedRunResult {
         job_id: args.job_id,
         source_id,
         final_text,
         text,
-        stop_reason: stop_reason_label(reason).to_string(),
+        stop_reason: reason,
         usage,
         context_usage,
         quota,
@@ -709,9 +772,40 @@ impl From<RunAgentJob> for RunAgentArgs {
             source_id: job.source_id,
             prompt: job.prompt,
             cwd: job.cwd,
+            timeout_seconds: job.timeout_seconds,
             permission_mode: job.permission_mode,
         }
     }
+}
+
+fn delegated_cwd(requested: Option<&PathBuf>) -> Result<PathBuf> {
+    let workspace = std::env::current_dir()
+        .context("current dir")?
+        .canonicalize()
+        .context("canonicalize current dir")?;
+    let requested = match requested {
+        Some(path) if path.is_absolute() => path.clone(),
+        Some(path) => workspace.join(path),
+        None => workspace.clone(),
+    };
+    let cwd = requested
+        .canonicalize()
+        .with_context(|| format!("canonicalize delegated cwd {}", requested.display()))?;
+    if !cwd.starts_with(&workspace) {
+        bail!(
+            "delegated cwd {} is outside workspace {}",
+            cwd.display(),
+            workspace.display()
+        );
+    }
+    Ok(cwd)
+}
+
+fn worker_timeout(timeout_seconds: Option<u64>) -> Duration {
+    timeout_seconds
+        .map(|seconds| seconds.clamp(1, MAX_WORKER_TIMEOUT_SECONDS))
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_WORKER_TIMEOUT)
 }
 
 fn push_progress(
@@ -821,7 +915,6 @@ fn permission_decision(
             tool_call.fields.kind,
             Some(ToolKind::Edit | ToolKind::Delete | ToolKind::Move)
         ),
-        BridgePermissionMode::Bypass => true,
     };
     if !allow {
         return None;
@@ -875,32 +968,25 @@ fn tool_status_label(status: ToolCallStatus) -> &'static str {
 }
 
 fn read_message(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
-    let mut content_length = None;
     loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line)?;
+        let mut line = Vec::new();
+        let read = reader.read_until(b'\n', &mut line)?;
         if read == 0 {
             return Ok(None);
         }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
         }
-        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-            content_length = Some(value.trim().parse::<usize>()?);
+        if line.is_empty() {
+            continue;
         }
+        return Ok(Some(line));
     }
-    let Some(len) = content_length else {
-        bail!("missing MCP Content-Length header");
-    };
-    let mut body = vec![0; len];
-    reader.read_exact(&mut body)?;
-    Ok(Some(body))
 }
 
 fn write_message(writer: &mut impl Write, body: &[u8]) -> Result<()> {
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
     writer.write_all(body)?;
+    writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
 }
@@ -942,6 +1028,69 @@ mod tests {
             list_tool
                 .pointer("/inputSchema/properties/validate")
                 .is_some()
+        );
+        let run_tool = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("thor_run_acp_agent"))
+            .expect("run tool");
+        assert_eq!(
+            run_tool.pointer("/inputSchema/properties/permissionMode/enum"),
+            Some(&json!(["reject", "accept_edits"]))
+        );
+        assert!(
+            run_tool
+                .pointer("/inputSchema/properties/timeoutSeconds")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stdio_messages_are_newline_delimited_json() {
+        let mut reader = std::io::Cursor::new(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+"#,
+        );
+
+        assert_eq!(
+            read_message(&mut reader).expect("read message"),
+            Some(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_vec())
+        );
+
+        let mut writer = Vec::new();
+        write_message(&mut writer, br#"{"jsonrpc":"2.0","id":1,"result":{}}"#)
+            .expect("write message");
+
+        assert_eq!(
+            String::from_utf8(writer).expect("utf8"),
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n"
+        );
+    }
+
+    #[test]
+    fn run_agent_args_reject_bypass_permission_mode() {
+        let parsed = serde_json::from_value::<RunAgentArgs>(json!({
+            "sourceId": "codex",
+            "prompt": "work",
+            "permissionMode": "bypass"
+        }));
+
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn delegated_cwd_must_stay_inside_workspace() {
+        let outside = PathBuf::from("..");
+
+        assert!(delegated_cwd(Some(&outside)).is_err());
+    }
+
+    #[test]
+    fn worker_timeout_defaults_and_clamps() {
+        assert_eq!(worker_timeout(None), DEFAULT_WORKER_TIMEOUT);
+        assert_eq!(worker_timeout(Some(0)), Duration::from_secs(1));
+        assert_eq!(
+            worker_timeout(Some(MAX_WORKER_TIMEOUT_SECONDS + 1)),
+            Duration::from_secs(MAX_WORKER_TIMEOUT_SECONDS)
         );
     }
 
