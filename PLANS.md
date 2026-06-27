@@ -53,10 +53,10 @@ default automatically when the platform config file has no `agent` block
 `%APPDATA%\mj\config.toml` on Windows).
 First run is a Thor setup flow: the user chooses work style
 (`Architect`/`Accountant`), chooses which validated agents Thor may use, chooses
-which ready agent hosts Thor, and can add a known registry-backed agent or a
-custom command without editing TOML. Model preference and reasoning level stay
-automatic during onboarding. The previous agent/model picker is no longer part
-of the normal user path.
+which ready agent hosts Thor, and can add a known agent or paste the launch
+command for an installed agent without editing TOML. Model preference and
+reasoning level stay automatic during onboarding. The previous agent/model
+picker is no longer part of the normal user path.
 
 The remaining startup gap is not the old picker; it is production-grade
 recovery and validation. The setup flow is now simpler, but failed provider rows
@@ -379,33 +379,33 @@ concepts must not leak into the setup path.
 Current assessment: the flow is improved but still not production-grade. It is
 no longer the old advanced picker: it starts with work style, exposes which
 ready agents Thor may use, and keeps model routing defaults out of the user
-path. A new user can add a custom ACP command or registry-backed ACP server from
-onboarding and have it validated before Thor uses it. The remaining product
-problem is recovery quality: failed rows can still land on broad install/auth
-messages when the registry does not provide exact setup instructions, so users
-may still have to infer whether they need to install Node/uv, sign in to Claude
-or Codex, pick a registry package, or retry validation after fixing their
-environment.
+path. A new user can add a known agent or paste the launch command for an
+installed agent from onboarding, and `mj` validates it before Thor uses it. The
+remaining product problem is recovery quality: failed rows can still land on
+broad install/auth messages when the registry does not provide exact setup
+instructions, so users may still have to infer whether they need to install
+Node/uv, sign in to Claude or Codex, pick a known agent, or retry validation
+after fixing their environment.
 
 Required end-user setup behavior before production:
 
 - First screen must clearly answer: what Thor is, what is already usable, what
   needs setup, and the next best action.
-- A user with no working ACP server must have an obvious path to install or
+- A user with no working agent must have an obvious path to install or
   configure one without editing TOML.
-- Registry-backed choices must show plain-language setup expectations before
-  they are added, including install/auth hints and the command that will be run
-  when known.
+- Known-agent choices must show plain-language setup expectations before they
+  are added, including install/auth hints and the command that will be run when
+  known.
 - Failed validation must produce a concrete recovery action and a retry path,
   not just a disabled row.
 - The UI must not require understanding ACP, quota backends, source IDs, or raw
-  package names unless the user opens an advanced/custom command path.
+  package names unless the user opens the installed-agent command path.
 - The success path must feel like: choose work style, choose which ready agents
   Thor may use, choose where Thor runs, optionally add/fix an agent, start Thor.
   It must not expose raw routing internals, quotas, source IDs, or model picker
   controls.
 - Manual smoke must verify the setup flow with no configured agents, one broken
-  default, at least one registry add, and one successful configured agent.
+  default, at least one known-agent add, and one successful configured agent.
 
 Fixed in this PR:
 
@@ -469,11 +469,11 @@ Fixed in this PR:
   model defaults, and reasoning defaults with friendly agent names and a simple
   work-style summary. Model selection remains automatic during onboarding.
 - [x] Replaced primary setup action labels like `Add from ACP registry` and
-  `Add ACP command` with end-user wording: `Add agent from registry` and
-  `Add custom command`.
+  `Add ACP command` with end-user wording: `Add known agent` and
+  `Add installed agent`.
 - [x] Made the setup summary step-aware. While selecting a registry entry it
   shows `Will add`, `Runs`, and `Setup` as separate lines before anything is
-  persisted; while adding a custom command it states that `mj` will validate the
+  persisted; while adding an installed agent it states that `mj` checks the
   command before Thor uses it.
 - [x] Corrected config-path docs to describe the actual platform config
   directory. The macOS path is `~/Library/Application Support/mj/config.toml`,
@@ -486,14 +486,14 @@ Fixed in this PR:
   temporary home and stripped `PATH`:
   `HOME=/tmp/mj-thor-smoke-home-4 XDG_CONFIG_HOME=/tmp/mj-thor-smoke-home-4/config XDG_CACHE_HOME=/tmp/mj-thor-smoke-home-4/cache PATH=/usr/bin:/bin target/debug/mj --cwd .`.
   Verified the rebuilt binary opens the new `Set up Thor` flow, not the old
-  worker/model picker; shows no-ready guidance; defaults to `Add custom command`;
+  worker/model picker; shows no-ready guidance; defaults to `Add installed agent`;
   keeps `Retry checks` visible; and exits cleanly with Esc.
 - [x] Manually smoke-tested an 80-column configured-but-broken path with a
   temporary macOS config under `/tmp/mj-thor-success-smoke/Library/Application Support/mj/config.toml`
   pointing at a local OpenCode ACP wrapper. OpenCode could not validate in that
   isolated setup, but the failure rows now render compactly as `agent exited /
   Check auth/config, then retry` and `timeout / Retry after install/auth is
-  ready`, with `Add custom command` and `Retry checks` still reachable.
+  ready`, with `Add installed agent` and `Retry checks` still reachable.
 - [x] Re-ran the 80-column configured OpenCode path with an isolated macOS home
   under `/tmp/mj-thor-opencode-success`, symlinking the real OpenCode config
   directories. OpenCode still exits during validation in that isolated setup, so
@@ -502,7 +502,7 @@ Fixed in this PR:
   provider, retry; docs: opencode`.
 - [x] Manually smoke-tested the registry-add path at 80 columns with a copied
   registry cache under `/tmp/mj-thor-registry-smoke/Library/Caches/mj/registry.json`.
-  The flow opened `Add agent from registry`, showed the step-aware `Will add /
+  The flow opened `Add known agent`, showed the step-aware `Will add /
   Runs / Setup` summary, selected the binary OpenCode entry without fetching
   `npx` code, persisted it to
   `/tmp/mj-thor-registry-smoke/Library/Application Support/mj/config.toml`, and
@@ -543,6 +543,10 @@ Fixed in this PR:
   timeout, and error events are mirrored into the transcript, so a delegated ACP
   run should no longer look frozen while the host Thor agent is blocked waiting
   for a worker result.
+- [x] Removed the remaining registry/custom-command/ACP jargon from the main
+  first-run setup screen. The visible path now says `known agent` for registry
+  choices and `installed agent` for pasted commands, while implementation terms
+  stay internal.
 
 Still not production-grade:
 

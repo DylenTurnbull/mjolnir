@@ -76,7 +76,7 @@ impl SetupStep {
         match self {
             Self::Persona => "work style",
             Self::Host => "agents",
-            Self::Registry => "add agent",
+            Self::Registry => "known agent",
             Self::CustomName => "name",
             Self::CustomCommand => "command",
             Self::Confirm => "start",
@@ -130,7 +130,7 @@ impl ThorSetupState {
             vec![ThorSetupAgent {
                 agent: crate::thor::default_anvil_agent(),
                 name: "Anvil".to_string(),
-                description: "Brokk ACP server via uvx".to_string(),
+                description: "Brokk agent via uv".to_string(),
                 setup_url: "https://github.com/BrokkAi/brokk".to_string(),
                 quota_backend: ThorQuotaBackend::None,
                 validation: None,
@@ -601,7 +601,7 @@ fn intro_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(status),
-        Line::from("Add a known agent from the registry, or add a custom command."),
+        Line::from("Add a known agent, or paste the command for an installed agent."),
         Line::from("Choose a work style, choose the ready agents Thor may use, then start."),
     ]
 }
@@ -785,7 +785,7 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
             vec![
                 Span::styled("Known agents".to_string(), Style::default().fg(theme.muted)),
                 Span::styled(
-                    "  unavailable; add a custom command instead".to_string(),
+                    "  unavailable; add an installed agent instead".to_string(),
                     Style::default().fg(theme.muted),
                 ),
             ],
@@ -799,11 +799,11 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
             registry_choice_idx == Some(state.cursor),
             vec![
                 Span::styled(
-                    "Add agent from registry".to_string(),
+                    "Add known agent".to_string(),
                     Style::default().fg(theme.text),
                 ),
                 Span::styled(
-                    format!("  {} available server types", state.registry_agents.len()),
+                    format!("  {} setup choices", state.registry_agents.len()),
                     Style::default().fg(theme.muted),
                 ),
             ],
@@ -817,11 +817,11 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
             == Some(state.cursor),
         vec![
             Span::styled(
-                "Add custom command".to_string(),
+                "Add installed agent".to_string(),
                 Style::default().fg(theme.text),
             ),
             Span::styled(
-                "  configure another agent for Thor".to_string(),
+                "  paste the command from that agent's docs".to_string(),
                 Style::default().fg(theme.muted),
             ),
         ],
@@ -1028,8 +1028,8 @@ fn default_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Li
 fn registry_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static>> {
     let Some(registry_agent) = state.registry_agents.get(state.cursor) else {
         return vec![detail_line(
-            "Registry",
-            "no entries loaded; go back and add a custom command".to_string(),
+            "Known agents",
+            "no entries loaded; go back and add an installed agent".to_string(),
             theme,
         )];
     };
@@ -1047,11 +1047,11 @@ fn registry_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<L
 
 fn custom_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static>> {
     vec![
-        detail_line("Custom agent", custom_name_summary(state), theme),
+        detail_line("Installed agent", custom_name_summary(state), theme),
         detail_line("Runs", custom_command_summary(state), theme),
         detail_line(
             "After add",
-            "mj will validate it before Thor uses it".to_string(),
+            "mj checks it before Thor uses it".to_string(),
             theme,
         ),
     ]
@@ -1287,8 +1287,8 @@ fn install_detail_label(setup_agent: &ThorSetupAgent) -> String {
             "Install GitHub Copilot CLI, then sign in to GitHub Copilot".to_string()
         }
         _ => match setup_agent.agent.program.to_string_lossy().as_ref() {
-            "npx" => "Install Node.js/npm, then retry this ACP server".to_string(),
-            "uvx" => "Install uv, then retry this ACP server".to_string(),
+            "npx" => "Install Node.js/npm, then retry this agent".to_string(),
+            "uvx" => "Install uv, then retry this agent".to_string(),
             _ => format!(
                 "Command: {}",
                 truncate_label(&command_label(&setup_agent.agent), 72)
@@ -1353,7 +1353,7 @@ fn generic_timeout_detail_label(setup_agent: &ThorSetupAgent) -> String {
 }
 
 fn default_custom_name(agents: &[ThorSetupAgent]) -> String {
-    let base = "Custom ACP";
+    let base = "Installed agent";
     if !agents.iter().any(|agent| setup_agent_label(agent) == base) {
         return base.to_string();
     }
@@ -1651,9 +1651,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("Custom agent: Local Agent"));
+        assert!(rendered.contains("Installed agent: Local Agent"));
         assert!(rendered.contains("Runs: local-agent acp"));
-        assert!(rendered.contains("After add: mj will validate it before Thor uses it"));
+        assert!(rendered.contains("After add: mj checks it before Thor uses it"));
     }
 
     #[test]
@@ -1991,6 +1991,9 @@ mod tests {
             assert!(rendered.contains("Set up Thor"));
             assert!(rendered.contains("Architect"));
             assert!(rendered.contains("Accountant"));
+            assert!(!rendered.contains("registry"));
+            assert!(!rendered.contains("custom command"));
+            assert!(!rendered.contains("ACP"));
         }
 
         state.set_step(SetupStep::Host);
@@ -2002,9 +2005,11 @@ mod tests {
                 .expect("draw setup");
             let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
 
-            assert!(rendered.contains("Add agent from registry"));
-            assert!(rendered.contains("Add custom command"));
+            assert!(rendered.contains("Add known agent"));
+            assert!(rendered.contains("Add installed agent"));
             assert!(rendered.contains("No agent is ready"));
+            assert!(!rendered.contains("Add agent from registry"));
+            assert!(!rendered.contains("Add custom command"));
         }
     }
 

@@ -23,12 +23,14 @@ changed and how much each harness/model used.
 - The registry/setup layer is the source of available ACP server types.
   Thor's runtime worker inventory is the persisted configured ACP server set,
   not the full registry and not locally installed provider CLIs.
-- The onboarding flow can add a registry-backed ACP server or custom ACP
-  command from setup, persist it, and rerun validation before Thor uses it. It
-  is not production-grade until the setup process feels like an end-user wizard
-  rather than a validation list: no raw ACP concepts on the happy path, concrete
-  install/auth recovery actions for failed agents, a clear retry path, and a
-  way for a user to reach a usable Thor host without editing TOML by hand.
+- The onboarding flow can add a known registry-backed agent or an installed
+  agent launch command from setup, persist it, and rerun validation before Thor
+  uses it. The visible happy path says `known agent` and `installed agent`;
+  registry/ACP/custom-command concepts stay implementation details. It is not
+  production-grade until the setup process feels like an end-user wizard rather
+  than a validation list: concrete install/auth recovery actions for failed
+  agents, a clear retry path, and a way for a user to reach a usable Thor host
+  without editing TOML by hand.
 - The normal prompt flow has no visible model picker or agent picker.
 - Thor presents an execution plan before doing work.
 - Thor keeps the transcript alive with short visible progress updates while it
@@ -95,20 +97,21 @@ changed and how much each harness/model used.
 10. Done: separate ACP server setup from quota probing. Registry entries and
     configured custom servers produce persisted ACP server instances; quota
     probes only run when a configured server declares a provider quota backend.
-11. Partially done: make onboarding end-user quality. Custom ACP commands can
-    be added from setup and revalidated through the normal configured-server
-    path. Registry entries can also be added from setup without probing the full
-    registry, and their website/repository links are preserved on configured
-    servers. Failed rows have provider-specific guidance for Anvil, Claude ACP,
-    Codex ACP, `npx`, and `uvx`. All-broken candidate sets no longer mark
-    failed agents as available workers. Small and large setup render tests cover
-    the recovery rows and no-ready-host summary. The first setup screen now
-    summarizes ready/broken agents in plain language, registry rows show the
-    command they will add when known plus setup expectations, current-platform
-    binary registry entries are represented as installed-command candidates
-    instead of being dropped, and a "Retry checks" action reruns ACP validation
-    after install/sign-in fixes. Local provider setup profiles fill known
-    auth/install gaps until the upstream registry exposes exact metadata.
+11. Partially done: make onboarding end-user quality. Installed-agent commands
+    can be added from setup and revalidated through the normal configured-server
+    path. Registry entries can also be added as known-agent choices without
+    probing the full registry, and their website/repository links are preserved
+    on configured servers. Failed rows have provider-specific guidance for
+    Anvil, Claude ACP, Codex ACP, `npx`, and `uvx`. All-broken candidate sets
+    no longer mark failed agents as available workers. Small and large setup
+    render tests cover the recovery rows and no-ready-host summary. The first
+    setup screen now summarizes ready/broken agents in plain language, known
+    agent rows show the command they will add when known plus setup
+    expectations, current-platform binary registry entries are represented as
+    installed-command candidates instead of being dropped, and a "Retry checks"
+    action reruns ACP validation after install/sign-in fixes. Local provider
+    setup profiles fill known auth/install gaps until the upstream registry
+    exposes exact metadata.
     Remaining: continue polishing the guided setup progression, replace
     remaining inferred setup labels with registry-provided exact commands/links
     where possible, and manually smoke-test the setup UI across terminal sizes.
