@@ -5,8 +5,8 @@
 //! network I/O. They communicate over two unbounded mpsc channels.
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, PermissionOption, SessionConfigId, SessionConfigValueId, SessionUpdate,
-    StopReason, TerminalExitStatus, ToolCallUpdate, Usage,
+    ContentBlock, EmbeddedResourceResource, PermissionOption, ResourceLink, SessionConfigId,
+    SessionConfigValueId, SessionUpdate, StopReason, TerminalExitStatus, ToolCallUpdate, Usage,
 };
 use std::path::PathBuf;
 use tokio::sync::oneshot;
@@ -156,10 +156,87 @@ pub enum LoadSessionResult {
 pub fn content_block_text(block: &ContentBlock) -> String {
     match block {
         ContentBlock::Text(t) => t.text.clone(),
-        ContentBlock::Image(_) => "[image]".to_string(),
-        ContentBlock::Audio(_) => "[audio]".to_string(),
-        ContentBlock::ResourceLink(link) => format!("[link {}]", link.uri),
-        ContentBlock::Resource(_) => "[resource]".to_string(),
+        ContentBlock::Image(image) => {
+            let mut parts = vec![
+                "image".to_string(),
+                image.mime_type.clone(),
+                encoded_payload_label(&image.data),
+            ];
+            if let Some(uri) = image.uri.as_deref().filter(|uri| !uri.is_empty()) {
+                parts.push(uri.to_string());
+            }
+            format!("[{}]", parts.join(": "))
+        }
+        ContentBlock::Audio(audio) => format!(
+            "[audio: {}: {}]",
+            audio.mime_type,
+            encoded_payload_label(&audio.data)
+        ),
+        ContentBlock::ResourceLink(link) => resource_link_text(link),
+        ContentBlock::Resource(resource) => match &resource.resource {
+            EmbeddedResourceResource::TextResourceContents(text) => {
+                let mime = text
+                    .mime_type
+                    .as_deref()
+                    .filter(|mime| !mime.is_empty())
+                    .unwrap_or("text");
+                format!("[resource: {}: {}]\n{}", text.uri, mime, text.text)
+            }
+            EmbeddedResourceResource::BlobResourceContents(blob) => {
+                let mime = blob
+                    .mime_type
+                    .as_deref()
+                    .filter(|mime| !mime.is_empty())
+                    .unwrap_or("binary");
+                format!(
+                    "[resource: {}: {}: {}]",
+                    blob.uri,
+                    mime,
+                    encoded_payload_label(&blob.blob)
+                )
+            }
+            _ => "[resource: unsupported embedded content]".to_string(),
+        },
         _ => "[unknown content]".to_string(),
+    }
+}
+
+fn resource_link_text(link: &ResourceLink) -> String {
+    let label = link
+        .title
+        .as_deref()
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&link.name);
+    let mut parts = vec![
+        "resource link".to_string(),
+        label.to_string(),
+        link.uri.clone(),
+    ];
+    if let Some(mime) = link.mime_type.as_deref().filter(|mime| !mime.is_empty()) {
+        parts.push(mime.to_string());
+    }
+    if let Some(size) = link.size {
+        parts.push(format_bytes(size));
+    }
+    if let Some(description) = link
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+    {
+        parts.push(description.to_string());
+    }
+    format!("[{}]", parts.join(": "))
+}
+
+fn encoded_payload_label(encoded: &str) -> String {
+    let chars = encoded.chars().filter(|ch| !ch.is_whitespace()).count();
+    format!("{} encoded chars", chars)
+}
+
+fn format_bytes(bytes: i64) -> String {
+    if bytes == 1 {
+        "1 byte".to_string()
+    } else {
+        format!("{bytes} bytes")
     }
 }

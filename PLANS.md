@@ -214,8 +214,10 @@ Deliverables:
 
 - Render more `ContentBlock` variants with clear fallbacks:
   `resource_link`, embedded `resource`, `image`, `audio`, and unknown variants.
-  Today they show labelled placeholders (`[image]`, `[resource]`, `[link …]`,
-  `[audio]`) — M2 should make them rich.
+  ✅ Text extraction now includes useful metadata for image/audio/resource links
+  and embedded resources, including MIME type, URI/name/title, known sizes, and
+  embedded text resource contents. True inline media previews remain a later UI
+  enhancement.
 - Improve tool-call rendering for diff, terminal, and structured content.
 - Hide host-agent session config options from the Thor UX; model, mode, and
   reasoning selection are Thor routing decisions, not user-facing pickers.

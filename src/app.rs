@@ -1889,11 +1889,11 @@ fn status_transcript_text(kind: StatusKind, text: &str) -> String {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        AudioContent, AvailableCommand, AvailableCommandsUpdate, ConfigOptionUpdate, Content,
-        ContentBlock, ContentChunk, Cost, Diff, EmbeddedResource, EmbeddedResourceResource,
-        ImageContent, PermissionOption, PermissionOptionKind, ResourceLink, SessionConfigOption,
-        SessionConfigOptionCategory, SessionConfigSelectOption, StopReason, Terminal, TextContent,
-        TextResourceContents, Usage, UsageUpdate,
+        AudioContent, AvailableCommand, AvailableCommandsUpdate, BlobResourceContents,
+        ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Cost, Diff, EmbeddedResource,
+        EmbeddedResourceResource, ImageContent, PermissionOption, PermissionOptionKind,
+        ResourceLink, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        StopReason, Terminal, TextContent, TextResourceContents, Usage, UsageUpdate,
     };
 
     fn text_chunk(s: &str) -> ContentChunk {
@@ -1986,26 +1986,26 @@ mod tests {
     }
 
     #[test]
-    fn content_block_variants_render_with_visible_placeholders() {
+    fn content_block_variants_render_with_visible_summaries() {
         // PLANS.md M2 calls for ContentBlock variants beyond Text to
         // degrade visibly instead of silently panicking. This pumps each
         // known variant through `AgentMessageChunk` and asserts the
-        // transcript shows a labelled placeholder so the user knows
-        // something was sent even if we can't render it inline yet.
+        // transcript shows useful metadata or embedded text.
+        let resource_link = ResourceLink::new("readme", "file:///readme.md")
+            .title("README")
+            .mime_type("text/markdown")
+            .size(123_i64);
         let blocks: Vec<(ContentBlock, &str)> = vec![
             (ContentBlock::Text(TextContent::new("hi")), "hi"),
             (
                 ContentBlock::Image(ImageContent::new("data", "image/png")),
-                "[image]",
+                "[image: image/png: 4 encoded chars]",
             ),
             (
                 ContentBlock::Audio(AudioContent::new("data", "audio/wav")),
-                "[audio]",
+                "[audio: audio/wav: 4 encoded chars]",
             ),
-            (
-                ContentBlock::ResourceLink(ResourceLink::new("readme", "file:///readme.md")),
-                "[link file:///readme.md]",
-            ),
+            (ContentBlock::ResourceLink(resource_link), "README"),
             (
                 ContentBlock::Resource(EmbeddedResource::new(
                     EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
@@ -2013,7 +2013,16 @@ mod tests {
                         "file:///snippet.txt",
                     )),
                 )),
-                "[resource]",
+                "snippet",
+            ),
+            (
+                ContentBlock::Resource(EmbeddedResource::new(
+                    EmbeddedResourceResource::BlobResourceContents(BlobResourceContents::new(
+                        "aW1hZ2U=",
+                        "file:///image.png",
+                    )),
+                )),
+                "[resource: file:///image.png: binary: 8 encoded chars]",
             ),
         ];
 
