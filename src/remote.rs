@@ -370,6 +370,7 @@ impl TrackerState {
             self.prompt_in_flight = true;
             self.set_name_from_user_prompt(text);
             self.push_transcript_entry("user", text.clone());
+            self.push_transcript_entry("system", "Thor is preparing a plan...".to_string());
             self.touch();
         }
     }
@@ -3197,12 +3198,36 @@ mod tests {
         ));
 
         let snapshot = state.snapshot().expect("snapshot");
-        assert_eq!(snapshot.transcript.len(), 2);
+        assert_eq!(snapshot.transcript.len(), 3);
         assert_eq!(snapshot.transcript[0].kind, "user");
         assert_eq!(snapshot.transcript[0].text, "hello");
         assert!(!snapshot.transcript[0].timestamp.is_empty());
-        assert_eq!(snapshot.transcript[1].kind, "agent");
-        assert_eq!(snapshot.transcript[1].text, "hi there");
+        assert_eq!(snapshot.transcript[1].kind, "system");
+        assert_eq!(snapshot.transcript[1].text, "Thor is preparing a plan...");
+        assert!(!snapshot.transcript[1].timestamp.is_empty());
+        assert_eq!(snapshot.transcript[2].kind, "agent");
+        assert_eq!(snapshot.transcript[2].text, "hi there");
+        assert!(!snapshot.transcript[2].timestamp.is_empty());
+    }
+
+    #[test]
+    fn tracker_records_immediate_thor_plan_status_for_prompt() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.observe_command(&UiCommand::SendPrompt {
+            text: "Fix blank progress".to_string(),
+            images: Vec::new(),
+        });
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.transcript.len(), 2);
+        assert_eq!(snapshot.transcript[0].kind, "user");
+        assert_eq!(snapshot.transcript[0].text, "Fix blank progress");
+        assert_eq!(snapshot.transcript[1].kind, "system");
+        assert_eq!(snapshot.transcript[1].text, "Thor is preparing a plan...");
         assert!(!snapshot.transcript[1].timestamp.is_empty());
     }
 

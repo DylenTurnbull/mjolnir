@@ -1876,31 +1876,9 @@ async fn run_session(
                 UiCommand::SendPrompt { text, images } => {
                     cmd_thor_turn_active.store(true, Ordering::Relaxed);
                     let text = if sent_thor_preamble {
-                        publish_local_ui_event(
-                            &cmd_tracker,
-                            &ui_event_tx,
-                            UiEvent::Info("Thor is working on the next request...".to_string()),
-                        );
                         text
                     } else {
                         sent_thor_preamble = true;
-                        publish_local_ui_event(
-                            &cmd_tracker,
-                            &ui_event_tx,
-                            UiEvent::SessionUpdate(
-                                agent_client_protocol::schema::v1::SessionUpdate::SessionInfoUpdate(
-                                    agent_client_protocol::schema::v1::SessionInfoUpdate::new()
-                                        .title(thor_task_title(&text)),
-                                ),
-                            ),
-                        );
-                        publish_local_ui_event(
-                            &cmd_tracker,
-                            &ui_event_tx,
-                            UiEvent::Info(
-                                "Thor is planning and checking available agents...".to_string(),
-                            ),
-                        );
                         thor::host_prompt(&thor_config, &text)
                     };
                     UiCommand::SendPrompt { text, images }
@@ -2180,26 +2158,6 @@ fn thor_progress_kind_label(kind: &str) -> &'static str {
     }
 }
 
-fn thor_task_title(prompt: &str) -> String {
-    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    let title = collapsed
-        .trim()
-        .trim_matches(|ch: char| ch == '"' || ch == '\'')
-        .to_string();
-    if title.is_empty() {
-        return "New Thor task".to_string();
-    }
-
-    const MAX_TITLE_CHARS: usize = 80;
-    let mut chars = title.chars();
-    let truncated = chars.by_ref().take(MAX_TITLE_CHARS).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
-    }
-}
-
 fn setup_session_terminal(
     mode: UiMode,
 ) -> Result<ratatui::Terminal<crate::term::TrackedBackend<std::io::Stdout>>> {
@@ -2352,25 +2310,6 @@ mod tests {
     fn project_label_uses_full_directory_path_without_worktree() {
         let cwd = std::path::Path::new("/Users/ryan/code/mjolnir/src");
         assert_eq!(project_label(cwd), paths::display_path_with_tilde(cwd));
-    }
-
-    #[test]
-    fn thor_task_title_uses_user_prompt_not_thor_preamble() {
-        assert_eq!(
-            thor_task_title("  \"Fix the parser failure\"  "),
-            "Fix the parser failure"
-        );
-        assert_eq!(thor_task_title("\n\n"), "New Thor task");
-    }
-
-    #[test]
-    fn thor_task_title_truncates_long_prompts() {
-        let title = thor_task_title(
-            "This is a very long user request that should not consume the entire header because headers need room for project state too",
-        );
-
-        assert!(title.ends_with("..."));
-        assert!(title.chars().count() <= 83);
     }
 
     #[test]

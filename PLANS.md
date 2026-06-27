@@ -131,28 +131,33 @@ usage.
 
 The interactive Thor runtime starts the host prompt with the user's raw task so
 ACP hosts are less likely to name saved sessions after the Thor persona. The
-local UI now assigns the visible session title immediately from the submitted
-user task, keeps that task-derived title sticky after the prompt is submitted,
-and both local and remote transcript paths reject generic Thor/coordinator host
-titles instead of accepting them as placeholders. The runtime records an
-immediate local planning line, the UI state machine can append distinct elapsed
-heartbeat lines during long host turns, and `mj` consumes the Thor MCP bridge's
-out-of-band worker progress stream so delegated ACP tool/permission/completion
-events can appear while the host waits for worker calls. The remote-control
-server path now receives the same Thor MCP progress side channel and heartbeat
-stream as the local TUI path, so browser transcripts are not left dependent on
-host text alone. This is still not production-proven: live use reported generic
-Thor session naming and no visible transcript updates during a multi-minute
-turn, so the title/progress fixes need a real-provider long-turn smoke before
-the coordinator can be called production-grade.
+local UI assigns the visible session title from the submitted user task, keeps
+that task-derived title sticky after the prompt is submitted, and both local
+and remote transcript paths reject generic Thor/coordinator host titles instead
+of accepting them as placeholders. `mj` no longer synthesizes a
+`SessionInfoUpdate` just to seed a Thor title; title state should come from the
+actual user prompt or from non-generic provider metadata. Prompt submission now
+records an immediate `Thor is preparing a plan...` status in the local
+transcript, and the remote tracker records the same status when it observes the
+command. The UI state machine can append distinct elapsed heartbeat lines
+during long host turns, and `mj` consumes the Thor MCP bridge's out-of-band
+worker progress stream so delegated ACP tool/permission/completion events can
+appear while the host waits for worker calls. The remote-control server path
+receives the same Thor MCP progress side channel and heartbeat stream as the
+local TUI path, so browser transcripts are not left dependent on host text
+alone. This is still not production-proven: live use on 2026-06-28 still
+reported generic Thor session naming and no visible transcript updates during a
+multi-minute turn, so the title/progress fixes remain open until a real
+interactive or remote long-turn smoke proves the transcript the user is
+watching updates correctly.
 
-The headless `--print --output-format stream-json` path now runs the same
-Thor MCP bridge with a progress side channel and emits `info` stream records for
-worker progress and elapsed heartbeats. This gives long-turn Thor smoke tests a
-repeatable non-TUI surface, but it still needs to be exercised against a real
-configured provider turn before closing the runtime validation gap.
-Headless `--print` also supports `--print-timeout-seconds` so real-provider
-smoke runs fail cleanly instead of hanging indefinitely.
+The headless `--print --output-format stream-json` path runs the same Thor MCP
+bridge with a progress side channel and emits `info` stream records for worker
+progress and elapsed heartbeats. A real configured Anvil-backed smoke has
+proven heartbeat emission and bounded timeout reporting, but it did not produce
+a Thor plan, worker progress, final recap, or usage before timing out.
+Headless `--print` supports `--print-timeout-seconds` so real-provider smoke
+runs fail cleanly instead of hanging indefinitely.
 
 Session listing also strips generic Thor/coordinator titles reported by ACP
 hosts and uses the locally known task title for the active session row, so the
@@ -592,10 +597,15 @@ Fixed in this PR:
   listings now drop generic Thor/coordinator titles, and the in-app session
   picker overrides the active session row with the locally known user-task
   title.
-- [x] Added an immediate user-visible Thor planning status when the first task
-  is sent, and tightened the Thor host prompt so it must emit concise progress
-  updates around long-running fact gathering and implementation/review/correction
-  phases.
+- [x] Removed the synthetic first-turn `SessionInfoUpdate` that was used only
+  to seed a Thor title. The runtime now relies on the real submitted prompt for
+  local/remote task naming and ignores generic Thor host titles.
+- [x] Added an immediate user-visible Thor planning status when a task is
+  submitted or a queued task drains. The local transcript and remote tracker
+  both record `Thor is preparing a plan...` before the host model has to stream
+  anything, and the Thor host prompt still instructs providers to emit concise
+  progress updates around long-running fact gathering and
+  implementation/review/correction phases.
 - [x] Added a UI-state fallback heartbeat for active Thor turns, so the local
   transcript can append distinct `Thor is still working... Ns elapsed` entries
   even if the host agent streams no text and no worker side-channel event has
@@ -658,22 +668,24 @@ Fixed in this PR:
 Still not production-grade:
 
 1. **Thor runtime progress and titles need real long-turn validation.**
-   Live use found generic Thor session naming and a transcript that appeared
-   frozen for several minutes. Current code now keeps user-task titles sticky,
-   rejects broader Thor/coordinator host titles locally and in the
-   remote/browser transcript and session lists, records a UI-state fallback
-   heartbeat during active local turns, keeps the remote-control heartbeat,
-   mirrors Thor MCP worker progress, and exposes the same progress stream
-   through headless `--print --output-format stream-json` for repeatable smoke
-   capture. Deterministic tests cover those local/remote/headless/listing
-   plumbing paths. A bounded real-provider Anvil-backed headless smoke now
-   proves heartbeat emission and structured timeout handling, but it timed out
-   before Thor produced a plan, worker progress, or recap. What remains is a
-   real-provider smoke where Thor runs long enough to delegate work, mirror
-   worker progress, show heartbeat entries in the same transcript or stream the
-   user is watching, and produce a final recap. This item is open until that
-   successful smoke is recorded.
-1. **Registry-backed agent setup still needs richer install/configure metadata.**
+   Live use on 2026-06-28 found generic Thor session naming and a transcript
+   that appeared frozen for several minutes. Current code keeps user-task
+   titles sticky, rejects broader Thor/coordinator host titles locally and in
+   the remote/browser transcript and session lists, no longer emits a synthetic
+   Thor title update at first prompt, records immediate local and remote
+   planning status, records a UI-state fallback heartbeat during active local
+   turns, keeps the remote-control heartbeat, mirrors Thor MCP worker progress,
+   and exposes the same progress stream through headless
+   `--print --output-format stream-json` for repeatable smoke capture.
+   Deterministic tests cover those local/remote/headless/listing plumbing paths.
+   A bounded real-provider Anvil-backed headless smoke proves heartbeat
+   emission and structured timeout handling, but it timed out before Thor
+   produced a plan, worker progress, or recap. What remains is a real-provider
+   smoke where Thor runs long enough to delegate work, mirror worker progress,
+   show heartbeat entries in the same transcript or stream the user is watching,
+   and produce a final recap. This item is open until that successful smoke is
+   recorded.
+2. **Registry-backed agent setup still needs richer install/configure metadata.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider
    setup profiles, distribution-based fallback hints, and exact setup metadata
@@ -682,7 +694,7 @@ Still not production-grade:
    entries omit setup metadata, but the registry itself still does not expose
    exact auth/install steps for every agent. Tracked in
    [#250](https://github.com/BrokkAi/mjolnir/issues/250).
-2. **Validation feedback is still partly inferred, not registry-metadata-driven.**
+3. **Validation feedback is still partly inferred, not registry-metadata-driven.**
    Rows now offer provider-specific actions for Anvil, Claude, Codex, Gemini,
    OpenCode, Goose, Cursor, GitHub Copilot, `npx`, and `uvx`, but production UX
    should use registry/auth metadata for exact commands and links when
@@ -691,14 +703,14 @@ Still not production-grade:
    exact registry setup hints are preferred when present, but broad upstream
    metadata coverage is still the target. Tracked in
    [#250](https://github.com/BrokkAi/mjolnir/issues/250).
-3. **Thor setup still needs a real end-user recovery pass.** The main path is
+4. **Thor setup still needs a real end-user recovery pass.** The main path is
    now the intended Thor setup path: choose work style, choose agents Thor may
    use, choose where Thor runs, optionally add/fix an agent, then start. What
    still needs production validation is the unhappy path: exact copy, action
    ordering, failure recovery, terminal sizes, and real provider
    success/failure combinations. Tracked in
    [#252](https://github.com/BrokkAi/mjolnir/issues/252).
-4. **The setup UI has only been manually smoked for a few terminal scenarios.**
+5. **The setup UI has only been manually smoked for a few terminal scenarios.**
    Unit tests cover state transitions, list windowing, small/large recovery
    rendering, and every setup step at 50x16 and 40x12; manual smoke now covers
    the no-working-agent 80-column path and a configured-but-broken 80-column

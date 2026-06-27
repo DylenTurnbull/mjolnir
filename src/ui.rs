@@ -2883,6 +2883,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
     }
 
     state.record_user_prompt(display_text);
+    state.record_status_message(StatusKind::Info, "Thor is preparing a plan...");
     let _ = cmd_tx.send(UiCommand::SendPrompt { text, images });
 }
 
@@ -3299,6 +3300,7 @@ fn drain_queued_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCo
         return;
     };
     state.record_user_prompt(queued.display_text);
+    state.record_status_message(StatusKind::Info, "Thor is preparing a plan...");
     let _ = cmd_tx.send(UiCommand::SendPrompt {
         text: queued.text,
         images: queued.images,
@@ -10705,9 +10707,12 @@ mod tests {
         }
         assert!(state.input.is_empty());
         assert!(state.image_attachments.is_empty());
+        assert!(state.transcript.iter().any(
+            |entry| matches!(entry, Entry::UserPrompt(text) if text == "describe this\n[image]")
+        ));
         assert!(matches!(
             state.transcript.last(),
-            Some(Entry::UserPrompt(text)) if text == "describe this\n[image]"
+            Some(Entry::System(text)) if text == "Thor is preparing a plan..."
         ));
     }
 
