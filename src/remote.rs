@@ -510,7 +510,7 @@ impl TrackerState {
             }
             SessionUpdate::SessionInfoUpdate(info) => {
                 if let Some(title) = info.title.value()
-                    && !(is_generic_thor_title(title) && self.name.is_some())
+                    && !is_generic_thor_title(title)
                 {
                     self.name = Some(task_title_from_prompt(title));
                 }
@@ -3112,6 +3112,21 @@ mod tests {
 
         let snapshot = state.snapshot().expect("snapshot");
         assert_eq!(snapshot.name, "Fix the flaky parser test");
+    }
+
+    #[test]
+    fn tracker_ignores_generic_thor_title_before_user_task() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.observe_session_update(&SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().title("Thor session"),
+        ));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.name, "sess-1");
     }
 
     #[test]

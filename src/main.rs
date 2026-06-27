@@ -2018,14 +2018,20 @@ async fn thor_activity_heartbeat(
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     tracker: remote::RemoteSessionTracker,
 ) {
+    let mut elapsed_seconds = 0u64;
     loop {
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_secs(15)).await;
         if active.load(Ordering::Relaxed) {
+            elapsed_seconds = elapsed_seconds.saturating_add(15);
             publish_local_ui_event(
                 &tracker,
                 &ui_tx,
-                UiEvent::Info("Thor is still working...".to_string()),
+                UiEvent::Info(format!(
+                    "Thor is still working... {elapsed_seconds}s elapsed"
+                )),
             );
+        } else {
+            elapsed_seconds = 0;
         }
     }
 }

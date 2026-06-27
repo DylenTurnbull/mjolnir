@@ -45,6 +45,10 @@ Current command-line surface:
 - `mj --cwd /path/to/repo` to choose the ACP session root.
 - `mj --log-file /path/to/mj.log` for TUI logs.
 - `mj --agent-stderr /path/to/agent.err` for child-process stderr.
+- `mj thor-mcp` is the internal stdio MCP bridge injected into the Thor host
+  ACP session.
+- `mj acp-smoke ...` validates configured or ad-hoc ACP launch commands without
+  sending a model prompt.
 
 There is no `--command` / `--agent` flag. Startup creates an `anvil` backend
 default automatically when the platform config file has no `agent` block
@@ -124,15 +128,17 @@ single-worker delegation, and
 concurrent multi-worker delegation with structured progress and aggregate
 usage.
 
-The interactive Thor runtime now starts the host prompt with the user's raw task
-so ACP hosts are less likely to name saved sessions after the Thor persona. The
-local UI and remote/browser transcript both derive the session name from the
-first real task, ignore later generic Thor host titles when a task title already
-exists, immediately record a visible `Thor is planning...` status line, publish
-periodic `Thor is still working...` heartbeats during long host planning, and
-consume the Thor MCP bridge's out-of-band worker progress stream so delegated
-ACP tool/permission/completion events keep appearing while the host waits for
-long worker calls.
+The interactive Thor runtime starts the host prompt with the user's raw task so
+ACP hosts are less likely to name saved sessions after the Thor persona. The
+local UI and remote/browser transcript derive the visible session name from the
+first real task and now ignore generic Thor host titles instead of accepting
+them as placeholders. The runtime records an immediate local planning line,
+publishes distinct elapsed heartbeats during long host turns, and consumes the
+Thor MCP bridge's out-of-band worker progress stream so delegated ACP
+tool/permission/completion events can appear while the host waits for worker
+calls. This still needs real-provider smoke against long Thor turns because the
+host model may fail to delegate or may produce sparse progress text even when
+the local heartbeat is working.
 
 Initial routing policy:
 
@@ -367,18 +373,19 @@ scrolling.)
 
 Medium-term:
 
-- Named agent presets.
-- Persisted local settings.
-- Export transcript.
-- Rich diff rendering.
-- Config option picker.
+- Real-provider Thor runtime smoke: verify task-derived titles, visible
+  planning, elapsed heartbeats, worker progress mirroring, final recap, and
+  usage reporting with Claude ACP, Codex ACP, Anvil, and at least one non-Claude
+  non-OpenAI host.
+- Registry/setup metadata coverage: replace remaining inferred install/auth
+  hints with exact registry-provided setup commands and docs.
+- Compatibility smoke expansion for Gemini CLI and Goose once installed or once
+  an approved safe test environment exists.
 - Session checkpoint/rewind support if agents expose it through the experimental
   `_meta` extension.
 
 Later:
 
-- Release packaging and installers.
-- ACP registry integration.
 - Filesystem capability support.
 - Terminal capability support.
 - Multiple sessions.
@@ -593,6 +600,14 @@ Fixed in this PR:
 
 Still not production-grade:
 
+1. **Thor runtime progress and titles need real long-turn validation.**
+   Generic Thor host titles are now ignored locally and in the remote/browser
+   transcript, and long host turns emit distinct elapsed heartbeat lines so the
+   transcript does not look frozen solely because repeated status text was
+   deduped. This still needs a real-provider smoke where Thor runs long enough
+   to delegate work, mirror worker progress, and produce a final recap. Track
+   this alongside the broader Thor runtime hardening work before calling the
+   coordinator production-grade.
 1. **Registry-backed agent setup still needs richer install/configure metadata.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider

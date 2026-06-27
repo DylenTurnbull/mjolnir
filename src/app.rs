@@ -1070,7 +1070,7 @@ impl AppState {
         if sanitized.is_empty() {
             return false;
         }
-        if self.session_title.is_some() && is_generic_thor_title(&sanitized) {
+        if is_generic_thor_title(&sanitized) {
             return false;
         }
         self.session_title = Some(sanitized);
@@ -1945,12 +1945,12 @@ mod tests {
     }
 
     #[test]
-    fn generic_thor_title_is_used_when_no_title_exists() {
+    fn generic_thor_title_is_ignored_when_no_title_exists() {
         let mut s = AppState::new();
 
-        assert!(s.set_session_title("Thor session"));
+        assert!(!s.set_session_title("Thor session"));
 
-        assert_eq!(s.session_title.as_deref(), Some("Thor session"));
+        assert_eq!(s.session_title.as_deref(), None);
     }
 
     #[test]
