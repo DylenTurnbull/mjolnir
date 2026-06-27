@@ -513,6 +513,12 @@ Fixed in this PR:
   explicit include toggles for the agents Thor may use, and lets Enter choose
   the ACP agent that hosts Thor. The summary now states the work style, selected
   worker agents, and Thor host instead of implying hidden defaults.
+- [x] Manually smoke-tested the new work-style-first onboarding screen with an
+  isolated fresh home under `/tmp/mj-thor-persona-smoke-2` and stripped `PATH`.
+  The first screen now shows readable `Architect` and `Accountant` choices at
+  the 80-column terminal size used by the PTY smoke, and pressing Enter advances
+  to the agent step where the no-ready-agent path defaults to `Add custom
+  command` while keeping Anvil install guidance visible.
 
 Still not production-grade:
 
@@ -532,12 +538,13 @@ Still not production-grade:
    picker. It still needs an end-user pass over copy, action ordering, failure
    recovery, terminal sizes, and real provider success/failure combinations
    before it can be called production-grade.
-4. **The setup UI has only been manually smoked for one terminal scenario.**
+4. **The setup UI has only been manually smoked for a few terminal scenarios.**
    Unit tests cover state transitions, list windowing, and small/large render
    output; manual smoke now covers the no-working-agent 80-column path and a
    configured-but-broken 80-column path, a registry-add path, and a successful
-   configured-agent path. Broader terminal-size smoke is still useful before
-   calling onboarding production-grade.
+   configured-agent path, plus the work-style-first fresh-home path. Broader
+   terminal-size smoke is still useful before calling onboarding
+   production-grade.
 
 ## Risks and open questions
 

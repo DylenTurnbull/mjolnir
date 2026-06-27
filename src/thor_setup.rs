@@ -685,12 +685,12 @@ fn persona_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'s
         (
             ThorOptimizationMode::BestSolution,
             "Architect",
-            "prioritize the strongest answer; Thor may compare agent results",
+            "best answer; Thor may compare results",
         ),
         (
             ThorOptimizationMode::Cost,
             "Accountant",
-            "control spend; Thor uses cheaper options when the task is simple",
+            "lower spend; cheaper agents for simple work",
         ),
     ]
     .into_iter()
