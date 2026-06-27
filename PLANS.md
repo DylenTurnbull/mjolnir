@@ -771,6 +771,17 @@ Observed stream evidence:
 | worker progress | not observed before timeout |
 | usage reporting | not observed before timeout |
 
+Diagnostic rerun:
+
+```text
+mj --agent-stderr /tmp/mj-thor-headless-smoke.err --output-format stream-json --permission-mode acceptEdits --print-timeout-seconds 20 --print "Thor runtime smoke. Do not modify files. List available Thor agents, submit a concise plan, and answer with a short recap."
+```
+
+The stderr log showed Anvil initialized, discovered ChatGPT subscription models
+(`gpt-5.3-codex-spark`, `gpt-5.4-mini`, `gpt-5.4`, `gpt-5.5`), received
+`session/prompt`, and started its MCP server. No plan, worker event, or model
+response was emitted before the 20s timeout.
+
 Known gap: this proves the progress heartbeat and timeout surface for a real
 provider run, but it does not close the production-grade Thor runtime smoke
 requirement because Thor did not produce a plan, delegate work, mirror worker
