@@ -744,6 +744,41 @@ Known gaps:
 Not yet exercised: `session/prompt`, tool-call permission flow, cancellation,
 live model/auth failures, and transcript rendering from a real OpenCode turn.
 
+### `@agentclientprotocol/codex-acp` 0.0.46 — 2026-06-28
+
+Source: configured Thor ACP server `custom:codex alt`, which resolves to the
+installed `@agentclientprotocol/codex-acp` package in this local environment.
+The smoke used the persisted Thor configured server so it validated the exact
+command/env Thor can delegate to, without fetching new third-party code.
+
+Launch:
+
+```text
+mj acp-smoke --configured-source-id "custom:codex alt" --format json
+```
+
+Verified at the protocol layer through `mj acp-smoke`, not a full interactive
+prompt round-trip, to avoid burning model tokens:
+
+| Feature | Result |
+| --- | --- |
+| `initialize` handshake (ACP v1) | works; `Connected` event received |
+| `agentInfo` (name + version) | populated as `@agentclientprotocol/codex-acp 0.0.46` |
+| `session/new` with repo cwd | works; validation reached `SessionStarted` |
+| `promptCapabilities.image` | advertised as supported |
+| session fork capability | not advertised in this smoke |
+| config options | none observed during this smoke |
+| validation runtime | completed in about 1.1s on this machine |
+
+Known gaps:
+
+- This was a configured-server smoke, not a registry install/setup test.
+- The smoke did not send a model prompt or exercise Codex auth/rate-limit
+  failure recovery.
+
+Not yet exercised: `session/prompt`, tool-call permission flow, cancellation,
+live model/auth failures, and transcript rendering from a real Codex ACP turn.
+
 ### Next targets
 
 - Gemini CLI (auth-required path test).
