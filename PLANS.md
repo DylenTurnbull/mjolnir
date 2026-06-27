@@ -325,6 +325,9 @@ Deliverables:
   product packaging explicitly owns Thor distribution.
 - ✅ The installer has a no-network self-test for release metadata parsing,
   checksum lookup, and Linux/macOS `mj` plus `bifrost` asset selection.
+- ✅ Re-verified the local installer guardrail on 2026-06-28:
+  `bash -n install.sh` exited cleanly and `./install.sh --self-test` printed
+  `mjolnir-installer: self-test passed`.
 
 Exit criteria:
 
