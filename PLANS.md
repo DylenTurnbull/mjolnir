@@ -252,8 +252,9 @@ Deliverables:
   agents — `@agentclientprotocol/claude-agent-acp` 0.36.1 and OpenCode
   1.17.11 are recorded in the Compatibility section below.
 - ✅ Add a repeatable no-token compatibility smoke path — `mj acp-smoke
-  --command "<agent acp command>"` runs initialize plus `session/new`, prints
-  text/json capability evidence, and exits non-zero if the agent is not usable.
+  --command "<agent acp command>"` or `mj acp-smoke --configured-source-id
+  <id>` runs initialize plus `session/new`, prints text/json capability
+  evidence, and exits non-zero if the agent is not usable.
 - Explore session rewind as an ACP extension paired with Anvil. The current
   proposal is documented in [docs/session-rewind-extension.md](docs/session-rewind-extension.md):
   model rewind as fork-from-checkpoint using `session/fork` `_meta`, not as
@@ -644,10 +645,13 @@ records the date, agent version, and what worked at the protocol layer.
 Update this table when re-running against newer versions or new agents.
 
 Use `mj acp-smoke --command "<agent acp command>" --source-id <name>` for new
-matrix entries when a full model turn is not needed. The smoke starts the ACP
-server, validates initialize plus `session/new`, records advertised
-capabilities, and shuts down without sending `session/prompt`. Add
-`--format json` when preserving machine-readable evidence.
+matrix entries when a full model turn is not needed. To verify the exact
+command/env Thor will use after onboarding, run `mj acp-smoke
+--configured-source-id <id>` against the persisted Thor configured ACP server.
+The smoke starts the ACP server, validates initialize plus `session/new`,
+records advertised capabilities, and shuts down without sending
+`session/prompt`. Add `--format json` when preserving machine-readable
+evidence.
 
 ### `@agentclientprotocol/claude-agent-acp` 0.36.1 — 2026-05-20
 

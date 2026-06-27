@@ -201,12 +201,21 @@ struct ServerArgs {
 }
 
 #[derive(Debug, clap::Args)]
+#[command(group(
+    clap::ArgGroup::new("target")
+        .required(true)
+        .args(["command", "configured_source_id"])
+))]
 struct AcpSmokeArgs {
     /// ACP server launch command to validate, quoted as one shell-style string.
     #[arg(long, value_name = "COMMAND")]
-    command: String,
+    command: Option<String>,
 
-    /// Label to write into the smoke result.
+    /// Validate a persisted Thor ACP server by source id.
+    #[arg(long, value_name = "SOURCE_ID")]
+    configured_source_id: Option<String>,
+
+    /// Label to write into the smoke result when using `--command`.
     #[arg(long, default_value = "acp-smoke")]
     source_id: String,
 
@@ -430,11 +439,11 @@ async fn main() -> Result<()> {
 }
 
 async fn run_acp_smoke(args: AcpSmokeArgs, default_cwd: PathBuf) -> Result<()> {
-    let cwd = match args.cwd {
-        Some(cwd) => absolutize_cwd(cwd)?,
+    let cwd = match args.cwd.as_ref() {
+        Some(cwd) => absolutize_cwd(cwd.clone())?,
         None => default_cwd,
     };
-    let agent = selected_agent_from_command(args.source_id, &args.command)?;
+    let agent = selected_agent_for_acp_smoke(&args)?;
     let validation =
         thor_probe::validate_agent(agent, cwd, Duration::from_secs(args.timeout_seconds)).await;
     print_acp_smoke_result(&validation, args.format)?;
@@ -449,6 +458,46 @@ async fn run_acp_smoke(args: AcpSmokeArgs, default_cwd: PathBuf) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn selected_agent_for_acp_smoke(args: &AcpSmokeArgs) -> Result<SelectedAgent> {
+    if let Some(source_id) = &args.configured_source_id {
+        return configured_acp_smoke_agent(source_id);
+    }
+    let command = args
+        .command
+        .as_deref()
+        .context("ACP smoke requires --command or --configured-source-id")?;
+    selected_agent_from_command(args.source_id.clone(), command)
+}
+
+fn configured_acp_smoke_agent(source_id: &str) -> Result<SelectedAgent> {
+    let config_path = config::default_config_path();
+    let cfg =
+        Config::load(&config_path).with_context(|| format!("load {}", config_path.display()))?;
+    let servers = thor::configured_acp_servers(&cfg);
+    servers
+        .iter()
+        .find(|server| server.source_id == source_id)
+        .map(ConfiguredAcpServer::selected_agent)
+        .with_context(|| {
+            let available = servers
+                .iter()
+                .map(|server| server.source_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if available.is_empty() {
+                format!(
+                    "no Thor ACP servers are configured in {}",
+                    config_path.display()
+                )
+            } else {
+                format!(
+                    "Thor ACP server {source_id:?} is not configured in {}; available: {available}",
+                    config_path.display()
+                )
+            }
+        })
 }
 
 fn selected_agent_from_command(source_id: String, command: &str) -> Result<SelectedAgent> {
@@ -2748,7 +2797,11 @@ mod tests {
         assert_eq!(cli.cwd, Some(PathBuf::from("/tmp/project")));
         match cli.command {
             Some(Commands::AcpSmoke(args)) => {
-                assert_eq!(args.command, "npx -y @example/acp --flag 'two words'");
+                assert_eq!(
+                    args.command.as_deref(),
+                    Some("npx -y @example/acp --flag 'two words'")
+                );
+                assert!(args.configured_source_id.is_none());
                 assert_eq!(args.source_id, "example");
                 assert_eq!(args.cwd, Some(PathBuf::from("/tmp/agent-cwd")));
                 assert_eq!(args.timeout_seconds, 12);
@@ -2771,6 +2824,50 @@ mod tests {
         .expect_err("reject zero timeout");
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn parse_acp_smoke_subcommand_with_configured_source_id() {
+        let cli = Cli::try_parse_from([
+            "mj",
+            "acp-smoke",
+            "--configured-source-id",
+            "opencode",
+            "--format",
+            "json",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Some(Commands::AcpSmoke(args)) => {
+                assert!(args.command.is_none());
+                assert_eq!(args.configured_source_id.as_deref(), Some("opencode"));
+                assert!(matches!(args.format, HeadlessOutputFormat::Json));
+            }
+            _ => panic!("expected AcpSmoke subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_acp_smoke_requires_target() {
+        let err = Cli::try_parse_from(["mj", "acp-smoke"]).expect_err("reject missing target");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn parse_acp_smoke_rejects_multiple_targets() {
+        let err = Cli::try_parse_from([
+            "mj",
+            "acp-smoke",
+            "--command",
+            "opencode acp",
+            "--configured-source-id",
+            "opencode",
+        ])
+        .expect_err("reject multiple targets");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
