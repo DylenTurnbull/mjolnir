@@ -744,7 +744,8 @@ fn prepare_existing_worktree(cwd: &std::path::Path, name_or_path: &str) -> Resul
 }
 
 fn should_open_thor_onboarding(cfg: &Config, initial_agent: Option<&SelectedAgent>) -> bool {
-    !cfg.thor.onboarding_complete && initial_agent.is_none()
+    initial_agent.is_none()
+        && (!cfg.thor.onboarding_complete || cfg.thor.configured_acp_servers.is_empty())
 }
 
 fn ensure_thor_default_agent(cfg: &mut Config) -> SelectedAgent {
@@ -1678,12 +1679,38 @@ mod tests {
             ),
             "old configs with a silently created host still need Thor onboarding"
         );
+        assert!(
+            should_open_thor_onboarding(
+                &Config {
+                    theme: Default::default(),
+                    spinner: Default::default(),
+                    thor: thor::ThorConfig {
+                        onboarding_complete: true,
+                        ..Default::default()
+                    },
+                    agent: Some(configured.clone()),
+                    favorite_agents: Vec::new(),
+                    custom_agents: Vec::new(),
+                },
+                None
+            ),
+            "completed legacy configs still need persisted Thor ACP servers"
+        );
         assert!(!should_open_thor_onboarding(
             &Config {
                 theme: Default::default(),
                 spinner: Default::default(),
                 thor: thor::ThorConfig {
                     onboarding_complete: true,
+                    configured_acp_servers: vec![ConfiguredAcpServer {
+                        source_id: configured.source_id.clone(),
+                        name: "Claude".to_string(),
+                        program: configured.program.clone(),
+                        args: configured.args.clone(),
+                        env: configured.env.clone(),
+                        description: String::new(),
+                        quota_backend: ThorQuotaBackend::ClaudeCli,
+                    }],
                     ..Default::default()
                 },
                 agent: Some(configured),
