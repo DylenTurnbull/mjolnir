@@ -752,6 +752,41 @@ testing): `session/prompt` round-trip, tool-call permission flow,
 prompt cancellation against a live agent, agent-initiated errors mid-
 turn.
 
+### Anvil dev ACP — 2026-06-28
+
+Source: configured Thor ACP server `custom:anvil dev`, which resolves to the
+installed local command `/Users/ryansvihla/.cargo/bin/anvil`. The smoke used the
+persisted Thor configured server, so it validated the exact command/env Thor can
+delegate to without fetching code or sending a model prompt.
+
+Launch:
+
+```text
+mj acp-smoke --configured-source-id "custom:anvil dev" --format json
+```
+
+Verified at the protocol layer through `mj acp-smoke`, not a full interactive
+prompt round-trip:
+
+| Feature | Result |
+| --- | --- |
+| `initialize` handshake (ACP v1) | works; `Connected` event received |
+| `session/new` with repo cwd | works; validation reached `SessionStarted` |
+| `promptCapabilities.image` | advertised as supported |
+| session fork capability | advertised as supported |
+| config options | none observed during this smoke |
+| validation runtime | completed in about 1.5s on this machine |
+
+Known gaps:
+
+- This was a configured local binary smoke, not registry install/setup
+  validation.
+- The smoke did not send a model prompt or exercise auth/rate-limit failure
+  recovery.
+
+Not yet exercised: `session/prompt`, tool-call permission flow, cancellation,
+live model/auth failures, and transcript rendering from a real Anvil turn.
+
 ### OpenCode 1.17.11 — 2026-06-27
 
 Source: ACP registry entry `opencode`, version `1.17.11`, from
@@ -794,12 +829,14 @@ Known gaps:
 Not yet exercised: `session/prompt`, tool-call permission flow, cancellation,
 live model/auth failures, and transcript rendering from a real OpenCode turn.
 
-### `@agentclientprotocol/codex-acp` 0.0.46 — 2026-06-28
+### `@agentclientprotocol/codex-acp` 0.0.46 — historical, re-check failed 2026-06-28
 
 Source: configured Thor ACP server `custom:codex alt`, which resolves to the
 installed `@agentclientprotocol/codex-acp` package in this local environment.
-The smoke used the persisted Thor configured server so it validated the exact
-command/env Thor can delegate to, without fetching new third-party code.
+Earlier on 2026-06-28 this configured-server smoke completed initialize plus
+`session/new`. A later re-check on the same date failed during `initialize`, so
+this local configured Codex server should not be treated as currently validated
+until its underlying Codex process starts cleanly again.
 
 Launch:
 
@@ -807,8 +844,7 @@ Launch:
 mj acp-smoke --configured-source-id "custom:codex alt" --format json
 ```
 
-Verified at the protocol layer through `mj acp-smoke`, not a full interactive
-prompt round-trip, to avoid burning model tokens:
+Historical successful result, kept for comparison:
 
 | Feature | Result |
 | --- | --- |
@@ -820,17 +856,27 @@ prompt round-trip, to avoid burning model tokens:
 | config options | none observed during this smoke |
 | validation runtime | completed in about 1.1s on this machine |
 
+Current re-check:
+
+```text
+mj --agent-stderr /tmp/mj-codex-acp-smoke.err acp-smoke --configured-source-id "custom:codex alt" --format json
+```
+
+Current result:
+
+| Feature | Result |
+| --- | --- |
+| `initialize` handshake (ACP v1) | failed |
+| stderr detail | wrapper reported `Codex process has exited with code 1` |
+| diagnostic path | top-level `--agent-stderr` now captures subprocess stderr for `acp-smoke` |
+
 Known gaps:
 
 - This was a configured-server smoke, not a registry install/setup test.
 - The smoke did not send a model prompt or exercise Codex auth/rate-limit
   failure recovery.
-- Re-check on 2026-06-28 with
-  `mj --agent-stderr /tmp/mj-codex-acp-smoke.err acp-smoke --configured-source-id "custom:codex alt" --format json`
-  failed during `initialize`: the wrapper reported `Codex process has exited
-  with code 1`. The stderr capture path now works for this diagnostic, but this
-  local configured Codex server should not be treated as currently validated
-  until its underlying Codex process starts cleanly again.
+- The currently configured local Codex server needs its underlying Codex
+  process fixed before it can count as live compatibility evidence again.
 
 Not yet exercised: `session/prompt`, tool-call permission flow, cancellation,
 live model/auth failures, and transcript rendering from a real Codex ACP turn.
