@@ -342,7 +342,8 @@ Near-term:
   Setup now starts with architect/accountant mode, lets users choose which ready
   agents Thor may use, and supports custom/registry agent setup from the flow.
   Richer registry/auth guidance, more real-provider recovery testing, and manual
-  visual smoke across more terminal sizes remain before it is production-grade.
+  visual smoke across more terminal sizes remain before it is production-grade;
+  tracked in [#252](https://github.com/BrokkAi/mjolnir/issues/252).
 
 (M1 closed: fatal/error rendering, child-process cleanup, transcript
 scrolling.)
@@ -546,14 +547,16 @@ Still not production-grade:
    worker agents, and lets the user choose Thor's host without the old model
    picker. It still needs an end-user pass over copy, action ordering, failure
    recovery, terminal sizes, and real provider success/failure combinations
-   before it can be called production-grade.
+   before it can be called production-grade. Tracked in
+   [#252](https://github.com/BrokkAi/mjolnir/issues/252).
 4. **The setup UI has only been manually smoked for a few terminal scenarios.**
    Unit tests cover state transitions, list windowing, and small/large render
    output; manual smoke now covers the no-working-agent 80-column path and a
    configured-but-broken 80-column path, a registry-add path, and a successful
    configured-agent path, plus the work-style-first fresh-home path. Broader
    terminal-size smoke is still useful before calling onboarding
-   production-grade.
+   production-grade. Tracked in
+   [#252](https://github.com/BrokkAi/mjolnir/issues/252).
 
 ## Risks and open questions
 
