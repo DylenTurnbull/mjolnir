@@ -441,6 +441,9 @@ Fixed in this PR:
 - [x] Show inferred install/auth expectations for registry rows before adding
   them, such as Node.js/npm, uv, Claude Code sign-in, Codex sign-in, Gemini CLI
   auth, OpenCode config, Cursor auth, or GitHub Copilot auth when known.
+- [x] Replaced first-run summary labels that exposed internal source IDs,
+  model defaults, and reasoning defaults with friendly agent names and a simple
+  work-style summary. Model selection remains automatic during onboarding.
 - [x] Manually smoke-tested the 80-column no-working-agent first-run path with a
   temporary home and stripped `PATH`:
   `HOME=/tmp/mj-thor-smoke-home-4 XDG_CONFIG_HOME=/tmp/mj-thor-smoke-home-4/config XDG_CACHE_HOME=/tmp/mj-thor-smoke-home-4/cache PATH=/usr/bin:/bin target/debug/mj --cwd .`.

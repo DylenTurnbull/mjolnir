@@ -874,40 +874,43 @@ fn disabled_row(spans: Vec<Span<'static>>, theme: TerminalTheme) -> ListItem<'st
 
 fn summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static>> {
     vec![
-        detail_line("Available agents", enabled_summary(state), theme),
-        detail_line("Thor runs in", host_summary(state), theme),
+        detail_line("Ready to use", ready_agent_summary(state), theme),
+        detail_line("Run Thor in", host_summary(state), theme),
         detail_line(
-            "Defaults",
+            "Work style",
             format!(
-                "{}, {}, {} reasoning",
-                persona_label(state.optimization_mode),
-                state.coordinator_model,
-                reasoning_label(state.coordinator_reasoning)
+                "{}; model choices stay automatic",
+                persona_label(state.optimization_mode)
             ),
             theme,
         ),
     ]
 }
 
-fn enabled_summary(state: &ThorSetupState) -> String {
-    let enabled = state.enabled_source_ids();
-    if enabled.is_empty() {
-        "none ready; add or fix an ACP command".to_string()
+fn ready_agent_summary(state: &ThorSetupState) -> String {
+    let ready = state
+        .agents
+        .iter()
+        .filter(|setup_agent| setup_agent_is_usable(setup_agent))
+        .map(setup_agent_label)
+        .collect::<Vec<_>>();
+    if ready.is_empty() {
+        "none yet; add an agent or fix setup".to_string()
     } else {
-        enabled.join(", ")
+        ready.join(", ")
     }
 }
 
 fn host_summary(state: &ThorSetupState) -> String {
-    if state
-        .host_choices()
+    state
+        .agents
         .iter()
-        .any(|choice| matches!(choice, HostChoice::Agent(source_id) if source_id == &state.host_source_id))
-    {
-        state.host_source_id.clone()
-    } else {
-        "none ready yet".to_string()
-    }
+        .find(|setup_agent| {
+            setup_agent.agent.source_id == state.host_source_id
+                && setup_agent_is_usable(setup_agent)
+        })
+        .map(setup_agent_label)
+        .unwrap_or_else(|| "choose a ready agent".to_string())
 }
 
 fn detail_line(label: &str, value: String, theme: TerminalTheme) -> Line<'static> {
@@ -922,14 +925,6 @@ fn persona_label(mode: ThorOptimizationMode) -> String {
         ThorOptimizationMode::Cost => "accountant".to_string(),
         ThorOptimizationMode::BestSolution => "architect".to_string(),
         ThorOptimizationMode::Balanced => "architect".to_string(),
-    }
-}
-
-fn reasoning_label(reasoning: ThorReasoning) -> String {
-    match reasoning {
-        ThorReasoning::Low => "low".to_string(),
-        ThorReasoning::Medium => "medium".to_string(),
-        ThorReasoning::High => "high".to_string(),
     }
 }
 
@@ -1324,11 +1319,36 @@ mod tests {
         let state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &initial_host);
 
         assert!(state.enabled_source_ids().is_empty());
-        assert_eq!(host_summary(&state), "none ready yet");
+        assert_eq!(host_summary(&state), "choose a ready agent");
         assert!(matches!(
             state.host_choices().first(),
             Some(HostChoice::AddCustom)
         ));
+    }
+
+    #[test]
+    fn summary_uses_display_names_instead_of_source_ids() {
+        let mut agents = vec![setup_agent_with_validation("custom:claude-code", true)];
+        agents[0].name = "Claude Code".to_string();
+        let initial_host = agents[0].agent.clone();
+        let state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &initial_host);
+
+        assert_eq!(ready_agent_summary(&state), "Claude Code");
+        assert_eq!(host_summary(&state), "Claude Code");
+        let summary = summary_lines(&state, crate::theme::TerminalThemeKind::Dark.palette());
+        let rendered = summary
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Work style: architect; model choices stay automatic"));
+        assert!(!rendered.contains("auto-strong"));
+        assert!(!rendered.contains("custom:claude-code"));
     }
 
     #[test]
@@ -1609,7 +1629,7 @@ mod tests {
             assert!(rendered.contains("Set up Thor"));
             assert!(rendered.contains("Add from ACP registry"));
             assert!(rendered.contains("Add ACP command"));
-            assert!(rendered.contains("none ready"));
+            assert!(rendered.contains("No agent is ready"));
         }
     }
 
