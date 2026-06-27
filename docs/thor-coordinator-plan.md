@@ -48,6 +48,10 @@ changed and how much each harness/model used.
   timeout, and error events through an out-of-band progress stream consumed by
   the interactive UI and remote tracker, so the transcript continues to update
   while the Thor host waits for a delegated ACP worker call to return.
+- Headless `--print --output-format stream-json` uses the same progress-enabled
+  Thor MCP bridge and emits `info` records for worker progress and elapsed
+  heartbeats, giving long-turn runtime smoke tests a repeatable non-TUI capture
+  path.
 - The MCP bridge is provided to the Thor host as an ACP `mcpServers` stdio
   entry that launches `mj thor-mcp`.
 - The final response includes a concise recap, validation, unresolved risks,
@@ -139,9 +143,10 @@ changed and how much each harness/model used.
     Remaining: continue polishing the guided setup progression, replace
     remaining inferred setup labels with registry-provided exact commands/links
     where possible, manually smoke-test the setup UI across terminal sizes, and
-    run real long-turn Thor smoke covering sticky task-derived titles, local
-    and remote heartbeats, worker progress mirroring, transcript freshness in
-    the UI the user is watching, and final recap.
+    run real long-turn Thor smoke covering sticky task-derived titles, local,
+    remote, and headless-stream heartbeats, worker progress mirroring,
+    transcript freshness in the UI or stream the user is watching, and final
+    recap.
 
 ## Quota reads
 

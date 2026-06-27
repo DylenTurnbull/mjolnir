@@ -286,10 +286,6 @@ impl WorkflowState {
     }
 }
 
-pub fn mcp_servers(config_path: PathBuf) -> Result<Vec<McpServer>> {
-    mcp_servers_with_progress(config_path, None)
-}
-
 pub fn mcp_servers_with_progress(
     config_path: PathBuf,
     progress_path: Option<PathBuf>,

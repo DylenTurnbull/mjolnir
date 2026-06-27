@@ -6,6 +6,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
     PermissionOptionKind, SessionUpdate, StopReason, ToolCall, ToolCallStatus, ToolCallUpdate,
@@ -79,6 +84,9 @@ enum StreamRecord<'a> {
         tool_call_id: &'a str,
         decision: &'a str,
     },
+    Info {
+        message: &'a str,
+    },
     Warning {
         message: &'a str,
     },
@@ -134,13 +142,19 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let project_label = crate::paths::project_label_from_cwd(&cfg.cwd);
     let thor_config = app_config.thor.clone();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let progress_event_tx = event_tx.clone();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let thor_progress_path = thor_progress_path();
+    let _ = std::fs::remove_file(&thor_progress_path);
     let runtime_cfg = AcpRuntimeConfig {
         command: agent.program,
         args: agent.args,
         cwd: cfg.cwd,
         additional_directories: cfg.additional_directories,
-        mcp_servers: crate::thor_mcp::mcp_servers(config_path.clone())?,
+        mcp_servers: crate::thor_mcp::mcp_servers_with_progress(
+            config_path.clone(),
+            Some(thor_progress_path.clone()),
+        )?,
         resume_session: cfg.resume_session.clone(),
         env: agent.env,
         agent_stderr: cfg.agent_stderr,
@@ -148,6 +162,15 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     };
 
     let runtime = tokio::spawn(async move { crate::acp::run(runtime_cfg, event_tx, cmd_rx).await });
+    let progress_proxy = tokio::spawn(poll_thor_progress(
+        thor_progress_path.clone(),
+        progress_event_tx.clone(),
+    ));
+    let thor_turn_active = Arc::new(AtomicBool::new(false));
+    let progress_heartbeat = tokio::spawn(thor_activity_heartbeat(
+        thor_turn_active.clone(),
+        progress_event_tx,
+    ));
     // No UI event channel: headless answers permissions by policy, so
     // remote decisions have nothing to resolve.
     let remote_tracker = remote::RemoteSessionTracker::new(
@@ -203,6 +226,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 if !sent_prompt {
                     sent_prompt = true;
                     prompt_sent = true;
+                    thor_turn_active.store(true, Ordering::Relaxed);
                     let command = UiCommand::SendPrompt {
                         text: cfg.prompt.clone(),
                         images: Vec::new(),
@@ -242,6 +266,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 stop_reason: reason,
                 usage: prompt_usage,
             } => {
+                thor_turn_active.store(false, Ordering::Relaxed);
                 stop_reason = Some(reason);
                 usage = prompt_usage;
                 saw_terminal_event = true;
@@ -251,6 +276,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             UiEvent::PromptFailed { message }
             | UiEvent::SessionForkFailed { message }
             | UiEvent::Fatal(message) => {
+                thor_turn_active.store(false, Ordering::Relaxed);
                 if matches!(cfg.output_format, OutputFormat::StreamJson) {
                     emit_json(&StreamRecord::Error { message: &message })?;
                 }
@@ -286,6 +312,11 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             // we keep that behavior local to the spawned task.
         }
     }
+    progress_proxy.abort();
+    progress_heartbeat.abort();
+    let _ = progress_proxy.await;
+    let _ = progress_heartbeat.await;
+    let _ = std::fs::remove_file(thor_progress_path);
     remote_tracker.shutdown().await;
 
     let stop_reason_label = stop_reason.map(stop_reason_label).unwrap_or_else(|| {
@@ -333,6 +364,97 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("prompt stopped with {}", stop_reason_label))
+    }
+}
+
+fn thor_progress_path() -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "mj-thor-headless-progress-{}-{now}.jsonl",
+        std::process::id()
+    ))
+}
+
+async fn poll_thor_progress(path: PathBuf, event_tx: mpsc::UnboundedSender<UiEvent>) {
+    let mut offset = 0usize;
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        tick.tick().await;
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if body.len() < offset {
+            offset = 0;
+        }
+        let Some(new_body) = body.get(offset..) else {
+            offset = body.len();
+            continue;
+        };
+        offset = body.len();
+        for line in new_body.lines() {
+            if let Some(message) = thor_progress_message(line) {
+                let _ = event_tx.send(UiEvent::Info(message));
+            }
+        }
+    }
+}
+
+async fn thor_activity_heartbeat(
+    active: Arc<AtomicBool>,
+    event_tx: mpsc::UnboundedSender<UiEvent>,
+) {
+    let mut elapsed_seconds = 0u64;
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        if let Some(message) =
+            thor_heartbeat_tick(active.load(Ordering::Relaxed), &mut elapsed_seconds, 15)
+        {
+            let _ = event_tx.send(UiEvent::Info(message));
+        }
+    }
+}
+
+fn thor_heartbeat_tick(
+    active: bool,
+    elapsed_seconds: &mut u64,
+    step_seconds: u64,
+) -> Option<String> {
+    if !active {
+        *elapsed_seconds = 0;
+        return None;
+    }
+    *elapsed_seconds = elapsed_seconds.saturating_add(step_seconds);
+    Some(format!(
+        "Thor is still working... {elapsed_seconds}s elapsed"
+    ))
+}
+
+fn thor_progress_message(line: &str) -> Option<String> {
+    let record: serde_json::Value = serde_json::from_str(line).ok()?;
+    let kind = record.get("kind").and_then(serde_json::Value::as_str)?;
+    let detail = record.get("detail").and_then(serde_json::Value::as_str)?;
+    Some(format!(
+        "Thor worker {}: {}",
+        thor_progress_kind_label(kind),
+        detail
+    ))
+}
+
+fn thor_progress_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "session_started" => "started",
+        "prompt_sent" => "prompt sent",
+        "tool_call" => "tool",
+        "tool_update" => "tool update",
+        "permission" => "permission",
+        "prompt_done" => "done",
+        "timeout" => "timeout",
+        "error" => "error",
+        "worker_closed" => "closed",
+        _ => "progress",
     }
 }
 
@@ -410,6 +532,9 @@ fn emit_stream_event(event: &UiEvent, state: &HeadlessState) -> Result<()> {
                     .status
                     .map(|s| tool_status_label(s).to_string()),
             })?;
+        }
+        UiEvent::Info(message) => {
+            emit_json(&StreamRecord::Info { message })?;
         }
         _ => {}
     }
@@ -526,5 +651,33 @@ mod tests {
         );
 
         assert_eq!(decision, None);
+    }
+
+    #[test]
+    fn headless_thor_progress_message_formats_worker_update() {
+        let message =
+            thor_progress_message(r#"{"kind":"tool_call","detail":"cargo test (execute)"}"#);
+
+        assert_eq!(
+            message.as_deref(),
+            Some("Thor worker tool: cargo test (execute)")
+        );
+        assert_eq!(thor_progress_message("not json"), None);
+    }
+
+    #[test]
+    fn headless_thor_heartbeat_tick_emits_distinct_elapsed_messages_and_resets() {
+        let mut elapsed = 0;
+
+        assert_eq!(
+            thor_heartbeat_tick(true, &mut elapsed, 15).as_deref(),
+            Some("Thor is still working... 15s elapsed")
+        );
+        assert_eq!(
+            thor_heartbeat_tick(true, &mut elapsed, 15).as_deref(),
+            Some("Thor is still working... 30s elapsed")
+        );
+        assert_eq!(thor_heartbeat_tick(false, &mut elapsed, 15), None);
+        assert_eq!(elapsed, 0);
     }
 }

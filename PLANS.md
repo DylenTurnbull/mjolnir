@@ -146,6 +146,12 @@ Thor session naming and no visible transcript updates during a multi-minute
 turn, so the title/progress fixes need a real-provider long-turn smoke before
 the coordinator can be called production-grade.
 
+The headless `--print --output-format stream-json` path now runs the same
+Thor MCP bridge with a progress side channel and emits `info` stream records for
+worker progress and elapsed heartbeats. This gives long-turn Thor smoke tests a
+repeatable non-TUI surface, but it still needs to be exercised against a real
+configured provider turn before closing the runtime validation gap.
+
 Initial routing policy:
 
 - Thor supports balanced, cost/accountant, and best-solution/architect
@@ -583,6 +589,10 @@ Fixed in this PR:
   transcript can append distinct `Thor is still working... Ns elapsed` entries
   even if the host agent streams no text and no worker side-channel event has
   arrived yet.
+- [x] Brought headless `--print --output-format stream-json` onto the same Thor
+  progress bridge: it now injects `mj thor-mcp` with a progress file and emits
+  stream `info` records for worker progress and elapsed heartbeats during the
+  active Thor host turn.
 - [x] Added a live Thor worker progress side channel from `mj thor-mcp` back to
   the interactive UI. Visible worker lifecycle, tool, permission, completion,
   timeout, and error events are mirrored into the transcript, so a delegated ACP
@@ -637,12 +647,14 @@ Still not production-grade:
    frozen for several minutes. Current code now keeps user-task titles sticky,
    rejects broader Thor/coordinator host titles locally and in the
    remote/browser transcript, records a UI-state fallback heartbeat during
-   active local turns, keeps the remote-control heartbeat, and mirrors Thor MCP
-   worker progress. Deterministic tests cover those local/remote plumbing paths.
-   What remains is a real-provider smoke where Thor runs long enough to delegate
+   active local turns, keeps the remote-control heartbeat, mirrors Thor MCP
+   worker progress, and exposes the same progress stream through headless
+   `--print --output-format stream-json` for repeatable smoke capture.
+   Deterministic tests cover those local/remote/headless plumbing paths. What
+   remains is a real-provider smoke where Thor runs long enough to delegate
    work, mirror worker progress, show heartbeat entries in the same transcript
-   the user is watching, and produce a final recap. This item is open until
-   that smoke is recorded.
+   or stream the user is watching, and produce a final recap. This item is open
+   until that smoke is recorded.
 1. **Registry-backed agent setup still needs richer install/configure metadata.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider
