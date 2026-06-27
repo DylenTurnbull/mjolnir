@@ -34,6 +34,7 @@ pub struct ThorSetupRegistryAgent {
     pub name: String,
     pub description: String,
     pub setup_url: String,
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,7 @@ pub enum ThorSetupOutcome {
     Selection(ThorSetupSelection),
     AddCustom(ThorSetupCustomAgent),
     AddRegistry(String),
+    RetryValidation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +95,7 @@ impl SetupStep {
 enum HostChoice {
     Agent(String),
     AddRegistry,
+    RetryValidation,
     AddCustom,
 }
 
@@ -188,6 +191,9 @@ impl ThorSetupState {
                 Some(HostChoice::AddRegistry) => {
                     self.notice = None;
                     self.set_step(SetupStep::Registry);
+                }
+                Some(HostChoice::RetryValidation) => {
+                    return Some(ThorSetupOutcome::RetryValidation);
                 }
                 Some(HostChoice::AddCustom) => {
                     self.notice = None;
@@ -299,6 +305,7 @@ impl ThorSetupState {
                 .position(|choice| match choice {
                     HostChoice::Agent(source_id) => source_id == &self.host_source_id,
                     HostChoice::AddRegistry => false,
+                    HostChoice::RetryValidation => false,
                     HostChoice::AddCustom => false,
                 })
                 .unwrap_or(0),
@@ -328,6 +335,13 @@ impl ThorSetupState {
             choices.push(HostChoice::AddRegistry);
         }
         choices.push(HostChoice::AddCustom);
+        if self
+            .agents
+            .iter()
+            .any(|agent| !setup_agent_is_usable(agent))
+        {
+            choices.push(HostChoice::RetryValidation);
+        }
         choices
     }
 
@@ -447,18 +461,7 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
         ])
         .split(inner);
 
-    let title = Paragraph::new(vec![
-        Line::from(vec![Span::styled(
-            "Thor coordinates your coding agents.",
-            Style::default()
-                .fg(theme.primary)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("Choose where Thor runs. The other defaults are ready to change later."),
-        Line::from("Configured agents that work are available for Thor to delegate to."),
-        Line::from("If the agent you need is missing, add the ACP command here."),
-    ])
-    .style(Style::default().fg(theme.text));
+    let title = Paragraph::new(intro_lines(state, theme)).style(Style::default().fg(theme.text));
     f.render_widget(title, layout[0]);
 
     f.render_widget(progress_line(state, theme), layout[1]);
@@ -490,10 +493,47 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
         SetupStep::CustomName | SetupStep::CustomCommand => {
             "Type to edit  |  Enter continues  |  Backspace deletes  |  Esc quits"
         }
-        _ => "Enter selects  |  Backspace edits  |  Esc quits",
+        SetupStep::Host => "Enter selects  |  Retry after install/sign-in  |  Esc quits",
+        SetupStep::Registry => "Enter adds and checks  |  Backspace returns  |  Esc quits",
     };
     let footer = Paragraph::new(footer_text).style(Style::default().fg(theme.muted));
     f.render_widget(footer, layout[4]);
+}
+
+fn intro_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static>> {
+    let ready_count = state
+        .agents
+        .iter()
+        .filter(|agent| setup_agent_is_usable(agent))
+        .count();
+    let failed_count = state.agents.len().saturating_sub(ready_count);
+    let status = if ready_count == 0 {
+        Span::styled(
+            "No agent is ready yet. Add one, fix install/sign-in, then retry checks.",
+            Style::default().fg(theme.warning),
+        )
+    } else if failed_count == 0 {
+        Span::styled(
+            format!("{ready_count} ready. Choose where Thor runs, then start."),
+            Style::default().fg(theme.text),
+        )
+    } else {
+        Span::styled(
+            format!("{ready_count} ready, {failed_count} need setup. Choose Thor or fix another."),
+            Style::default().fg(theme.text),
+        )
+    };
+    vec![
+        Line::from(vec![Span::styled(
+            "Thor coordinates your coding agents.",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(status),
+        Line::from("Add from the registry for known agents, or add a custom ACP command."),
+        Line::from("Model and reasoning defaults are already set and can be changed later."),
+    ]
 }
 
 fn progress_line(state: &ThorSetupState, theme: TerminalTheme) -> Paragraph<'static> {
@@ -646,7 +686,10 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
         ));
     }
     rows.push(selectable_row(
-        state.cursor == choices.len().saturating_sub(1),
+        choices
+            .iter()
+            .position(|choice| matches!(choice, HostChoice::AddCustom))
+            == Some(state.cursor),
         vec![
             Span::styled(
                 "Add ACP command".to_string(),
@@ -659,6 +702,26 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
         ],
         theme,
     ));
+    if state
+        .agents
+        .iter()
+        .any(|agent| !setup_agent_is_usable(agent))
+    {
+        let retry_choice_idx = choices
+            .iter()
+            .position(|choice| matches!(choice, HostChoice::RetryValidation));
+        rows.push(selectable_row(
+            retry_choice_idx == Some(state.cursor),
+            vec![
+                Span::styled("Retry checks".to_string(), Style::default().fg(theme.text)),
+                Span::styled(
+                    "  after installing or signing in".to_string(),
+                    Style::default().fg(theme.muted),
+                ),
+            ],
+            theme,
+        ));
+    }
     rows
 }
 
@@ -696,16 +759,28 @@ fn host_selected_row_index(state: &ThorSetupState) -> usize {
             .unwrap_or(0),
         HostChoice::AddRegistry => state.agents.len(),
         HostChoice::AddCustom => state.agents.len() + 1,
+        HostChoice::RetryValidation => state.agents.len() + 2,
     }
 }
 
 fn registry_agent_summary(registry_agent: &ThorSetupRegistryAgent) -> String {
+    let mut parts = Vec::new();
     if !registry_agent.description.trim().is_empty() {
-        truncate_label(&registry_agent.description, 72)
-    } else if !registry_agent.setup_url.trim().is_empty() {
-        truncate_label(&registry_agent.setup_url, 72)
-    } else {
+        parts.push(registry_agent.description.clone());
+    }
+    if !registry_agent.command.trim().is_empty() {
+        parts.push(format!("runs `{}`", registry_agent.command));
+    }
+    if parts.is_empty() && !registry_agent.setup_url.trim().is_empty() {
+        parts.push(format!("docs: {}", registry_agent.setup_url));
+    }
+    if parts.is_empty() {
         registry_agent.source_id.clone()
+    } else if !registry_agent.setup_url.trim().is_empty() {
+        parts.push(format!("docs: {}", registry_agent.setup_url));
+        truncate_label(&parts.join("; "), 96)
+    } else {
+        truncate_label(&parts.join("; "), 96)
     }
 }
 
@@ -1114,6 +1189,7 @@ mod tests {
             name: source_id.to_string(),
             description: format!("{source_id} from registry"),
             setup_url: format!("https://example.com/{source_id}"),
+            command: format!("npx -y {source_id}"),
         }
     }
 
@@ -1232,6 +1308,21 @@ mod tests {
     }
 
     #[test]
+    fn retry_validation_choice_returns_retry_outcome() {
+        let agents = vec![setup_agent_with_validation("claude", false)];
+        let initial_host = agents[0].agent.clone();
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &initial_host);
+
+        state.cursor = state
+            .host_choices()
+            .iter()
+            .position(|choice| matches!(choice, HostChoice::RetryValidation))
+            .expect("retry choice");
+
+        assert_eq!(state.advance(), Some(ThorSetupOutcome::RetryValidation));
+    }
+
+    #[test]
     fn validation_error_gives_actionable_sign_in_guidance() {
         let setup_agent = setup_agent_with_validation("claude", false);
 
@@ -1333,15 +1424,22 @@ mod tests {
     }
 
     #[test]
-    fn host_selected_row_index_tracks_registry_and_custom_actions() {
-        let raw_agents = vec![agent("anvil")];
-        let agents = setup_agents(&raw_agents);
+    fn registry_summary_includes_command() {
+        let registry_agent = registry_agent("gemini");
+
+        assert!(registry_agent_summary(&registry_agent).contains("runs `npx -y gemini`"));
+    }
+
+    #[test]
+    fn host_selected_row_index_tracks_registry_custom_and_retry_actions() {
+        let agents = vec![setup_agent_with_validation("anvil", false)];
+        let raw_agent = agents[0].agent.clone();
         let registry_agents = vec![registry_agent("gemini")];
         let mut state = ThorSetupState::new(
             &ThorConfig::default(),
             &agents,
             &registry_agents,
-            &raw_agents[0],
+            &raw_agent,
         );
 
         state.cursor = state
@@ -1352,6 +1450,13 @@ mod tests {
         assert_eq!(host_selected_row_index(&state), 1);
 
         state.cursor = state.host_choices().len() - 1;
+        assert_eq!(host_selected_row_index(&state), 3);
+
+        state.cursor = state
+            .host_choices()
+            .iter()
+            .position(|choice| matches!(choice, HostChoice::AddCustom))
+            .expect("custom choice");
         assert_eq!(host_selected_row_index(&state), 2);
     }
 
@@ -1397,9 +1502,21 @@ mod tests {
         ];
         let initial_host = agents[0].agent.clone();
         let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &initial_host);
-        state.cursor = state.host_choices().len() - 1;
+        state.cursor = state
+            .host_choices()
+            .iter()
+            .position(|choice| matches!(choice, HostChoice::AddCustom))
+            .expect("custom choice");
 
         assert_eq!(host_selected_row_index(&state), 3);
+
+        state.cursor = state
+            .host_choices()
+            .iter()
+            .position(|choice| matches!(choice, HostChoice::RetryValidation))
+            .expect("retry choice");
+
+        assert_eq!(host_selected_row_index(&state), 4);
     }
 
     #[test]

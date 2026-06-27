@@ -425,6 +425,13 @@ Fixed in this PR:
   host is ready instead of naming a failed host.
 - [x] Added automated render coverage for Thor setup at small and large terminal
   sizes, including the registry/custom recovery rows and no-ready-host summary.
+- [x] Added an explicit "Retry checks" setup action. After a user installs a
+  missing command or signs in, onboarding reruns ACP validation without making
+  them quit and restart `mj`.
+- [x] Made the first setup screen state the current readiness summary and next
+  action in plain language instead of only listing validation results.
+- [x] Show the command that registry-backed setup will run when the registry
+  entry is added, so users are not asked to choose from names alone.
 
 Still not production-grade:
 
@@ -436,7 +443,11 @@ Still not production-grade:
    Rows now offer provider-specific actions for Anvil, Claude, Codex, `npx`,
    and `uvx`, but production UX should use registry/auth metadata for exact
    commands and links when available.
-3. **The setup UI has not been manually smoke-tested in multiple terminal sizes.**
+3. **The guided setup path still needs a full end-to-end polish pass.** The
+   first screen now has a readiness summary and retry action, but the setup flow
+   still needs manual tuning for copy, action ordering, and failure recovery
+   across real terminal sizes.
+4. **The setup UI has not been manually smoke-tested in multiple terminal sizes.**
    Unit tests cover state transitions, list windowing, and small/large render
    output; visual polish still needs an interactive pass.
 

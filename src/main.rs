@@ -898,6 +898,7 @@ async fn run_thor_onboarding(
                 name: server.name.clone(),
                 description: server.description.clone(),
                 setup_url: server.setup_url.clone(),
+                command: selected_agent_command_label(&server.selected_agent()),
             })
             .collect::<Vec<_>>();
         let available_agents = available_servers
@@ -970,6 +971,7 @@ async fn run_thor_onboarding(
                 cfg.save(config_path)
                     .with_context(|| format!("save {}", config_path.display()))?;
             }
+            thor_setup::ThorSetupOutcome::RetryValidation => {}
         }
     };
     cfg.thor.enabled_worker_source_ids = selection.enabled_worker_source_ids;
@@ -1034,6 +1036,12 @@ fn add_custom_thor_agent(cfg: &mut Config, custom: thor_setup::ThorSetupCustomAg
     };
     cfg.custom_agents.push(agent);
     Ok(())
+}
+
+fn selected_agent_command_label(agent: &SelectedAgent) -> String {
+    let mut parts = vec![agent.program.to_string_lossy().into_owned()];
+    parts.extend(agent.args.iter().cloned());
+    parts.join(" ")
 }
 
 fn unique_custom_agent_name(cfg: &Config, requested: &str) -> String {

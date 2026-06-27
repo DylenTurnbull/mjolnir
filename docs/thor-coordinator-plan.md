@@ -94,12 +94,13 @@ changed and how much each harness/model used.
     servers. Failed rows have provider-specific guidance for Anvil, Claude ACP,
     Codex ACP, `npx`, and `uvx`. All-broken candidate sets no longer mark
     failed agents as available workers. Small and large setup render tests cover
-    the recovery rows and no-ready-host summary. Remaining: redesign the setup
-    progression so the first screen clearly explains usable agents, broken
-    agents, and the next best action; replace inferred setup labels with richer
-    metadata-driven exact commands/links where possible; add an explicit retry
-    path after fixes; and manually smoke-test the setup UI across terminal
-    sizes.
+    the recovery rows and no-ready-host summary. The first setup screen now
+    summarizes ready/broken agents in plain language, registry rows show the
+    command they will add when known, and a "Retry checks" action reruns ACP
+    validation after install/sign-in fixes. Remaining: continue polishing the
+    guided setup progression, replace inferred setup labels with richer
+    metadata-driven exact commands/links where possible, and manually
+    smoke-test the setup UI across terminal sizes.
 
 ## Quota reads
 
