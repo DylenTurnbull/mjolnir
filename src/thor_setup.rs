@@ -2013,6 +2013,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn setup_screen_draws_every_step_on_small_terminals() {
+        let agents = vec![setup_agent_with_validation("mock-agent", true)];
+        let registry_agents = vec![registry_agent("gemini")];
+        let initial_host = agents[0].agent.clone();
+        let mut state = ThorSetupState::new(
+            &ThorConfig::default(),
+            &agents,
+            &registry_agents,
+            &initial_host,
+        );
+
+        for step in [
+            SetupStep::Persona,
+            SetupStep::Host,
+            SetupStep::Registry,
+            SetupStep::CustomName,
+            SetupStep::CustomCommand,
+            SetupStep::Confirm,
+        ] {
+            state.set_step(step);
+            for (width, height) in [(50, 16), (40, 12)] {
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).expect("terminal");
+                terminal
+                    .draw(|f| draw(f, &state, crate::theme::TerminalThemeKind::Dark.palette()))
+                    .expect("draw setup");
+                let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+                assert!(
+                    rendered.contains("Thor") || rendered.contains("Agent"),
+                    "setup step {step:?} rendered blank at {width}x{height}:\n{rendered}"
+                );
+            }
+        }
+    }
+
     fn buffer_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
         (0..buffer.area().height)
             .map(|y| {

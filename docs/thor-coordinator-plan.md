@@ -104,7 +104,8 @@ changed and how much each harness/model used.
     on configured servers. Failed rows have provider-specific guidance for
     Anvil, Claude ACP, Codex ACP, `npx`, and `uvx`. All-broken candidate sets
     no longer mark failed agents as available workers. Small and large setup
-    render tests cover the recovery rows and no-ready-host summary. The first
+    render tests cover the recovery rows and no-ready-host summary, and every
+    setup step now has automated 50x16 and 40x12 render coverage. The first
     setup screen now summarizes ready/broken agents in plain language, known
     agent rows show the command they will add when known plus setup
     expectations, current-platform binary registry entries are represented as

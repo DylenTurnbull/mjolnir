@@ -547,6 +547,9 @@ Fixed in this PR:
   first-run setup screen. The visible path now says `known agent` for registry
   choices and `installed agent` for pasted commands, while implementation terms
   stay internal.
+- [x] Added automated small-terminal render coverage for every first-run setup
+  step at 50x16 and 40x12, extending the previous 72x24 and 120x36 recovery
+  path coverage.
 
 Still not production-grade:
 
@@ -570,11 +573,12 @@ Still not production-grade:
    before it can be called production-grade. Tracked in
    [#252](https://github.com/BrokkAi/mjolnir/issues/252).
 4. **The setup UI has only been manually smoked for a few terminal scenarios.**
-   Unit tests cover state transitions, list windowing, and small/large render
-   output; manual smoke now covers the no-working-agent 80-column path and a
-   configured-but-broken 80-column path, a registry-add path, and a successful
-   configured-agent path, plus the work-style-first fresh-home path. Broader
-   terminal-size smoke is still useful before calling onboarding
+   Unit tests cover state transitions, list windowing, small/large recovery
+   rendering, and every setup step at 50x16 and 40x12; manual smoke now covers
+   the no-working-agent 80-column path and a configured-but-broken 80-column
+   path, a known-agent add path, and a successful configured-agent path, plus
+   the work-style-first fresh-home path. Broader real-terminal smoke is still
+   useful before calling onboarding
    production-grade. Tracked in
    [#252](https://github.com/BrokkAi/mjolnir/issues/252).
 
