@@ -49,6 +49,7 @@ pub struct RunConfig {
     pub fs_max_text_bytes: u64,
     pub output_format: OutputFormat,
     pub permission_mode: PermissionMode,
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,6 +144,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let thor_config = app_config.thor.clone();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let progress_event_tx = event_tx.clone();
+    let timeout_event_tx = event_tx.clone();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let thor_progress_path = thor_progress_path();
     let _ = std::fs::remove_file(&thor_progress_path);
@@ -162,6 +164,14 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     };
 
     let runtime = tokio::spawn(async move { crate::acp::run(runtime_cfg, event_tx, cmd_rx).await });
+    let timeout_task = cfg.timeout.map(|timeout| {
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            let _ = timeout_event_tx.send(UiEvent::PromptFailed {
+                message: format!("headless prompt timed out after {}s", timeout.as_secs()),
+            });
+        })
+    });
     let progress_proxy = tokio::spawn(poll_thor_progress(
         thor_progress_path.clone(),
         progress_event_tx.clone(),
@@ -314,6 +324,10 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     }
     progress_proxy.abort();
     progress_heartbeat.abort();
+    if let Some(timeout_task) = timeout_task {
+        timeout_task.abort();
+        let _ = timeout_task.await;
+    }
     let _ = progress_proxy.await;
     let _ = progress_heartbeat.await;
     let _ = std::fs::remove_file(thor_progress_path);

@@ -151,6 +151,8 @@ Thor MCP bridge with a progress side channel and emits `info` stream records for
 worker progress and elapsed heartbeats. This gives long-turn Thor smoke tests a
 repeatable non-TUI surface, but it still needs to be exercised against a real
 configured provider turn before closing the runtime validation gap.
+Headless `--print` also supports `--print-timeout-seconds` so real-provider
+smoke runs fail cleanly instead of hanging indefinitely.
 
 Session listing also strips generic Thor/coordinator titles reported by ACP
 hosts and uses the locally known task title for the active session row, so the
@@ -602,6 +604,10 @@ Fixed in this PR:
   progress bridge: it now injects `mj thor-mcp` with a progress file and emits
   stream `info` records for worker progress and elapsed heartbeats during the
   active Thor host turn.
+- [x] Added bounded headless Thor smoke support with
+  `--print-timeout-seconds`, so a provider that never produces a plan, worker
+  progress, or final recap returns a structured timeout error/result instead of
+  requiring manual interruption.
 - [x] Added a live Thor worker progress side channel from `mj thor-mcp` back to
   the interactive UI. Visible worker lifecycle, tool, permission, completion,
   timeout, and error events are mirrored into the transcript, so a delegated ACP
@@ -660,10 +666,13 @@ Still not production-grade:
    mirrors Thor MCP worker progress, and exposes the same progress stream
    through headless `--print --output-format stream-json` for repeatable smoke
    capture. Deterministic tests cover those local/remote/headless/listing
-   plumbing paths. What remains is a real-provider smoke where Thor runs long
-   enough to delegate work, mirror worker progress, show heartbeat entries in
-   the same transcript or stream the user is watching, and produce a final
-   recap. This item is open until that smoke is recorded.
+   plumbing paths. A bounded real-provider Anvil-backed headless smoke now
+   proves heartbeat emission and structured timeout handling, but it timed out
+   before Thor produced a plan, worker progress, or recap. What remains is a
+   real-provider smoke where Thor runs long enough to delegate work, mirror
+   worker progress, show heartbeat entries in the same transcript or stream the
+   user is watching, and produce a final recap. This item is open until that
+   successful smoke is recorded.
 1. **Registry-backed agent setup still needs richer install/configure metadata.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider
@@ -736,6 +745,36 @@ only when token spend is acceptable or when testing a deterministic mock ACP
 agent. Use the top-level `--agent-stderr <path>` before `acp-smoke` when a
 server exits before initialize and the JSON result needs subprocess stderr for
 diagnosis.
+
+### Thor headless runtime smoke — 2026-06-28
+
+Source: configured Thor host path using the local configured Anvil-backed
+agent. This was a real-provider headless Thor runtime run, not a no-token
+protocol-only ACP smoke.
+
+Launch:
+
+```text
+mj --output-format stream-json --permission-mode acceptEdits --print-timeout-seconds 45 --print "Thor runtime smoke. Do not modify files. Use the Thor tools to list configured ACP agents, submit a concise plan, delegate one read-only worker task if a usable worker is available, include an adversarial review step if practical, then recap what happened with any usage reported. Keep the final answer short."
+```
+
+Observed stream evidence:
+
+| Feature | Result |
+| --- | --- |
+| ACP host connection | `connected` stream record emitted |
+| session start | `session_started` stream record emitted with session `caed4053-f9e9-4eba-aa0b-63fca3264d72` |
+| host text | Anvil readiness message emitted |
+| elapsed heartbeat | `info` records emitted at 15s and 30s |
+| bounded failure | structured `error` and final `result` emitted: `headless prompt timed out after 45s` |
+| final recap | not reached |
+| worker progress | not observed before timeout |
+| usage reporting | not observed before timeout |
+
+Known gap: this proves the progress heartbeat and timeout surface for a real
+provider run, but it does not close the production-grade Thor runtime smoke
+requirement because Thor did not produce a plan, delegate work, mirror worker
+progress, or recap before the 45s timeout.
 
 ### `@agentclientprotocol/claude-agent-acp` 0.36.1 — 2026-05-20
 

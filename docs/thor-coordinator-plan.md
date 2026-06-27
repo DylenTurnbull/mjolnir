@@ -51,7 +51,8 @@ changed and how much each harness/model used.
 - Headless `--print --output-format stream-json` uses the same progress-enabled
   Thor MCP bridge and emits `info` records for worker progress and elapsed
   heartbeats, giving long-turn runtime smoke tests a repeatable non-TUI capture
-  path.
+  path. `--print-timeout-seconds` bounds those smoke runs and returns a
+  structured timeout error/result when the provider does not finish.
 - ACP session listings drop generic Thor/coordinator titles, and the in-app
   picker uses the locally known task title for the active session row when
   available.
@@ -146,10 +147,12 @@ changed and how much each harness/model used.
     Remaining: continue polishing the guided setup progression, replace
     remaining inferred setup labels with registry-provided exact commands/links
     where possible, manually smoke-test the setup UI across terminal sizes, and
-    run real long-turn Thor smoke covering sticky task-derived titles, sanitized
-    session-list titles, local, remote, and headless-stream heartbeats, worker
-    progress mirroring, transcript freshness in the UI or stream the user is
-    watching, and final recap.
+    run a successful real long-turn Thor smoke covering sticky task-derived
+    titles, sanitized session-list titles, local, remote, and headless-stream
+    heartbeats, worker progress mirroring, transcript freshness in the UI or
+    stream the user is watching, and final recap. A bounded Anvil-backed
+    headless smoke proved heartbeat and timeout output but timed out before
+    plan, delegation, worker progress, and recap.
 
 ## Quota reads
 

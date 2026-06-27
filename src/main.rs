@@ -83,6 +83,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = HeadlessPermissionMode::Default)]
     permission_mode: HeadlessPermissionMode,
 
+    /// Maximum seconds to wait for `--print` to finish.
+    #[arg(long, value_parser = parse_positive_u64)]
+    print_timeout_seconds: Option<u64>,
+
     /// Working directory used when opening a new session. Defaults to
     /// the current directory.
     #[arg(long)]
@@ -417,6 +421,7 @@ async fn main() -> Result<()> {
             fs_max_text_bytes,
             output_format: cli.output_format.into(),
             permission_mode: cli.permission_mode.into(),
+            timeout: cli.print_timeout_seconds.map(Duration::from_secs),
         })
         .await;
     }
@@ -2950,6 +2955,22 @@ mod tests {
         let cli = Cli::try_parse_from(["mj", "--print", "hi", "--resume-session", "sess-123"])
             .expect("parse");
         assert_eq!(cli.resume_session.as_deref(), Some("sess-123"));
+    }
+
+    #[test]
+    fn parse_accepts_print_timeout_seconds() {
+        let cli = Cli::try_parse_from(["mj", "--print", "hi", "--print-timeout-seconds", "45"])
+            .expect("parse");
+
+        assert_eq!(cli.print_timeout_seconds, Some(45));
+    }
+
+    #[test]
+    fn parse_rejects_zero_print_timeout() {
+        let err = Cli::try_parse_from(["mj", "--print", "hi", "--print-timeout-seconds", "0"])
+            .expect_err("reject zero timeout");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
