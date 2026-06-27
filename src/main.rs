@@ -204,7 +204,7 @@ struct ServerArgs {
 #[command(group(
     clap::ArgGroup::new("target")
         .required(true)
-        .args(["command", "configured_source_id", "all_configured"])
+        .args(["command", "configured_source_id", "all_configured", "list_configured"])
 ))]
 struct AcpSmokeArgs {
     /// ACP server launch command to validate, quoted as one shell-style string.
@@ -218,6 +218,10 @@ struct AcpSmokeArgs {
     /// Validate every persisted Thor ACP server.
     #[arg(long)]
     all_configured: bool,
+
+    /// List persisted Thor ACP servers that can be used with `--configured-source-id`.
+    #[arg(long)]
+    list_configured: bool,
 
     /// Label to write into the smoke result when using `--command`.
     #[arg(long, default_value = "acp-smoke")]
@@ -443,6 +447,9 @@ async fn main() -> Result<()> {
 }
 
 async fn run_acp_smoke(args: AcpSmokeArgs, default_cwd: PathBuf) -> Result<()> {
+    if args.list_configured {
+        return list_configured_acp_smoke_servers(args.format);
+    }
     let cwd = match args.cwd.as_ref() {
         Some(cwd) => absolutize_cwd(cwd.clone())?,
         None => default_cwd,
@@ -537,6 +544,51 @@ fn configured_acp_smoke_agents() -> Result<Vec<SelectedAgent>> {
     Ok(servers
         .iter()
         .map(ConfiguredAcpServer::selected_agent)
+        .collect())
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcpSmokeConfiguredServer {
+    source_id: String,
+    name: String,
+    command: String,
+    setup_hint: String,
+    setup_url: String,
+}
+
+fn list_configured_acp_smoke_servers(format: HeadlessOutputFormat) -> Result<()> {
+    let servers = configured_acp_smoke_server_records()?;
+    match format {
+        HeadlessOutputFormat::Json | HeadlessOutputFormat::StreamJson => {
+            println!("{}", serde_json::to_string_pretty(&servers)?);
+        }
+        HeadlessOutputFormat::Text => {
+            if servers.is_empty() {
+                println!("no Thor ACP servers are configured");
+            } else {
+                for server in servers {
+                    println!("{}\t{}\t{}", server.source_id, server.name, server.command);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn configured_acp_smoke_server_records() -> Result<Vec<AcpSmokeConfiguredServer>> {
+    let config_path = config::default_config_path();
+    let cfg =
+        Config::load(&config_path).with_context(|| format!("load {}", config_path.display()))?;
+    Ok(thor::configured_acp_servers(&cfg)
+        .iter()
+        .map(|server| AcpSmokeConfiguredServer {
+            source_id: server.source_id.clone(),
+            name: server.name.clone(),
+            command: selected_agent_command_label(&server.selected_agent()),
+            setup_hint: server.setup_hint.clone(),
+            setup_url: server.setup_url.clone(),
+        })
         .collect())
 }
 
@@ -2856,6 +2908,7 @@ mod tests {
                 );
                 assert!(args.configured_source_id.is_none());
                 assert!(!args.all_configured);
+                assert!(!args.list_configured);
                 assert_eq!(args.source_id, "example");
                 assert_eq!(args.cwd, Some(PathBuf::from("/tmp/agent-cwd")));
                 assert_eq!(args.timeout_seconds, 12);
@@ -2897,6 +2950,7 @@ mod tests {
                 assert!(args.command.is_none());
                 assert_eq!(args.configured_source_id.as_deref(), Some("opencode"));
                 assert!(!args.all_configured);
+                assert!(!args.list_configured);
                 assert!(matches!(args.format, HeadlessOutputFormat::Json));
             }
             _ => panic!("expected AcpSmoke subcommand"),
@@ -2913,6 +2967,24 @@ mod tests {
                 assert!(args.command.is_none());
                 assert!(args.configured_source_id.is_none());
                 assert!(args.all_configured);
+                assert!(!args.list_configured);
+                assert!(matches!(args.format, HeadlessOutputFormat::Json));
+            }
+            _ => panic!("expected AcpSmoke subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_acp_smoke_subcommand_with_list_configured() {
+        let cli = Cli::try_parse_from(["mj", "acp-smoke", "--list-configured", "--format", "json"])
+            .expect("parse");
+
+        match cli.command {
+            Some(Commands::AcpSmoke(args)) => {
+                assert!(args.command.is_none());
+                assert!(args.configured_source_id.is_none());
+                assert!(!args.all_configured);
+                assert!(args.list_configured);
                 assert!(matches!(args.format, HeadlessOutputFormat::Json));
             }
             _ => panic!("expected AcpSmoke subcommand"),
@@ -2936,6 +3008,7 @@ mod tests {
             "--configured-source-id",
             "opencode",
             "--all-configured",
+            "--list-configured",
         ])
         .expect_err("reject multiple targets");
 

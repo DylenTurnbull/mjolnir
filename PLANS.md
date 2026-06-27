@@ -255,8 +255,9 @@ Deliverables:
   --command "<agent acp command>"` or `mj acp-smoke --configured-source-id
   <id>` runs initialize plus `session/new`, prints text/json capability
   evidence, and exits non-zero if the agent is not usable. `mj acp-smoke
-  --all-configured` validates the whole persisted Thor worker set after
-  onboarding or config edits.
+  --list-configured` shows the persisted Thor source IDs, and
+  `mj acp-smoke --all-configured` validates the whole persisted Thor worker set
+  after onboarding or config edits.
 - Explore session rewind as an ACP extension paired with Anvil. The current
   proposal is documented in [docs/session-rewind-extension.md](docs/session-rewind-extension.md):
   model rewind as fork-from-checkpoint using `session/fork` `_meta`, not as
@@ -650,9 +651,10 @@ Update this table when re-running against newer versions or new agents.
 Use `mj acp-smoke --command "<agent acp command>" --source-id <name>` for new
 matrix entries when a full model turn is not needed. To verify the exact
 command/env Thor will use after onboarding, run `mj acp-smoke
---configured-source-id <id>` against the persisted Thor configured ACP server,
-or `mj acp-smoke --all-configured` to validate every persisted Thor worker in
-one pass. The smoke starts the ACP server, validates initialize plus
+--list-configured` to discover source IDs, then `mj acp-smoke
+--configured-source-id <id>` against a persisted Thor configured ACP server, or
+`mj acp-smoke --all-configured` to validate every persisted Thor worker in one
+pass. The smoke starts the ACP server, validates initialize plus
 `session/new`, records advertised capabilities, and shuts down without sending
 `session/prompt`. Add `--format json` when preserving machine-readable
 evidence.
