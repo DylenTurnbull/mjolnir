@@ -52,6 +52,9 @@ changed and how much each harness/model used.
   Thor MCP bridge and emits `info` records for worker progress and elapsed
   heartbeats, giving long-turn runtime smoke tests a repeatable non-TUI capture
   path.
+- ACP session listings drop generic Thor/coordinator titles, and the in-app
+  picker uses the locally known task title for the active session row when
+  available.
 - The MCP bridge is provided to the Thor host as an ACP `mcpServers` stdio
   entry that launches `mj thor-mcp`.
 - The final response includes a concise recap, validation, unresolved risks,
@@ -143,10 +146,10 @@ changed and how much each harness/model used.
     Remaining: continue polishing the guided setup progression, replace
     remaining inferred setup labels with registry-provided exact commands/links
     where possible, manually smoke-test the setup UI across terminal sizes, and
-    run real long-turn Thor smoke covering sticky task-derived titles, local,
-    remote, and headless-stream heartbeats, worker progress mirroring,
-    transcript freshness in the UI or stream the user is watching, and final
-    recap.
+    run real long-turn Thor smoke covering sticky task-derived titles, sanitized
+    session-list titles, local, remote, and headless-stream heartbeats, worker
+    progress mirroring, transcript freshness in the UI or stream the user is
+    watching, and final recap.
 
 ## Quota reads
 

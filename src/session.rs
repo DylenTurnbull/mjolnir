@@ -46,10 +46,44 @@ impl From<SessionInfo> for SessionEntry {
         Self {
             session_id: info.session_id.to_string(),
             cwd: info.cwd,
-            title: info.title,
+            title: sanitize_session_title(info.title),
             updated_at: info.updated_at,
         }
     }
+}
+
+fn sanitize_session_title(title: Option<String>) -> Option<String> {
+    let title = title?;
+    let trimmed = title.trim();
+    if trimmed.is_empty() || is_generic_thor_title(trimmed) {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn is_generic_thor_title(title: &str) -> bool {
+    let lower = title.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "thor"
+            | "thor session"
+            | "new thor session"
+            | "thor task"
+            | "new thor task"
+            | "thor coordinator"
+            | "mjolnir thor"
+            | "thor omni-agent coordinator"
+            | "thor omni agent coordinator"
+    ) || lower.starts_with("thor:")
+        || lower.starts_with("thor -")
+        || lower.starts_with("thor session ")
+        || lower.starts_with("new thor session ")
+        || lower.starts_with("mjolnir thor ")
+        || (lower.contains("thor")
+            && (lower.contains("coordinator")
+                || lower.contains("omni-agent")
+                || lower.contains("omni agent")))
 }
 
 /// Serializable session info for `mj resume --list --format json`.
@@ -715,6 +749,26 @@ mod tests {
                 updated_at: None,
             },
         ]
+    }
+
+    #[test]
+    fn session_entry_drops_generic_thor_titles() {
+        let entry = SessionEntry {
+            session_id: "sess-1".into(),
+            cwd: PathBuf::from("/tmp/project"),
+            title: sanitize_session_title(Some("Thor omni-agent coordinator".to_string())),
+            updated_at: None,
+        };
+
+        assert_eq!(entry.title, None);
+    }
+
+    #[test]
+    fn session_entry_keeps_real_titles_trimmed() {
+        assert_eq!(
+            sanitize_session_title(Some("  Fix payment flow  ".to_string())).as_deref(),
+            Some("Fix payment flow")
+        );
     }
 
     #[test]

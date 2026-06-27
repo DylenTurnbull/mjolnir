@@ -1546,7 +1546,13 @@ async fn run_session_picker_action_for_agent(
     loop {
         let listing =
             session::list_sessions_with_capabilities(agent, cwd.clone(), agent_stderr).await?;
-        if listing.sessions.is_empty() {
+        let mut sessions = listing.sessions;
+        apply_current_session_title_override(
+            &mut sessions,
+            current_session_id.as_deref(),
+            current_session_title.as_deref(),
+        );
+        if sessions.is_empty() {
             return Ok(session_picker_empty_action(
                 current_session_id,
                 current_session_title,
@@ -1558,8 +1564,7 @@ async fn run_session_picker_action_for_agent(
             current_session_id.as_deref(),
         );
         let outcome =
-            run_session_picker_once(listing.sessions, delete_supported, notice.take(), theme)
-                .await?;
+            run_session_picker_once(sessions, delete_supported, notice.take(), theme).await?;
         if let session::ResumeOutcome::DeleteRequested(entry) = outcome {
             if current_session_id.as_deref() == Some(entry.session_id.as_str()) {
                 notice = Some(
@@ -1573,6 +1578,28 @@ async fn run_session_picker_action_for_agent(
         }
 
         return session_picker_action(outcome, current_session_id, current_session_title);
+    }
+}
+
+fn apply_current_session_title_override(
+    sessions: &mut [session::SessionEntry],
+    current_session_id: Option<&str>,
+    current_session_title: Option<&str>,
+) {
+    let (Some(current_session_id), Some(current_session_title)) =
+        (current_session_id, current_session_title)
+    else {
+        return;
+    };
+    let title = current_session_title.trim();
+    if title.is_empty() {
+        return;
+    }
+    for entry in sessions {
+        if entry.session_id == current_session_id {
+            entry.title = Some(title.to_string());
+            break;
+        }
     }
 }
 
@@ -3471,6 +3498,33 @@ mod tests {
                 title: Some("My selected session".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn current_session_title_override_updates_matching_picker_entry() {
+        let mut sessions = vec![
+            session::SessionEntry {
+                session_id: "current-session".into(),
+                cwd: PathBuf::from("/tmp/project"),
+                title: None,
+                updated_at: None,
+            },
+            session::SessionEntry {
+                session_id: "other-session".into(),
+                cwd: PathBuf::from("/tmp/project"),
+                title: Some("Other".to_string()),
+                updated_at: None,
+            },
+        ];
+
+        apply_current_session_title_override(
+            &mut sessions,
+            Some("current-session"),
+            Some("Fix session naming"),
+        );
+
+        assert_eq!(sessions[0].title.as_deref(), Some("Fix session naming"));
+        assert_eq!(sessions[1].title.as_deref(), Some("Other"));
     }
 
     #[test]

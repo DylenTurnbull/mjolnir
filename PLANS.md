@@ -152,6 +152,11 @@ worker progress and elapsed heartbeats. This gives long-turn Thor smoke tests a
 repeatable non-TUI surface, but it still needs to be exercised against a real
 configured provider turn before closing the runtime validation gap.
 
+Session listing also strips generic Thor/coordinator titles reported by ACP
+hosts and uses the locally known task title for the active session row, so the
+session picker no longer reinforces host-saved "Thor session" placeholders when
+the user opens `/load` during a task.
+
 Initial routing policy:
 
 - Thor supports balanced, cost/accountant, and best-solution/architect
@@ -581,6 +586,10 @@ Fixed in this PR:
   names a session from the first real task when the current name is blank, a
   raw session id, or a generic Thor title, and ignores later generic Thor host
   titles and host renames after a task name exists.
+- [x] Fixed session-list title display for generic Thor host names: ACP session
+  listings now drop generic Thor/coordinator titles, and the in-app session
+  picker overrides the active session row with the locally known user-task
+  title.
 - [x] Added an immediate user-visible Thor planning status when the first task
   is sent, and tightened the Thor host prompt so it must emit concise progress
   updates around long-running fact gathering and implementation/review/correction
@@ -646,15 +655,15 @@ Still not production-grade:
    Live use found generic Thor session naming and a transcript that appeared
    frozen for several minutes. Current code now keeps user-task titles sticky,
    rejects broader Thor/coordinator host titles locally and in the
-   remote/browser transcript, records a UI-state fallback heartbeat during
-   active local turns, keeps the remote-control heartbeat, mirrors Thor MCP
-   worker progress, and exposes the same progress stream through headless
-   `--print --output-format stream-json` for repeatable smoke capture.
-   Deterministic tests cover those local/remote/headless plumbing paths. What
-   remains is a real-provider smoke where Thor runs long enough to delegate
-   work, mirror worker progress, show heartbeat entries in the same transcript
-   or stream the user is watching, and produce a final recap. This item is open
-   until that smoke is recorded.
+   remote/browser transcript and session lists, records a UI-state fallback
+   heartbeat during active local turns, keeps the remote-control heartbeat,
+   mirrors Thor MCP worker progress, and exposes the same progress stream
+   through headless `--print --output-format stream-json` for repeatable smoke
+   capture. Deterministic tests cover those local/remote/headless/listing
+   plumbing paths. What remains is a real-provider smoke where Thor runs long
+   enough to delegate work, mirror worker progress, show heartbeat entries in
+   the same transcript or stream the user is watching, and produce a final
+   recap. This item is open until that smoke is recorded.
 1. **Registry-backed agent setup still needs richer install/configure metadata.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider
