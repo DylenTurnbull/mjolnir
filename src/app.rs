@@ -1070,6 +1070,9 @@ impl AppState {
         if sanitized.is_empty() {
             return false;
         }
+        if self.session_title.is_some() && is_generic_thor_title(&sanitized) {
+            return false;
+        }
         self.session_title = Some(sanitized);
         true
     }
@@ -1891,6 +1894,15 @@ fn status_transcript_text(kind: StatusKind, text: &str) -> String {
     }
 }
 
+fn is_generic_thor_title(title: &str) -> bool {
+    let lower = title.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "thor" | "thor session" | "new thor session" | "thor task" | "new thor task"
+    ) || lower.starts_with("thor:")
+        || lower.starts_with("thor -")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1920,6 +1932,25 @@ mod tests {
             Entry::AgentMessage(s) => assert_eq!(s, "hello world"),
             other => panic!("unexpected entry: {other:?}"),
         }
+    }
+
+    #[test]
+    fn generic_thor_title_does_not_replace_task_title() {
+        let mut s = AppState::new();
+
+        assert!(s.set_session_title("Fix flaky parser test"));
+        assert!(!s.set_session_title("Thor session"));
+
+        assert_eq!(s.session_title.as_deref(), Some("Fix flaky parser test"));
+    }
+
+    #[test]
+    fn generic_thor_title_is_used_when_no_title_exists() {
+        let mut s = AppState::new();
+
+        assert!(s.set_session_title("Thor session"));
+
+        assert_eq!(s.session_title.as_deref(), Some("Thor session"));
     }
 
     #[test]

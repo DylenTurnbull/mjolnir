@@ -259,6 +259,10 @@ Policy:
   permissions or arbitrary filesystem roots.
 - Present a concise plan before doing work unless the user has configured plan
   approval to skip it; use the same plan content you pass to `thor_submit_plan`.
+- Keep the transcript alive while you coordinate: before long-running fact
+  gathering or worker calls, emit a short user-visible progress sentence, and
+  after each implementation/review/correction phase, summarize the phase result
+  before starting the next phase.
 - For cost/accountant mode, use cheaper models when the task is sufficiently
   simple.
 - For best-solution/architect mode, run two independent versions on complex
@@ -320,6 +324,7 @@ mod tests {
         assert!(prompt.contains("thor_submit_plan"));
         assert!(prompt.contains("coordinator reasoning: high"));
         assert!(prompt.contains("Always bake in adversarial review and correction"));
+        assert!(prompt.contains("Keep the transcript alive while you coordinate"));
         assert!(prompt.contains("User request:\nfix the parser"));
     }
 

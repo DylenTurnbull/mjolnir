@@ -51,24 +51,19 @@ default automatically when the platform config file has no `agent` block
 (`~/.config/mj/config.toml` on Linux,
 `~/Library/Application Support/mj/config.toml` on macOS, or
 `%APPDATA%\mj\config.toml` on Windows).
-First run asks the user to choose where Thor runs, then starts with sane Thor
-defaults for work style, model preference, and reasoning level. Configured
-agents that validate successfully are made available to Thor automatically and
-written to visible `[thor]` configuration. The previous agent picker is no
-longer part of the normal user path.
+First run is a Thor setup flow: the user chooses work style
+(`Architect`/`Accountant`), chooses which validated agents Thor may use, chooses
+which ready agent hosts Thor, and can add a known registry-backed agent or a
+custom command without editing TOML. Model preference and reasoning level stay
+automatic during onboarding. The previous agent/model picker is no longer part
+of the normal user path.
 
-The remaining startup gap is onboarding quality. This is the top release
-blocker, not polish. The current first-run process is still too confusing for
-end users: it feels like a developer validation screen instead of a guided
-Thor setup wizard, and it still expects the user to understand too much about
-ACP commands, installed programs, auth state, and recovery after failed checks.
-It now avoids the old model/agent picker, validates candidates, lets a user add
-a custom ACP command or registry-backed ACP server from setup, and reruns
-validation before Thor uses the agent. That is necessary infrastructure, but it
-is not enough. Production-grade onboarding means the user can understand what
-Thor needs, see which agents are ready, fix missing setup through clear actions,
-choose Thor's host/work style, and enter the chat without feeling exposed to
-internal routing machinery.
+The remaining startup gap is not the old picker; it is production-grade
+recovery and validation. The setup flow is now simpler, but failed provider rows
+still rely on partly inferred install/auth guidance when the registry lacks
+exact metadata. Before v1, the flow still needs real-provider recovery testing
+and broader terminal-size smoke so users are not left guessing how to install,
+sign in, or retry.
 
 M1 hardening landed (PR #34): an explicit `ConnectionState` lifecycle drives
 the header label, a `LaunchError` enum surfaces spawn / initialize /
@@ -128,6 +123,12 @@ reads through Claude Code `/usage` and Codex appserver
 single-worker delegation, and
 concurrent multi-worker delegation with structured progress and aggregate
 usage.
+
+The interactive Thor runtime now sets the session title from the user's raw task
+before wrapping it in the Thor coordinator prompt, ignores later generic Thor
+host titles when a task title already exists, and immediately records a visible
+`Thor is planning...` status line so the transcript does not sit silent while
+the host gathers facts.
 
 Initial routing policy:
 
@@ -527,6 +528,14 @@ Fixed in this PR:
   the 80-column terminal size used by the PTY smoke, and pressing Enter advances
   to the agent step where the no-ready-agent path defaults to `Add custom
   command` while keeping Anvil install guidance visible.
+- [x] Fixed the interactive Thor runtime title path: the session title now comes
+  from the user's raw task before `mj` wraps it in the Thor coordinator prompt,
+  and later generic Thor host titles no longer overwrite an existing task
+  title.
+- [x] Added an immediate user-visible Thor planning status when the first task
+  is sent, and tightened the Thor host prompt so it must emit concise progress
+  updates around long-running fact gathering and implementation/review/correction
+  phases.
 
 Still not production-grade:
 

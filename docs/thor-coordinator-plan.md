@@ -31,6 +31,8 @@ changed and how much each harness/model used.
   way for a user to reach a usable Thor host without editing TOML by hand.
 - The normal prompt flow has no visible model picker or agent picker.
 - Thor presents an execution plan before doing work.
+- Thor keeps the transcript alive with short visible progress updates while it
+  gathers facts and runs implementation/review/correction phases.
 - The MCP bridge is provided to the Thor host as an ACP `mcpServers` stdio
   entry that launches `mj thor-mcp`.
 - The final response includes a concise recap, validation, unresolved risks,

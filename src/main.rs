@@ -47,7 +47,7 @@ use crate::config::{
     Config, ConfiguredAcpServer, SelectedAgent, ThorQuotaBackend, history_path,
     transcript_export_dir,
 };
-use crate::event::{LoadSessionResult, UiCommand};
+use crate::event::{LoadSessionResult, UiCommand, UiEvent};
 use crate::session::SessionEntryJson;
 use crate::ui::{HeaderLabels, UiMode};
 use crate::worktree::CreatedWorktree;
@@ -1436,6 +1436,7 @@ async fn run_session(
     );
 
     let event_tracker = remote_tracker.clone();
+    let ui_event_tx_for_events = ui_event_tx.clone();
     let event_proxy = tokio::spawn(async move {
         let mut runtime_event_rx = runtime_event_rx;
         while let Some(event) = runtime_event_rx.recv().await {
@@ -1444,7 +1445,7 @@ async fn run_session(
             // the pending request.
             let event = event_tracker.intercept_event(event);
             event_tracker.observe_event(&event);
-            if ui_event_tx.send(event).is_err() {
+            if ui_event_tx_for_events.send(event).is_err() {
                 break;
             }
         }
@@ -1461,6 +1462,15 @@ async fn run_session(
                         text
                     } else {
                         sent_thor_preamble = true;
+                        let _ = ui_event_tx.send(UiEvent::SessionUpdate(
+                            agent_client_protocol::schema::v1::SessionUpdate::SessionInfoUpdate(
+                                agent_client_protocol::schema::v1::SessionInfoUpdate::new()
+                                    .title(thor_task_title(&text)),
+                            ),
+                        ));
+                        let _ = ui_event_tx.send(UiEvent::Info(
+                            "Thor is planning and checking available agents...".to_string(),
+                        ));
                         thor::host_prompt(&thor_config, &text)
                     };
                     UiCommand::SendPrompt { text, images }
@@ -1628,6 +1638,26 @@ async fn run_session(
     ui_result
 }
 
+fn thor_task_title(prompt: &str) -> String {
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = collapsed
+        .trim()
+        .trim_matches(|ch: char| ch == '"' || ch == '\'')
+        .to_string();
+    if title.is_empty() {
+        return "New Thor task".to_string();
+    }
+
+    const MAX_TITLE_CHARS: usize = 80;
+    let mut chars = title.chars();
+    let truncated = chars.by_ref().take(MAX_TITLE_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
 fn setup_session_terminal(
     mode: UiMode,
 ) -> Result<ratatui::Terminal<crate::term::TrackedBackend<std::io::Stdout>>> {
@@ -1780,6 +1810,25 @@ mod tests {
     fn project_label_uses_full_directory_path_without_worktree() {
         let cwd = std::path::Path::new("/Users/ryan/code/mjolnir/src");
         assert_eq!(project_label(cwd), paths::display_path_with_tilde(cwd));
+    }
+
+    #[test]
+    fn thor_task_title_uses_user_prompt_not_thor_preamble() {
+        assert_eq!(
+            thor_task_title("  \"Fix the parser failure\"  "),
+            "Fix the parser failure"
+        );
+        assert_eq!(thor_task_title("\n\n"), "New Thor task");
+    }
+
+    #[test]
+    fn thor_task_title_truncates_long_prompts() {
+        let title = thor_task_title(
+            "This is a very long user request that should not consume the entire header because headers need room for project state too",
+        );
+
+        assert!(title.ends_with("..."));
+        assert!(title.chars().count() <= 83);
     }
 
     #[test]
