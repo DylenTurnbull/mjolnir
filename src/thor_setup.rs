@@ -510,7 +510,7 @@ fn intro_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static
     let failed_count = state.agents.len().saturating_sub(ready_count);
     let status = if ready_count == 0 {
         Span::styled(
-            "No agent is ready yet. Add one, fix install/sign-in, then retry checks.",
+            "No agent is ready. Add one, fix setup, then retry checks.",
             Style::default().fg(theme.warning),
         )
     } else if failed_count == 0 {
@@ -972,9 +972,19 @@ fn setup_agent_description(setup_agent: &ThorSetupAgent) -> String {
     }
 }
 
-fn setup_url_label(setup_agent: &ThorSetupAgent) -> Option<String> {
+fn compact_setup_url_label(setup_agent: &ThorSetupAgent) -> Option<String> {
     let url = setup_agent.setup_url.trim();
-    (!url.is_empty()).then(|| url.to_string())
+    if url.is_empty() {
+        return None;
+    }
+    let compact = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .or_else(|| url.strip_prefix("https://"))
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    Some(truncate_label(compact, 28))
 }
 
 fn setup_agent_is_usable(setup_agent: &ThorSetupAgent) -> bool {
@@ -1045,10 +1055,10 @@ fn validation_detail_label(setup_agent: &ThorSetupAgent, validation: &AgentValid
 }
 
 fn with_setup_url(detail: String, setup_agent: &ThorSetupAgent) -> String {
-    let Some(url) = setup_url_label(setup_agent) else {
+    let Some(url) = compact_setup_url_label(setup_agent) else {
         return detail;
     };
-    truncate_label(&format!("{detail}; docs: {url}"), 96)
+    truncate_label(&format!("{detail}; docs: {url}"), 64)
 }
 
 fn install_action_label(setup_agent: &ThorSetupAgent) -> String {
@@ -1066,14 +1076,11 @@ fn install_action_label(setup_agent: &ThorSetupAgent) -> String {
 
 fn install_detail_label(setup_agent: &ThorSetupAgent) -> String {
     match setup_agent.agent.source_id.as_str() {
-        "anvil" => "Install uv; Thor starts Anvil with `uvx brokk acp`".to_string(),
+        "anvil" => "Install uv; `uvx brokk acp`".to_string(),
         "claude-acp" => {
-            "Install Node.js/npm and Claude Code; setup starts `npx ... claude-agent-acp`"
-                .to_string()
+            "Install Node.js/npm and Claude Code; runs `npx ... claude-agent-acp`".to_string()
         }
-        "codex-acp" => {
-            "Install Node.js/npm and Codex; setup starts `npx ... codex-acp`".to_string()
-        }
+        "codex-acp" => "Install Node.js/npm and Codex; runs `npx ... codex-acp`".to_string(),
         _ => match setup_agent.agent.program.to_string_lossy().as_ref() {
             "npx" => "Install Node.js/npm, then retry this ACP server".to_string(),
             "uvx" => "Install uv, then retry this ACP server".to_string(),
@@ -1354,7 +1361,7 @@ mod tests {
         assert_eq!(host_status_label(&setup_agent), "install Node.js and Codex");
         assert_eq!(
             setup_agent_description(&setup_agent),
-            "Install Node.js/npm and Codex; setup starts `npx ... codex-acp`"
+            "Install Node.js/npm and Codex; runs `npx ... codex-acp`"
         );
     }
 
@@ -1366,7 +1373,18 @@ mod tests {
         assert_eq!(host_status_label(&setup_agent), "install uv");
         assert_eq!(
             setup_agent_description(&setup_agent),
-            "Install uv; Thor starts Anvil with `uvx brokk acp`"
+            "Install uv; `uvx brokk acp`"
+        );
+    }
+
+    #[test]
+    fn setup_docs_urls_are_compacted_for_rows() {
+        let mut setup_agent = setup_agent_with_validation("anvil", false);
+        setup_agent.setup_url = "https://github.com/BrokkAi/brokk".to_string();
+
+        assert_eq!(
+            compact_setup_url_label(&setup_agent).as_deref(),
+            Some("BrokkAi/brokk")
         );
     }
 

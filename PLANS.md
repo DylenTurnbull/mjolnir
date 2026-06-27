@@ -440,6 +440,12 @@ Fixed in this PR:
 - [x] Show inferred install/auth expectations for registry rows before adding
   them, such as Node.js/npm, uv, Claude Code sign-in, Codex sign-in, Gemini CLI
   auth, OpenCode config, Cursor auth, or GitHub Copilot auth when known.
+- [x] Manually smoke-tested the 80-column no-working-agent first-run path with a
+  temporary home and stripped `PATH`:
+  `HOME=/tmp/mj-thor-smoke-home-4 XDG_CONFIG_HOME=/tmp/mj-thor-smoke-home-4/config XDG_CACHE_HOME=/tmp/mj-thor-smoke-home-4/cache PATH=/usr/bin:/bin target/debug/mj --cwd .`.
+  Verified the rebuilt binary opens the new `Set up Thor` flow, not the old
+  worker/model picker; shows no-ready guidance; defaults to `Add ACP command`;
+  keeps `Retry checks` visible; and exits cleanly with Esc.
 
 Still not production-grade:
 
@@ -455,10 +461,12 @@ Still not production-grade:
 3. **The guided setup path still needs a full end-to-end polish pass.** The
    first screen now has a readiness summary and retry action, but the setup flow
    still needs manual tuning for copy, action ordering, and failure recovery
-   across real terminal sizes.
-4. **The setup UI has not been manually smoke-tested in multiple terminal sizes.**
+   across more real terminal sizes and success/failure combinations.
+4. **The setup UI has only been manually smoked for one terminal scenario.**
    Unit tests cover state transitions, list windowing, and small/large render
-   output; visual polish still needs an interactive pass.
+   output; manual smoke now covers the no-working-agent 80-column path, but
+   still needs at least one successful configured agent and one registry-add
+   flow.
 
 ## Risks and open questions
 
