@@ -1010,7 +1010,7 @@ fn summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'stat
 }
 
 fn default_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static>> {
-    vec![
+    let mut lines = vec![
         detail_line(
             "Work style",
             persona_summary(state.optimization_mode),
@@ -1018,7 +1018,14 @@ fn default_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Li
         ),
         detail_line("Agents Thor may use", worker_summary(state), theme),
         detail_line("Run Thor in", host_summary(state), theme),
-    ]
+    ];
+    if let Some(notice) = state.notice.as_ref() {
+        lines.push(Line::from(Span::styled(
+            notice.clone(),
+            Style::default().fg(theme.warning),
+        )));
+    }
+    lines
 }
 
 fn registry_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static>> {
@@ -1836,6 +1843,32 @@ mod tests {
 
         assert_eq!(state.enabled_source_ids(), vec!["claude"]);
         assert_eq!(worker_summary(&state), "claude");
+    }
+
+    #[test]
+    fn last_ready_agent_notice_is_visible() {
+        let raw_agents = vec![agent("claude")];
+        let agents = setup_agents(&raw_agents);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &raw_agents[0]);
+        state.set_step(SetupStep::Host);
+
+        handle_event(
+            &mut state,
+            CtEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+        );
+
+        let summary = summary_lines(&state, crate::theme::TerminalThemeKind::Dark.palette());
+        let rendered = summary
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Thor needs at least one ready agent."));
     }
 
     #[test]
