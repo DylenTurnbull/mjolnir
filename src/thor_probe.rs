@@ -827,16 +827,8 @@ mod tests {
         std::fs::write(
             &codex,
             r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*)
-      printf '%s\n' '{"id":1,"result":{"ok":true}}'
-      ;;
-    *'"method":"account/rateLimits/read"'*)
-      printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":null,"primary":{"usedPercent":5,"windowDurationMins":300,"resetsAt":1800000002},"secondary":{"usedPercent":25,"windowDurationMins":10080,"resetsAt":1800000003},"credits":null,"individualLimit":null,"planType":"pro","rateLimitReachedType":null},"rateLimitsByLimitId":null,"rateLimitResetCredits":null}}'
-      ;;
-  esac
-done
+printf '%s\n' '{"id":1,"result":{"ok":true}}'
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":null,"primary":{"usedPercent":5,"windowDurationMins":300,"resetsAt":1800000002},"secondary":{"usedPercent":25,"windowDurationMins":10080,"resetsAt":1800000003},"credits":null,"individualLimit":null,"planType":"pro","rateLimitReachedType":null},"rateLimitsByLimitId":null,"rateLimitResetCredits":null}}'
 "#,
         )
         .expect("write fake codex");
