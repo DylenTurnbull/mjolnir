@@ -324,6 +324,89 @@ Later:
 - Terminal capability support.
 - Multiple sessions.
 
+## Onboarding (Thor first-run) issues
+
+Tracked from review of PR #243 (`codex/thor-orchestrator`, "thor onboarding").
+The first-run Thor setup screen (`src/thor_setup.rs`) needs an end-user-quality
+pass before it ships. All four are blockers for a usable first launch; line
+references are against the PR branch.
+
+1. **Setup copy is written for implementers, not end users.** The screen leads
+   with internal framing and unexplained jargon and never explains what Thor is
+   or why the user is choosing anything: the headline "Thor is the only prompt
+   path." (`thor_setup.rs:434`), step labels "select workers" / "pick Thor host"
+   / "pick Thor model" (`thor_setup.rs:52-55`), persona names "accountant" /
+   "architect" (`thor_setup.rs:701-703`), and inline tags like `quota: claude` /
+   `quota: codex` / `quota: none` plus validation labels
+   (`thor_setup.rs:531-537, 735-737`). A first-time user has no idea what a
+   "worker", "host", or "coordinator model" is. Fix: rewrite the copy to explain
+   the feature and each choice in plain language; define or remove every internal
+   term.
+
+2. **"Thor is the only prompt path." is bad headline copy.** This is the bold
+   title of the entire onboarding screen (`thor_setup.rs:434`). It reads as an
+   internal architecture statement — confusing and faintly ominous — not a
+   welcome. Fix: replace with copy that says what the screen is for and that the
+   choices can be changed later.
+
+3. **Setup selection lists don't scroll.** Reported: the ACP agent picker during
+   onboarding can't reach items past the fold. Grounding: the setup steps render
+   their rows with a plain `List::new(content)` into a fixed `Constraint::Min(10)`
+   region (`thor_setup.rs:426, 454`) with no scroll viewport / `ListState` offset
+   — unlike the standalone agent picker in `src/picker.rs`, which windows around
+   the selection (`picker.rs:1103-1110`). When configured agents/hosts/models
+   exceed the visible rows, the lower entries are unreachable. Fix: give the
+   setup lists the same selection-following scroll window the main picker has (or
+   reuse it).
+
+4. **Onboarding window is tiny / not responsive.** The setup window is a fixed
+   80×24 box regardless of terminal size: `centered_rect(f.area(), 80, 24)`
+   (`thor_setup.rs:413`) passes absolute cell dimensions, so it never grows to
+   use the available terminal. Combined with #3 this makes longer lists
+   unusable. Fix: size the window responsively (a percentage of `f.area()` with
+   sane min/max bounds), which also relieves the scroll pressure.
+
+5. **Onboarding validates agents that aren't installed.** The candidate list is
+   seeded from the *entire* ACP registry index, not the user's installed agents:
+   `thor_onboarding_servers` (`main.rs:981`) merges `registry.configured_servers()`
+   into the list, then `validate_agents` (`main.rs:896` → `thor_probe::validate_agent`,
+   `thor_probe.rs:102`) spawns/probes every entry via `acp::run`. Agents the user
+   never installed fail the probe and render as `unavailable: <reason>` rows
+   (`thor_setup.rs:765-771`). This wastes startup time spawning doomed
+   processes and confronts a first-time user with a wall of "unavailable"
+   agents they never asked about. Fix: only consider installed/configured agents
+   as candidates; don't probe registry entries that aren't present.
+
+6. **The "worker" concept is unnecessary for end users.** Every installed ACP
+   agent is de-facto a worker, so the "select workers" toggle step
+   (`thor_setup.rs:52`, `SetupStep::Workers` / `worker_rows`) makes users
+   curate a list that — thanks to #5 — is mostly uninstalled registry agents.
+   Fix: drop the "worker" concept from the onboarding UX entirely. Treat all
+   installed agents as available to Thor, and replace the step with plain
+   guidance like "install the agents you want Thor to use" (after Thor itself is
+   actually explained — see #1). The toggle step is redundant.
+
+7. **No explanation of what a "persona" is.** The persona step is labelled "pick
+   persona" (`thor_setup.rs:53`) and lists "Architect" / "Accountant" with
+   one-line descriptions (`persona_rows`, `thor_setup.rs:547-560`), but never
+   tells the user what a persona is or that it sets Thor's optimization strategy
+   (best-solution vs. cost). Fix: add a plain-language sentence explaining the
+   concept and what changes when you pick one.
+
+8. **Overarching: onboarding mirrors the implementation, not user intent.**
+   Issues #1, #5, and #6 share a root cause — the first-run flow exposes the
+   internal model (registry-seeded candidate set, "workers", "personas",
+   "hosts", quota backends, validation states) directly as the user's mental
+   model, across six steps (`SetupStep::{Workers, Persona, Host, Model,
+   Reasoning, Confirm}`). Rewording strings (#1, #2, #7) is necessary but not
+   sufficient. The deeper fix is to decide what a user actually needs to choose
+   on first run and collapse the rest into sane defaults with an
+   advanced/settings path: plausibly just (a) explain what Thor is, (b) point
+   them at installing the agents they want available, and (c) pick a coordinator
+   model — then start. Persona, host, reasoning, and worker-toggle likely become
+   defaults the user can revisit later, not first-run gates. Treat #1–#7 as the
+   concrete defects and this as the design direction that should shape the fix.
+
 ## Risks and open questions
 
 1. **How agent-agnostic should the UI stay?** Brokk-specific affordances can make
