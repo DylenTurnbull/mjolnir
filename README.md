@@ -23,7 +23,9 @@ work to configured ACP harnesses. Today `mj` defaults to the `anvil` ACP
 backend (`uvx brokk acp`) as the first Thor host. `mj` injects a local MCP
 bridge into that host session so Thor can discover and run worker ACP agents.
 On first run, `mj` shows the Thor coordinator configuration before starting a
-session and writes a visible `[thor]` section to `~/.config/mj/config.toml`.
+session and writes a visible `[thor]` section to the platform config file
+(`~/.config/mj/config.toml` on Linux, `~/Library/Application Support/mj/config.toml`
+on macOS).
 
 ![Mjolnir inline chat showing streaming agent output and tool activity](docs/readme-images/default-ui.png)
 
@@ -47,7 +49,7 @@ mj
 ```
 
 The default `anvil` backend runs `uvx brokk acp`, so `uvx` must be available on
-`PATH` unless you configure a different backend in `~/.config/mj/config.toml`.
+`PATH` unless you configure a different backend in the platform config file.
 
 ## Quick Start
 
@@ -68,7 +70,9 @@ save it to config, and validate it before Thor uses it.
 ```
 
 Thor preferences, configured ACP servers, and quota backend metadata are stored in
-`~/.config/mj/config.toml`.
+the platform config file: usually `~/.config/mj/config.toml` on Linux,
+`~/Library/Application Support/mj/config.toml` on macOS, and
+`%APPDATA%\mj\config.toml` on Windows.
 
 Use `/new` inside the TUI to start a fresh Thor session with the configured
 backend. Use `/load` to open the session picker for the current backend.
@@ -276,8 +280,10 @@ Keyboard basics:
 
 On-disk files:
 
-- `~/.config/mj/config.toml`: Thor preferences and the configured backend
-  (program + args + env).
+- platform config file: Thor preferences and the configured backend
+  (program + args + env). Common paths are `~/.config/mj/config.toml` on Linux,
+  `~/Library/Application Support/mj/config.toml` on macOS, and
+  `%APPDATA%\mj\config.toml` on Windows.
 - `<project>/.mjolnir/worktrees/`: linked Git worktrees created by
   `mj --worktree`.
 

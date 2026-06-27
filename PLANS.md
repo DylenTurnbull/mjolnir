@@ -47,7 +47,10 @@ Current command-line surface:
 - `mj --agent-stderr /path/to/agent.err` for child-process stderr.
 
 There is no `--command` / `--agent` flag. Startup creates an `anvil` backend
-default automatically when `~/.config/mj/config.toml` has no `agent` block.
+default automatically when the platform config file has no `agent` block
+(`~/.config/mj/config.toml` on Linux,
+`~/Library/Application Support/mj/config.toml` on macOS, or
+`%APPDATA%\mj\config.toml` on Windows).
 First run asks the user to choose where Thor runs, then starts with sane Thor
 defaults for work style, model preference, and reasoning level. Configured
 agents that validate successfully are made available to Thor automatically and
@@ -459,6 +462,9 @@ Fixed in this PR:
   shows `Will add`, `Runs`, and `Setup` as separate lines before anything is
   persisted; while adding a custom command it states that `mj` will validate the
   command before Thor uses it.
+- [x] Corrected config-path docs to describe the actual platform config
+  directory. The macOS path is `~/Library/Application Support/mj/config.toml`,
+  not `~/.config/mj/config.toml`.
 - [x] Manually smoke-tested the 80-column no-working-agent first-run path with a
   temporary home and stripped `PATH`:
   `HOME=/tmp/mj-thor-smoke-home-4 XDG_CONFIG_HOME=/tmp/mj-thor-smoke-home-4/config XDG_CACHE_HOME=/tmp/mj-thor-smoke-home-4/cache PATH=/usr/bin:/bin target/debug/mj --cwd .`.

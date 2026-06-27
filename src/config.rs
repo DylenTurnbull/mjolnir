@@ -1,7 +1,8 @@
 //! Persistent user config for `mj`.
 //!
-//! Stores the default launch command and global picker preferences. Lives at
-//! `~/.config/mj/config.toml`.
+//! Stores the default launch command and global picker preferences under the
+//! platform config directory (`~/.config/mj/config.toml` on Linux,
+//! `~/Library/Application Support/mj/config.toml` on macOS).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -176,8 +177,10 @@ impl Config {
     }
 }
 
-/// Default config path: `$XDG_CONFIG_HOME/mj/config.toml` (or
-/// `~/.config/mj/config.toml` when `XDG_CONFIG_HOME` is unset).
+/// Default config path under the platform config directory: usually
+/// `$XDG_CONFIG_HOME/mj/config.toml` on Linux,
+/// `~/Library/Application Support/mj/config.toml` on macOS, and
+/// `%APPDATA%\mj\config.toml` on Windows.
 pub fn default_config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from(".config"))
@@ -185,14 +188,14 @@ pub fn default_config_path() -> PathBuf {
         .join("config.toml")
 }
 
-/// Directory for exported conversation transcripts:
-/// `$XDG_CONFIG_HOME/mj/transcripts`.
+/// Directory for exported conversation transcripts under the platform config
+/// directory.
 pub fn transcript_export_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join("mj").join("transcripts"))
 }
 
 /// Path for the persisted prompt-history file (NUL-delimited format to
-/// support multiline prompts): `$XDG_CONFIG_HOME/mj/history.txt`.
+/// support multiline prompts) under the platform config directory.
 pub fn history_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from(".config"))
