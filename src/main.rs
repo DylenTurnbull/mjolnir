@@ -1047,6 +1047,9 @@ fn selected_agent_command_label(agent: &SelectedAgent) -> String {
 }
 
 fn registry_setup_hint(server: &ConfiguredAcpServer) -> String {
+    if !server.setup_hint.trim().is_empty() {
+        return server.setup_hint.clone();
+    }
     if let Some(hint) = known_registry_setup_hint(server) {
         return hint.to_string();
     }
@@ -1120,6 +1123,7 @@ async fn thor_onboarding_servers(cfg: &Config) -> Vec<ConfiguredAcpServer> {
                 args: custom.args.clone(),
                 env: Default::default(),
                 description: custom.description.clone(),
+                setup_hint: String::new(),
                 setup_url: String::new(),
                 quota_backend: ThorQuotaBackend::None,
             },
@@ -2011,6 +2015,7 @@ mod tests {
                         args: configured.args.clone(),
                         env: configured.env.clone(),
                         description: String::new(),
+                        setup_hint: String::new(),
                         setup_url: String::new(),
                         quota_backend: ThorQuotaBackend::ClaudeCli,
                     }],
@@ -2035,6 +2040,7 @@ mod tests {
                         args: Vec::new(),
                         env: Default::default(),
                         description: "Local mock ACP server".to_string(),
+                        setup_hint: String::new(),
                         setup_url: String::new(),
                         quota_backend: ThorQuotaBackend::None,
                     }],
@@ -2082,6 +2088,7 @@ mod tests {
                     args: vec!["-y".to_string(), "@x/claude".to_string()],
                     env: Default::default(),
                     description: String::new(),
+                    setup_hint: String::new(),
                     setup_url: String::new(),
                     quota_backend: ThorQuotaBackend::ClaudeCli,
                 }],
@@ -2189,6 +2196,7 @@ mod tests {
             ],
             env: Default::default(),
             description: "Google Gemini ACP".to_string(),
+            setup_hint: "install Node.js/npm; sign in with Gemini CLI".to_string(),
             setup_url: "https://geminicli.com".to_string(),
             quota_backend: ThorQuotaBackend::None,
         }];
@@ -2211,6 +2219,7 @@ mod tests {
             ],
             env: Default::default(),
             description: String::new(),
+            setup_hint: String::new(),
             setup_url: String::new(),
             quota_backend: ThorQuotaBackend::None,
         };
@@ -2221,6 +2230,7 @@ mod tests {
             args: vec!["brokk".to_string(), "acp".to_string()],
             env: Default::default(),
             description: String::new(),
+            setup_hint: String::new(),
             setup_url: String::new(),
             quota_backend: ThorQuotaBackend::None,
         };
@@ -2244,6 +2254,7 @@ mod tests {
             args: vec!["acp".to_string()],
             env: Default::default(),
             description: String::new(),
+            setup_hint: String::new(),
             setup_url: "https://opencode.ai".to_string(),
             quota_backend: ThorQuotaBackend::None,
         };
@@ -2251,6 +2262,30 @@ mod tests {
         assert_eq!(
             registry_setup_hint(&opencode),
             "install OpenCode CLI; configure OpenCode provider credentials"
+        );
+    }
+
+    #[test]
+    fn registry_setup_hint_prefers_exact_registry_metadata() {
+        let gemini = ConfiguredAcpServer {
+            source_id: "gemini".to_string(),
+            name: "Gemini CLI".to_string(),
+            program: PathBuf::from("npx"),
+            args: vec![
+                "-y".to_string(),
+                "@google/gemini-cli".to_string(),
+                "--acp".to_string(),
+            ],
+            env: Default::default(),
+            description: String::new(),
+            setup_hint: "install from exact registry metadata; run exact auth".to_string(),
+            setup_url: "https://example.com/exact-setup".to_string(),
+            quota_backend: ThorQuotaBackend::None,
+        };
+
+        assert_eq!(
+            registry_setup_hint(&gemini),
+            "install from exact registry metadata; run exact auth"
         );
     }
 
@@ -2265,6 +2300,7 @@ mod tests {
                     args: Vec::new(),
                     env: Default::default(),
                     description: String::new(),
+                    setup_hint: String::new(),
                     setup_url: "https://geminicli.com".to_string(),
                     quota_backend: ThorQuotaBackend::None,
                 }],

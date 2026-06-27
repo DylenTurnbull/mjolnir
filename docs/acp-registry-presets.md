@@ -15,7 +15,9 @@ selected entry into `[thor.configured_acp_servers]`, and validate it before Thor
 can use it. `npx`, `uvx`, and current-platform binary distributions are shown;
 binary distributions resolve to the expected installed command name and are not
 downloaded or executed automatically during setup. Custom commands can also be
-saved as named local agents.
+saved as named local agents. Registry-provided setup hints and setup-doc URLs
+are persisted when present and take precedence over local inferred setup
+profiles.
 
 The runtime worker inventory is intentionally the configured server set, not the
 full registry. Thor must never assume a registry entry is usable until `mj`
@@ -42,6 +44,7 @@ Presets should be named configured ACP servers:
 - `name`: user-facing label.
 - `program`, `args`, `env`: exact launch command.
 - `description`: short explanation.
+- `setup_hint`: exact setup guidance when registry metadata provides it.
 - `setup_url`: provider docs, website, or repository.
 - `quota_backend`: direct quota probe backend, if known.
 
@@ -76,6 +79,7 @@ Useful future registry metadata:
    configured-agent validation failures when the exact error is not classifiable.
 3. Use local provider setup profiles for known agents until the registry
    exposes exact install/auth metadata.
-4. Add exact metadata when the registry provides it.
+4. Prefer and persist exact metadata when the registry provides setup hints or
+   setup-doc URLs.
 5. Add named preset editing only after first-run setup is production-grade.
 6. Add update/uninstall flows only if users actually need them.

@@ -558,21 +558,27 @@ Fixed in this PR:
   unclassified exits, timeouts, and no-detail failures can still show the
   concrete install/auth expectation before `Retry checks` instead of falling
   straight back to generic `Check auth/config` copy.
+- [x] Added a forward-compatible exact setup metadata path for registry-backed
+  agents. Registry entries can now carry setup hints and setup-doc URLs into
+  persisted Thor server config, and onboarding prefers those exact hints over
+  local inferred provider profiles when present.
 
 Still not production-grade:
 
 1. **Registry-backed agent setup still needs richer install/configure metadata.**
    Registry entries can now be added from onboarding, and website/repository
-   links, launch commands, binary installed-command candidates, and local
-   provider setup profiles are shown, but the registry itself does not
-   currently expose exact auth/install steps for every agent. Tracked in
+   links, launch commands, binary installed-command candidates, local provider
+   setup profiles, and exact setup metadata fields are shown when available,
+   but the registry itself does not currently expose exact auth/install steps
+   for every agent. Tracked in
    [#250](https://github.com/BrokkAi/mjolnir/issues/250).
 2. **Validation feedback is still partly inferred, not registry-metadata-driven.**
    Rows now offer provider-specific actions for Anvil, Claude, Codex, Gemini,
    OpenCode, Goose, Cursor, GitHub Copilot, `npx`, and `uvx`, but production UX
    should use registry/auth metadata for exact commands and links when
    available. Inferred setup hints now carry into generic validation failures,
-   but exact upstream metadata is still the target. Tracked in
+   and exact registry setup hints are preferred when present, but broad upstream
+   metadata coverage is still the target. Tracked in
    [#250](https://github.com/BrokkAi/mjolnir/issues/250).
 3. **The current onboarding process still needs production UX validation.**
    The setup flow now starts with architect/accountant mode, exposes selected
@@ -580,8 +586,8 @@ Still not production-grade:
    picker. Step summaries now include explicit next-action guidance for the
    main setup and recovery paths. It still needs an end-user pass over copy,
    action ordering, failure recovery, terminal sizes, and real provider
-   success/failure combinations before it can be called production-grade. Tracked in
-   [#252](https://github.com/BrokkAi/mjolnir/issues/252).
+   success/failure combinations before it can be called production-grade.
+   Tracked in [#252](https://github.com/BrokkAi/mjolnir/issues/252).
 4. **The setup UI has only been manually smoked for a few terminal scenarios.**
    Unit tests cover state transitions, list windowing, small/large recovery
    rendering, and every setup step at 50x16 and 40x12; manual smoke now covers

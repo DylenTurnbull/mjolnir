@@ -27,8 +27,24 @@ pub struct Agent {
     pub repository: String,
     #[serde(default)]
     pub website: String,
+    #[serde(default, alias = "setupHint")]
+    pub setup_hint: String,
+    #[serde(default)]
+    pub setup: SetupMetadata,
     #[serde(default)]
     pub distribution: Distribution,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SetupMetadata {
+    #[serde(default)]
+    pub hint: String,
+    #[serde(default, alias = "installHint")]
+    pub install: String,
+    #[serde(default, alias = "authHint")]
+    pub auth: String,
+    #[serde(default, alias = "docsUrl")]
+    pub docs_url: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -100,6 +116,7 @@ impl Agent {
                     args,
                     env: package.env.clone(),
                     description: self.description.clone(),
+                    setup_hint: self.setup_hint(),
                     setup_url: self.setup_url(),
                     quota_backend: quota_backend_for_registry_id(&self.id),
                 })
@@ -115,6 +132,7 @@ impl Agent {
                     args,
                     env: package.env.clone(),
                     description: self.description.clone(),
+                    setup_hint: self.setup_hint(),
                     setup_url: self.setup_url(),
                     quota_backend: quota_backend_for_registry_id(&self.id),
                 })
@@ -128,6 +146,7 @@ impl Agent {
                     args: target.args.clone(),
                     env: HashMap::new(),
                     description: self.description.clone(),
+                    setup_hint: self.setup_hint(),
                     setup_url: self.setup_url(),
                     quota_backend: quota_backend_for_registry_id(&self.id),
                 })
@@ -136,11 +155,28 @@ impl Agent {
     }
 
     fn setup_url(&self) -> String {
+        if !self.setup.docs_url.trim().is_empty() {
+            return self.setup.docs_url.clone();
+        }
         if !self.website.trim().is_empty() {
             self.website.clone()
         } else {
             self.repository.clone()
         }
+    }
+
+    fn setup_hint(&self) -> String {
+        if !self.setup_hint.trim().is_empty() {
+            return self.setup_hint.clone();
+        }
+        if !self.setup.hint.trim().is_empty() {
+            return self.setup.hint.clone();
+        }
+        [self.setup.install.trim(), self.setup.auth.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     fn binary_target_for_current_platform(&self) -> Option<&BinaryTarget> {
@@ -302,6 +338,11 @@ mod tests {
                 "name": "Generic",
                 "version": "1.0.0",
                 "website": "https://example.com/generic",
+                "setup": {
+                    "install": "install Generic CLI",
+                    "auth": "run generic login",
+                    "docsUrl": "https://example.com/generic/setup"
+                },
                 "distribution": {
                     "uvx": { "package": "generic-acp==1.0.0", "args": ["--acp"] }
                 }
@@ -381,7 +422,8 @@ mod tests {
         assert_eq!(generic.program, PathBuf::from("uvx"));
         assert_eq!(generic.args, vec!["generic-acp==1.0.0", "--acp"]);
         assert_eq!(generic.quota_backend, ThorQuotaBackend::None);
-        assert_eq!(generic.setup_url, "https://example.com/generic");
+        assert_eq!(generic.setup_url, "https://example.com/generic/setup");
+        assert_eq!(generic.setup_hint, "install Generic CLI; run generic login");
 
         let binary = servers
             .iter()
