@@ -74,7 +74,7 @@ impl SetupStep {
     fn title(self) -> &'static str {
         match self {
             Self::Host => "choose Thor",
-            Self::Registry => "registry",
+            Self::Registry => "add agent",
             Self::CustomName => "name",
             Self::CustomCommand => "command",
             Self::Confirm => "start",
@@ -222,7 +222,7 @@ impl ThorSetupState {
             }
             SetupStep::CustomCommand => {
                 if self.custom_command.trim().is_empty() {
-                    self.notice = Some("Enter the command that starts the ACP server.".to_string());
+                    self.notice = Some("Enter the command that starts this agent.".to_string());
                 } else {
                     return Some(ThorSetupOutcome::AddCustom(ThorSetupCustomAgent {
                         name: self.custom_name.trim().to_string(),
@@ -532,7 +532,7 @@ fn intro_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(status),
-        Line::from("Add from the registry for known agents, or add a custom ACP command."),
+        Line::from("Add a known agent from the registry, or add a custom command."),
         Line::from("Model and reasoning defaults are already set and can be changed later."),
     ]
 }
@@ -659,9 +659,12 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
     if state.registry_agents.is_empty() {
         rows.push(disabled_row(
             vec![
-                Span::styled("ACP registry".to_string(), Style::default().fg(theme.muted)),
                 Span::styled(
-                    "  unavailable; add a custom ACP command instead".to_string(),
+                    "Agent registry".to_string(),
+                    Style::default().fg(theme.muted),
+                ),
+                Span::styled(
+                    "  unavailable; add a custom command instead".to_string(),
                     Style::default().fg(theme.muted),
                 ),
             ],
@@ -675,7 +678,7 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
             registry_choice_idx == Some(state.cursor),
             vec![
                 Span::styled(
-                    "Add from ACP registry".to_string(),
+                    "Add agent from registry".to_string(),
                     Style::default().fg(theme.text),
                 ),
                 Span::styled(
@@ -693,7 +696,7 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
             == Some(state.cursor),
         vec![
             Span::styled(
-                "Add ACP command".to_string(),
+                "Add custom command".to_string(),
                 Style::default().fg(theme.text),
             ),
             Span::styled(
@@ -800,7 +803,7 @@ fn custom_name_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListIte
 
 fn custom_command_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'static>> {
     text_input_rows(
-        "ACP command",
+        "Command",
         &state.custom_command,
         "Example: npx -y @agentclientprotocol/claude-agent-acp",
         state.notice.as_deref(),
@@ -1627,8 +1630,8 @@ mod tests {
             let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
 
             assert!(rendered.contains("Set up Thor"));
-            assert!(rendered.contains("Add from ACP registry"));
-            assert!(rendered.contains("Add ACP command"));
+            assert!(rendered.contains("Add agent from registry"));
+            assert!(rendered.contains("Add custom command"));
             assert!(rendered.contains("No agent is ready"));
         }
     }

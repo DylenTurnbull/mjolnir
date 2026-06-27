@@ -444,18 +444,21 @@ Fixed in this PR:
 - [x] Replaced first-run summary labels that exposed internal source IDs,
   model defaults, and reasoning defaults with friendly agent names and a simple
   work-style summary. Model selection remains automatic during onboarding.
+- [x] Replaced primary setup action labels like `Add from ACP registry` and
+  `Add ACP command` with end-user wording: `Add agent from registry` and
+  `Add custom command`.
 - [x] Manually smoke-tested the 80-column no-working-agent first-run path with a
   temporary home and stripped `PATH`:
   `HOME=/tmp/mj-thor-smoke-home-4 XDG_CONFIG_HOME=/tmp/mj-thor-smoke-home-4/config XDG_CACHE_HOME=/tmp/mj-thor-smoke-home-4/cache PATH=/usr/bin:/bin target/debug/mj --cwd .`.
   Verified the rebuilt binary opens the new `Set up Thor` flow, not the old
-  worker/model picker; shows no-ready guidance; defaults to `Add ACP command`;
+  worker/model picker; shows no-ready guidance; defaults to `Add custom command`;
   keeps `Retry checks` visible; and exits cleanly with Esc.
 - [x] Manually smoke-tested an 80-column configured-but-broken path with a
   temporary macOS config under `/tmp/mj-thor-success-smoke/Library/Application Support/mj/config.toml`
   pointing at a local OpenCode ACP wrapper. OpenCode could not validate in that
   isolated setup, but the failure rows now render compactly as `agent exited /
   Check auth/config, then retry` and `timeout / Retry after install/auth is
-  ready`, with `Add ACP command` and `Retry checks` still reachable.
+  ready`, with `Add custom command` and `Retry checks` still reachable.
 
 Still not production-grade:
 
