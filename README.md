@@ -52,9 +52,10 @@ The default `anvil` backend runs `uvx brokk acp`, so `uvx` must be available on
 ## Quick Start
 
 By default, `mj` starts Thor inside the configured ACP host. On first run, setup
-asks which agents Thor may use as workers, whether Thor should act as Architect
-or Accountant, and which agent/model/reasoning level hosts Thor. The normal
-prompt flow does not ask the user to choose a model or agent.
+asks where Thor should run, then starts with the saved Thor defaults for work
+style, model preference, and reasoning level. Configured agents that validate
+successfully are made available to Thor automatically. The normal prompt flow
+does not ask the user to choose a model or agent.
 
 ```
  mj
@@ -70,13 +71,48 @@ Thor preferences, configured ACP servers, and quota backend metadata are stored 
 Use `/new` inside the TUI to start a fresh Thor session with the configured
 backend. Use `/load` to open the session picker for the current backend.
 
+## Install Options
+
+The recommended install path is the shell installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BrokkAi/mjolnir/master/install.sh | bash
+```
+
+It installs the latest `mj` and `bifrost` release binaries on macOS, Linux, and
+Android/Termux, verifies published `.sha256` checksums when present, and writes
+to `~/.local/bin` unless `INSTALL_DIR` or `MJOLNIR_INSTALL_DIR` is set.
+
+To install a specific release:
+
+```bash
+MJOLNIR_VERSION=v0.10.6 \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/BrokkAi/mjolnir/master/install.sh)"
+```
+
+Set `BIFROST_VERSION` as well only when you need a specific `bifrost` release.
+
+Windows users should download the `x86_64-pc-windows-msvc.zip` asset from the
+GitHub release page, verify it against the adjacent `.sha256` file, and put
+`mj.exe` on `PATH`.
+
+Rust users can install from source:
+
+```bash
+cargo install --git https://github.com/BrokkAi/mjolnir.git
+```
+
+On Linux, install ALSA development headers first because microphone dictation
+links against ALSA, for example `sudo apt-get install libasound2-dev` on
+Debian/Ubuntu.
+
 ## Thor Routing
 
 Thor is a coordinator persona running inside an ACP host agent. Onboarding
-retrieves ACP server definitions from the ACP registry, lets the user choose
-which servers Thor may use, and persists those configured server instances.
-Thor only sees configured ACP servers, not every registry possibility and not
-locally installed provider CLIs by themselves.
+validates configured/custom/default ACP servers, lets the user choose where Thor
+runs, and persists the usable configured server instances. Thor only sees
+configured ACP servers, not every registry possibility and not locally installed
+provider CLIs by themselves.
 
 `mj` passes a stdio MCP bridge (`mj thor-mcp`) to the host through ACP
 `mcpServers`; the MCP tools validate configured ACP workers, list usable

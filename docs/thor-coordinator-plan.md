@@ -13,16 +13,18 @@ changed and how much each harness/model used.
 ## UX contract
 
 - `mj` opens a Thor host ACP session, not an agent/model picker.
-- First run retrieves ACP server definitions from the ACP registry, asks the
-  user which ACP servers to configure for Thor, then asks the user to pick
-  Architect or Accountant and choose Thor's host agent, model preference, and
-  reasoning level.
+- First run is a Thor setup wizard, not an advanced picker. It asks where Thor
+  should run, uses saved defaults for work style/model preference/reasoning,
+  and makes configured ACP servers available to Thor after validation.
 - Before first-run setup marks a worker usable, `mj` validates configured ACP
   servers by launching each candidate and waiting for initialize plus
   `session/new`.
 - The registry/setup layer is the source of available ACP server types.
   Thor's runtime worker inventory is the persisted configured ACP server set,
   not the full registry and not locally installed provider CLIs.
+- The onboarding flow is not production-grade until a user can add/configure
+  ACP servers from setup, recover from missing auth or missing commands with
+  exact guidance, and reach a usable Thor host without editing TOML by hand.
 - The normal prompt flow has no visible model picker or agent picker.
 - Thor presents an execution plan before doing work.
 - The MCP bridge is provided to the Thor host as an ACP `mcpServers` stdio
@@ -66,8 +68,8 @@ changed and how much each harness/model used.
    through ACP `mcpServers`.
 3. Done: expose initial MCP tools to list ACP workers and run a prompt through
    a selected worker.
-4. Done: first-run onboarding selects available Thor workers, persona, Thor
-   host, model preference, and reasoning level.
+4. Done: first-run onboarding opens a Thor setup path, validates configured
+   ACP server candidates, chooses the Thor host, and persists Thor defaults.
 5. Done: add a local model catalog cache populated from LM Arena and OpenRouter
    data when Thor requests a refresh.
 6. Done: support concurrent ACP worker sessions with aggregated progress and
@@ -82,6 +84,10 @@ changed and how much each harness/model used.
 10. Done: separate ACP server setup from quota probing. Registry entries and
     configured custom servers produce persisted ACP server instances; quota
     probes only run when a configured server declares a provider quota backend.
+11. Remaining: make onboarding end-user quality. Add an install/configure path
+    for ACP servers, replace inferred setup labels with exact registry/auth
+    guidance where possible, handle empty/broken states as guided recovery, and
+    manually smoke-test the setup UI across terminal sizes.
 
 ## Quota reads
 

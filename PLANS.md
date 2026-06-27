@@ -54,6 +54,12 @@ agents that validate successfully are made available to Thor automatically and
 written to visible `[thor]` configuration. The previous agent picker is no
 longer part of the normal user path.
 
+The remaining startup gap is onboarding quality. The current first-run flow
+validates candidates and avoids the old model/agent picker, but it still does
+not feel like an end-user setup wizard. It must guide a user from "nothing is
+configured" to "Thor has usable ACP agents" with explicit add/configure/auth
+actions before this is production-grade.
+
 M1 hardening landed (PR #34): an explicit `ConnectionState` lifecycle drives
 the header label, a `LaunchError` enum surfaces spawn / initialize /
 `session/new` failures with one-line action hints, permission prompts queue
@@ -270,16 +276,22 @@ Goal: make `mj` easy to install without cloning the repo.
 
 Deliverables:
 
-- GitHub release workflow for Linux x86_64, macOS aarch64, and Windows x86_64.
-- Release artifacts named consistently, with checksums.
-- Document `cargo install --git`, release binary install, and local build paths.
-- Decide whether to provide a shell installer, Homebrew formula, or both.
-- Decide whether `mj` should ever be installed by Brokk's installer, or remain
-  independent.
+- ✅ GitHub release workflow for Linux x86_64, macOS aarch64, and Windows
+  x86_64. The current workflow also publishes Linux aarch64, macOS universal,
+  and Android/Termux artifacts.
+- ✅ Release artifacts named consistently, with `.sha256` checksums.
+- ✅ Document `cargo install --git`, release binary install, shell installer,
+  and local build paths in README.
+- ✅ Use the shell installer as the first install path. Do not add Homebrew for
+  v1 unless user demand justifies maintaining a formula.
+- ✅ Keep `mj` independent of Brokk's installer for v1. Revisit only if Brokk
+  product packaging explicitly owns Thor distribution.
 
 Exit criteria:
 
 - Fresh machine install path works for at least macOS aarch64 and Linux x86_64.
+  The release workflow and installer support this; a fresh-machine smoke pass
+  still needs to be recorded before calling distribution production-grade.
 - `mj --version` and `mj --cwd .` work after install.
 
 ### M5: Optional client capabilities
@@ -302,12 +314,15 @@ Each should start with a separate design note before implementation.
 
 Near-term:
 
-- Multiline input.
-- Prompt history.
-- More complete `SessionUpdate` rendering (image/audio/resource go beyond
-  placeholders; structured tool-call output for diff/terminal).
+- ✅ Multiline input.
+- ✅ Prompt history.
+- ✅ More complete `SessionUpdate` rendering (image/audio/resource metadata and
+  resource text fallbacks; structured tool-call output for diff/terminal).
 - Compatibility smoke tests against more non-Brokk ACP agents (one done in
   M1; see the Compatibility section).
+- Production-grade Thor first-run onboarding: add/configure ACP agents from
+  setup, exact install/auth guidance, and manual visual smoke across terminal
+  sizes.
 
 (M1 closed: fatal/error rendering, child-process cleanup, transcript
 scrolling.)
@@ -336,6 +351,13 @@ Tracked from review of PR #243 (`codex/thor-orchestrator`, "thor onboarding").
 The first-run Thor setup screen (`src/thor_setup.rs`) must be end-user-quality
 before it ships. The flow is the first product impression, so implementation
 concepts must not leak into the setup path.
+
+Current assessment: the flow is still not production-grade. It is no longer the
+old advanced picker, but it remains too much like a validation list and not
+enough like a guided setup wizard. A new user who does not already have usable
+ACP servers configured can still land on broad "install" or "setup needed"
+messages without an obvious path to configure the agent they expected Thor to
+use.
 
 Fixed in this PR:
 
@@ -369,7 +391,11 @@ Still not production-grade:
 2. **Validation feedback is still inferred, not agent-specific.** Rows now offer
    broad actions like install/sign-in/configure, but production UX should use
    registry/auth metadata for exact commands and links when available.
-3. **The setup UI has not been manually smoke-tested in multiple terminal sizes.**
+3. **Empty and broken states need real user-facing recovery.** If no usable
+   Thor host validates, setup should drive the user through installing/signing
+   into the default path or adding a custom ACP command, rather than leaving the
+   user with an inert list of failed candidates.
+4. **The setup UI has not been manually smoke-tested in multiple terminal sizes.**
    Unit tests cover state transitions and list windowing; visual polish still
    needs an interactive pass.
 
