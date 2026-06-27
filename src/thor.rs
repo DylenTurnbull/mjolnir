@@ -119,6 +119,7 @@ pub fn default_anvil_server() -> ConfiguredAcpServer {
         args: agent.args,
         env: agent.env,
         description: "Brokk ACP server via uvx".to_string(),
+        setup_url: "https://github.com/BrokkAi/brokk".to_string(),
         quota_backend: ThorQuotaBackend::None,
     }
 }
@@ -155,6 +156,7 @@ pub fn configured_acp_servers(config: &Config) -> Vec<ConfiguredAcpServer> {
             args: custom.args.clone(),
             env: HashMap::new(),
             description: custom.description.clone(),
+            setup_url: String::new(),
             quota_backend: ThorQuotaBackend::None,
         });
     }
@@ -177,6 +179,7 @@ fn configured_from_selected(
         args: agent.args,
         env: agent.env,
         description,
+        setup_url: String::new(),
         quota_backend,
     }
 }
@@ -352,6 +355,7 @@ mod tests {
                     args: vec!["@agentclientprotocol/claude-agent-acp".to_string()],
                     env: HashMap::new(),
                     description: String::new(),
+                    setup_url: String::new(),
                     quota_backend: ThorQuotaBackend::ClaudeCli,
                 }],
                 ..ThorConfig::default()

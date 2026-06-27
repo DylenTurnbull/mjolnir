@@ -1473,6 +1473,7 @@ mod tests {
             args: Vec::new(),
             env: Default::default(),
             description: String::new(),
+            setup_url: String::new(),
             quota_backend: config::ThorQuotaBackend::None,
         }
     }

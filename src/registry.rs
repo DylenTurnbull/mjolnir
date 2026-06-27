@@ -24,6 +24,10 @@ pub struct Agent {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
+    pub repository: String,
+    #[serde(default)]
+    pub website: String,
+    #[serde(default)]
     pub distribution: Distribution,
 }
 
@@ -93,6 +97,7 @@ impl Agent {
                     args,
                     env: package.env.clone(),
                     description: self.description.clone(),
+                    setup_url: self.setup_url(),
                     quota_backend: quota_backend_for_registry_id(&self.id),
                 })
             }
@@ -107,9 +112,18 @@ impl Agent {
                     args,
                     env: package.env.clone(),
                     description: self.description.clone(),
+                    setup_url: self.setup_url(),
                     quota_backend: quota_backend_for_registry_id(&self.id),
                 })
             }
+        }
+    }
+
+    fn setup_url(&self) -> String {
+        if !self.website.trim().is_empty() {
+            self.website.clone()
+        } else {
+            self.repository.clone()
         }
     }
 }
@@ -228,6 +242,7 @@ mod tests {
                 "name": "Claude",
                 "version": "0.36.1",
                 "description": "Claude ACP agent",
+                "repository": "https://github.com/agentclientprotocol/claude-agent-acp",
                 "distribution": {
                     "npx": { "package": "@agentclientprotocol/claude-agent-acp@0.36.1" }
                 }
@@ -245,6 +260,7 @@ mod tests {
                 "id": "generic-acp",
                 "name": "Generic",
                 "version": "1.0.0",
+                "website": "https://example.com/generic",
                 "distribution": {
                     "uvx": { "package": "generic-acp==1.0.0", "args": ["--acp"] }
                 }
@@ -279,6 +295,10 @@ mod tests {
             normalize_spawn_program(PathBuf::from("npx"))
         );
         assert_eq!(claude.quota_backend, ThorQuotaBackend::ClaudeCli);
+        assert_eq!(
+            claude.setup_url,
+            "https://github.com/agentclientprotocol/claude-agent-acp"
+        );
 
         let codex = servers
             .iter()
@@ -293,6 +313,7 @@ mod tests {
         assert_eq!(generic.program, PathBuf::from("uvx"));
         assert_eq!(generic.args, vec!["generic-acp==1.0.0", "--acp"]);
         assert_eq!(generic.quota_backend, ThorQuotaBackend::None);
+        assert_eq!(generic.setup_url, "https://example.com/generic");
 
         assert!(
             !servers

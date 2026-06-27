@@ -23,8 +23,17 @@ pub struct ThorSetupAgent {
     pub agent: SelectedAgent,
     pub name: String,
     pub description: String,
+    pub setup_url: String,
     pub quota_backend: ThorQuotaBackend,
     pub validation: Option<AgentValidation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThorSetupRegistryAgent {
+    pub source_id: String,
+    pub name: String,
+    pub description: String,
+    pub setup_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,11 +55,13 @@ pub struct ThorSetupCustomAgent {
 pub enum ThorSetupOutcome {
     Selection(ThorSetupSelection),
     AddCustom(ThorSetupCustomAgent),
+    AddRegistry(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupStep {
     Host,
+    Registry,
     CustomName,
     CustomCommand,
     Confirm,
@@ -60,6 +71,7 @@ impl SetupStep {
     fn title(self) -> &'static str {
         match self {
             Self::Host => "choose Thor",
+            Self::Registry => "registry",
             Self::CustomName => "name",
             Self::CustomCommand => "command",
             Self::Confirm => "start",
@@ -69,9 +81,10 @@ impl SetupStep {
     fn index(self) -> usize {
         match self {
             Self::Host => 0,
-            Self::CustomName => 1,
-            Self::CustomCommand => 2,
-            Self::Confirm => 3,
+            Self::Registry => 1,
+            Self::CustomName => 2,
+            Self::CustomCommand => 3,
+            Self::Confirm => 4,
         }
     }
 }
@@ -79,12 +92,14 @@ impl SetupStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HostChoice {
     Agent(String),
+    AddRegistry,
     AddCustom,
 }
 
 #[derive(Debug, Clone)]
 struct ThorSetupState {
     agents: Vec<ThorSetupAgent>,
+    registry_agents: Vec<ThorSetupRegistryAgent>,
     step: SetupStep,
     cursor: usize,
     selected_workers: Vec<bool>,
@@ -101,6 +116,7 @@ impl ThorSetupState {
     fn new(
         thor_config: &ThorConfig,
         agents: &[ThorSetupAgent],
+        registry_agents: &[ThorSetupRegistryAgent],
         initial_host: &SelectedAgent,
     ) -> Self {
         let agents = if agents.is_empty() {
@@ -108,6 +124,7 @@ impl ThorSetupState {
                 agent: crate::thor::default_anvil_agent(),
                 name: "Anvil".to_string(),
                 description: "Brokk ACP server via uvx".to_string(),
+                setup_url: "https://github.com/BrokkAi/brokk".to_string(),
                 quota_backend: ThorQuotaBackend::None,
                 validation: None,
             }]
@@ -139,6 +156,7 @@ impl ThorSetupState {
 
         let mut state = Self {
             agents,
+            registry_agents: registry_agents.to_vec(),
             step: SetupStep::Host,
             cursor: 0,
             selected_workers,
@@ -171,6 +189,10 @@ impl ThorSetupState {
                     self.host_source_id = source_id.clone();
                     self.set_step(SetupStep::Confirm);
                 }
+                Some(HostChoice::AddRegistry) => {
+                    self.notice = None;
+                    self.set_step(SetupStep::Registry);
+                }
                 Some(HostChoice::AddCustom) => {
                     self.notice = None;
                     if self.custom_name.trim().is_empty() {
@@ -180,6 +202,13 @@ impl ThorSetupState {
                 }
                 None => {}
             },
+            SetupStep::Registry => {
+                if let Some(registry_agent) = self.registry_agents.get(self.cursor) {
+                    return Some(ThorSetupOutcome::AddRegistry(
+                        registry_agent.source_id.clone(),
+                    ));
+                }
+            }
             SetupStep::CustomName => {
                 if self.custom_name.trim().is_empty() {
                     self.notice = Some("Enter a short name for this ACP agent.".to_string());
@@ -206,6 +235,7 @@ impl ThorSetupState {
     fn back(&mut self) {
         match self.step {
             SetupStep::Host => {}
+            SetupStep::Registry => self.set_step(SetupStep::Host),
             SetupStep::CustomName => self.set_step(SetupStep::Host),
             SetupStep::CustomCommand => self.set_step(SetupStep::CustomName),
             SetupStep::Confirm => self.set_step(SetupStep::Host),
@@ -222,7 +252,7 @@ impl ThorSetupState {
                 self.custom_command.push(ch);
                 self.notice = None;
             }
-            SetupStep::Host | SetupStep::Confirm => {}
+            SetupStep::Host | SetupStep::Registry | SetupStep::Confirm => {}
         }
     }
 
@@ -242,7 +272,7 @@ impl ThorSetupState {
                 }
                 deleted
             }
-            SetupStep::Host | SetupStep::Confirm => false,
+            SetupStep::Host | SetupStep::Registry | SetupStep::Confirm => false,
         }
     }
 
@@ -272,9 +302,11 @@ impl ThorSetupState {
                 .iter()
                 .position(|choice| match choice {
                     HostChoice::Agent(source_id) => source_id == &self.host_source_id,
+                    HostChoice::AddRegistry => false,
                     HostChoice::AddCustom => false,
                 })
                 .unwrap_or(0),
+            SetupStep::Registry => 0,
             SetupStep::CustomName | SetupStep::CustomCommand => 0,
             SetupStep::Confirm => 0,
         }
@@ -283,6 +315,7 @@ impl ThorSetupState {
     fn current_len(&self) -> usize {
         match self.step {
             SetupStep::Host => self.host_choices().len(),
+            SetupStep::Registry => self.registry_agents.len(),
             SetupStep::CustomName | SetupStep::CustomCommand => 1,
             SetupStep::Confirm => 1,
         }
@@ -295,6 +328,9 @@ impl ThorSetupState {
             .filter(|setup_agent| setup_agent_is_usable(setup_agent))
             .map(|setup_agent| HostChoice::Agent(setup_agent.agent.source_id.clone()))
             .collect::<Vec<_>>();
+        if !self.registry_agents.is_empty() {
+            choices.push(HostChoice::AddRegistry);
+        }
         choices.push(HostChoice::AddCustom);
         choices
     }
@@ -328,9 +364,10 @@ pub async fn run_thor_setup(
     theme: TerminalTheme,
     thor_config: &ThorConfig,
     agents: &[ThorSetupAgent],
+    registry_agents: &[ThorSetupRegistryAgent],
     initial_host: &SelectedAgent,
 ) -> Result<Option<ThorSetupOutcome>> {
-    let mut state = ThorSetupState::new(thor_config, agents, initial_host);
+    let mut state = ThorSetupState::new(thor_config, agents, registry_agents, initial_host);
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
 
@@ -432,13 +469,17 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
 
     let content = match state.step {
         SetupStep::Host => host_rows(state, theme),
+        SetupStep::Registry => registry_rows(state, theme),
         SetupStep::CustomName => custom_name_rows(state, theme),
         SetupStep::CustomCommand => custom_command_rows(state, theme),
         SetupStep::Confirm => confirm_rows(state, theme),
     };
     let content_cursor = match state.step {
         SetupStep::Host => host_selected_row_index(state),
-        SetupStep::CustomName | SetupStep::CustomCommand | SetupStep::Confirm => state.cursor,
+        SetupStep::Registry
+        | SetupStep::CustomName
+        | SetupStep::CustomCommand
+        | SetupStep::Confirm => state.cursor,
     };
     let content = visible_rows(content, content_cursor, layout[2].height as usize);
     f.render_widget(List::new(content), layout[2]);
@@ -467,6 +508,7 @@ fn progress_line(state: &ThorSetupState, theme: TerminalTheme) -> Paragraph<'sta
             SetupStep::CustomCommand,
             SetupStep::Confirm,
         ],
+        SetupStep::Registry => vec![SetupStep::Host, SetupStep::Registry, SetupStep::Confirm],
         SetupStep::Host | SetupStep::Confirm => vec![SetupStep::Host, SetupStep::Confirm],
     };
     let spans = steps
@@ -577,6 +619,36 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
             ));
         }
     }
+    if state.registry_agents.is_empty() {
+        rows.push(disabled_row(
+            vec![
+                Span::styled("ACP registry".to_string(), Style::default().fg(theme.muted)),
+                Span::styled(
+                    "  unavailable; add a custom ACP command instead".to_string(),
+                    Style::default().fg(theme.muted),
+                ),
+            ],
+            theme,
+        ));
+    } else {
+        let registry_choice_idx = choices
+            .iter()
+            .position(|choice| matches!(choice, HostChoice::AddRegistry));
+        rows.push(selectable_row(
+            registry_choice_idx == Some(state.cursor),
+            vec![
+                Span::styled(
+                    "Add from ACP registry".to_string(),
+                    Style::default().fg(theme.text),
+                ),
+                Span::styled(
+                    format!("  {} available server types", state.registry_agents.len()),
+                    Style::default().fg(theme.muted),
+                ),
+            ],
+            theme,
+        ));
+    }
     rows.push(selectable_row(
         state.cursor == choices.len().saturating_sub(1),
         vec![
@@ -594,6 +666,27 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
     rows
 }
 
+fn registry_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'static>> {
+    state
+        .registry_agents
+        .iter()
+        .enumerate()
+        .map(|(idx, registry_agent)| {
+            selectable_row(
+                idx == state.cursor,
+                vec![
+                    Span::styled(registry_agent.name.clone(), Style::default().fg(theme.text)),
+                    Span::styled(
+                        format!("  {}", registry_agent_summary(registry_agent)),
+                        Style::default().fg(theme.muted),
+                    ),
+                ],
+                theme,
+            )
+        })
+        .collect()
+}
+
 fn host_selected_row_index(state: &ThorSetupState) -> usize {
     let choices = state.host_choices();
     let Some(choice) = choices.get(state.cursor) else {
@@ -605,7 +698,18 @@ fn host_selected_row_index(state: &ThorSetupState) -> usize {
             .iter()
             .position(|setup_agent| setup_agent.agent.source_id == *source_id)
             .unwrap_or(0),
-        HostChoice::AddCustom => state.agents.len(),
+        HostChoice::AddRegistry => state.agents.len(),
+        HostChoice::AddCustom => state.agents.len() + 1,
+    }
+}
+
+fn registry_agent_summary(registry_agent: &ThorSetupRegistryAgent) -> String {
+    if !registry_agent.description.trim().is_empty() {
+        truncate_label(&registry_agent.description, 72)
+    } else if !registry_agent.setup_url.trim().is_empty() {
+        truncate_label(&registry_agent.setup_url, 72)
+    } else {
+        registry_agent.source_id.clone()
     }
 }
 
@@ -781,6 +885,11 @@ fn setup_agent_description(setup_agent: &ThorSetupAgent) -> String {
     }
 }
 
+fn setup_url_label(setup_agent: &ThorSetupAgent) -> Option<String> {
+    let url = setup_agent.setup_url.trim();
+    (!url.is_empty()).then(|| url.to_string())
+}
+
 fn setup_agent_is_usable(setup_agent: &ThorSetupAgent) -> bool {
     setup_agent
         .validation
@@ -834,7 +943,7 @@ fn validation_detail_label(setup_agent: &ThorSetupAgent, validation: &AgentValid
         || lower.contains("missing command")
         || lower.contains("permission denied")
     {
-        return install_detail_label(setup_agent);
+        return with_setup_url(install_detail_label(setup_agent), setup_agent);
     }
     if lower.contains("auth")
         || lower.contains("login")
@@ -843,9 +952,16 @@ fn validation_detail_label(setup_agent: &ThorSetupAgent, validation: &AgentValid
         || lower.contains("token")
         || lower.contains("credential")
     {
-        return auth_detail_label(setup_agent);
+        return with_setup_url(auth_detail_label(setup_agent), setup_agent);
     }
     format!("Last error: {}", truncate_label(error, 72))
+}
+
+fn with_setup_url(detail: String, setup_agent: &ThorSetupAgent) -> String {
+    let Some(url) = setup_url_label(setup_agent) else {
+        return detail;
+    };
+    truncate_label(&format!("{detail}; docs: {url}"), 96)
 }
 
 fn install_action_label(setup_agent: &ThorSetupAgent) -> String {
@@ -949,6 +1065,7 @@ mod tests {
                 agent,
                 name: String::new(),
                 description: String::new(),
+                setup_url: String::new(),
                 quota_backend: ThorQuotaBackend::None,
                 validation: None,
             })
@@ -964,6 +1081,7 @@ mod tests {
             agent: agent(source_id),
             name: source_id.to_string(),
             description: String::new(),
+            setup_url: String::new(),
             quota_backend: ThorQuotaBackend::None,
             validation: Some(AgentValidation {
                 source_id: source_id.to_string(),
@@ -981,11 +1099,20 @@ mod tests {
         }
     }
 
+    fn registry_agent(source_id: &str) -> ThorSetupRegistryAgent {
+        ThorSetupRegistryAgent {
+            source_id: source_id.to_string(),
+            name: source_id.to_string(),
+            description: format!("{source_id} from registry"),
+            setup_url: format!("https://example.com/{source_id}"),
+        }
+    }
+
     #[test]
     fn available_agents_are_enabled_without_worker_step() {
         let raw_agents = vec![agent("claude"), agent("codex")];
         let agents = setup_agents(&raw_agents);
-        let state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
+        let state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &raw_agents[0]);
 
         assert_eq!(state.step, SetupStep::Host);
         assert_eq!(state.enabled_source_ids(), vec!["claude", "codex"]);
@@ -995,7 +1122,7 @@ mod tests {
     fn host_selection_advances_directly_to_confirm() {
         let raw_agents = vec![agent("claude"), agent("codex")];
         let agents = setup_agents(&raw_agents);
-        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &raw_agents[0]);
 
         state.cursor = 1;
         state.advance();
@@ -1008,7 +1135,7 @@ mod tests {
     fn back_from_confirm_returns_to_host_selection() {
         let raw_agents = vec![agent("anvil")];
         let agents = setup_agents(&raw_agents);
-        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &raw_agents[0]);
 
         state.set_step(SetupStep::Confirm);
         state.back();
@@ -1027,7 +1154,7 @@ mod tests {
             ..ThorConfig::default()
         };
         cfg.optimization_mode = ThorOptimizationMode::Cost;
-        let mut state = ThorSetupState::new(&cfg, &agents, &raw_agents[1]);
+        let mut state = ThorSetupState::new(&cfg, &agents, &[], &raw_agents[1]);
         state.set_step(SetupStep::Confirm);
 
         let ThorSetupOutcome::Selection(selection) = state.advance().expect("selection") else {
@@ -1044,7 +1171,7 @@ mod tests {
     fn enter_on_confirm_finishes() {
         let raw_agents = vec![agent("anvil")];
         let agents = setup_agents(&raw_agents);
-        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &raw_agents[0]);
         state.set_step(SetupStep::Confirm);
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
 
@@ -1059,7 +1186,7 @@ mod tests {
     fn escape_cancels() {
         let raw_agents = vec![agent("anvil")];
         let agents = setup_agents(&raw_agents);
-        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &raw_agents[0]);
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
 
         assert_eq!(handle_event(&mut state, CtEvent::Key(key)), Some(None));
@@ -1072,7 +1199,7 @@ mod tests {
             setup_agent_with_validation("codex", true),
         ];
         let initial_host = agents[0].agent.clone();
-        let state = ThorSetupState::new(&ThorConfig::default(), &agents, &initial_host);
+        let state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &initial_host);
 
         assert_eq!(state.enabled_source_ids(), vec!["codex"]);
         assert_eq!(state.host_source_id, "codex");
@@ -1125,7 +1252,7 @@ mod tests {
     fn add_custom_choice_collects_name_and_command() {
         let raw_agents = vec![agent("anvil")];
         let agents = setup_agents(&raw_agents);
-        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &raw_agents[0]);
 
         state.cursor = state.host_choices().len() - 1;
         state.advance();
@@ -1152,10 +1279,61 @@ mod tests {
     }
 
     #[test]
+    fn registry_choice_returns_selected_registry_source() {
+        let raw_agents = vec![agent("anvil")];
+        let agents = setup_agents(&raw_agents);
+        let registry_agents = vec![registry_agent("gemini"), registry_agent("goose")];
+        let mut state = ThorSetupState::new(
+            &ThorConfig::default(),
+            &agents,
+            &registry_agents,
+            &raw_agents[0],
+        );
+
+        let registry_choice_idx = state
+            .host_choices()
+            .iter()
+            .position(|choice| matches!(choice, HostChoice::AddRegistry))
+            .expect("registry choice");
+        state.cursor = registry_choice_idx;
+        state.advance();
+        assert_eq!(state.step, SetupStep::Registry);
+
+        state.cursor = 1;
+        let ThorSetupOutcome::AddRegistry(source_id) = state.advance().expect("registry") else {
+            panic!("expected registry selection");
+        };
+        assert_eq!(source_id, "goose");
+    }
+
+    #[test]
+    fn host_selected_row_index_tracks_registry_and_custom_actions() {
+        let raw_agents = vec![agent("anvil")];
+        let agents = setup_agents(&raw_agents);
+        let registry_agents = vec![registry_agent("gemini")];
+        let mut state = ThorSetupState::new(
+            &ThorConfig::default(),
+            &agents,
+            &registry_agents,
+            &raw_agents[0],
+        );
+
+        state.cursor = state
+            .host_choices()
+            .iter()
+            .position(|choice| matches!(choice, HostChoice::AddRegistry))
+            .expect("registry choice");
+        assert_eq!(host_selected_row_index(&state), 1);
+
+        state.cursor = state.host_choices().len() - 1;
+        assert_eq!(host_selected_row_index(&state), 2);
+    }
+
+    #[test]
     fn space_key_edits_custom_command() {
         let raw_agents = vec![agent("anvil")];
         let agents = setup_agents(&raw_agents);
-        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &raw_agents[0]);
         state.set_step(SetupStep::CustomCommand);
 
         handle_event(
@@ -1192,9 +1370,9 @@ mod tests {
             setup_agent_with_validation("codex", false),
         ];
         let initial_host = agents[0].agent.clone();
-        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &initial_host);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &initial_host);
         state.cursor = state.host_choices().len() - 1;
 
-        assert_eq!(host_selected_row_index(&state), 2);
+        assert_eq!(host_selected_row_index(&state), 3);
     }
 }

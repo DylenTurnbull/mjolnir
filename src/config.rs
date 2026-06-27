@@ -34,6 +34,8 @@ pub struct ConfiguredAcpServer {
     pub env: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub setup_url: String,
     #[serde(default, skip_serializing_if = "ThorQuotaBackend::is_none")]
     pub quota_backend: ThorQuotaBackend,
 }
@@ -613,6 +615,7 @@ args = ["--flag", "$HOME/data"]
                     ],
                     env: HashMap::new(),
                     description: "Claude ACP".to_string(),
+                    setup_url: String::new(),
                     quota_backend: ThorQuotaBackend::ClaudeCli,
                 }],
                 enabled_worker_source_ids: vec!["anvil".to_string()],

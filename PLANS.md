@@ -57,9 +57,10 @@ longer part of the normal user path.
 The remaining startup gap is onboarding quality. The current first-run flow
 validates candidates and avoids the old model/agent picker, but it still does
 not fully feel like an end-user setup wizard. It now lets a user add a custom
-ACP command from setup and reruns validation before Thor uses it, but exact
-install/auth guidance beyond the first provider-specific cases and manual
-visual smoke are still required before this is production-grade.
+ACP command or registry-backed ACP server from setup and reruns validation
+before Thor uses it, but exact install/auth guidance beyond available registry
+links and the first provider-specific cases, plus manual visual smoke, are still
+required before this is production-grade.
 
 M1 hardening landed (PR #34): an explicit `ConnectionState` lifecycle drives
 the header label, a `LaunchError` enum surfaces spawn / initialize /
@@ -322,8 +323,9 @@ Near-term:
 - Compatibility smoke tests against more non-Brokk ACP agents (one done in
   M1; see the Compatibility section).
 - Production-grade Thor first-run onboarding: add/configure ACP agents from
-  setup is implemented for custom ACP commands; exact registry/auth guidance
-  and manual visual smoke across terminal sizes remain.
+  setup is implemented for custom ACP commands and registry-backed entries;
+  richer registry/auth guidance and manual visual smoke across terminal sizes
+  remain.
 
 (M1 closed: fatal/error rendering, child-process cleanup, transcript
 scrolling.)
@@ -356,9 +358,9 @@ concepts must not leak into the setup path.
 Current assessment: the flow is still not production-grade. It is no longer the
 old advanced picker, but it remains too much like a validation list and not
 enough like a guided setup wizard. A new user can now add a custom ACP command
-from onboarding and have it validated before Thor uses it, but failed rows can
-still land on broad install/auth messages instead of exact agent-specific setup
-instructions.
+or registry-backed ACP server from onboarding and have it validated before Thor
+uses it, but failed rows can still land on broad install/auth messages when the
+registry does not provide exact setup instructions.
 
 Fixed in this PR:
 
@@ -385,6 +387,11 @@ Fixed in this PR:
 - [x] Added an onboarding recovery path to add a custom ACP command, persist it
   as a named custom agent, rerun ACP validation, and only expose it to Thor after
   the normal configured-server path sees it.
+- [x] Added an onboarding path to add ACP registry entries without probing the
+  whole registry. Selecting a registry entry persists it as a configured Thor
+  ACP server, then the normal validation loop decides whether it is usable.
+- [x] Preserved registry website/repository links on configured servers and
+  surfaced those links in failed-row setup guidance when available.
 - [x] Kept failed candidates visible while making the add-command row reachable
   in long or mostly broken setup lists.
 - [x] Added provider-specific failed-row guidance for Anvil, Claude ACP, Codex
@@ -392,10 +399,10 @@ Fixed in this PR:
 
 Still not production-grade:
 
-1. **Registry-backed agent setup still needs a clearer install/configure path.**
-   Custom ACP commands can now be added from onboarding, but registry entries
-   still need first-class setup actions when their provider CLI, package
-   manager, or auth is missing.
+1. **Registry-backed agent setup still needs richer install/configure metadata.**
+   Registry entries can now be added from onboarding, and website/repository
+   links are preserved, but the registry itself does not currently expose exact
+   auth/install steps for every agent.
 2. **Validation feedback is still partly inferred, not registry-metadata-driven.**
    Rows now offer provider-specific actions for Anvil, Claude, Codex, `npx`,
    and `uvx`, but production UX should use registry/auth metadata for exact

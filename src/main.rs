@@ -890,6 +890,16 @@ async fn run_thor_onboarding(
 ) -> Result<Option<SelectedAgent>> {
     let (selection, setup_agents, available_servers) = loop {
         let available_servers = thor_onboarding_servers(cfg).await;
+        let registry_servers = thor_registry_onboarding_servers(cfg, &available_servers).await;
+        let registry_agents = registry_servers
+            .iter()
+            .map(|server| thor_setup::ThorSetupRegistryAgent {
+                source_id: server.source_id.clone(),
+                name: server.name.clone(),
+                description: server.description.clone(),
+                setup_url: server.setup_url.clone(),
+            })
+            .collect::<Vec<_>>();
         let available_agents = available_servers
             .iter()
             .map(ConfiguredAcpServer::selected_agent)
@@ -905,6 +915,7 @@ async fn run_thor_onboarding(
                     agent: agent.clone(),
                     name: server.name.clone(),
                     description: server.description.clone(),
+                    setup_url: server.setup_url.clone(),
                     quota_backend: server.quota_backend,
                     validation: validations
                         .iter()
@@ -934,9 +945,14 @@ async fn run_thor_onboarding(
                     .map(|candidate| candidate.agent.clone())
                     .unwrap_or_else(thor::default_anvil_agent)
             });
-        let Some(outcome) =
-            run_thor_setup_once(cfg.theme.palette(), &cfg.thor, &setup_agents, &initial_host)
-                .await?
+        let Some(outcome) = run_thor_setup_once(
+            cfg.theme.palette(),
+            &cfg.thor,
+            &setup_agents,
+            &registry_agents,
+            &initial_host,
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -946,6 +962,11 @@ async fn run_thor_onboarding(
             }
             thor_setup::ThorSetupOutcome::AddCustom(custom) => {
                 add_custom_thor_agent(cfg, custom)?;
+                cfg.save(config_path)
+                    .with_context(|| format!("save {}", config_path.display()))?;
+            }
+            thor_setup::ThorSetupOutcome::AddRegistry(source_id) => {
+                add_registry_thor_agent(cfg, &registry_servers, &source_id)?;
                 cfg.save(config_path)
                     .with_context(|| format!("save {}", config_path.display()))?;
             }
@@ -1034,6 +1055,20 @@ fn unique_custom_agent_name(cfg: &Config, requested: &str) -> String {
     format!("{base} {}", cfg.custom_agents.len() + 1)
 }
 
+fn add_registry_thor_agent(
+    cfg: &mut Config,
+    registry_servers: &[ConfiguredAcpServer],
+    source_id: &str,
+) -> Result<()> {
+    let server = registry_servers
+        .iter()
+        .find(|server| server.source_id == source_id)
+        .cloned()
+        .with_context(|| format!("registry ACP server {source_id} is no longer available"))?;
+    push_unique_server(&mut cfg.thor.configured_acp_servers, server);
+    Ok(())
+}
+
 async fn thor_onboarding_servers(cfg: &Config) -> Vec<ConfiguredAcpServer> {
     let mut servers = Vec::new();
     for server in thor::configured_acp_servers(cfg) {
@@ -1049,12 +1084,54 @@ async fn thor_onboarding_servers(cfg: &Config) -> Vec<ConfiguredAcpServer> {
                 args: custom.args.clone(),
                 env: Default::default(),
                 description: custom.description.clone(),
+                setup_url: String::new(),
                 quota_backend: ThorQuotaBackend::None,
             },
         );
     }
     push_unique_server(&mut servers, thor::default_anvil_server());
     servers
+}
+
+async fn thor_registry_onboarding_servers(
+    cfg: &Config,
+    available_servers: &[ConfiguredAcpServer],
+) -> Vec<ConfiguredAcpServer> {
+    let registry = match tokio::time::timeout(
+        Duration::from_secs(2),
+        registry::load_with_cache(
+            &registry::default_cache_path(),
+            registry::CACHE_TTL,
+            registry::REGISTRY_URL,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(registry)) => registry,
+        Ok(Err(error)) => {
+            tracing::warn!("load ACP registry for Thor onboarding: {error:#}");
+            return Vec::new();
+        }
+        Err(_) => {
+            tracing::warn!("load ACP registry for Thor onboarding timed out");
+            return Vec::new();
+        }
+    };
+
+    registry
+        .configured_servers()
+        .into_iter()
+        .filter(|server| {
+            !available_servers
+                .iter()
+                .any(|existing| existing.source_id == server.source_id)
+                && !cfg
+                    .thor
+                    .configured_acp_servers
+                    .iter()
+                    .any(|existing| existing.source_id == server.source_id)
+        })
+        .collect()
 }
 
 fn push_unique_server(servers: &mut Vec<ConfiguredAcpServer>, server: ConfiguredAcpServer) {
@@ -1190,11 +1267,19 @@ async fn run_thor_setup_once(
     theme: palette::TerminalTheme,
     thor_config: &thor::ThorConfig,
     agents: &[thor_setup::ThorSetupAgent],
+    registry_agents: &[thor_setup::ThorSetupRegistryAgent],
     host_agent: &SelectedAgent,
 ) -> Result<Option<thor_setup::ThorSetupOutcome>> {
     let mut terminal = ui::setup_fullscreen_terminal().context("setup terminal")?;
-    let result =
-        thor_setup::run_thor_setup(&mut terminal, theme, thor_config, agents, host_agent).await;
+    let result = thor_setup::run_thor_setup(
+        &mut terminal,
+        theme,
+        thor_config,
+        agents,
+        registry_agents,
+        host_agent,
+    )
+    .await;
     if let Err(e) = ui::restore_fullscreen_terminal(&mut terminal) {
         tracing::warn!("restore terminal (Thor setup) failed: {e}");
     }
@@ -1749,6 +1834,7 @@ mod tests {
                         args: configured.args.clone(),
                         env: configured.env.clone(),
                         description: String::new(),
+                        setup_url: String::new(),
                         quota_backend: ThorQuotaBackend::ClaudeCli,
                     }],
                     ..Default::default()
@@ -1789,6 +1875,7 @@ mod tests {
                     args: vec!["-y".to_string(), "@x/claude".to_string()],
                     env: Default::default(),
                     description: String::new(),
+                    setup_url: String::new(),
                     quota_backend: ThorQuotaBackend::ClaudeCli,
                 }],
                 ..Default::default()
@@ -1879,6 +1966,54 @@ mod tests {
         assert_eq!(custom.name, "Local ACP");
         assert_eq!(custom.program, PathBuf::from("/opt/local acp/bin/server"));
         assert_eq!(custom.args, vec!["--mode", "thor"]);
+    }
+
+    #[test]
+    fn add_registry_thor_agent_persists_selected_server() {
+        let mut cfg = Config::default();
+        let registry_servers = vec![ConfiguredAcpServer {
+            source_id: "gemini".to_string(),
+            name: "Gemini CLI".to_string(),
+            program: PathBuf::from("npx"),
+            args: vec![
+                "-y".to_string(),
+                "@google/gemini-cli".to_string(),
+                "--acp".to_string(),
+            ],
+            env: Default::default(),
+            description: "Google Gemini ACP".to_string(),
+            setup_url: "https://geminicli.com".to_string(),
+            quota_backend: ThorQuotaBackend::None,
+        }];
+
+        add_registry_thor_agent(&mut cfg, &registry_servers, "gemini").expect("add registry");
+
+        assert_eq!(cfg.thor.configured_acp_servers, registry_servers);
+    }
+
+    #[test]
+    fn add_registry_thor_agent_deduplicates_existing_server() {
+        let mut cfg = Config {
+            thor: thor::ThorConfig {
+                configured_acp_servers: vec![ConfiguredAcpServer {
+                    source_id: "gemini".to_string(),
+                    name: "Gemini CLI".to_string(),
+                    program: PathBuf::from("npx"),
+                    args: Vec::new(),
+                    env: Default::default(),
+                    description: String::new(),
+                    setup_url: "https://geminicli.com".to_string(),
+                    quota_backend: ThorQuotaBackend::None,
+                }],
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry_servers = cfg.thor.configured_acp_servers.clone();
+
+        add_registry_thor_agent(&mut cfg, &registry_servers, "gemini").expect("add registry");
+
+        assert_eq!(cfg.thor.configured_acp_servers.len(), 1);
     }
 
     #[test]
