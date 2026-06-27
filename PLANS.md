@@ -305,14 +305,19 @@ Goal: decide whether `mjolnir` should become more than a prompt/permission UI.
 Candidate capabilities:
 
 - ACP filesystem operations (`fs/read_text_file`, `fs/write_text_file`) backed
-  by local disk.
+  by local disk. Design note:
+  [docs/trust-folder-support.md](docs/trust-folder-support.md).
 - ACP terminal operations backed by a managed subprocess view.
-- ACP registry lookup and agent launch presets.
+  Design note: [docs/trust-folder-support.md](docs/trust-folder-support.md).
+- ACP registry lookup and agent launch presets. Design note:
+  [docs/acp-registry-presets.md](docs/acp-registry-presets.md).
 - Deeper session persistence UX beyond the current session history, `/load`,
-  and `/fork` support, including checkpoint/rewind flows.
+  and `/fork` support, including checkpoint/rewind flows. Design note:
+  [docs/session-rewind-extension.md](docs/session-rewind-extension.md).
 
 These are intentionally later because they can expand the blast radius quickly.
-Each should start with a separate design note before implementation.
+Each should start with a design note before implementation; the current
+candidate notes are linked above.
 
 ## Feature backlog
 
