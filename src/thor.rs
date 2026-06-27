@@ -101,47 +101,6 @@ fn default_pricing_url() -> String {
     OPENROUTER_MODELS_URL.to_string()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum TaskComplexity {
-    Simple,
-    Hard,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum HarnessKind {
-    ClaudeCode,
-    Codex,
-    Anvil,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub struct ModelScore {
-    pub model: String,
-    pub arena_score: f64,
-    pub input_price_per_million: Option<f64>,
-    pub output_price_per_million: Option<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub struct HarnessCandidate {
-    pub source_id: String,
-    pub kind: HarnessKind,
-    pub remaining_quota_known: bool,
-    pub remaining_quota_available: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub struct RouteChoice {
-    pub model: String,
-    pub harness_source_id: String,
-    pub harness_kind: HarnessKind,
-}
-
 pub fn default_anvil_agent() -> SelectedAgent {
     SelectedAgent {
         source_id: "anvil".to_string(),
@@ -253,8 +212,8 @@ You are Thor, the mjolnir omni-agent coordinator.
 
 You are running inside an ACP host agent. You are not a local in-process
 subagent. `mj` has provided an MCP server named `{server_name}` with tools for
-listing configured ACP workers, reading model/pricing metadata, and delegating
-prompts to them.
+listing configured ACP workers, reading model/pricing metadata, submitting a
+structured plan, and delegating prompts to workers.
 
 Operating mode:
 - optimization: {optimization}
@@ -262,6 +221,18 @@ Operating mode:
 - coordinator reasoning: {reasoning}
 - model strength source: {leaderboard}
 - pricing source: {pricing}
+
+Rust-enforced workflow:
+- Gather facts first: call `thor_list_acp_agents` with `refreshQuota: true` and
+  `validate: true`, then call `thor_get_model_catalog`.
+- Decide task complexity, strategy, worker/model choices, and prompts yourself.
+  Rust provides facts and guardrails; it does not classify task difficulty or
+  pick routes for you.
+- Submit your structured plan with `thor_submit_plan` before any worker run.
+- The plan must include implementation, adversarial review, and correction
+  phases. `mj` rejects phase-skipping and unknown worker/job IDs.
+- Run planned implementation jobs, then planned review jobs, then planned
+  correction jobs. Use `phase` and `jobId` values from the accepted plan.
 
 Policy:
 - Keep the UX aggressively simple: no model picker or agent picker unless the
@@ -284,7 +255,7 @@ Policy:
   modes and only run inside mj's current workspace. Do not request bypassed
   permissions or arbitrary filesystem roots.
 - Present a concise plan before doing work unless the user has configured plan
-  approval to skip it.
+  approval to skip it; use the same plan content you pass to `thor_submit_plan`.
 - For cost/accountant mode, use cheaper models when the task is sufficiently
   simple.
 - For best-solution/architect mode, run two independent versions on complex
@@ -308,111 +279,6 @@ User request:
     )
 }
 
-#[allow(dead_code)]
-pub fn choose_model(
-    models: &[ModelScore],
-    complexity: TaskComplexity,
-    mode: ThorOptimizationMode,
-) -> Option<ModelScore> {
-    match mode {
-        ThorOptimizationMode::Cost if complexity == TaskComplexity::Simple => models
-            .iter()
-            .filter(|model| {
-                model.input_price_per_million.is_some() && model.output_price_per_million.is_some()
-            })
-            .min_by(|a, b| model_cost(a).total_cmp(&model_cost(b)))
-            .cloned()
-            .or_else(|| strongest_model(models)),
-        ThorOptimizationMode::BestSolution => strongest_model(models),
-        _ => match complexity {
-            TaskComplexity::Simple => models
-                .iter()
-                .filter(|model| model.arena_score >= 900.0)
-                .min_by(|a, b| model_cost(a).total_cmp(&model_cost(b)))
-                .cloned()
-                .or_else(|| strongest_model(models)),
-            TaskComplexity::Hard => strongest_model(models),
-        },
-    }
-}
-
-#[allow(dead_code)]
-pub fn choose_route(
-    models: &[ModelScore],
-    harnesses: &[HarnessCandidate],
-    complexity: TaskComplexity,
-    mode: ThorOptimizationMode,
-) -> Option<RouteChoice> {
-    let model = choose_model(models, complexity, mode)?;
-    let preferred = preferred_harness_kind(&model.model);
-    let harness = harnesses
-        .iter()
-        .filter(|harness| harness.remaining_quota_available)
-        .find(|harness| Some(harness.kind) == preferred)
-        .or_else(|| {
-            harnesses
-                .iter()
-                .filter(|harness| harness.remaining_quota_available)
-                .find(|harness| harness.kind == HarnessKind::Anvil)
-        })
-        .or_else(|| {
-            harnesses
-                .iter()
-                .find(|harness| harness.remaining_quota_available)
-        })?;
-    Some(RouteChoice {
-        model: model.model,
-        harness_source_id: harness.source_id.clone(),
-        harness_kind: harness.kind,
-    })
-}
-
-#[allow(dead_code)]
-pub fn infer_complexity(prompt: &str) -> TaskComplexity {
-    let lower = prompt.to_ascii_lowercase();
-    let hard_keywords = [
-        "architecture",
-        "redesign",
-        "multi-agent",
-        "orchestr",
-        "security",
-        "refactor",
-        "migration",
-        "complex",
-    ];
-    if prompt.len() > 240 || hard_keywords.iter().any(|keyword| lower.contains(keyword)) {
-        TaskComplexity::Hard
-    } else {
-        TaskComplexity::Simple
-    }
-}
-
-#[allow(dead_code)]
-fn strongest_model(models: &[ModelScore]) -> Option<ModelScore> {
-    models
-        .iter()
-        .max_by(|a, b| a.arena_score.total_cmp(&b.arena_score))
-        .cloned()
-}
-
-#[allow(dead_code)]
-fn model_cost(model: &ModelScore) -> f64 {
-    model.input_price_per_million.unwrap_or(f64::INFINITY)
-        + model.output_price_per_million.unwrap_or(f64::INFINITY)
-}
-
-#[allow(dead_code)]
-fn preferred_harness_kind(model: &str) -> Option<HarnessKind> {
-    let lower = model.to_ascii_lowercase();
-    if lower.contains("claude") || lower.contains("anthropic") {
-        Some(HarnessKind::ClaudeCode)
-    } else if lower.contains("gpt") || lower.contains("openai") {
-        Some(HarnessKind::Codex)
-    } else {
-        None
-    }
-}
-
 fn optimization_label(mode: ThorOptimizationMode) -> &'static str {
     match mode {
         ThorOptimizationMode::Balanced => "balanced",
@@ -433,15 +299,6 @@ fn reasoning_label(reasoning: ThorReasoning) -> &'static str {
 mod tests {
     use super::*;
 
-    fn harness(source_id: &str, kind: HarnessKind, available: bool) -> HarnessCandidate {
-        HarnessCandidate {
-            source_id: source_id.to_string(),
-            kind,
-            remaining_quota_known: true,
-            remaining_quota_available: available,
-        }
-    }
-
     #[test]
     fn default_anvil_agent_uses_uvx_brokk_acp() {
         let agent = default_anvil_agent();
@@ -456,6 +313,8 @@ mod tests {
         assert!(prompt.contains("running inside an ACP host agent"));
         assert!(prompt.contains(THOR_MCP_SERVER_NAME));
         assert!(prompt.contains("listing configured ACP workers"));
+        assert!(prompt.contains("Rust-enforced workflow"));
+        assert!(prompt.contains("thor_submit_plan"));
         assert!(prompt.contains("coordinator reasoning: high"));
         assert!(prompt.contains("Always bake in adversarial review and correction"));
         assert!(prompt.contains("User request:\nfix the parser"));
@@ -523,103 +382,5 @@ mod tests {
         assert!(prompt.contains("best-solution/architect"));
         assert!(prompt.contains("run two independent versions"));
         assert!(prompt.contains("choose the best result"));
-    }
-
-    #[test]
-    fn balanced_hard_tasks_choose_strongest_model() {
-        let models = vec![
-            ModelScore {
-                model: "cheap".to_string(),
-                arena_score: 900.0,
-                input_price_per_million: Some(0.1),
-                output_price_per_million: Some(0.1),
-            },
-            ModelScore {
-                model: "strong".to_string(),
-                arena_score: 1300.0,
-                input_price_per_million: Some(10.0),
-                output_price_per_million: Some(30.0),
-            },
-        ];
-        assert_eq!(
-            choose_model(
-                &models,
-                TaskComplexity::Hard,
-                ThorOptimizationMode::Balanced
-            )
-            .expect("model")
-            .model,
-            "strong"
-        );
-    }
-
-    #[test]
-    fn accountant_mode_simple_tasks_choose_cheapest_priced_model() {
-        let models = vec![
-            ModelScore {
-                model: "strong".to_string(),
-                arena_score: 1300.0,
-                input_price_per_million: Some(10.0),
-                output_price_per_million: Some(30.0),
-            },
-            ModelScore {
-                model: "small".to_string(),
-                arena_score: 900.0,
-                input_price_per_million: Some(0.1),
-                output_price_per_million: Some(0.1),
-            },
-        ];
-        assert_eq!(
-            choose_model(&models, TaskComplexity::Simple, ThorOptimizationMode::Cost)
-                .expect("model")
-                .model,
-            "small"
-        );
-    }
-
-    #[test]
-    fn claude_models_prefer_claude_code_when_quota_available() {
-        let models = vec![ModelScore {
-            model: "anthropic/claude-example".to_string(),
-            arena_score: 1200.0,
-            input_price_per_million: Some(3.0),
-            output_price_per_million: Some(15.0),
-        }];
-        let harnesses = vec![
-            harness("anvil", HarnessKind::Anvil, true),
-            harness("claude-code", HarnessKind::ClaudeCode, true),
-        ];
-        let route = choose_route(
-            &models,
-            &harnesses,
-            TaskComplexity::Hard,
-            ThorOptimizationMode::Balanced,
-        )
-        .expect("route");
-        assert_eq!(route.harness_kind, HarnessKind::ClaudeCode);
-        assert_eq!(route.harness_source_id, "claude-code");
-    }
-
-    #[test]
-    fn gpt_models_prefer_codex_and_fall_back_to_anvil_without_quota() {
-        let models = vec![ModelScore {
-            model: "openai/gpt-example".to_string(),
-            arena_score: 1200.0,
-            input_price_per_million: Some(2.0),
-            output_price_per_million: Some(8.0),
-        }];
-        let harnesses = vec![
-            harness("codex", HarnessKind::Codex, false),
-            harness("anvil", HarnessKind::Anvil, true),
-        ];
-        let route = choose_route(
-            &models,
-            &harnesses,
-            TaskComplexity::Hard,
-            ThorOptimizationMode::Balanced,
-        )
-        .expect("route");
-        assert_eq!(route.harness_kind, HarnessKind::Anvil);
-        assert_eq!(route.harness_source_id, "anvil");
     }
 }
