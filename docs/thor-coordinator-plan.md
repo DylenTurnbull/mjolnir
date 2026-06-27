@@ -24,8 +24,10 @@ changed and how much each harness/model used.
   not the full registry and not locally installed provider CLIs.
 - The onboarding flow can add a registry-backed ACP server or custom ACP
   command from setup, persist it, and rerun validation before Thor uses it. It
-  is not production-grade until setup has richer metadata-driven install/auth
-  guidance and a user can reach a usable Thor host without editing TOML by hand.
+  is not production-grade until the setup process feels like an end-user wizard
+  rather than a validation list: no raw ACP concepts on the happy path, concrete
+  install/auth recovery actions for failed agents, a clear retry path, and a
+  way for a user to reach a usable Thor host without editing TOML by hand.
 - The normal prompt flow has no visible model picker or agent picker.
 - Thor presents an execution plan before doing work.
 - The MCP bridge is provided to the Thor host as an ACP `mcpServers` stdio
@@ -92,9 +94,12 @@ changed and how much each harness/model used.
     servers. Failed rows have provider-specific guidance for Anvil, Claude ACP,
     Codex ACP, `npx`, and `uvx`. All-broken candidate sets no longer mark
     failed agents as available workers. Small and large setup render tests cover
-    the recovery rows and no-ready-host summary. Remaining: replace inferred
-    setup labels with richer metadata-driven exact commands/links where
-    possible and manually smoke-test the setup UI across terminal sizes.
+    the recovery rows and no-ready-host summary. Remaining: redesign the setup
+    progression so the first screen clearly explains usable agents, broken
+    agents, and the next best action; replace inferred setup labels with richer
+    metadata-driven exact commands/links where possible; add an explicit retry
+    path after fixes; and manually smoke-test the setup UI across terminal
+    sizes.
 
 ## Quota reads
 

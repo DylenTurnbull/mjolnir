@@ -54,13 +54,15 @@ agents that validate successfully are made available to Thor automatically and
 written to visible `[thor]` configuration. The previous agent picker is no
 longer part of the normal user path.
 
-The remaining startup gap is onboarding quality. The current first-run flow
-validates candidates and avoids the old model/agent picker, but it still does
-not fully feel like an end-user setup wizard. It now lets a user add a custom
-ACP command or registry-backed ACP server from setup and reruns validation
-before Thor uses it, but exact install/auth guidance beyond available registry
-links and the first provider-specific cases, plus manual visual smoke, are still
-required before this is production-grade.
+The remaining startup gap is onboarding quality. This is a release blocker, not
+polish. The current first-run flow validates candidates and avoids the old
+model/agent picker, but it still feels like a developer validation screen rather
+than an end-user setup wizard. It now lets a user add a custom ACP command or
+registry-backed ACP server from setup and reruns validation before Thor uses it,
+but the user still has to understand too much about ACP commands, installed
+programs, auth state, and what to do after a failed check. Exact install/auth
+guidance beyond available registry links and the first provider-specific cases,
+plus manual visual smoke, are required before this is production-grade.
 
 M1 hardening landed (PR #34): an explicit `ConnectionState` lifecycle drives
 the header label, a `LaunchError` enum surfaces spawn / initialize /
@@ -322,10 +324,11 @@ Near-term:
   resource text fallbacks; structured tool-call output for diff/terminal).
 - Compatibility smoke tests against more non-Brokk ACP agents (one done in
   M1; see the Compatibility section).
-- Production-grade Thor first-run onboarding: add/configure ACP agents from
-  setup is implemented for custom ACP commands and registry-backed entries;
-  richer registry/auth guidance and manual visual smoke across terminal sizes
-  remain.
+- Production-grade Thor first-run onboarding: the current setup process is
+  still too rough for end users. Add/configure ACP agents from setup is
+  implemented for custom ACP commands and registry-backed entries; richer
+  registry/auth guidance, a more guided setup/retry flow, and manual visual
+  smoke across terminal sizes remain.
 
 (M1 closed: fatal/error rendering, child-process cleanup, transcript
 scrolling.)
@@ -355,12 +358,33 @@ The first-run Thor setup screen (`src/thor_setup.rs`) must be end-user-quality
 before it ships. The flow is the first product impression, so implementation
 concepts must not leak into the setup path.
 
-Current assessment: the flow is still not production-grade. It is no longer the
-old advanced picker, but it remains too much like a validation list and not
-enough like a guided setup wizard. A new user can now add a custom ACP command
-or registry-backed ACP server from onboarding and have it validated before Thor
-uses it, but failed rows can still land on broad install/auth messages when the
-registry does not provide exact setup instructions.
+Current assessment: the flow is still not production-grade and is still a poor
+first-run experience for end users. It is no longer the old advanced picker, but
+it remains too much like a validation list and not enough like a guided setup
+wizard. A new user can now add a custom ACP command or registry-backed ACP
+server from onboarding and have it validated before Thor uses it, but failed
+rows can still land on broad install/auth messages when the registry does not
+provide exact setup instructions. The user should not have to infer whether they
+need to install Node/uv, sign in to Claude or Codex, pick a registry package, or
+retry validation after fixing their environment.
+
+Required end-user setup behavior before production:
+
+- First screen must clearly answer: what Thor is, what is already usable, what
+  needs setup, and the next best action.
+- A user with no working ACP server must have an obvious path to install or
+  configure one without editing TOML.
+- Registry-backed choices must show plain-language setup expectations before
+  they are added, including install/auth hints and the command that will be run
+  when known.
+- Failed validation must produce a concrete recovery action and a retry path,
+  not just a disabled row.
+- The UI must not require understanding ACP, quota backends, source IDs, or raw
+  package names unless the user opens an advanced/custom command path.
+- The success path must feel like: choose where Thor runs, optionally add/fix an
+  agent, start Thor. It must not feel like curating an internal worker list.
+- Manual smoke must verify the setup flow with no configured agents, one broken
+  default, at least one registry add, and one successful configured agent.
 
 Fixed in this PR:
 
