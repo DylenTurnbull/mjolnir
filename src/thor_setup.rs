@@ -39,9 +39,6 @@ pub struct ThorSetupSelection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupStep {
     Host,
-    Persona,
-    Model,
-    Reasoning,
     Confirm,
 }
 
@@ -49,9 +46,6 @@ impl SetupStep {
     fn title(self) -> &'static str {
         match self {
             Self::Host => "choose Thor",
-            Self::Persona => "work style",
-            Self::Model => "model preference",
-            Self::Reasoning => "planning depth",
             Self::Confirm => "start",
         }
     }
@@ -59,61 +53,10 @@ impl SetupStep {
     fn index(self) -> usize {
         match self {
             Self::Host => 0,
-            Self::Persona => 1,
-            Self::Model => 2,
-            Self::Reasoning => 3,
-            Self::Confirm => 4,
+            Self::Confirm => 1,
         }
     }
 }
-
-#[derive(Debug, Clone, Copy)]
-struct ModelOption {
-    value: &'static str,
-    label: &'static str,
-    description: &'static str,
-}
-
-const MODEL_OPTIONS: [ModelOption; 4] = [
-    ModelOption {
-        value: "auto-strong",
-        label: "Auto strong",
-        description: "let Thor choose the strongest configured coordinator model",
-    },
-    ModelOption {
-        value: "claude-strong",
-        label: "Claude strong",
-        description: "prefer a strong Claude-family coordinator",
-    },
-    ModelOption {
-        value: "gpt-strong",
-        label: "GPT strong",
-        description: "prefer a strong GPT-family coordinator",
-    },
-    ModelOption {
-        value: "openrouter-strong",
-        label: "OpenRouter strong",
-        description: "prefer the strongest OpenRouter route",
-    },
-];
-
-const REASONING_OPTIONS: [(ThorReasoning, &str, &str); 3] = [
-    (
-        ThorReasoning::High,
-        "High",
-        "best default for Thor planning, routing, and review",
-    ),
-    (
-        ThorReasoning::Medium,
-        "Medium",
-        "less planning overhead for routine work",
-    ),
-    (
-        ThorReasoning::Low,
-        "Low",
-        "fastest coordinator behavior for simple requests",
-    ),
-];
 
 #[derive(Debug, Clone)]
 struct ThorSetupState {
@@ -197,18 +140,6 @@ impl ThorSetupState {
                 if let Some(source_id) = self.enabled_source_ids().get(self.cursor) {
                     self.host_source_id = source_id.clone();
                 }
-                self.set_step(SetupStep::Persona);
-            }
-            SetupStep::Persona => {
-                self.optimization_mode = persona_mode_for_cursor(self.cursor);
-                self.set_step(SetupStep::Model);
-            }
-            SetupStep::Model => {
-                self.coordinator_model = MODEL_OPTIONS[self.cursor].value.to_string();
-                self.set_step(SetupStep::Reasoning);
-            }
-            SetupStep::Reasoning => {
-                self.coordinator_reasoning = REASONING_OPTIONS[self.cursor].0;
                 self.set_step(SetupStep::Confirm);
             }
             SetupStep::Confirm => return Some(self.selection()),
@@ -219,10 +150,7 @@ impl ThorSetupState {
     fn back(&mut self) {
         match self.step {
             SetupStep::Host => {}
-            SetupStep::Persona => self.set_step(SetupStep::Host),
-            SetupStep::Model => self.set_step(SetupStep::Host),
-            SetupStep::Reasoning => self.set_step(SetupStep::Model),
-            SetupStep::Confirm => self.set_step(SetupStep::Reasoning),
+            SetupStep::Confirm => self.set_step(SetupStep::Host),
         }
     }
 
@@ -248,21 +176,6 @@ impl ThorSetupState {
                 .iter()
                 .position(|source_id| source_id == &self.host_source_id)
                 .unwrap_or(0),
-            SetupStep::Persona => {
-                if self.optimization_mode == ThorOptimizationMode::Cost {
-                    1
-                } else {
-                    0
-                }
-            }
-            SetupStep::Model => MODEL_OPTIONS
-                .iter()
-                .position(|option| option.value == self.coordinator_model)
-                .unwrap_or(0),
-            SetupStep::Reasoning => REASONING_OPTIONS
-                .iter()
-                .position(|(reasoning, _, _)| *reasoning == self.coordinator_reasoning)
-                .unwrap_or(0),
             SetupStep::Confirm => 0,
         }
     }
@@ -270,9 +183,6 @@ impl ThorSetupState {
     fn current_len(&self) -> usize {
         match self.step {
             SetupStep::Host => self.enabled_source_ids().len(),
-            SetupStep::Persona => 2,
-            SetupStep::Model => MODEL_OPTIONS.len(),
-            SetupStep::Reasoning => REASONING_OPTIONS.len(),
             SetupStep::Confirm => 1,
         }
     }
@@ -388,8 +298,8 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
                 .fg(theme.primary)
                 .add_modifier(Modifier::BOLD),
         )]),
-        Line::from("Pick how Thor starts. You can change these choices later in config."),
-        Line::from("Installed and configured agents are available for Thor to delegate work."),
+        Line::from("Choose where Thor runs. The other defaults are ready to change later."),
+        Line::from("Configured agents that work are available for Thor to delegate to."),
     ])
     .style(Style::default().fg(theme.text));
     f.render_widget(title, layout[0]);
@@ -398,9 +308,6 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
 
     let content = match state.step {
         SetupStep::Host => host_rows(state, theme),
-        SetupStep::Persona => persona_rows(state, theme),
-        SetupStep::Model => model_rows(state, theme),
-        SetupStep::Reasoning => reasoning_rows(state, theme),
         SetupStep::Confirm => confirm_rows(state, theme),
     };
     let content = visible_rows(content, state.cursor, layout[2].height as usize);
@@ -420,13 +327,7 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
 }
 
 fn progress_line(state: &ThorSetupState, theme: TerminalTheme) -> Paragraph<'static> {
-    let steps = [
-        SetupStep::Host,
-        SetupStep::Persona,
-        SetupStep::Model,
-        SetupStep::Reasoning,
-        SetupStep::Confirm,
-    ];
+    let steps = [SetupStep::Host, SetupStep::Confirm];
     let spans = steps
         .iter()
         .enumerate()
@@ -482,32 +383,6 @@ fn visible_rows(
     rows.into_iter().skip(start).take(viewport_height).collect()
 }
 
-fn persona_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'static>> {
-    [
-        (
-            "Architect",
-            "optimize for the best solution; compare two versions on complex work",
-        ),
-        (
-            "Accountant",
-            "optimize for cost; use cheaper models when the task is simple enough",
-        ),
-    ]
-    .iter()
-    .enumerate()
-    .map(|(idx, (label, description))| {
-        selectable_row(
-            idx == state.cursor,
-            vec![
-                Span::styled((*label).to_string(), Style::default().fg(theme.text)),
-                Span::styled(format!("  {description}"), Style::default().fg(theme.muted)),
-            ],
-            theme,
-        )
-    })
-    .collect()
-}
-
 fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'static>> {
     let enabled = state.enabled_source_ids();
     enabled
@@ -540,43 +415,6 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
                 ],
                 theme,
             ))
-        })
-        .collect()
-}
-
-fn model_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'static>> {
-    MODEL_OPTIONS
-        .iter()
-        .enumerate()
-        .map(|(idx, option)| {
-            selectable_row(
-                idx == state.cursor,
-                vec![
-                    Span::styled(option.label.to_string(), Style::default().fg(theme.text)),
-                    Span::styled(
-                        format!("  {}", option.description),
-                        Style::default().fg(theme.muted),
-                    ),
-                ],
-                theme,
-            )
-        })
-        .collect()
-}
-
-fn reasoning_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'static>> {
-    REASONING_OPTIONS
-        .iter()
-        .enumerate()
-        .map(|(idx, (_, label, description))| {
-            selectable_row(
-                idx == state.cursor,
-                vec![
-                    Span::styled((*label).to_string(), Style::default().fg(theme.text)),
-                    Span::styled(format!("  {description}"), Style::default().fg(theme.muted)),
-                ],
-                theme,
-            )
         })
         .collect()
 }
@@ -620,12 +458,15 @@ fn summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'stat
             state.enabled_source_ids().join(", "),
             theme,
         ),
-        detail_line("Work style", persona_label(state.optimization_mode), theme),
         detail_line("Thor runs in", state.host_source_id.clone(), theme),
-        detail_line("Model preference", state.coordinator_model.clone(), theme),
         detail_line(
-            "Planning depth",
-            reasoning_label(state.coordinator_reasoning),
+            "Defaults",
+            format!(
+                "{}, {}, {} reasoning",
+                persona_label(state.optimization_mode),
+                state.coordinator_model,
+                reasoning_label(state.coordinator_reasoning)
+            ),
             theme,
         ),
     ]
@@ -636,14 +477,6 @@ fn detail_line(label: &str, value: String, theme: TerminalTheme) -> Line<'static
         Span::styled(format!("{label}: "), Style::default().fg(theme.muted)),
         Span::styled(value, Style::default().fg(theme.text)),
     ])
-}
-
-fn persona_mode_for_cursor(cursor: usize) -> ThorOptimizationMode {
-    if cursor == 1 {
-        ThorOptimizationMode::Cost
-    } else {
-        ThorOptimizationMode::BestSolution
-    }
 }
 
 fn persona_label(mode: ThorOptimizationMode) -> String {
@@ -705,9 +538,33 @@ fn setup_agent_is_usable(setup_agent: &ThorSetupAgent) -> bool {
 fn host_status_label(setup_agent: &ThorSetupAgent) -> String {
     match &setup_agent.validation {
         Some(validation) if validation.usable => "ready".to_string(),
-        Some(_) => "needs setup".to_string(),
+        Some(validation) => validation_action_label(setup_agent, validation),
         None => "available".to_string(),
     }
+}
+
+fn validation_action_label(setup_agent: &ThorSetupAgent, validation: &AgentValidation) -> String {
+    let Some(error) = validation.error.as_deref() else {
+        return "setup needed".to_string();
+    };
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("not found")
+        || lower.contains("no such file")
+        || lower.contains("missing command")
+        || lower.contains("permission denied")
+    {
+        return format!("install {}", setup_agent.agent.program.to_string_lossy());
+    }
+    if lower.contains("auth")
+        || lower.contains("login")
+        || lower.contains("api key")
+        || lower.contains("missing key")
+        || lower.contains("token")
+        || lower.contains("credential")
+    {
+        return "sign in or add key".to_string();
+    }
+    format!("setup needed: {}", truncate_label(error, 48))
 }
 
 fn truncate_label(value: &str, max_chars: usize) -> String {
@@ -783,20 +640,28 @@ mod tests {
     }
 
     #[test]
-    fn persona_step_maps_architect_and_accountant() {
+    fn host_selection_advances_directly_to_confirm() {
+        let raw_agents = vec![agent("claude"), agent("codex")];
+        let agents = setup_agents(&raw_agents);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
+
+        state.cursor = 1;
+        state.advance();
+
+        assert_eq!(state.step, SetupStep::Confirm);
+        assert_eq!(state.host_source_id, "codex");
+    }
+
+    #[test]
+    fn back_from_confirm_returns_to_host_selection() {
         let raw_agents = vec![agent("anvil")];
         let agents = setup_agents(&raw_agents);
         let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
 
-        state.set_step(SetupStep::Persona);
-        state.cursor = 0;
-        state.advance();
-        assert_eq!(state.optimization_mode, ThorOptimizationMode::BestSolution);
+        state.set_step(SetupStep::Confirm);
+        state.back();
 
-        state.set_step(SetupStep::Persona);
-        state.cursor = 1;
-        state.advance();
-        assert_eq!(state.optimization_mode, ThorOptimizationMode::Cost);
+        assert_eq!(state.step, SetupStep::Host);
     }
 
     #[test]
@@ -857,6 +722,13 @@ mod tests {
 
         assert_eq!(state.enabled_source_ids(), vec!["codex"]);
         assert_eq!(state.host_source_id, "codex");
+    }
+
+    #[test]
+    fn validation_error_gives_actionable_sign_in_guidance() {
+        let setup_agent = setup_agent_with_validation("claude", false);
+
+        assert_eq!(host_status_label(&setup_agent), "sign in or add key");
     }
 
     #[test]

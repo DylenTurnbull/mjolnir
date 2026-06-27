@@ -48,11 +48,11 @@ Current command-line surface:
 
 There is no `--command` / `--agent` flag. Startup creates an `anvil` backend
 default automatically when `~/.config/mj/config.toml` has no `agent` block.
-First run asks the user to select agents Thor may use as workers, choose the
-Architect or Accountant persona, and pick Thor's host agent, model preference,
-and reasoning level. Those choices are written to visible `[thor]`
-configuration. The previous agent picker is no longer part of the normal user
-path.
+First run asks the user to choose where Thor runs, then starts with sane Thor
+defaults for work style, model preference, and reasoning level. Configured
+agents that validate successfully are made available to Thor automatically and
+written to visible `[thor]` configuration. The previous agent picker is no
+longer part of the normal user path.
 
 M1 hardening landed (PR #34): an explicit `ConnectionState` lifecycle drives
 the header label, a `LaunchError` enum surfaces spawn / initialize /
@@ -348,22 +348,22 @@ Fixed in this PR:
   jargon.
 - [x] Replaced "persona" step copy with "work style" copy that explains the
   architect/accountant tradeoff in user-facing terms.
+- [x] Collapsed first run from host/work-style/model/reasoning/confirm to
+  host/confirm; work style, model preference, and reasoning now use the saved
+  Thor defaults and can be changed later.
+- [x] Replaced the dead-end "needs setup" validation label with inferred user
+  actions such as `install <program>` or `sign in or add key`.
 
 Still not production-grade:
 
-1. **The flow still asks too many first-run questions.** The current sequence is
-   Thor agent, work style, model preference, reasoning depth, confirm. That is
-   better than the old six-step implementation mirror, but a polished first-run
-   should probably default work style/reasoning and leave only the smallest
-   viable set of choices up front.
-2. **Agent setup still needs a clearer install/configure path.** The candidate
+1. **Agent setup still needs a clearer install/configure path.** The candidate
    set is no longer the whole registry, but users still need an obvious way to
    add/configure more ACP agents from onboarding when their desired agent is not
    present or usable.
-3. **Validation feedback is still terse.** "ready" and "needs setup" avoid
-   implementation jargon, but failures need a human action: install command,
-   auth command, missing binary, or config file edit.
-4. **The setup UI has not been manually smoke-tested in multiple terminal sizes.**
+2. **Validation feedback is still inferred, not agent-specific.** Rows now offer
+   broad actions like install/sign-in/configure, but production UX should use
+   registry/auth metadata for exact commands and links when available.
+3. **The setup UI has not been manually smoke-tested in multiple terminal sizes.**
    Unit tests cover state transitions and list windowing; visual polish still
    needs an interactive pass.
 
