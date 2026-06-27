@@ -1079,9 +1079,9 @@ fn validation_action_label(setup_agent: &ThorSetupAgent, validation: &AgentValid
         return auth_action_label(setup_agent);
     }
     if lower.contains("exited unexpectedly") || lower.contains("exit status") {
-        "agent exited".to_string()
+        generic_failure_action_label(setup_agent)
     } else if lower.contains("timed out") || lower.contains("timeout") {
-        "timeout".to_string()
+        generic_timeout_action_label(setup_agent)
     } else {
         "setup needed".to_string()
     }
@@ -1112,10 +1112,10 @@ fn validation_detail_label(setup_agent: &ThorSetupAgent, validation: &AgentValid
         return with_setup_url(auth_detail_label(setup_agent), setup_agent);
     }
     if lower.contains("exited unexpectedly") || lower.contains("exit status") {
-        return "Check auth/config, then retry".to_string();
+        return with_setup_url(generic_failure_detail_label(setup_agent), setup_agent);
     }
     if lower.contains("timed out") || lower.contains("timeout") {
-        return "Retry after install/auth is ready".to_string();
+        return with_setup_url(generic_timeout_detail_label(setup_agent), setup_agent);
     }
     format!("Last error: {}", truncate_label(error, 56))
 }
@@ -1132,6 +1132,10 @@ fn install_action_label(setup_agent: &ThorSetupAgent) -> String {
         "anvil" => "install uv".to_string(),
         "claude-acp" => "install Node.js and Claude Code".to_string(),
         "codex-acp" => "install Node.js and Codex".to_string(),
+        "opencode" => "install OpenCode CLI".to_string(),
+        "goose" => "install Goose".to_string(),
+        "cursor" => "install Cursor Agent".to_string(),
+        "github-copilot-cli" => "install GitHub Copilot CLI".to_string(),
         _ => match setup_agent.agent.program.to_string_lossy().as_ref() {
             "npx" => "install Node.js/npm".to_string(),
             "uvx" => "install uv".to_string(),
@@ -1147,6 +1151,12 @@ fn install_detail_label(setup_agent: &ThorSetupAgent) -> String {
             "Install Node.js/npm and Claude Code; runs `npx ... claude-agent-acp`".to_string()
         }
         "codex-acp" => "Install Node.js/npm and Codex; runs `npx ... codex-acp`".to_string(),
+        "opencode" => "Install OpenCode CLI, then configure provider credentials".to_string(),
+        "goose" => "Install Goose, then configure a Goose provider".to_string(),
+        "cursor" => "Install Cursor Agent, then sign in to Cursor".to_string(),
+        "github-copilot-cli" => {
+            "Install GitHub Copilot CLI, then sign in to GitHub Copilot".to_string()
+        }
         _ => match setup_agent.agent.program.to_string_lossy().as_ref() {
             "npx" => "Install Node.js/npm, then retry this ACP server".to_string(),
             "uvx" => "Install uv, then retry this ACP server".to_string(),
@@ -1162,6 +1172,10 @@ fn auth_action_label(setup_agent: &ThorSetupAgent) -> String {
     match setup_agent.agent.source_id.as_str() {
         "claude-acp" => "sign in with Claude Code".to_string(),
         "codex-acp" => "sign in with Codex".to_string(),
+        "opencode" => "set OpenCode provider".to_string(),
+        "goose" => "set Goose provider".to_string(),
+        "cursor" => "sign in to Cursor".to_string(),
+        "github-copilot-cli" => "sign in to GitHub Copilot".to_string(),
         _ => "sign in or add key".to_string(),
     }
 }
@@ -1170,10 +1184,42 @@ fn auth_detail_label(setup_agent: &ThorSetupAgent) -> String {
     match setup_agent.agent.source_id.as_str() {
         "claude-acp" => "Run Claude Code sign-in, then retry Thor setup".to_string(),
         "codex-acp" => "Run Codex sign-in, then retry Thor setup".to_string(),
+        "opencode" => "Set provider, retry".to_string(),
+        "goose" => "Set provider, retry".to_string(),
+        "cursor" => "Sign in, retry".to_string(),
+        "github-copilot-cli" => "Sign in, retry".to_string(),
         _ => format!(
             "Command: {}",
             truncate_label(&command_label(&setup_agent.agent), 72)
         ),
+    }
+}
+
+fn generic_failure_action_label(setup_agent: &ThorSetupAgent) -> String {
+    match setup_agent.agent.source_id.as_str() {
+        "opencode" | "goose" | "cursor" | "github-copilot-cli" => auth_action_label(setup_agent),
+        _ => "agent exited".to_string(),
+    }
+}
+
+fn generic_failure_detail_label(setup_agent: &ThorSetupAgent) -> String {
+    match setup_agent.agent.source_id.as_str() {
+        "opencode" | "goose" | "cursor" | "github-copilot-cli" => auth_detail_label(setup_agent),
+        _ => "Check auth/config, then retry".to_string(),
+    }
+}
+
+fn generic_timeout_action_label(setup_agent: &ThorSetupAgent) -> String {
+    match setup_agent.agent.source_id.as_str() {
+        "opencode" | "goose" | "cursor" | "github-copilot-cli" => auth_action_label(setup_agent),
+        _ => "timeout".to_string(),
+    }
+}
+
+fn generic_timeout_detail_label(setup_agent: &ThorSetupAgent) -> String {
+    match setup_agent.agent.source_id.as_str() {
+        "opencode" | "goose" | "cursor" | "github-copilot-cli" => auth_detail_label(setup_agent),
+        _ => "Retry after install/auth is ready".to_string(),
     }
 }
 
@@ -1538,7 +1584,7 @@ mod tests {
     #[test]
     fn validation_error_compacts_unexpected_exit_guidance() {
         let setup_agent = setup_agent_with_error(
-            "opencode",
+            "unknown-agent",
             Some("agent process exited unexpectedly: exit status 1".to_string()),
         );
 
@@ -1547,6 +1593,17 @@ mod tests {
             setup_agent_description(&setup_agent),
             "Check auth/config, then retry"
         );
+    }
+
+    #[test]
+    fn validation_error_uses_provider_guidance_for_known_binary_agents() {
+        let setup_agent = setup_agent_with_error(
+            "opencode",
+            Some("agent process exited unexpectedly: exit status 1".to_string()),
+        );
+
+        assert_eq!(host_status_label(&setup_agent), "set OpenCode provider");
+        assert_eq!(setup_agent_description(&setup_agent), "Set provider, retry");
     }
 
     #[test]

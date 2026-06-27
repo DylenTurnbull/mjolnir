@@ -465,6 +465,10 @@ Fixed in this PR:
 - [x] Corrected config-path docs to describe the actual platform config
   directory. The macOS path is `~/Library/Application Support/mj/config.toml`,
   not `~/.config/mj/config.toml`.
+- [x] Added provider-specific recovery labels for known binary registry agents
+  when validation exits or times out without an auth-shaped error. OpenCode now
+  shows `set OpenCode provider` / `Set provider, retry` instead of generic
+  `agent exited` guidance.
 - [x] Manually smoke-tested the 80-column no-working-agent first-run path with a
   temporary home and stripped `PATH`:
   `HOME=/tmp/mj-thor-smoke-home-4 XDG_CONFIG_HOME=/tmp/mj-thor-smoke-home-4/config XDG_CACHE_HOME=/tmp/mj-thor-smoke-home-4/cache PATH=/usr/bin:/bin target/debug/mj --cwd .`.
@@ -477,6 +481,12 @@ Fixed in this PR:
   isolated setup, but the failure rows now render compactly as `agent exited /
   Check auth/config, then retry` and `timeout / Retry after install/auth is
   ready`, with `Add custom command` and `Retry checks` still reachable.
+- [x] Re-ran the 80-column configured OpenCode path with an isolated macOS home
+  under `/tmp/mj-thor-opencode-success`, symlinking the real OpenCode config
+  directories. OpenCode still exits during validation in that isolated setup, so
+  this does not close the successful configured-agent smoke requirement. It did
+  verify the improved failed row: `OpenCode / set OpenCode provider / Set
+  provider, retry; docs: opencode`.
 
 Still not production-grade:
 
