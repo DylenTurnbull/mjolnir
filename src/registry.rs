@@ -180,9 +180,25 @@ impl Agent {
         if !exact_hint.trim().is_empty() {
             return exact_hint;
         }
-        known_provider_setup_hint(&self.id)
-            .unwrap_or_default()
-            .to_string()
+        if let Some(hint) = known_provider_setup_hint(&self.id) {
+            return hint.to_string();
+        }
+        self.distribution_setup_hint()
+    }
+
+    fn distribution_setup_hint(&self) -> String {
+        let name = self.name.trim();
+        let name = if name.is_empty() { "this agent" } else { name };
+        if self.distribution.npx.is_some() {
+            return format!("install Node.js/npm; configure or sign in to {name} if prompted");
+        }
+        if self.distribution.uvx.is_some() {
+            return format!("install uv; configure or sign in to {name} if prompted");
+        }
+        if self.binary_target_for_current_platform().is_some() {
+            return format!("install {name}; configure or sign in if prompted");
+        }
+        String::new()
     }
 
     fn binary_target_for_current_platform(&self) -> Option<&BinaryTarget> {
@@ -364,6 +380,14 @@ mod tests {
                 }
             },
             {
+                "id": "generic-npx",
+                "name": "Generic NPM Agent",
+                "version": "1.0.0",
+                "distribution": {
+                    "npx": { "package": "generic-npm-agent@1.0.0", "args": ["--acp"] }
+                }
+            },
+            {
                 "id": "generic-acp",
                 "name": "Generic",
                 "version": "1.0.0",
@@ -460,6 +484,15 @@ mod tests {
         );
         assert_eq!(gemini.setup_url, "https://geminicli.com");
 
+        let generic_npx = servers
+            .iter()
+            .find(|server| server.source_id == "generic-npx")
+            .expect("generic npx");
+        assert_eq!(
+            generic_npx.setup_hint,
+            "install Node.js/npm; configure or sign in to Generic NPM Agent if prompted"
+        );
+
         let generic = servers
             .iter()
             .find(|server| server.source_id == "generic-acp")
@@ -481,6 +514,10 @@ mod tests {
         }
         assert_eq!(binary.args, vec!["acp"]);
         assert_eq!(binary.setup_url, "https://example.com/binary");
+        assert_eq!(
+            binary.setup_hint,
+            "install Binary; configure or sign in if prompted"
+        );
     }
 
     #[test]
@@ -525,7 +562,7 @@ mod tests {
         let registry = load_with_cache(&path, Duration::from_secs(3600), "http://127.0.0.1:1/")
             .await
             .expect("load");
-        assert_eq!(registry.agents.len(), 5);
+        assert_eq!(registry.agents.len(), 6);
     }
 
     #[tokio::test]
@@ -544,6 +581,6 @@ mod tests {
         let registry = load_with_cache(&path, Duration::from_secs(3600), "http://127.0.0.1:1/")
             .await
             .expect("load stale");
-        assert_eq!(registry.agents.len(), 5);
+        assert_eq!(registry.agents.len(), 6);
     }
 }

@@ -36,12 +36,14 @@ changed and how much each harness/model used.
 - Thor is instructed to keep the transcript alive with short visible progress
   updates while it gathers facts and runs implementation/review/correction
   phases. `mj` also titles local sessions from the submitted user task and
-  emits distinct elapsed heartbeat lines during long host turns so the TUI and
-  remote/browser transcript do not look frozen when the host has not produced
-  text yet. The remote-control server path also receives the Thor MCP worker
-  progress side channel, not only the local TUI path. This still needs
-  real-provider validation on long turns because live use reported generic Thor
-  session names and no visible transcript updates over a multi-minute turn.
+  keeps that task title sticky after submit. The local UI state machine emits
+  distinct elapsed heartbeat lines during long host turns, and the
+  remote/browser transcript receives its own heartbeat stream, so neither path
+  depends only on host text when the host has not produced output yet. The
+  remote-control server path also receives the Thor MCP worker progress side
+  channel, not only the local TUI path. This still needs real-provider
+  validation on long turns because live use reported generic Thor session names
+  and no visible transcript updates over a multi-minute turn.
 - `mj thor-mcp` mirrors visible worker lifecycle, tool, permission, completion,
   timeout, and error events through an out-of-band progress stream consumed by
   the interactive UI and remote tracker, so the transcript continues to update
@@ -131,13 +133,15 @@ changed and how much each harness/model used.
     exact setup hints and setup-doc URLs are persisted and preferred when
     present; when they are absent, known-provider fallback hints are now
     persisted into saved Thor server config instead of remaining only transient
-    onboarding UI text.
+    onboarding UI text. Other registry entries now get conservative
+    distribution-based fallback setup hints for `npx`, `uvx`, and
+    current-platform binary launchers.
     Remaining: continue polishing the guided setup progression, replace
     remaining inferred setup labels with registry-provided exact commands/links
     where possible, manually smoke-test the setup UI across terminal sizes, and
-    run real long-turn Thor smoke covering task-derived titles, local
-    heartbeats, worker progress mirroring, transcript freshness in the UI the
-    user is watching, and final recap.
+    run real long-turn Thor smoke covering sticky task-derived titles, local
+    and remote heartbeats, worker progress mirroring, transcript freshness in
+    the UI the user is watching, and final recap.
 
 ## Quota reads
 

@@ -511,6 +511,7 @@ impl TrackerState {
             SessionUpdate::SessionInfoUpdate(info) => {
                 if let Some(title) = info.title.value()
                     && !is_generic_thor_title(title)
+                    && self.name_is_replaceable()
                 {
                     self.name = Some(task_title_from_prompt(title));
                 }
@@ -665,9 +666,24 @@ fn is_generic_thor_title(title: &str) -> bool {
     let lower = title.trim().to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "thor" | "thor session" | "new thor session" | "thor task" | "new thor task"
+        "thor"
+            | "thor session"
+            | "new thor session"
+            | "thor task"
+            | "new thor task"
+            | "thor coordinator"
+            | "mjolnir thor"
+            | "thor omni-agent coordinator"
+            | "thor omni agent coordinator"
     ) || lower.starts_with("thor:")
         || lower.starts_with("thor -")
+        || lower.starts_with("thor session ")
+        || lower.starts_with("new thor session ")
+        || lower.starts_with("mjolnir thor ")
+        || (lower.contains("thor")
+            && (lower.contains("coordinator")
+                || lower.contains("omni-agent")
+                || lower.contains("omni agent")))
 }
 
 impl RemoteSessionTracker {
@@ -3220,9 +3236,31 @@ mod tests {
         state.observe_session_update(&SessionUpdate::SessionInfoUpdate(
             SessionInfoUpdate::new().title("Thor session"),
         ));
+        state.observe_session_update(&SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().title("Mjolnir Thor Coordinator"),
+        ));
 
         let snapshot = state.snapshot().expect("snapshot");
         assert_eq!(snapshot.name, "Fix the flaky parser test");
+    }
+
+    #[test]
+    fn tracker_keeps_user_task_name_over_host_title() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.observe_command(&UiCommand::SendPrompt {
+            text: "Fix transcript progress".to_string(),
+            images: Vec::new(),
+        });
+        state.observe_session_update(&SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().title("Investigate runtime behavior"),
+        ));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.name, "Fix transcript progress");
     }
 
     #[test]
@@ -3234,6 +3272,9 @@ mod tests {
         });
         state.observe_session_update(&SessionUpdate::SessionInfoUpdate(
             SessionInfoUpdate::new().title("Thor session"),
+        ));
+        state.observe_session_update(&SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().title("Thor omni-agent coordinator"),
         ));
 
         let snapshot = state.snapshot().expect("snapshot");

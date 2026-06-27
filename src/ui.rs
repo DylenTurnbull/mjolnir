@@ -431,6 +431,7 @@ const INLINE_REPAIR_INTERVAL: Duration = Duration::from_secs(1);
 const INLINE_PERMISSION_REPAIR_INTERVAL: Duration = Duration::from_secs(1);
 const INLINE_PERMISSION_REPAIR_WINDOW: Duration = Duration::from_secs(2);
 const INLINE_PERMISSION_REPAIR_ATTEMPTS: usize = 3;
+const THOR_TRANSCRIPT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Maximum number of lines we render from each tool-output entry when
 /// `expand_tool_outputs` is false. Picked to keep the head of long
@@ -601,6 +602,9 @@ async fn ui_loop(
             }
             _ = frame_tick.tick() => {
                 if flush_input_paste_burst_if_due(&mut state, Instant::now(), false) {
+                    dirty = true;
+                }
+                if state.record_turn_progress_heartbeat(THOR_TRANSCRIPT_HEARTBEAT_INTERVAL) {
                     dirty = true;
                 }
                 if timer_driven_live_redraw(mode, &state) {

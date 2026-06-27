@@ -580,6 +580,7 @@ pub struct AppState {
     /// Timing for the active or most recently completed prompt turn.
     turn_started_at: Option<Instant>,
     last_turn_elapsed: Option<Duration>,
+    last_turn_progress_heartbeat_seconds: u64,
     /// Time since the current connection lifecycle state was entered.
     connection_state_started_at: Instant,
     /// Last token/context usage reported by the agent.
@@ -749,6 +750,7 @@ impl AppState {
             voice_input_level: None,
             turn_started_at: None,
             last_turn_elapsed: None,
+            last_turn_progress_heartbeat_seconds: 0,
             connection_state_started_at: now,
             token_usage: TokenUsage::default(),
             autocomplete: Autocomplete::default(),
@@ -1073,8 +1075,19 @@ impl AppState {
         if is_generic_thor_title(&sanitized) {
             return false;
         }
+        if !self.session_title_is_replaceable() {
+            return false;
+        }
         self.session_title = Some(sanitized);
         true
+    }
+
+    fn session_title_is_replaceable(&self) -> bool {
+        match self.session_title.as_deref() {
+            None => true,
+            Some(title) if is_generic_thor_title(title) => true,
+            Some(title) => self.session_id.as_deref() == Some(title),
+        }
     }
 
     pub fn set_session_title_from_user_prompt(&mut self, raw: &str) -> bool {
@@ -1115,6 +1128,10 @@ impl AppState {
 
     pub fn record_status_message(&mut self, kind: StatusKind, text: impl Into<String>) {
         let text = text.into();
+        if let Some(seconds) = thor_heartbeat_elapsed_seconds(&text) {
+            self.last_turn_progress_heartbeat_seconds =
+                self.last_turn_progress_heartbeat_seconds.max(seconds);
+        }
         let transcript_text = status_transcript_text(kind, &text);
         self.set_status_line(kind, text.clone());
         if matches!(self.transcript.last(), Some(Entry::System(existing)) if existing == &transcript_text)
@@ -1166,6 +1183,7 @@ impl AppState {
         self.set_connection_state(ConnectionState::Forking);
         self.turn_started_at = Some(Instant::now());
         self.last_turn_elapsed = None;
+        self.last_turn_progress_heartbeat_seconds = 0;
         self.autocomplete = Autocomplete::default();
     }
 
@@ -1264,6 +1282,37 @@ impl AppState {
         // Sending the prompt clears the input; tear down any open
         // autocomplete popover so it doesn't linger over an empty buffer.
         self.autocomplete = Autocomplete::default();
+    }
+
+    pub fn record_turn_progress_heartbeat(&mut self, interval: Duration) -> bool {
+        let Some(started_at) = self.turn_started_at else {
+            return false;
+        };
+        if !matches!(
+            self.connection_state,
+            ConnectionState::Streaming | ConnectionState::Cancelling
+        ) {
+            return false;
+        }
+        let interval_seconds = interval.as_secs();
+        if interval_seconds == 0 {
+            return false;
+        }
+        let elapsed_seconds = started_at.elapsed().as_secs();
+        let heartbeat_seconds = elapsed_seconds / interval_seconds * interval_seconds;
+        if heartbeat_seconds < interval_seconds {
+            return false;
+        }
+        if heartbeat_seconds == self.last_turn_progress_heartbeat_seconds {
+            return false;
+        }
+        self.last_turn_progress_heartbeat_seconds = heartbeat_seconds;
+        let message = format!("Thor is still working... {heartbeat_seconds}s elapsed");
+        if matches!(self.transcript.last(), Some(Entry::System(existing)) if existing == &message) {
+            return false;
+        }
+        self.record_status_message(StatusKind::Info, message);
+        true
     }
 
     /// Open the value picker for one config option. Returns `true` if it
@@ -1681,6 +1730,7 @@ impl AppState {
         if let Some(started_at) = self.turn_started_at.take() {
             self.last_turn_elapsed = Some(started_at.elapsed());
         }
+        self.last_turn_progress_heartbeat_seconds = 0;
     }
 
     fn apply_session_update(&mut self, update: SessionUpdate) {
@@ -1927,6 +1977,11 @@ fn is_generic_thor_title(title: &str) -> bool {
         || lower.starts_with("thor -")
         || lower.starts_with("thor session ")
         || lower.starts_with("new thor session ")
+        || lower.starts_with("mjolnir thor ")
+        || (lower.contains("thor")
+            && (lower.contains("coordinator")
+                || lower.contains("omni-agent")
+                || lower.contains("omni agent")))
 }
 
 fn task_title_from_prompt(prompt: &str) -> String {
@@ -1943,6 +1998,12 @@ fn task_title_from_prompt(prompt: &str) -> String {
     } else {
         truncated
     }
+}
+
+fn thor_heartbeat_elapsed_seconds(text: &str) -> Option<u64> {
+    let rest = text.strip_prefix("Thor is still working... ")?;
+    let seconds = rest.strip_suffix("s elapsed")?;
+    seconds.parse().ok()
 }
 
 #[cfg(test)]
@@ -1982,6 +2043,8 @@ mod tests {
 
         assert!(s.set_session_title("Fix flaky parser test"));
         assert!(!s.set_session_title("Thor session"));
+        assert!(!s.set_session_title("Mjolnir Thor Coordinator"));
+        assert!(!s.set_session_title("Thor omni-agent coordinator"));
 
         assert_eq!(s.session_title.as_deref(), Some("Fix flaky parser test"));
     }
@@ -1993,6 +2056,16 @@ mod tests {
         assert!(!s.set_session_title("Thor session"));
 
         assert_eq!(s.session_title.as_deref(), None);
+    }
+
+    #[test]
+    fn host_title_does_not_replace_user_prompt_title() {
+        let mut s = AppState::new();
+
+        s.record_user_prompt("Fix blank Thor progress".to_string());
+        assert!(!s.set_session_title("Investigate runtime"));
+
+        assert_eq!(s.session_title.as_deref(), Some("Fix blank Thor progress"));
     }
 
     #[test]
@@ -2053,6 +2126,37 @@ mod tests {
             usage: None,
         });
         assert!(!s.is_streaming());
+    }
+
+    #[test]
+    fn turn_progress_heartbeat_records_distinct_elapsed_lines() {
+        let mut s = AppState::new();
+        s.record_user_prompt("test".to_string());
+        s.turn_started_at = Some(Instant::now() - Duration::from_secs(16));
+
+        assert!(s.record_turn_progress_heartbeat(Duration::from_secs(15)));
+        assert!(matches!(
+            s.transcript.last(),
+            Some(Entry::System(message)) if message == "Thor is still working... 15s elapsed"
+        ));
+        assert!(!s.record_turn_progress_heartbeat(Duration::from_secs(15)));
+
+        s.turn_started_at = Some(Instant::now() - Duration::from_secs(31));
+        assert!(s.record_turn_progress_heartbeat(Duration::from_secs(15)));
+        assert!(matches!(
+            s.transcript.last(),
+            Some(Entry::System(message)) if message == "Thor is still working... 30s elapsed"
+        ));
+    }
+
+    #[test]
+    fn external_turn_progress_heartbeat_advances_local_bucket() {
+        let mut s = AppState::new();
+        s.record_user_prompt("test".to_string());
+        s.record_status_message(StatusKind::Info, "Thor is still working... 15s elapsed");
+        s.turn_started_at = Some(Instant::now() - Duration::from_secs(16));
+
+        assert!(!s.record_turn_progress_heartbeat(Duration::from_secs(15)));
     }
 
     #[test]
