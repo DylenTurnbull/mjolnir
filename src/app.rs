@@ -563,6 +563,9 @@ pub struct AppState {
     /// tool outputs fully expanded. Inline scrollback is immutable once
     /// flushed, so this reader is how users re-read earlier output in full.
     pub transcript_viewer: bool,
+    /// Case-insensitive filter query applied inside the inline transcript
+    /// reader. Empty means show the full transcript.
+    pub transcript_filter: String,
     pub exit_reason: Option<UiExitReason>,
     /// True once the runtime has stopped accepting commands.
     pub runtime_closed: bool,
@@ -737,6 +740,7 @@ impl AppState {
             scroll_offset: 0,
             expand_tool_outputs: false,
             transcript_viewer: false,
+            transcript_filter: String::new(),
             exit_reason: None,
             runtime_closed: false,
             status_line: None,
@@ -992,12 +996,14 @@ impl AppState {
     /// index and clamped to the last screen during draw).
     pub fn open_transcript_viewer(&mut self) {
         self.transcript_viewer = true;
+        self.transcript_filter.clear();
         self.scroll_offset = usize::MAX;
     }
 
     /// Close the inline full-transcript reader and reset its scroll position.
     pub fn close_transcript_viewer(&mut self) {
         self.transcript_viewer = false;
+        self.transcript_filter.clear();
         self.scroll_offset = 0;
     }
 

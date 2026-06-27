@@ -2650,6 +2650,13 @@ fn handle_transcript_viewer_key(
         }
         KeyCode::Home => state.scroll_offset = 0,
         KeyCode::End => state.scroll_offset = usize::MAX,
+        KeyCode::Backspace if state.transcript_filter.pop().is_some() => {
+            state.scroll_offset = 0;
+        }
+        KeyCode::Char(c) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+            state.transcript_filter.push(c);
+            state.scroll_offset = 0;
+        }
         _ => {}
     }
     TerminalRequest::None
@@ -3958,7 +3965,11 @@ fn draw_inline_transcript_viewer(f: &mut ratatui::Frame, area: Rect, state: &mut
     f.render_widget(block, layout[0]);
 
     if inner.width > 0 && inner.height > 0 {
-        let lines = render_full_transcript_lines(state, inner.width);
+        let mut lines = render_full_transcript_lines(state, inner.width);
+        if !state.transcript_filter.is_empty() {
+            let query = state.transcript_filter.to_lowercase();
+            lines.retain(|line| line_plain_text(line).to_lowercase().contains(&query));
+        }
         let total = Paragraph::new(lines.clone())
             .wrap(Wrap { trim: false })
             .line_count(inner.width);
@@ -3973,11 +3984,25 @@ fn draw_inline_transcript_viewer(f: &mut ratatui::Frame, area: Rect, state: &mut
         );
     }
 
+    let footer = if state.transcript_filter.is_empty() {
+        "Type filter | Backspace edit | Up/Down scroll | Esc/Ctrl-T close".to_string()
+    } else {
+        format!(
+            "filter: {} | Backspace edit | Up/Down scroll | Esc/Ctrl-T close",
+            state.transcript_filter
+        )
+    };
     f.render_widget(
-        Paragraph::new("Up/Down PgUp/PgDn scroll · Home/End top/bottom · Esc or Ctrl-T to close")
-            .style(Style::default().fg(state.theme.muted)),
+        Paragraph::new(footer).style(Style::default().fg(state.theme.muted)),
         layout[1],
     );
+}
+
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
 }
 
 fn inline_config_view_line_count(state: &AppState, width: u16) -> usize {
@@ -5949,9 +5974,7 @@ fn draw_help_modal(f: &mut ratatui::Frame, area: Rect, mode: UiMode, theme: Term
                 "Read transcript",
                 Style::default().add_modifier(Modifier::BOLD),
             )]),
-            Line::from(
-                "  Ctrl-T           open full transcript reader (Up/Down/PgUp/PgDn, Esc closes)",
-            ),
+            Line::from("  Ctrl-T           open transcript reader (type filters, Up/Down scroll)"),
             Line::from(""),
         ]);
     }
@@ -8519,17 +8542,47 @@ mod tests {
         assert_eq!(state.scroll_offset, TRANSCRIPT_SCROLL_PAGE_STEP);
         handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::End));
         assert_eq!(state.scroll_offset, usize::MAX);
-        // Typing while the reader owns the keyboard must not edit the prompt.
+        // Typing while the reader owns the keyboard filters the transcript
+        // without editing the prompt.
         handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('a')));
         assert!(state.input.is_empty());
+        assert_eq!(state.transcript_filter, "a");
+        handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::Backspace));
+        assert!(state.transcript_filter.is_empty());
 
         let request = handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::Esc));
         assert!(!state.transcript_viewer);
         assert_eq!(state.scroll_offset, 0);
+        assert!(state.transcript_filter.is_empty());
         assert!(
             terminal_request_forces_inline_repair(request),
             "closing the reader must repair the shrunken inline viewport"
         );
+    }
+
+    #[test]
+    fn transcript_reader_filters_rendered_lines() {
+        let mut state = AppState::new();
+        state.record_user_prompt("alpha prompt".to_string());
+        state
+            .transcript
+            .push(Entry::AgentMessage("beta answer".to_string()));
+        state.open_transcript_viewer();
+        state.transcript_filter = "beta".to_string();
+
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_inline_chat(frame, &mut state))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("beta answer"), "rendered:\n{rendered}");
+        assert!(
+            !rendered.contains("alpha prompt"),
+            "filtered reader should hide non-matching lines:\n{rendered}"
+        );
+        assert!(rendered.contains("filter: beta"), "rendered:\n{rendered}");
     }
 
     #[test]

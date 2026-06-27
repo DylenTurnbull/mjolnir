@@ -218,8 +218,11 @@ Deliverables:
   and embedded resources, including MIME type, URI/name/title, known sizes, and
   embedded text resource contents. True inline media previews remain a later UI
   enhancement.
-- Improve tool-call rendering for diff, terminal, and structured content.
-- Hide host-agent session config options from the Thor UX; model, mode, and
+- ✅ Improve tool-call rendering for diff, terminal, and structured content —
+  tool-call content is split into text, diff, and terminal outputs, terminal
+  snapshots update live, and the transcript reader expands collapsed tool
+  output in full.
+- ✅ Hide host-agent session config options from the Thor UX; model, mode, and
   reasoning selection are Thor routing decisions, not user-facing pickers.
 - ✅ Handle ACP auth-required responses with actionable UI text — shipped
   early in M1 as `LaunchError::AuthRequired`, classified at both
@@ -245,12 +248,13 @@ Goal: reduce friction in everyday terminal use.
 
 Deliverables:
 
-- Prompt history across the current process.
-- Optional persisted prompt history under a user config directory.
-- Better multiline editing, including newline insertion and submit semantics.
-- Search or filter over the transcript.
-- Copy-friendly transcript output mode or an export command.
-- Session title display and clearer session metadata.
+- ✅ Prompt history across the current process.
+- ✅ Optional persisted prompt history under a user config directory.
+- ✅ Better multiline editing, including newline insertion and submit semantics.
+- ✅ Search or filter over the transcript through the inline full-transcript
+  reader.
+- ✅ Copy-friendly transcript output mode or an export command.
+- ✅ Session title display and clearer session metadata.
 - ✅ Startup now opens Thor and defaults to `anvil` without exposing an agent or
   model picker.
 
