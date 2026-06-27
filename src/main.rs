@@ -899,6 +899,7 @@ async fn run_thor_onboarding(
                 description: server.description.clone(),
                 setup_url: server.setup_url.clone(),
                 command: selected_agent_command_label(&server.selected_agent()),
+                setup_hint: registry_setup_hint(server),
             })
             .collect::<Vec<_>>();
         let available_agents = available_servers
@@ -1042,6 +1043,28 @@ fn selected_agent_command_label(agent: &SelectedAgent) -> String {
     let mut parts = vec![agent.program.to_string_lossy().into_owned()];
     parts.extend(agent.args.iter().cloned());
     parts.join(" ")
+}
+
+fn registry_setup_hint(server: &ConfiguredAcpServer) -> String {
+    let install_hint = match server.program.to_string_lossy().as_ref() {
+        "npx" => Some("requires Node.js/npm"),
+        "uvx" => Some("requires uv"),
+        _ => None,
+    };
+    let auth_hint = match server.source_id.as_str() {
+        "claude-acp" => Some("uses Claude Code sign-in"),
+        "codex-acp" => Some("uses Codex sign-in"),
+        "gemini" => Some("uses Gemini CLI auth"),
+        "opencode" => Some("uses OpenCode auth/config"),
+        "cursor" => Some("uses Cursor auth"),
+        "github-copilot-cli" => Some("uses GitHub Copilot auth"),
+        _ => None,
+    };
+    [install_hint, auth_hint]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn unique_custom_agent_name(cfg: &Config, requested: &str) -> String {
@@ -1997,6 +2020,40 @@ mod tests {
         add_registry_thor_agent(&mut cfg, &registry_servers, "gemini").expect("add registry");
 
         assert_eq!(cfg.thor.configured_acp_servers, registry_servers);
+    }
+
+    #[test]
+    fn registry_setup_hint_describes_install_and_auth_expectations() {
+        let gemini = ConfiguredAcpServer {
+            source_id: "gemini".to_string(),
+            name: "Gemini CLI".to_string(),
+            program: PathBuf::from("npx"),
+            args: vec![
+                "-y".to_string(),
+                "@google/gemini-cli".to_string(),
+                "--acp".to_string(),
+            ],
+            env: Default::default(),
+            description: String::new(),
+            setup_url: String::new(),
+            quota_backend: ThorQuotaBackend::None,
+        };
+        let anvil = ConfiguredAcpServer {
+            source_id: "anvil".to_string(),
+            name: "Anvil".to_string(),
+            program: PathBuf::from("uvx"),
+            args: vec!["brokk".to_string(), "acp".to_string()],
+            env: Default::default(),
+            description: String::new(),
+            setup_url: String::new(),
+            quota_backend: ThorQuotaBackend::None,
+        };
+
+        assert_eq!(
+            registry_setup_hint(&gemini),
+            "requires Node.js/npm; uses Gemini CLI auth"
+        );
+        assert_eq!(registry_setup_hint(&anvil), "requires uv");
     }
 
     #[test]

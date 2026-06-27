@@ -432,17 +432,21 @@ Fixed in this PR:
   action in plain language instead of only listing validation results.
 - [x] Show the command that registry-backed setup will run when the registry
   entry is added, so users are not asked to choose from names alone.
+- [x] Show inferred install/auth expectations for registry rows before adding
+  them, such as Node.js/npm, uv, Claude Code sign-in, Codex sign-in, Gemini CLI
+  auth, OpenCode config, Cursor auth, or GitHub Copilot auth when known.
 
 Still not production-grade:
 
 1. **Registry-backed agent setup still needs richer install/configure metadata.**
    Registry entries can now be added from onboarding, and website/repository
-   links are preserved, but the registry itself does not currently expose exact
-   auth/install steps for every agent.
+   links, launch commands, and inferred install/auth expectations are shown,
+   but the registry itself does not currently expose exact auth/install steps
+   for every agent.
 2. **Validation feedback is still partly inferred, not registry-metadata-driven.**
    Rows now offer provider-specific actions for Anvil, Claude, Codex, `npx`,
-   and `uvx`, but production UX should use registry/auth metadata for exact
-   commands and links when available.
+   `uvx`, and known registry providers, but production UX should use
+   registry/auth metadata for exact commands and links when available.
 3. **The guided setup path still needs a full end-to-end polish pass.** The
    first screen now has a readiness summary and retry action, but the setup flow
    still needs manual tuning for copy, action ordering, and failure recovery

@@ -35,6 +35,7 @@ pub struct ThorSetupRegistryAgent {
     pub description: String,
     pub setup_url: String,
     pub command: String,
+    pub setup_hint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -771,6 +772,9 @@ fn registry_agent_summary(registry_agent: &ThorSetupRegistryAgent) -> String {
     if !registry_agent.command.trim().is_empty() {
         parts.push(format!("runs `{}`", registry_agent.command));
     }
+    if !registry_agent.setup_hint.trim().is_empty() {
+        parts.push(registry_agent.setup_hint.clone());
+    }
     if parts.is_empty() && !registry_agent.setup_url.trim().is_empty() {
         parts.push(format!("docs: {}", registry_agent.setup_url));
     }
@@ -1190,6 +1194,7 @@ mod tests {
             description: format!("{source_id} from registry"),
             setup_url: format!("https://example.com/{source_id}"),
             command: format!("npx -y {source_id}"),
+            setup_hint: "requires Node.js/npm".to_string(),
         }
     }
 
@@ -1428,6 +1433,7 @@ mod tests {
         let registry_agent = registry_agent("gemini");
 
         assert!(registry_agent_summary(&registry_agent).contains("runs `npx -y gemini`"));
+        assert!(registry_agent_summary(&registry_agent).contains("requires Node.js/npm"));
     }
 
     #[test]
