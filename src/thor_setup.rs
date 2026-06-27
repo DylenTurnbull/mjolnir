@@ -1308,6 +1308,7 @@ fn install_action_label(setup_agent: &ThorSetupAgent) -> String {
         "anvil" => "install uv".to_string(),
         "claude-acp" => "install Node.js and Claude Code".to_string(),
         "codex-acp" => "install Node.js and Codex".to_string(),
+        "gemini" => "install Node.js and Gemini CLI".to_string(),
         "opencode" => "install OpenCode CLI".to_string(),
         "goose" => "install Goose".to_string(),
         "cursor" => "install Cursor Agent".to_string(),
@@ -1327,6 +1328,7 @@ fn install_detail_label(setup_agent: &ThorSetupAgent) -> String {
             "Install Node.js/npm and Claude Code; runs `npx ... claude-agent-acp`".to_string()
         }
         "codex-acp" => "Install Node.js/npm and Codex; runs `npx ... codex-acp`".to_string(),
+        "gemini" => "Install Node.js/npm and sign in with Gemini CLI".to_string(),
         "opencode" => "Install OpenCode CLI, then configure provider credentials".to_string(),
         "goose" => "Install Goose, then configure a Goose provider".to_string(),
         "cursor" => "Install Cursor Agent, then sign in to Cursor".to_string(),
@@ -1348,6 +1350,7 @@ fn auth_action_label(setup_agent: &ThorSetupAgent) -> String {
     match setup_agent.agent.source_id.as_str() {
         "claude-acp" => "sign in with Claude Code".to_string(),
         "codex-acp" => "sign in with Codex".to_string(),
+        "gemini" => "sign in with Gemini CLI".to_string(),
         "opencode" => "set OpenCode provider".to_string(),
         "goose" => "set Goose provider".to_string(),
         "cursor" => "sign in to Cursor".to_string(),
@@ -1360,6 +1363,7 @@ fn auth_detail_label(setup_agent: &ThorSetupAgent) -> String {
     match setup_agent.agent.source_id.as_str() {
         "claude-acp" => "Run Claude Code sign-in, then retry Thor setup".to_string(),
         "codex-acp" => "Run Codex sign-in, then retry Thor setup".to_string(),
+        "gemini" => "Sign in with Gemini CLI, then retry".to_string(),
         "opencode" => "Set provider, retry".to_string(),
         "goose" => "Set provider, retry".to_string(),
         "cursor" => "Sign in, retry".to_string(),
@@ -1373,14 +1377,18 @@ fn auth_detail_label(setup_agent: &ThorSetupAgent) -> String {
 
 fn generic_failure_action_label(setup_agent: &ThorSetupAgent) -> String {
     match setup_agent.agent.source_id.as_str() {
-        "opencode" | "goose" | "cursor" | "github-copilot-cli" => auth_action_label(setup_agent),
+        "gemini" | "opencode" | "goose" | "cursor" | "github-copilot-cli" => {
+            auth_action_label(setup_agent)
+        }
         _ => "agent exited".to_string(),
     }
 }
 
 fn generic_failure_detail_label(setup_agent: &ThorSetupAgent) -> String {
     match setup_agent.agent.source_id.as_str() {
-        "opencode" | "goose" | "cursor" | "github-copilot-cli" => auth_detail_label(setup_agent),
+        "gemini" | "opencode" | "goose" | "cursor" | "github-copilot-cli" => {
+            auth_detail_label(setup_agent)
+        }
         _ if !setup_agent.setup_hint.trim().is_empty() => setup_hint_retry_detail(setup_agent),
         _ => "Check auth/config, then retry".to_string(),
     }
@@ -1388,14 +1396,18 @@ fn generic_failure_detail_label(setup_agent: &ThorSetupAgent) -> String {
 
 fn generic_timeout_action_label(setup_agent: &ThorSetupAgent) -> String {
     match setup_agent.agent.source_id.as_str() {
-        "opencode" | "goose" | "cursor" | "github-copilot-cli" => auth_action_label(setup_agent),
+        "gemini" | "opencode" | "goose" | "cursor" | "github-copilot-cli" => {
+            auth_action_label(setup_agent)
+        }
         _ => "timeout".to_string(),
     }
 }
 
 fn generic_timeout_detail_label(setup_agent: &ThorSetupAgent) -> String {
     match setup_agent.agent.source_id.as_str() {
-        "opencode" | "goose" | "cursor" | "github-copilot-cli" => auth_detail_label(setup_agent),
+        "gemini" | "opencode" | "goose" | "cursor" | "github-copilot-cli" => {
+            auth_detail_label(setup_agent)
+        }
         _ if !setup_agent.setup_hint.trim().is_empty() => setup_hint_retry_detail(setup_agent),
         _ => "Retry after install/auth is ready".to_string(),
     }
@@ -1789,6 +1801,67 @@ mod tests {
             setup_agent_description(&setup_agent),
             "Install uv; `uvx brokk acp`"
         );
+    }
+
+    #[test]
+    fn validation_recovery_matrix_covers_known_provider_agents() {
+        let cases = [
+            (
+                "anvil",
+                "uvx not found",
+                "install uv",
+                "Install uv; `uvx brokk acp`",
+            ),
+            (
+                "claude-acp",
+                "auth required",
+                "sign in with Claude Code",
+                "Run Claude Code sign-in, then retry Thor setup",
+            ),
+            (
+                "codex-acp",
+                "auth required",
+                "sign in with Codex",
+                "Run Codex sign-in, then retry Thor setup",
+            ),
+            (
+                "gemini",
+                "agent process exited unexpectedly: exit status 1",
+                "sign in with Gemini CLI",
+                "Sign in with Gemini CLI, then retry",
+            ),
+            (
+                "opencode",
+                "agent process exited unexpectedly: exit status 1",
+                "set OpenCode provider",
+                "Set provider, retry",
+            ),
+            (
+                "goose",
+                "agent process exited unexpectedly: exit status 1",
+                "set Goose provider",
+                "Set provider, retry",
+            ),
+            (
+                "cursor",
+                "agent process exited unexpectedly: exit status 1",
+                "sign in to Cursor",
+                "Sign in, retry",
+            ),
+            (
+                "github-copilot-cli",
+                "agent process exited unexpectedly: exit status 1",
+                "sign in to GitHub Copilot",
+                "Sign in, retry",
+            ),
+        ];
+
+        for (source_id, error, status, detail) in cases {
+            let setup_agent = setup_agent_with_error(source_id, Some(error.to_string()));
+
+            assert_eq!(host_status_label(&setup_agent), status, "{source_id}");
+            assert_eq!(setup_agent_description(&setup_agent), detail, "{source_id}");
+        }
     }
 
     #[test]

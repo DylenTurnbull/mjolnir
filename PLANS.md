@@ -565,6 +565,10 @@ Fixed in this PR:
   agents. Registry entries can now carry setup hints and setup-doc URLs into
   persisted Thor server config, and onboarding prefers those exact hints over
   local inferred provider profiles when present.
+- [x] Added automated provider recovery matrix coverage for Anvil, Claude,
+  Codex, Gemini, OpenCode, Goose, Cursor, and GitHub Copilot rows, and made
+  Gemini generic exits/timeouts resolve to Gemini sign-in guidance instead of
+  generic `agent exited` / `timeout` copy.
 
 Still not production-grade:
 
