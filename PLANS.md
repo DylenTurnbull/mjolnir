@@ -550,6 +550,10 @@ Fixed in this PR:
 - [x] Added automated small-terminal render coverage for every first-run setup
   step at 50x16 and 40x12, extending the previous 72x24 and 120x36 recovery
   path coverage.
+- [x] Added step-specific `Next` guidance to the setup summary so the work
+  style, agent selection, known-agent add, installed-agent command, recovery,
+  and confirmation steps each tell the user the next action without relying
+  only on footer shortcuts.
 
 Still not production-grade:
 
@@ -568,9 +572,10 @@ Still not production-grade:
 3. **The current onboarding process still needs production UX validation.**
    The setup flow now starts with architect/accountant mode, exposes selected
    worker agents, and lets the user choose Thor's host without the old model
-   picker. It still needs an end-user pass over copy, action ordering, failure
-   recovery, terminal sizes, and real provider success/failure combinations
-   before it can be called production-grade. Tracked in
+   picker. Step summaries now include explicit next-action guidance for the
+   main setup and recovery paths. It still needs an end-user pass over copy,
+   action ordering, failure recovery, terminal sizes, and real provider
+   success/failure combinations before it can be called production-grade. Tracked in
    [#252](https://github.com/BrokkAi/mjolnir/issues/252).
 4. **The setup UI has only been manually smoked for a few terminal scenarios.**
    Unit tests cover state transitions, list windowing, small/large recovery

@@ -1021,6 +1021,8 @@ fn default_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Li
             notice.clone(),
             Style::default().fg(theme.warning),
         )));
+    } else {
+        lines.push(detail_line("Next", next_action_summary(state), theme));
     }
     lines
 }
@@ -1042,6 +1044,11 @@ fn registry_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<L
         detail_line("Will add", registry_agent.name.clone(), theme),
         detail_line("Runs", truncate_label(&registry_agent.command, 72), theme),
         detail_line("Setup", truncate_label(&setup, 72), theme),
+        detail_line(
+            "Next",
+            "Press Enter to add it, then mj checks it".to_string(),
+            theme,
+        ),
     ]
 }
 
@@ -1054,7 +1061,31 @@ fn custom_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Lin
             "mj checks it before Thor uses it".to_string(),
             theme,
         ),
+        detail_line("Next", custom_next_action_summary(state), theme),
     ]
+}
+
+fn next_action_summary(state: &ThorSetupState) -> String {
+    match state.step {
+        SetupStep::Persona => "choose Architect or Accountant".to_string(),
+        SetupStep::Host => {
+            if state.agents.iter().any(setup_agent_is_usable) {
+                "Space includes agents; Enter chooses where Thor runs".to_string()
+            } else {
+                "add an agent, fix setup, or retry checks".to_string()
+            }
+        }
+        SetupStep::Confirm => "press Enter to save setup and start Thor".to_string(),
+        SetupStep::Registry | SetupStep::CustomName | SetupStep::CustomCommand => String::new(),
+    }
+}
+
+fn custom_next_action_summary(state: &ThorSetupState) -> String {
+    match state.step {
+        SetupStep::CustomName => "enter a name, then paste the launch command".to_string(),
+        SetupStep::CustomCommand => "paste the launch command, then press Enter".to_string(),
+        _ => "finish this agent setup".to_string(),
+    }
 }
 
 fn custom_name_summary(state: &ThorSetupState) -> String {
@@ -1596,6 +1627,7 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("Work style: architect; prioritize the strongest answer"));
         assert!(rendered.contains("Agents Thor may use: Claude Code"));
+        assert!(rendered.contains("Next: choose Architect or Accountant"));
         assert!(!rendered.contains("auto-strong"));
         assert!(!rendered.contains("custom:claude-code"));
     }
@@ -1628,6 +1660,7 @@ mod tests {
         assert!(rendered.contains("Will add: gemini"));
         assert!(rendered.contains("Runs: npx -y gemini"));
         assert!(rendered.contains("Setup: requires Node.js/npm"));
+        assert!(rendered.contains("Next: Press Enter to add it, then mj checks it"));
     }
 
     #[test]
@@ -1654,6 +1687,29 @@ mod tests {
         assert!(rendered.contains("Installed agent: Local Agent"));
         assert!(rendered.contains("Runs: local-agent acp"));
         assert!(rendered.contains("After add: mj checks it before Thor uses it"));
+        assert!(rendered.contains("Next: paste the launch command, then press Enter"));
+    }
+
+    #[test]
+    fn host_summary_guides_recovery_when_no_agent_is_ready() {
+        let agents = vec![setup_agent_with_validation("anvil", false)];
+        let initial_host = agents[0].agent.clone();
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &[], &initial_host);
+        state.set_step(SetupStep::Host);
+
+        let summary = summary_lines(&state, crate::theme::TerminalThemeKind::Dark.palette());
+        let rendered = summary
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Next: add an agent, fix setup, or retry checks"));
     }
 
     #[test]

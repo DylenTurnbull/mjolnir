@@ -110,9 +110,11 @@ changed and how much each harness/model used.
     agent rows show the command they will add when known plus setup
     expectations, current-platform binary registry entries are represented as
     installed-command candidates instead of being dropped, and a "Retry checks"
-    action reruns ACP validation after install/sign-in fixes. Local provider
-    setup profiles fill known auth/install gaps until the upstream registry
-    exposes exact metadata.
+    action reruns ACP validation after install/sign-in fixes. Step summaries
+    now include explicit next-action guidance for work style, agent selection,
+    known-agent add, installed-agent command, recovery, and confirmation paths.
+    Local provider setup profiles fill known auth/install gaps until the
+    upstream registry exposes exact metadata.
     Remaining: continue polishing the guided setup progression, replace
     remaining inferred setup labels with registry-provided exact commands/links
     where possible, and manually smoke-test the setup UI across terminal sizes.
