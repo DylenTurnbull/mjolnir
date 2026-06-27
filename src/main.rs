@@ -147,6 +147,12 @@ struct Cli {
 enum Commands {
     #[command(hide = true)]
     ThorMcp,
+    /// Run a no-prompt ACP compatibility smoke check.
+    ///
+    /// Starts the command, completes ACP initialize plus `session/new`, prints
+    /// observed capabilities, then shuts the agent down. It does not send
+    /// `session/prompt` and should not consume model tokens.
+    AcpSmoke(AcpSmokeArgs),
     /// Resume an existing ACP session.
     ///
     /// Lists or loads sessions from the configured Thor backend. Without a
@@ -172,6 +178,16 @@ fn parse_fs_max_text_bytes(value: &str) -> std::result::Result<u64, String> {
     Ok(bytes)
 }
 
+fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|e| format!("invalid positive integer: {e}"))?;
+    if parsed == 0 {
+        return Err("value must be greater than 0".to_string());
+    }
+    Ok(parsed)
+}
+
 #[derive(Debug, clap::Args, Default)]
 struct ServerArgs {
     /// Public hostname to embed in the login QR code and TLS certificate.
@@ -182,6 +198,30 @@ struct ServerArgs {
     /// periodic sweeper. Pass 0 to keep history forever.
     #[arg(long, default_value_t = 30)]
     history_days: u32,
+}
+
+#[derive(Debug, clap::Args)]
+struct AcpSmokeArgs {
+    /// ACP server launch command to validate, quoted as one shell-style string.
+    #[arg(long, value_name = "COMMAND")]
+    command: String,
+
+    /// Label to write into the smoke result.
+    #[arg(long, default_value = "acp-smoke")]
+    source_id: String,
+
+    /// Working directory for `session/new`. Defaults to the top-level `--cwd`
+    /// or the current directory.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+
+    /// Maximum seconds to wait for initialize plus `session/new`.
+    #[arg(long, default_value_t = 8, value_parser = parse_positive_u64)]
+    timeout_seconds: u64,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = HeadlessOutputFormat::Text)]
+    format: HeadlessOutputFormat,
 }
 
 #[derive(Debug, clap::Args)]
@@ -281,6 +321,7 @@ fn should_run_startup_update_check(cli: &Cli) -> bool {
         return false;
     }
     match &cli.command {
+        Some(Commands::AcpSmoke(_)) => false,
         Some(Commands::Resume(args)) => !args.list,
         Some(Commands::Server(_)) => false,
         Some(Commands::ThorMcp) => false,
@@ -312,6 +353,7 @@ async fn main() -> Result<()> {
     if let Some(command) = cli.command {
         return match command {
             Commands::ThorMcp => thor_mcp::run_stdio().await,
+            Commands::AcpSmoke(args) => run_acp_smoke(args, cwd).await,
             Commands::Resume(mut args) => {
                 args.fullscreen_tui |= fullscreen_tui;
                 run_resume(args, fs_max_text_bytes, top_level_additional_directories).await
@@ -385,6 +427,89 @@ async fn main() -> Result<()> {
     }
 
     result.map(|_| ())
+}
+
+async fn run_acp_smoke(args: AcpSmokeArgs, default_cwd: PathBuf) -> Result<()> {
+    let cwd = match args.cwd {
+        Some(cwd) => absolutize_cwd(cwd)?,
+        None => default_cwd,
+    };
+    let agent = selected_agent_from_command(args.source_id, &args.command)?;
+    let validation =
+        thor_probe::validate_agent(agent, cwd, Duration::from_secs(args.timeout_seconds)).await;
+    print_acp_smoke_result(&validation, args.format)?;
+    if !validation.usable {
+        anyhow::bail!(
+            "ACP smoke failed for {}: {}",
+            validation.source_id,
+            validation
+                .error
+                .as_deref()
+                .unwrap_or("agent did not reach session/new")
+        );
+    }
+    Ok(())
+}
+
+fn selected_agent_from_command(source_id: String, command: &str) -> Result<SelectedAgent> {
+    let words = shell_words::split(command).context("parse ACP smoke command")?;
+    let Some((program, args)) = words.split_first() else {
+        anyhow::bail!("ACP smoke command cannot be empty");
+    };
+    Ok(SelectedAgent {
+        source_id,
+        program: PathBuf::from(program),
+        args: args.to_vec(),
+        env: Default::default(),
+    })
+}
+
+fn print_acp_smoke_result(
+    validation: &thor_probe::AgentValidation,
+    format: HeadlessOutputFormat,
+) -> Result<()> {
+    match format {
+        HeadlessOutputFormat::Json | HeadlessOutputFormat::StreamJson => {
+            println!("{}", serde_json::to_string_pretty(validation)?);
+        }
+        HeadlessOutputFormat::Text => {
+            println!("source: {}", validation.source_id);
+            println!(
+                "status: {}",
+                if validation.usable {
+                    "usable"
+                } else {
+                    "not usable"
+                }
+            );
+            if let Some(name) = &validation.agent_name {
+                if let Some(version) = &validation.agent_version {
+                    println!("agent: {name} {version}");
+                } else {
+                    println!("agent: {name}");
+                }
+            }
+            println!("session/new: {}", yes_no(validation.session_started));
+            println!("config options: {}", yes_no(validation.config_advertised));
+            println!(
+                "image prompts: {}",
+                yes_no(validation.prompt_images_supported)
+            );
+            println!(
+                "session fork: {}",
+                yes_no(validation.session_fork_supported)
+            );
+            println!("elapsed: {}ms", validation.elapsed_ms);
+            if let Some(error) = &validation.error {
+                println!("error: {error}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 /// Print a hint showing how to resume the session.
@@ -2493,6 +2618,10 @@ mod tests {
 
         let cli = Cli::try_parse_from(["mj", "server"]).expect("parse");
         assert!(!should_run_startup_update_check(&cli));
+
+        let cli =
+            Cli::try_parse_from(["mj", "acp-smoke", "--command", "opencode acp"]).expect("parse");
+        assert!(!should_run_startup_update_check(&cli));
     }
 
     #[test]
@@ -2594,6 +2723,70 @@ mod tests {
             }
             _ => panic!("expected Server subcommand"),
         }
+    }
+
+    #[test]
+    fn parse_acp_smoke_subcommand() {
+        let cli = Cli::try_parse_from([
+            "mj",
+            "--cwd",
+            "/tmp/project",
+            "acp-smoke",
+            "--command",
+            "npx -y @example/acp --flag 'two words'",
+            "--source-id",
+            "example",
+            "--cwd",
+            "/tmp/agent-cwd",
+            "--timeout-seconds",
+            "12",
+            "--format",
+            "json",
+        ])
+        .expect("parse");
+
+        assert_eq!(cli.cwd, Some(PathBuf::from("/tmp/project")));
+        match cli.command {
+            Some(Commands::AcpSmoke(args)) => {
+                assert_eq!(args.command, "npx -y @example/acp --flag 'two words'");
+                assert_eq!(args.source_id, "example");
+                assert_eq!(args.cwd, Some(PathBuf::from("/tmp/agent-cwd")));
+                assert_eq!(args.timeout_seconds, 12);
+                assert!(matches!(args.format, HeadlessOutputFormat::Json));
+            }
+            _ => panic!("expected AcpSmoke subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_acp_smoke_rejects_zero_timeout() {
+        let err = Cli::try_parse_from([
+            "mj",
+            "acp-smoke",
+            "--command",
+            "opencode acp",
+            "--timeout-seconds",
+            "0",
+        ])
+        .expect_err("reject zero timeout");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn acp_smoke_command_uses_shell_words() {
+        let agent = selected_agent_from_command(
+            "example".to_string(),
+            "npx -y @example/acp --flag 'two words'",
+        )
+        .expect("agent");
+
+        assert_eq!(agent.source_id, "example");
+        assert_eq!(agent.program, PathBuf::from("npx"));
+        assert_eq!(
+            agent.args,
+            vec!["-y", "@example/acp", "--flag", "two words"]
+        );
     }
 
     #[test]
