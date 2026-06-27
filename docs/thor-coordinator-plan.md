@@ -22,9 +22,10 @@ changed and how much each harness/model used.
 - The registry/setup layer is the source of available ACP server types.
   Thor's runtime worker inventory is the persisted configured ACP server set,
   not the full registry and not locally installed provider CLIs.
-- The onboarding flow is not production-grade until a user can add/configure
-  ACP servers from setup, recover from missing auth or missing commands with
-  exact guidance, and reach a usable Thor host without editing TOML by hand.
+- The onboarding flow can add a custom ACP command from setup, persist it, and
+  rerun validation before Thor uses it. It is not production-grade until
+  registry-backed setup also has exact install/auth guidance and a user can
+  reach a usable Thor host without editing TOML by hand.
 - The normal prompt flow has no visible model picker or agent picker.
 - Thor presents an execution plan before doing work.
 - The MCP bridge is provided to the Thor host as an ACP `mcpServers` stdio
@@ -84,10 +85,12 @@ changed and how much each harness/model used.
 10. Done: separate ACP server setup from quota probing. Registry entries and
     configured custom servers produce persisted ACP server instances; quota
     probes only run when a configured server declares a provider quota backend.
-11. Remaining: make onboarding end-user quality. Add an install/configure path
-    for ACP servers, replace inferred setup labels with exact registry/auth
-    guidance where possible, handle empty/broken states as guided recovery, and
-    manually smoke-test the setup UI across terminal sizes.
+11. Partially done: make onboarding end-user quality. Custom ACP commands can
+    be added from setup and revalidated through the normal configured-server
+    path. Remaining: add registry-backed setup actions, replace inferred setup
+    labels with exact registry/auth guidance where possible, handle default
+    empty/broken states as guided recovery, and manually smoke-test the setup UI
+    across terminal sizes.
 
 ## Quota reads
 

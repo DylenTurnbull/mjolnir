@@ -888,48 +888,68 @@ async fn run_thor_onboarding(
     config_path: &Path,
     cwd: PathBuf,
 ) -> Result<Option<SelectedAgent>> {
-    let available_servers = thor_onboarding_servers(cfg).await;
-    let available_agents = available_servers
-        .iter()
-        .map(ConfiguredAcpServer::selected_agent)
-        .collect::<Vec<_>>();
-    let validations = thor_probe::validate_agents(&available_agents, cwd).await;
-    let setup_agents = available_agents
-        .iter()
-        .filter_map(|agent| {
-            let server = available_servers
-                .iter()
-                .find(|server| server.source_id == agent.source_id)?;
-            Some(thor_setup::ThorSetupAgent {
-                agent: agent.clone(),
-                name: server.name.clone(),
-                description: server.description.clone(),
-                quota_backend: server.quota_backend,
-                validation: validations
+    let (selection, setup_agents, available_servers) = loop {
+        let available_servers = thor_onboarding_servers(cfg).await;
+        let available_agents = available_servers
+            .iter()
+            .map(ConfiguredAcpServer::selected_agent)
+            .collect::<Vec<_>>();
+        let validations = thor_probe::validate_agents(&available_agents, cwd.clone()).await;
+        let setup_agents = available_agents
+            .iter()
+            .filter_map(|agent| {
+                let server = available_servers
                     .iter()
-                    .find(|validation| validation.source_id == agent.source_id)
-                    .cloned(),
+                    .find(|server| server.source_id == agent.source_id)?;
+                Some(thor_setup::ThorSetupAgent {
+                    agent: agent.clone(),
+                    name: server.name.clone(),
+                    description: server.description.clone(),
+                    quota_backend: server.quota_backend,
+                    validation: validations
+                        .iter()
+                        .find(|validation| validation.source_id == agent.source_id)
+                        .cloned(),
+                })
             })
-        })
-        .collect::<Vec<_>>();
-    let initial_host = cfg
-        .agent
-        .clone()
-        .filter(|agent| {
-            setup_agents
-                .iter()
-                .any(|candidate| candidate.agent.source_id == agent.source_id)
-        })
-        .unwrap_or_else(|| {
-            setup_agents
-                .first()
-                .map(|candidate| candidate.agent.clone())
-                .unwrap_or_else(thor::default_anvil_agent)
-        });
-    let Some(selection) =
-        run_thor_setup_once(cfg.theme.palette(), &cfg.thor, &setup_agents, &initial_host).await?
-    else {
-        return Ok(None);
+            .collect::<Vec<_>>();
+        let initial_host = cfg
+            .agent
+            .clone()
+            .filter(|agent| {
+                setup_agents
+                    .iter()
+                    .any(|candidate| candidate.agent.source_id == agent.source_id)
+            })
+            .unwrap_or_else(|| {
+                setup_agents
+                    .iter()
+                    .find(|candidate| {
+                        candidate
+                            .validation
+                            .as_ref()
+                            .map(|validation| validation.usable)
+                            .unwrap_or(true)
+                    })
+                    .map(|candidate| candidate.agent.clone())
+                    .unwrap_or_else(thor::default_anvil_agent)
+            });
+        let Some(outcome) =
+            run_thor_setup_once(cfg.theme.palette(), &cfg.thor, &setup_agents, &initial_host)
+                .await?
+        else {
+            return Ok(None);
+        };
+        match outcome {
+            thor_setup::ThorSetupOutcome::Selection(selection) => {
+                break (selection, setup_agents, available_servers);
+            }
+            thor_setup::ThorSetupOutcome::AddCustom(custom) => {
+                add_custom_thor_agent(cfg, custom)?;
+                cfg.save(config_path)
+                    .with_context(|| format!("save {}", config_path.display()))?;
+            }
+        }
     };
     cfg.thor.enabled_worker_source_ids = selection.enabled_worker_source_ids;
     cfg.thor.configured_acp_servers = setup_agents
@@ -976,6 +996,42 @@ async fn run_thor_onboarding(
     cfg.save(config_path)
         .with_context(|| format!("save {}", config_path.display()))?;
     Ok(Some(agent))
+}
+
+fn add_custom_thor_agent(cfg: &mut Config, custom: thor_setup::ThorSetupCustomAgent) -> Result<()> {
+    let words = shell_words::split(&custom.command)
+        .with_context(|| format!("parse ACP command for {}", custom.name))?;
+    let Some((program, args)) = words.split_first() else {
+        anyhow::bail!("ACP command cannot be empty");
+    };
+    let name = unique_custom_agent_name(cfg, &custom.name);
+    let agent = config::CustomAgent {
+        name,
+        program: PathBuf::from(program),
+        args: args.to_vec(),
+        description: "Custom ACP command added during Thor setup".to_string(),
+    };
+    cfg.custom_agents.push(agent);
+    Ok(())
+}
+
+fn unique_custom_agent_name(cfg: &Config, requested: &str) -> String {
+    let base = requested.trim();
+    let base = if base.is_empty() { "Custom ACP" } else { base };
+    if !cfg.custom_agents.iter().any(|agent| agent.name == base) {
+        return base.to_string();
+    }
+    for idx in 2..1000 {
+        let candidate = format!("{base} {idx}");
+        if !cfg
+            .custom_agents
+            .iter()
+            .any(|agent| agent.name == candidate)
+        {
+            return candidate;
+        }
+    }
+    format!("{base} {}", cfg.custom_agents.len() + 1)
 }
 
 async fn thor_onboarding_servers(cfg: &Config) -> Vec<ConfiguredAcpServer> {
@@ -1135,7 +1191,7 @@ async fn run_thor_setup_once(
     thor_config: &thor::ThorConfig,
     agents: &[thor_setup::ThorSetupAgent],
     host_agent: &SelectedAgent,
-) -> Result<Option<thor_setup::ThorSetupSelection>> {
+) -> Result<Option<thor_setup::ThorSetupOutcome>> {
     let mut terminal = ui::setup_fullscreen_terminal().context("setup terminal")?;
     let result =
         thor_setup::run_thor_setup(&mut terminal, theme, thor_config, agents, host_agent).await;
@@ -1754,6 +1810,75 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(source_ids, vec!["claude-acp", "custom:local", "anvil"]);
+    }
+
+    #[test]
+    fn add_custom_thor_agent_parses_and_persists_command() {
+        let mut cfg = Config::default();
+
+        add_custom_thor_agent(
+            &mut cfg,
+            thor_setup::ThorSetupCustomAgent {
+                name: "Claude Code".to_string(),
+                command: "npx -y @agentclientprotocol/claude-agent-acp".to_string(),
+            },
+        )
+        .expect("add custom agent");
+
+        assert_eq!(cfg.custom_agents.len(), 1);
+        assert_eq!(cfg.custom_agents[0].name, "Claude Code");
+        assert_eq!(cfg.custom_agents[0].program, PathBuf::from("npx"));
+        assert_eq!(
+            cfg.custom_agents[0].args,
+            vec!["-y", "@agentclientprotocol/claude-agent-acp"]
+        );
+    }
+
+    #[test]
+    fn add_custom_thor_agent_keeps_names_unique() {
+        let mut cfg = Config {
+            custom_agents: vec![config::CustomAgent {
+                name: "Claude Code".to_string(),
+                program: PathBuf::from("npx"),
+                args: Vec::new(),
+                description: String::new(),
+            }],
+            ..Config::default()
+        };
+
+        add_custom_thor_agent(
+            &mut cfg,
+            thor_setup::ThorSetupCustomAgent {
+                name: "Claude Code".to_string(),
+                command: "npx -y @agentclientprotocol/claude-agent-acp".to_string(),
+            },
+        )
+        .expect("add custom agent");
+
+        assert_eq!(cfg.custom_agents[1].name, "Claude Code 2");
+    }
+
+    #[tokio::test]
+    async fn custom_thor_agent_becomes_onboarding_server() {
+        let mut cfg = Config::default();
+        add_custom_thor_agent(
+            &mut cfg,
+            thor_setup::ThorSetupCustomAgent {
+                name: "Local ACP".to_string(),
+                command: "'/opt/local acp/bin/server' --mode thor".to_string(),
+            },
+        )
+        .expect("add custom agent");
+
+        let custom = thor_onboarding_servers(&cfg)
+            .await
+            .into_iter()
+            .find(|server| server.source_id == "custom:Local ACP")
+            .expect("custom server");
+
+        assert_eq!(custom.name, "Local ACP");
+        assert_eq!(custom.program, PathBuf::from("/opt/local acp/bin/server"));
+        assert_eq!(custom.args, vec!["--mode", "thor"]);
     }
 
     #[test]

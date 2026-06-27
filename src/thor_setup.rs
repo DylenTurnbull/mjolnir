@@ -36,9 +36,23 @@ pub struct ThorSetupSelection {
     pub coordinator_reasoning: ThorReasoning,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThorSetupCustomAgent {
+    pub name: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThorSetupOutcome {
+    Selection(ThorSetupSelection),
+    AddCustom(ThorSetupCustomAgent),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupStep {
     Host,
+    CustomName,
+    CustomCommand,
     Confirm,
 }
 
@@ -46,6 +60,8 @@ impl SetupStep {
     fn title(self) -> &'static str {
         match self {
             Self::Host => "choose Thor",
+            Self::CustomName => "name",
+            Self::CustomCommand => "command",
             Self::Confirm => "start",
         }
     }
@@ -53,9 +69,17 @@ impl SetupStep {
     fn index(self) -> usize {
         match self {
             Self::Host => 0,
-            Self::Confirm => 1,
+            Self::CustomName => 1,
+            Self::CustomCommand => 2,
+            Self::Confirm => 3,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostChoice {
+    Agent(String),
+    AddCustom,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +92,9 @@ struct ThorSetupState {
     host_source_id: String,
     coordinator_model: String,
     coordinator_reasoning: ThorReasoning,
+    custom_name: String,
+    custom_command: String,
+    notice: Option<String>,
 }
 
 impl ThorSetupState {
@@ -119,6 +146,9 @@ impl ThorSetupState {
             host_source_id,
             coordinator_model: thor_config.coordinator_model.clone(),
             coordinator_reasoning: thor_config.coordinator_reasoning,
+            custom_name: String::new(),
+            custom_command: String::new(),
+            notice: None,
         };
         state.cursor = state.default_cursor_for(SetupStep::Host);
         state.ensure_host_is_enabled();
@@ -134,15 +164,41 @@ impl ThorSetupState {
         self.cursor = (self.cursor as i32 + delta).rem_euclid(len as i32) as usize;
     }
 
-    fn advance(&mut self) -> Option<ThorSetupSelection> {
+    fn advance(&mut self) -> Option<ThorSetupOutcome> {
         match self.step {
-            SetupStep::Host => {
-                if let Some(source_id) = self.enabled_source_ids().get(self.cursor) {
+            SetupStep::Host => match self.host_choices().get(self.cursor) {
+                Some(HostChoice::Agent(source_id)) => {
                     self.host_source_id = source_id.clone();
+                    self.set_step(SetupStep::Confirm);
                 }
-                self.set_step(SetupStep::Confirm);
+                Some(HostChoice::AddCustom) => {
+                    self.notice = None;
+                    if self.custom_name.trim().is_empty() {
+                        self.custom_name = default_custom_name(&self.agents);
+                    }
+                    self.set_step(SetupStep::CustomName);
+                }
+                None => {}
+            },
+            SetupStep::CustomName => {
+                if self.custom_name.trim().is_empty() {
+                    self.notice = Some("Enter a short name for this ACP agent.".to_string());
+                } else {
+                    self.notice = None;
+                    self.set_step(SetupStep::CustomCommand);
+                }
             }
-            SetupStep::Confirm => return Some(self.selection()),
+            SetupStep::CustomCommand => {
+                if self.custom_command.trim().is_empty() {
+                    self.notice = Some("Enter the command that starts the ACP server.".to_string());
+                } else {
+                    return Some(ThorSetupOutcome::AddCustom(ThorSetupCustomAgent {
+                        name: self.custom_name.trim().to_string(),
+                        command: self.custom_command.trim().to_string(),
+                    }));
+                }
+            }
+            SetupStep::Confirm => return Some(ThorSetupOutcome::Selection(self.selection())),
         }
         None
     }
@@ -150,8 +206,48 @@ impl ThorSetupState {
     fn back(&mut self) {
         match self.step {
             SetupStep::Host => {}
+            SetupStep::CustomName => self.set_step(SetupStep::Host),
+            SetupStep::CustomCommand => self.set_step(SetupStep::CustomName),
             SetupStep::Confirm => self.set_step(SetupStep::Host),
         }
+    }
+
+    fn edit_text(&mut self, ch: char) {
+        match self.step {
+            SetupStep::CustomName => {
+                self.custom_name.push(ch);
+                self.notice = None;
+            }
+            SetupStep::CustomCommand => {
+                self.custom_command.push(ch);
+                self.notice = None;
+            }
+            SetupStep::Host | SetupStep::Confirm => {}
+        }
+    }
+
+    fn delete_text(&mut self) -> bool {
+        match self.step {
+            SetupStep::CustomName => {
+                let deleted = self.custom_name.pop().is_some();
+                if deleted {
+                    self.notice = None;
+                }
+                deleted
+            }
+            SetupStep::CustomCommand => {
+                let deleted = self.custom_command.pop().is_some();
+                if deleted {
+                    self.notice = None;
+                }
+                deleted
+            }
+            SetupStep::Host | SetupStep::Confirm => false,
+        }
+    }
+
+    fn is_text_step(&self) -> bool {
+        matches!(self.step, SetupStep::CustomName | SetupStep::CustomCommand)
     }
 
     fn selection(&self) -> ThorSetupSelection {
@@ -172,19 +268,35 @@ impl ThorSetupState {
     fn default_cursor_for(&self, step: SetupStep) -> usize {
         match step {
             SetupStep::Host => self
-                .enabled_source_ids()
+                .host_choices()
                 .iter()
-                .position(|source_id| source_id == &self.host_source_id)
+                .position(|choice| match choice {
+                    HostChoice::Agent(source_id) => source_id == &self.host_source_id,
+                    HostChoice::AddCustom => false,
+                })
                 .unwrap_or(0),
+            SetupStep::CustomName | SetupStep::CustomCommand => 0,
             SetupStep::Confirm => 0,
         }
     }
 
     fn current_len(&self) -> usize {
         match self.step {
-            SetupStep::Host => self.enabled_source_ids().len(),
+            SetupStep::Host => self.host_choices().len(),
+            SetupStep::CustomName | SetupStep::CustomCommand => 1,
             SetupStep::Confirm => 1,
         }
+    }
+
+    fn host_choices(&self) -> Vec<HostChoice> {
+        let mut choices = self
+            .agents
+            .iter()
+            .filter(|setup_agent| setup_agent_is_usable(setup_agent))
+            .map(|setup_agent| HostChoice::Agent(setup_agent.agent.source_id.clone()))
+            .collect::<Vec<_>>();
+        choices.push(HostChoice::AddCustom);
+        choices
     }
 
     fn enabled_source_ids(&self) -> Vec<String> {
@@ -217,7 +329,7 @@ pub async fn run_thor_setup(
     thor_config: &ThorConfig,
     agents: &[ThorSetupAgent],
     initial_host: &SelectedAgent,
-) -> Result<Option<ThorSetupSelection>> {
+) -> Result<Option<ThorSetupOutcome>> {
     let mut state = ThorSetupState::new(thor_config, agents, initial_host);
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -242,7 +354,7 @@ pub async fn run_thor_setup(
     }
 }
 
-fn handle_event(state: &mut ThorSetupState, ev: CtEvent) -> Option<Option<ThorSetupSelection>> {
+fn handle_event(state: &mut ThorSetupState, ev: CtEvent) -> Option<Option<ThorSetupOutcome>> {
     let CtEvent::Key(key) = ev else {
         return None;
     };
@@ -262,10 +374,21 @@ fn handle_event(state: &mut ThorSetupState, ev: CtEvent) -> Option<Option<ThorSe
             None
         }
         KeyCode::Backspace | KeyCode::Left => {
-            state.back();
+            if !state.delete_text() {
+                state.back();
+            }
             None
         }
-        KeyCode::Char(' ') => None,
+        KeyCode::Char(' ') => {
+            if state.is_text_step() {
+                state.edit_text(' ');
+            }
+            None
+        }
+        KeyCode::Char(ch) => {
+            state.edit_text(ch);
+            None
+        }
         KeyCode::Enter | KeyCode::Right => state.advance().map(Some),
         _ => None,
     }
@@ -283,7 +406,7 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Length(2),
             Constraint::Min(10),
             Constraint::Length(4),
@@ -300,6 +423,7 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
         )]),
         Line::from("Choose where Thor runs. The other defaults are ready to change later."),
         Line::from("Configured agents that work are available for Thor to delegate to."),
+        Line::from("If the agent you need is missing, add the ACP command here."),
     ])
     .style(Style::default().fg(theme.text));
     f.render_widget(title, layout[0]);
@@ -308,9 +432,15 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
 
     let content = match state.step {
         SetupStep::Host => host_rows(state, theme),
+        SetupStep::CustomName => custom_name_rows(state, theme),
+        SetupStep::CustomCommand => custom_command_rows(state, theme),
         SetupStep::Confirm => confirm_rows(state, theme),
     };
-    let content = visible_rows(content, state.cursor, layout[2].height as usize);
+    let content_cursor = match state.step {
+        SetupStep::Host => host_selected_row_index(state),
+        SetupStep::CustomName | SetupStep::CustomCommand | SetupStep::Confirm => state.cursor,
+    };
+    let content = visible_rows(content, content_cursor, layout[2].height as usize);
     f.render_widget(List::new(content), layout[2]);
 
     let summary = Paragraph::new(summary_lines(state, theme))
@@ -320,6 +450,9 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
 
     let footer_text = match state.step {
         SetupStep::Confirm => "Enter starts Thor  |  Backspace edits  |  Esc quits",
+        SetupStep::CustomName | SetupStep::CustomCommand => {
+            "Type to edit  |  Enter continues  |  Backspace deletes  |  Esc quits"
+        }
         _ => "Enter selects  |  Backspace edits  |  Esc quits",
     };
     let footer = Paragraph::new(footer_text).style(Style::default().fg(theme.muted));
@@ -327,7 +460,15 @@ fn draw(f: &mut ratatui::Frame, state: &ThorSetupState, theme: TerminalTheme) {
 }
 
 fn progress_line(state: &ThorSetupState, theme: TerminalTheme) -> Paragraph<'static> {
-    let steps = [SetupStep::Host, SetupStep::Confirm];
+    let steps = match state.step {
+        SetupStep::CustomName | SetupStep::CustomCommand => vec![
+            SetupStep::Host,
+            SetupStep::CustomName,
+            SetupStep::CustomCommand,
+            SetupStep::Confirm,
+        ],
+        SetupStep::Host | SetupStep::Confirm => vec![SetupStep::Host, SetupStep::Confirm],
+    };
     let spans = steps
         .iter()
         .enumerate()
@@ -384,17 +525,18 @@ fn visible_rows(
 }
 
 fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'static>> {
-    let enabled = state.enabled_source_ids();
-    enabled
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, source_id)| {
-            let setup_agent = state
-                .agents
-                .iter()
-                .find(|setup_agent| &setup_agent.agent.source_id == source_id)?;
-            Some(selectable_row(
-                idx == state.cursor,
+    let choices = state.host_choices();
+    let mut choice_idx = 0usize;
+    let mut rows = Vec::new();
+    for setup_agent in &state.agents {
+        if setup_agent_is_usable(setup_agent) {
+            let selected = matches!(
+                choices.get(choice_idx),
+                Some(HostChoice::Agent(source_id)) if source_id == &setup_agent.agent.source_id
+            ) && choice_idx == state.cursor;
+            choice_idx += 1;
+            rows.push(selectable_row(
+                selected,
                 vec![
                     Span::styled(
                         setup_agent_label(setup_agent),
@@ -414,9 +556,103 @@ fn host_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'stat
                     ),
                 ],
                 theme,
-            ))
-        })
-        .collect()
+            ));
+        } else {
+            rows.push(disabled_row(
+                vec![
+                    Span::styled(
+                        setup_agent_label(setup_agent),
+                        Style::default().fg(theme.muted),
+                    ),
+                    Span::styled(
+                        format!("  {}", host_status_label(setup_agent)),
+                        Style::default().fg(theme.warning),
+                    ),
+                    Span::styled(
+                        format!("  {}", setup_agent_description(setup_agent)),
+                        Style::default().fg(theme.muted),
+                    ),
+                ],
+                theme,
+            ));
+        }
+    }
+    rows.push(selectable_row(
+        state.cursor == choices.len().saturating_sub(1),
+        vec![
+            Span::styled(
+                "Add ACP command".to_string(),
+                Style::default().fg(theme.text),
+            ),
+            Span::styled(
+                "  configure another agent for Thor".to_string(),
+                Style::default().fg(theme.muted),
+            ),
+        ],
+        theme,
+    ));
+    rows
+}
+
+fn host_selected_row_index(state: &ThorSetupState) -> usize {
+    let choices = state.host_choices();
+    let Some(choice) = choices.get(state.cursor) else {
+        return 0;
+    };
+    match choice {
+        HostChoice::Agent(source_id) => state
+            .agents
+            .iter()
+            .position(|setup_agent| setup_agent.agent.source_id == *source_id)
+            .unwrap_or(0),
+        HostChoice::AddCustom => state.agents.len(),
+    }
+}
+
+fn custom_name_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'static>> {
+    text_input_rows(
+        "Agent name",
+        &state.custom_name,
+        "Example: Claude Code, Codex, Goose",
+        state.notice.as_deref(),
+        theme,
+    )
+}
+
+fn custom_command_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'static>> {
+    text_input_rows(
+        "ACP command",
+        &state.custom_command,
+        "Example: npx -y @agentclientprotocol/claude-agent-acp",
+        state.notice.as_deref(),
+        theme,
+    )
+}
+
+fn text_input_rows(
+    label: &str,
+    value: &str,
+    hint: &str,
+    notice: Option<&str>,
+    theme: TerminalTheme,
+) -> Vec<ListItem<'static>> {
+    let mut rows = vec![
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("{label}: "), Style::default().fg(theme.muted)),
+            Span::styled(format!("{value}_"), Style::default().fg(theme.text)),
+        ])),
+        ListItem::new(Line::from(Span::styled(
+            hint.to_string(),
+            Style::default().fg(theme.muted),
+        ))),
+    ];
+    if let Some(notice) = notice {
+        rows.push(ListItem::new(Line::from(Span::styled(
+            notice.to_string(),
+            Style::default().fg(theme.warning),
+        ))));
+    }
+    rows
 }
 
 fn confirm_rows(state: &ThorSetupState, theme: TerminalTheme) -> Vec<ListItem<'static>> {
@@ -451,13 +687,15 @@ fn selectable_row(
     ListItem::new(Line::from(row)).style(row_style)
 }
 
+fn disabled_row(spans: Vec<Span<'static>>, theme: TerminalTheme) -> ListItem<'static> {
+    let mut row = vec![Span::raw("  ")];
+    row.extend(spans);
+    ListItem::new(Line::from(row)).style(Style::default().fg(theme.muted))
+}
+
 fn summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'static>> {
     vec![
-        detail_line(
-            "Available agents",
-            state.enabled_source_ids().join(", "),
-            theme,
-        ),
+        detail_line("Available agents", enabled_summary(state), theme),
         detail_line("Thor runs in", state.host_source_id.clone(), theme),
         detail_line(
             "Defaults",
@@ -470,6 +708,15 @@ fn summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<Line<'stat
             theme,
         ),
     ]
+}
+
+fn enabled_summary(state: &ThorSetupState) -> String {
+    let enabled = state.enabled_source_ids();
+    if enabled.is_empty() {
+        "none ready; add or fix an ACP command".to_string()
+    } else {
+        enabled.join(", ")
+    }
 }
 
 fn detail_line(label: &str, value: String, theme: TerminalTheme) -> Line<'static> {
@@ -553,7 +800,7 @@ fn validation_action_label(setup_agent: &ThorSetupAgent, validation: &AgentValid
         || lower.contains("missing command")
         || lower.contains("permission denied")
     {
-        return format!("install {}", setup_agent.agent.program.to_string_lossy());
+        return install_action_label(setup_agent);
     }
     if lower.contains("auth")
         || lower.contains("login")
@@ -562,9 +809,44 @@ fn validation_action_label(setup_agent: &ThorSetupAgent, validation: &AgentValid
         || lower.contains("token")
         || lower.contains("credential")
     {
-        return "sign in or add key".to_string();
+        return auth_action_label(setup_agent);
     }
     format!("setup needed: {}", truncate_label(error, 48))
+}
+
+fn install_action_label(setup_agent: &ThorSetupAgent) -> String {
+    match setup_agent.agent.source_id.as_str() {
+        "anvil" => "install uv".to_string(),
+        "claude-acp" => "install Node.js and Claude Code".to_string(),
+        "codex-acp" => "install Node.js and Codex".to_string(),
+        _ => match setup_agent.agent.program.to_string_lossy().as_ref() {
+            "npx" => "install Node.js/npm".to_string(),
+            "uvx" => "install uv".to_string(),
+            program => format!("install {program}"),
+        },
+    }
+}
+
+fn auth_action_label(setup_agent: &ThorSetupAgent) -> String {
+    match setup_agent.agent.source_id.as_str() {
+        "claude-acp" => "sign in with Claude Code".to_string(),
+        "codex-acp" => "sign in with Codex".to_string(),
+        _ => "sign in or add key".to_string(),
+    }
+}
+
+fn default_custom_name(agents: &[ThorSetupAgent]) -> String {
+    let base = "Custom ACP";
+    if !agents.iter().any(|agent| setup_agent_label(agent) == base) {
+        return base.to_string();
+    }
+    for idx in 2..100 {
+        let name = format!("{base} {idx}");
+        if !agents.iter().any(|agent| setup_agent_label(agent) == name) {
+            return name;
+        }
+    }
+    base.to_string()
 }
 
 fn truncate_label(value: &str, max_chars: usize) -> String {
@@ -678,7 +960,9 @@ mod tests {
         let mut state = ThorSetupState::new(&cfg, &agents, &raw_agents[1]);
         state.set_step(SetupStep::Confirm);
 
-        let selection = state.advance().expect("selection");
+        let ThorSetupOutcome::Selection(selection) = state.advance().expect("selection") else {
+            panic!("expected selection");
+        };
         assert_eq!(selection.enabled_worker_source_ids, vec!["claude", "codex"]);
         assert_eq!(selection.host_source_id, "codex");
         assert_eq!(selection.optimization_mode, ThorOptimizationMode::Cost);
@@ -732,6 +1016,59 @@ mod tests {
     }
 
     #[test]
+    fn add_custom_choice_collects_name_and_command() {
+        let raw_agents = vec![agent("anvil")];
+        let agents = setup_agents(&raw_agents);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
+
+        state.cursor = state.host_choices().len() - 1;
+        state.advance();
+        assert_eq!(state.step, SetupStep::CustomName);
+
+        state.custom_name.clear();
+        for ch in "Claude Code".chars() {
+            state.edit_text(ch);
+        }
+        state.advance();
+        assert_eq!(state.step, SetupStep::CustomCommand);
+
+        for ch in "npx -y @agentclientprotocol/claude-agent-acp".chars() {
+            state.edit_text(ch);
+        }
+        let ThorSetupOutcome::AddCustom(custom) = state.advance().expect("custom agent") else {
+            panic!("expected custom agent");
+        };
+        assert_eq!(custom.name, "Claude Code");
+        assert_eq!(
+            custom.command,
+            "npx -y @agentclientprotocol/claude-agent-acp"
+        );
+    }
+
+    #[test]
+    fn space_key_edits_custom_command() {
+        let raw_agents = vec![agent("anvil")];
+        let agents = setup_agents(&raw_agents);
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &raw_agents[0]);
+        state.set_step(SetupStep::CustomCommand);
+
+        handle_event(
+            &mut state,
+            CtEvent::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+        );
+        handle_event(
+            &mut state,
+            CtEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+        );
+        handle_event(
+            &mut state,
+            CtEvent::Key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE)),
+        );
+
+        assert_eq!(state.custom_command, "n -");
+    }
+
+    #[test]
     fn visible_rows_follow_cursor_for_long_lists() {
         let rows = (0..10)
             .map(|idx| ListItem::new(Line::from(format!("row {idx}"))))
@@ -740,5 +1077,18 @@ mod tests {
         let window = visible_rows(rows, 8, 4);
 
         assert_eq!(window.len(), 4);
+    }
+
+    #[test]
+    fn host_selected_row_index_tracks_add_command_after_failed_rows() {
+        let agents = vec![
+            setup_agent_with_validation("claude", false),
+            setup_agent_with_validation("codex", false),
+        ];
+        let initial_host = agents[0].agent.clone();
+        let mut state = ThorSetupState::new(&ThorConfig::default(), &agents, &initial_host);
+        state.cursor = state.host_choices().len() - 1;
+
+        assert_eq!(host_selected_row_index(&state), 2);
     }
 }

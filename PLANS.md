@@ -56,9 +56,10 @@ longer part of the normal user path.
 
 The remaining startup gap is onboarding quality. The current first-run flow
 validates candidates and avoids the old model/agent picker, but it still does
-not feel like an end-user setup wizard. It must guide a user from "nothing is
-configured" to "Thor has usable ACP agents" with explicit add/configure/auth
-actions before this is production-grade.
+not fully feel like an end-user setup wizard. It now lets a user add a custom
+ACP command from setup and reruns validation before Thor uses it, but exact
+install/auth guidance and manual visual smoke are still required before this is
+production-grade.
 
 M1 hardening landed (PR #34): an explicit `ConnectionState` lifecycle drives
 the header label, a `LaunchError` enum surfaces spawn / initialize /
@@ -321,8 +322,8 @@ Near-term:
 - Compatibility smoke tests against more non-Brokk ACP agents (one done in
   M1; see the Compatibility section).
 - Production-grade Thor first-run onboarding: add/configure ACP agents from
-  setup, exact install/auth guidance, and manual visual smoke across terminal
-  sizes.
+  setup is implemented for custom ACP commands; exact registry/auth guidance
+  and manual visual smoke across terminal sizes remain.
 
 (M1 closed: fatal/error rendering, child-process cleanup, transcript
 scrolling.)
@@ -354,10 +355,10 @@ concepts must not leak into the setup path.
 
 Current assessment: the flow is still not production-grade. It is no longer the
 old advanced picker, but it remains too much like a validation list and not
-enough like a guided setup wizard. A new user who does not already have usable
-ACP servers configured can still land on broad "install" or "setup needed"
-messages without an obvious path to configure the agent they expected Thor to
-use.
+enough like a guided setup wizard. A new user can now add a custom ACP command
+from onboarding and have it validated before Thor uses it, but failed rows can
+still land on broad install/auth messages instead of exact agent-specific setup
+instructions.
 
 Fixed in this PR:
 
@@ -381,20 +382,25 @@ Fixed in this PR:
   Thor defaults and can be changed later.
 - [x] Replaced the dead-end "needs setup" validation label with inferred user
   actions such as `install <program>` or `sign in or add key`.
+- [x] Added an onboarding recovery path to add a custom ACP command, persist it
+  as a named custom agent, rerun ACP validation, and only expose it to Thor after
+  the normal configured-server path sees it.
+- [x] Kept failed candidates visible while making the add-command row reachable
+  in long or mostly broken setup lists.
 
 Still not production-grade:
 
-1. **Agent setup still needs a clearer install/configure path.** The candidate
-   set is no longer the whole registry, but users still need an obvious way to
-   add/configure more ACP agents from onboarding when their desired agent is not
-   present or usable.
-2. **Validation feedback is still inferred, not agent-specific.** Rows now offer
+1. **Registry-backed agent setup still needs a clearer install/configure path.**
+   Custom ACP commands can now be added from onboarding, but registry entries
+   still need first-class setup actions when their provider CLI, package
+   manager, or auth is missing.
+2. **Validation feedback is still mostly inferred, not agent-specific.** Rows now offer
    broad actions like install/sign-in/configure, but production UX should use
    registry/auth metadata for exact commands and links when available.
 3. **Empty and broken states need real user-facing recovery.** If no usable
-   Thor host validates, setup should drive the user through installing/signing
-   into the default path or adding a custom ACP command, rather than leaving the
-   user with an inert list of failed candidates.
+   Thor host validates, setup can now add a custom ACP command, but it should
+   also drive the user through installing/signing into the default path with
+   exact steps.
 4. **The setup UI has not been manually smoke-tested in multiple terminal sizes.**
    Unit tests cover state transitions and list windowing; visual polish still
    needs an interactive pass.

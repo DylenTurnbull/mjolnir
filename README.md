@@ -55,7 +55,9 @@ By default, `mj` starts Thor inside the configured ACP host. On first run, setup
 asks where Thor should run, then starts with the saved Thor defaults for work
 style, model preference, and reasoning level. Configured agents that validate
 successfully are made available to Thor automatically. The normal prompt flow
-does not ask the user to choose a model or agent.
+does not ask the user to choose a model or agent. If the agent you need is not
+listed, setup can add a custom ACP command, save it to config, and validate it
+before Thor uses it.
 
 ```
  mj
@@ -110,9 +112,11 @@ Debian/Ubuntu.
 
 Thor is a coordinator persona running inside an ACP host agent. Onboarding
 validates configured/custom/default ACP servers, lets the user choose where Thor
-runs, and persists the usable configured server instances. Thor only sees
-configured ACP servers, not every registry possibility and not locally installed
-provider CLIs by themselves.
+runs, and persists the usable configured server instances. The setup flow can
+also add a custom ACP command and rerun validation so the new server is only
+offered to Thor after it starts successfully. Thor only sees configured ACP
+servers, not every registry possibility and not locally installed provider CLIs
+by themselves.
 
 `mj` passes a stdio MCP bridge (`mj thor-mcp`) to the host through ACP
 `mcpServers`; the MCP tools validate configured ACP workers, list usable
