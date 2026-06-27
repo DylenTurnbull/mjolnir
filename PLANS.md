@@ -301,7 +301,9 @@ Exit criteria:
 
 - Fresh machine install path works for at least macOS aarch64 and Linux x86_64.
   The release workflow and installer support this; a fresh-machine smoke pass
-  still needs to be recorded before calling distribution production-grade.
+  still needs to be recorded before calling distribution production-grade. Use
+  [docs/install-smoke.md](docs/install-smoke.md) for the exact evidence to
+  collect.
 - `mj --version` and `mj --cwd .` work after install.
 
 ### M5: Optional client capabilities

@@ -54,12 +54,12 @@ The default `anvil` backend runs `uvx brokk acp`, so `uvx` must be available on
 ## Quick Start
 
 By default, `mj` starts Thor inside the configured ACP host. On first run, setup
-asks where Thor should run, then starts with the saved Thor defaults for work
-style, model preference, and reasoning level. Configured agents that validate
-successfully are made available to Thor automatically. The normal prompt flow
-does not ask the user to choose a model or agent. If the agent you need is not
-listed, setup can add a server from the ACP registry or a custom ACP command,
-save it to config, and validate it before Thor uses it.
+asks for Thor's work style, which ready agents Thor may use, and which ready
+agent should host Thor. Model preference and reasoning level stay automatic in
+the onboarding path. The normal prompt flow does not ask the user to choose a
+model or agent. If the agent you need is not listed, setup can add a server from
+the ACP registry or a custom ACP command, save it to config, and validate it
+before Thor uses it.
 
 ```
  mj
@@ -102,6 +102,9 @@ Windows users should download the `x86_64-pc-windows-msvc.zip` asset from the
 GitHub release page, verify it against the adjacent `.sha256` file, and put
 `mj.exe` on `PATH`.
 
+Release smoke instructions for macOS and Linux are in
+[docs/install-smoke.md](docs/install-smoke.md).
+
 Rust users can install from source:
 
 ```bash
@@ -115,10 +118,11 @@ Debian/Ubuntu.
 ## Thor Routing
 
 Thor is a coordinator persona running inside an ACP host agent. Onboarding
-validates configured/custom/default ACP servers, lets the user choose where Thor
-runs, and persists the usable configured server instances. The setup flow can
-also add a registry-backed server or custom ACP command and rerun validation so
-the new server is only offered to Thor after it starts successfully. Registry
+validates configured/custom/default ACP servers, lets the user choose Thor's
+work style, choose the ready agents Thor may use, choose where Thor runs, and
+persists the usable configured server instances. The setup flow can also add a
+registry-backed server or custom ACP command and rerun validation so the new
+server is only offered to Thor after it starts successfully. Registry
 website/repository links are kept with configured servers and shown in setup
 guidance when available. Thor only sees configured ACP servers, not every
 registry possibility and not locally installed provider CLIs by themselves.
