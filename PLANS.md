@@ -131,15 +131,19 @@ usage.
 
 The interactive Thor runtime starts the host prompt with the user's raw task so
 ACP hosts are less likely to name saved sessions after the Thor persona. The
-local UI and remote/browser transcript derive the visible session name from the
-first real task and now ignore generic Thor host titles instead of accepting
-them as placeholders. The runtime records an immediate local planning line,
-publishes distinct elapsed heartbeats during long host turns, and consumes the
-Thor MCP bridge's out-of-band worker progress stream so delegated ACP
-tool/permission/completion events can appear while the host waits for worker
-calls. This still needs real-provider smoke against long Thor turns because the
-host model may fail to delegate or may produce sparse progress text even when
-the local heartbeat is working.
+local UI now assigns the visible session title immediately from the submitted
+user task, and both local and remote transcript paths ignore generic Thor host
+titles instead of accepting them as placeholders. The runtime records an
+immediate local planning line, publishes distinct elapsed heartbeats during long
+host turns, and consumes the Thor MCP bridge's out-of-band worker progress
+stream so delegated ACP tool/permission/completion events can appear while the
+host waits for worker calls. The remote-control server path now receives the
+same Thor MCP progress side channel and heartbeat stream as the local TUI path,
+so browser transcripts are not left dependent on host text alone. This is still
+not production-proven: live use reported generic Thor session naming and no
+visible transcript updates during a multi-minute turn, so the title/progress
+fixes need a real-provider long-turn smoke before the coordinator can be called
+production-grade.
 
 Initial routing policy:
 
@@ -266,7 +270,9 @@ Deliverables:
   `mj acp-smoke --all-configured` validates the whole persisted Thor worker set
   after onboarding or config edits. By default this is no-token; passing
   `--prompt <text>` explicitly sends one prompt turn, records completion and
-  stop reason, and fails if `session/prompt` does not complete.
+  stop reason, and fails if `session/prompt` does not complete. Adding
+  `--cancel-after-ms <ms>` requests `session/cancel` during that prompt and
+  fails unless the turn completes as cancelled.
 - Explore session rewind as an ACP extension paired with Anvil. The current
   proposal is documented in [docs/session-rewind-extension.md](docs/session-rewind-extension.md):
   model rewind as fork-from-checkpoint using `session/fork` `_meta`, not as
@@ -554,10 +560,10 @@ Fixed in this PR:
   the 80-column terminal size used by the PTY smoke, and pressing Enter advances
   to the agent step where the no-ready-agent path defaults to `Add custom
   command` while keeping Anvil install guidance visible.
-- [x] Fixed the interactive Thor runtime title path: the session title now comes
-  from the user's raw task before `mj` wraps it in the Thor coordinator prompt,
-  and later generic Thor host titles no longer overwrite an existing task
-  title.
+- [x] Fixed the interactive Thor runtime title path in the UI state machine:
+  `record_user_prompt` now assigns the visible session title from the submitted
+  user task immediately, before any host-supplied title can arrive, and later
+  generic Thor host titles no longer overwrite an existing task title.
 - [x] Moved the raw user task to the top of the Thor host prompt and instructed
   host agents to use that task, not the Thor persona preamble, when setting a
   saved session title.
@@ -577,6 +583,9 @@ Fixed in this PR:
 - [x] Made local Thor status events remote-visible. Planning, long-running
   heartbeats, and worker side-channel progress are now recorded as `system`
   entries in the remote/browser transcript instead of only appearing in the TUI.
+- [x] Wired the remote-control server path to the same Thor MCP progress file
+  and elapsed heartbeat used by the local TUI path, so browser-only Thor
+  sessions can receive worker progress and distinct long-turn status entries.
 - [x] Added regression coverage for distinct Thor heartbeat messages so long
   host turns do not lose progress lines to transcript dedupe; inactive periods
   reset the elapsed timer before the next turn.
@@ -607,13 +616,16 @@ Fixed in this PR:
 Still not production-grade:
 
 1. **Thor runtime progress and titles need real long-turn validation.**
-   Generic Thor host titles are now ignored locally and in the remote/browser
-   transcript, and long host turns emit distinct elapsed heartbeat lines so the
-   transcript does not look frozen solely because repeated status text was
-   deduped; this elapsed heartbeat behavior now has deterministic unit
-   coverage. What remains is a real-provider smoke where Thor runs long enough
-   to delegate work, mirror worker progress, and produce a final recap. Track
-   this alongside the broader Thor runtime hardening work before calling the
+   Live use found generic Thor session naming and a transcript that appeared
+   frozen for several minutes. The local state machine now titles the session
+   from the user prompt at submit time, generic Thor host titles are ignored
+   locally and in the remote/browser transcript, local and remote-control paths
+   both emit distinct elapsed heartbeat lines, and both paths can mirror Thor
+   MCP worker progress. Deterministic tests cover those local/remote plumbing
+   paths. What remains is a real-provider smoke where Thor runs long enough to
+   delegate work, mirror worker progress, show heartbeat entries in the same
+   transcript the user is watching, and produce a final recap. Track this
+   alongside the broader Thor runtime hardening work before calling the
    coordinator production-grade.
 1. **Registry-backed agent setup still needs richer install/configure metadata.**
    Registry entries can now be added from onboarding, and website/repository
@@ -679,8 +691,9 @@ command/env Thor will use after onboarding, run `mj acp-smoke
 pass. The smoke starts the ACP server, validates initialize plus
 `session/new`, records advertised capabilities, and shuts down without sending
 `session/prompt` unless `--prompt <text>` is supplied. Add `--format json` when
-preserving machine-readable evidence. Use `--prompt` only when token spend is
-acceptable or when testing a deterministic mock ACP agent.
+preserving machine-readable evidence. Use `--prompt` or `--cancel-after-ms`
+only when token spend is acceptable or when testing a deterministic mock ACP
+agent.
 
 ### `@agentclientprotocol/claude-agent-acp` 0.36.1 — 2026-05-20
 

@@ -244,6 +244,12 @@ struct AcpSmokeArgs {
     #[arg(long, value_name = "TEXT")]
     prompt: Option<String>,
 
+    /// Request `session/cancel` this many milliseconds after sending `--prompt`.
+    ///
+    /// Requires `--prompt` and fails unless the prompt completes as cancelled.
+    #[arg(long, value_parser = parse_positive_u64)]
+    cancel_after_ms: Option<u64>,
+
     /// Output format.
     #[arg(long, value_enum, default_value_t = HeadlessOutputFormat::Text)]
     format: HeadlessOutputFormat,
@@ -458,6 +464,12 @@ async fn run_acp_smoke(args: AcpSmokeArgs, default_cwd: PathBuf) -> Result<()> {
     if args.list_configured && args.prompt.is_some() {
         anyhow::bail!("--prompt cannot be used with --list-configured");
     }
+    if args.list_configured && args.cancel_after_ms.is_some() {
+        anyhow::bail!("--cancel-after-ms cannot be used with --list-configured");
+    }
+    if args.cancel_after_ms.is_some() && args.prompt.is_none() {
+        anyhow::bail!("--cancel-after-ms requires --prompt");
+    }
     if args.list_configured {
         return list_configured_acp_smoke_servers(args.format);
     }
@@ -467,15 +479,25 @@ async fn run_acp_smoke(args: AcpSmokeArgs, default_cwd: PathBuf) -> Result<()> {
     };
     let agents = selected_agents_for_acp_smoke(&args)?;
     let timeout = Duration::from_secs(args.timeout_seconds);
+    let cancel_after = args.cancel_after_ms.map(Duration::from_millis);
     let validations = futures::future::join_all(agents.into_iter().map(|agent| {
-        thor_probe::validate_agent_with_prompt(agent, cwd.clone(), timeout, args.prompt.clone())
+        thor_probe::validate_agent_with_prompt_and_cancel(
+            agent,
+            cwd.clone(),
+            timeout,
+            args.prompt.clone(),
+            cancel_after,
+        )
     }))
     .await;
     print_acp_smoke_results(&validations, args.format)?;
     let failed = validations
         .iter()
         .filter(|validation| {
-            !validation.usable || (args.prompt.is_some() && !validation.prompt_completed)
+            !validation.usable
+                || (args.prompt.is_some() && !validation.prompt_completed)
+                || (args.cancel_after_ms.is_some()
+                    && validation.prompt_stop_reason.as_deref() != Some("Cancelled"))
         })
         .map(|validation| {
             format!(
@@ -485,7 +507,11 @@ async fn run_acp_smoke(args: AcpSmokeArgs, default_cwd: PathBuf) -> Result<()> {
                     .error
                     .as_deref()
                     .unwrap_or(if args.prompt.is_some() {
-                        "agent did not complete session/prompt"
+                        if args.cancel_after_ms.is_some() {
+                            "agent did not complete session/prompt with Cancelled"
+                        } else {
+                            "agent did not complete session/prompt"
+                        }
                     } else {
                         "agent did not reach session/new"
                     })
@@ -663,6 +689,10 @@ fn print_acp_smoke_text_result(validation: &thor_probe::AgentValidation) {
     }
     println!("session/new: {}", yes_no(validation.session_started));
     println!("session/prompt: {}", acp_smoke_prompt_status(validation));
+    println!(
+        "session/cancel: {}",
+        yes_no(validation.prompt_cancel_requested)
+    );
     println!("config options: {}", yes_no(validation.config_advertised));
     println!(
         "image prompts: {}",
@@ -2963,6 +2993,8 @@ mod tests {
             "12",
             "--prompt",
             "ping",
+            "--cancel-after-ms",
+            "25",
             "--format",
             "json",
         ])
@@ -2982,6 +3014,7 @@ mod tests {
                 assert_eq!(args.cwd, Some(PathBuf::from("/tmp/agent-cwd")));
                 assert_eq!(args.timeout_seconds, 12);
                 assert_eq!(args.prompt.as_deref(), Some("ping"));
+                assert_eq!(args.cancel_after_ms, Some(25));
                 assert!(matches!(args.format, HeadlessOutputFormat::Json));
             }
             _ => panic!("expected AcpSmoke subcommand"),
@@ -2997,6 +3030,7 @@ mod tests {
             agent_version: None,
             session_started: true,
             prompt_sent: false,
+            prompt_cancel_requested: false,
             prompt_completed: false,
             prompt_stop_reason: None,
             config_advertised: false,

@@ -6,7 +6,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, PermissionOptionKind, SessionConfigId, SessionConfigValueId, SessionUpdate,
@@ -1302,6 +1302,8 @@ fn start_server_agent_session(
     let (runtime_cmd_tx, runtime_cmd_rx) = mpsc::unbounded_channel();
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let (remote_event_tx, mut remote_event_rx) = mpsc::unbounded_channel();
+    let thor_progress_path = thor_progress_path();
+    let _ = std::fs::remove_file(&thor_progress_path);
     let agent_label = "Thor".to_string();
     let project_label = crate::paths::project_label_from_cwd(&cwd);
     let tracker = RemoteSessionTracker::new(
@@ -1315,20 +1317,34 @@ fn start_server_agent_session(
         args: agent.args,
         cwd,
         additional_directories,
-        mcp_servers: crate::thor_mcp::mcp_servers(config::default_config_path())?,
+        mcp_servers: crate::thor_mcp::mcp_servers_with_progress(
+            config::default_config_path(),
+            Some(thor_progress_path.clone()),
+        )?,
         resume_session: None,
         env: agent.env,
         agent_stderr: None,
         fs_max_text_bytes,
     };
     let shutdown_tx = runtime_cmd_tx.clone();
+    let thor_turn_active = Arc::new(AtomicBool::new(false));
 
     let task = tokio::spawn(async move {
+        let progress_tracker = tracker.clone();
+        let progress_path_for_task = thor_progress_path.clone();
+        let progress_proxy =
+            tokio::spawn(poll_thor_progress(progress_path_for_task, progress_tracker));
+        let heartbeat_tracker = tracker.clone();
+        let heartbeat_active = thor_turn_active.clone();
+        let progress_heartbeat =
+            tokio::spawn(thor_activity_heartbeat(heartbeat_active, heartbeat_tracker));
+        let command_active = thor_turn_active.clone();
         let command_proxy = tokio::spawn(async move {
             let mut sent_thor_preamble = false;
             while let Some(command) = command_rx.recv().await {
                 let runtime_command = match command {
                     UiCommand::SendPrompt { text, images } => {
+                        command_active.store(true, Ordering::Relaxed);
                         let text = if sent_thor_preamble {
                             text
                         } else {
@@ -1364,7 +1380,14 @@ fn start_server_agent_session(
                     let Some(event) = event else {
                         break;
                     };
+                    let turn_finished = matches!(
+                        event,
+                        UiEvent::PromptDone { .. } | UiEvent::PromptFailed { .. } | UiEvent::Fatal(_)
+                    );
                     handle_server_agent_event(event, &tracker, &mut pending_permissions);
+                    if turn_finished {
+                        thor_turn_active.store(false, Ordering::Relaxed);
+                    }
                 }
                 event = remote_event_rx.recv() => {
                     let Some(event) = event else {
@@ -1395,11 +1418,99 @@ fn start_server_agent_session(
             }
         }
         command_proxy.abort();
+        progress_proxy.abort();
+        progress_heartbeat.abort();
+        let _ = std::fs::remove_file(thor_progress_path);
         pending_permissions.clear();
         tracker.shutdown().await;
     });
 
     Ok(ServerAgentSession { command_tx, task })
+}
+
+fn thor_progress_path() -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "mj-thor-remote-progress-{}-{now}.jsonl",
+        std::process::id()
+    ))
+}
+
+async fn poll_thor_progress(path: PathBuf, tracker: RemoteSessionTracker) {
+    let mut offset = 0usize;
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        tick.tick().await;
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if body.len() < offset {
+            offset = 0;
+        }
+        let new_body = &body[offset..];
+        offset = body.len();
+        for line in new_body.lines() {
+            if let Some(message) = thor_progress_message(line) {
+                tracker.observe_event(&UiEvent::Info(message));
+            }
+        }
+    }
+}
+
+async fn thor_activity_heartbeat(active: Arc<AtomicBool>, tracker: RemoteSessionTracker) {
+    let mut elapsed_seconds = 0u64;
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        if let Some(message) =
+            thor_heartbeat_tick(active.load(Ordering::Relaxed), &mut elapsed_seconds, 15)
+        {
+            tracker.observe_event(&UiEvent::Info(message));
+        }
+    }
+}
+
+fn thor_heartbeat_tick(
+    active: bool,
+    elapsed_seconds: &mut u64,
+    step_seconds: u64,
+) -> Option<String> {
+    if !active {
+        *elapsed_seconds = 0;
+        return None;
+    }
+    *elapsed_seconds = elapsed_seconds.saturating_add(step_seconds);
+    Some(format!(
+        "Thor is still working... {elapsed_seconds}s elapsed"
+    ))
+}
+
+fn thor_progress_message(line: &str) -> Option<String> {
+    let record: serde_json::Value = serde_json::from_str(line).ok()?;
+    let kind = record.get("kind").and_then(serde_json::Value::as_str)?;
+    let detail = record.get("detail").and_then(serde_json::Value::as_str)?;
+    Some(format!(
+        "Thor worker {}: {}",
+        thor_progress_kind_label(kind),
+        detail
+    ))
+}
+
+fn thor_progress_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "session_started" => "started",
+        "prompt_sent" => "prompt sent",
+        "tool_call" => "tool",
+        "tool_update" => "tool update",
+        "permission" => "permission",
+        "prompt_done" => "done",
+        "timeout" => "timeout",
+        "error" => "error",
+        "worker_closed" => "closed",
+        _ => "progress",
+    }
 }
 
 impl ServerAgentSession {
@@ -3142,6 +3253,33 @@ mod tests {
         assert_eq!(snapshot.transcript.len(), 1);
         assert_eq!(snapshot.transcript[0].kind, "system");
         assert_eq!(snapshot.transcript[0].text, "Thor is still working...");
+    }
+
+    #[test]
+    fn remote_thor_heartbeat_tick_emits_distinct_elapsed_messages_and_resets() {
+        let mut elapsed = 0;
+
+        assert_eq!(
+            thor_heartbeat_tick(true, &mut elapsed, 15).as_deref(),
+            Some("Thor is still working... 15s elapsed")
+        );
+        assert_eq!(
+            thor_heartbeat_tick(true, &mut elapsed, 15).as_deref(),
+            Some("Thor is still working... 30s elapsed")
+        );
+        assert_eq!(thor_heartbeat_tick(false, &mut elapsed, 15), None);
+        assert_eq!(elapsed, 0);
+    }
+
+    #[test]
+    fn remote_thor_progress_message_formats_visible_worker_update() {
+        let message =
+            thor_progress_message(r#"{"kind":"tool_call","detail":"cargo test (execute)"}"#);
+
+        assert_eq!(
+            message.as_deref(),
+            Some("Thor worker tool: cargo test (execute)")
+        );
     }
 
     #[test]

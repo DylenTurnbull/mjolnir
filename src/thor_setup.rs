@@ -1489,6 +1489,7 @@ mod tests {
                 agent_version: None,
                 session_started: error.is_none(),
                 prompt_sent: false,
+                prompt_cancel_requested: false,
                 prompt_completed: false,
                 prompt_stop_reason: None,
                 config_advertised: false,

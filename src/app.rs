@@ -1077,6 +1077,21 @@ impl AppState {
         true
     }
 
+    pub fn set_session_title_from_user_prompt(&mut self, raw: &str) -> bool {
+        if self.session_title.as_deref().is_some_and(|title| {
+            let title = title.trim();
+            !title.is_empty() && !is_generic_thor_title(title)
+        }) {
+            return false;
+        }
+        let title = task_title_from_prompt(raw);
+        if title.is_empty() {
+            return false;
+        }
+        self.session_title = Some(title);
+        true
+    }
+
     pub(crate) fn set_connection_state(&mut self, state: ConnectionState) {
         if self.connection_state != state {
             self.connection_state = state;
@@ -1232,6 +1247,7 @@ impl AppState {
     /// Push a user prompt into the transcript immediately, before the
     /// command reaches the runtime. Keeps the UI responsive.
     pub fn record_user_prompt(&mut self, text: String) {
+        self.set_session_title_from_user_prompt(&text);
         self.transcript.push(Entry::UserPrompt(text.clone()));
         // Record in prompt history for Up/Down navigation, deduplicating
         // consecutive identical prompts.
@@ -1898,9 +1914,35 @@ fn is_generic_thor_title(title: &str) -> bool {
     let lower = title.trim().to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "thor" | "thor session" | "new thor session" | "thor task" | "new thor task"
+        "thor"
+            | "thor session"
+            | "new thor session"
+            | "thor task"
+            | "new thor task"
+            | "thor coordinator"
+            | "mjolnir thor"
+            | "thor omni-agent coordinator"
+            | "thor omni agent coordinator"
     ) || lower.starts_with("thor:")
         || lower.starts_with("thor -")
+        || lower.starts_with("thor session ")
+        || lower.starts_with("new thor session ")
+}
+
+fn task_title_from_prompt(prompt: &str) -> String {
+    let sanitized = crate::notifications::sanitize_message(prompt);
+    let title = sanitized
+        .trim()
+        .trim_matches(|ch: char| ch == '"' || ch == '\'')
+        .to_string();
+    const MAX_TITLE_CHARS: usize = 80;
+    let mut chars = title.chars();
+    let truncated = chars.by_ref().take(MAX_TITLE_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 #[cfg(test)]
@@ -1951,6 +1993,38 @@ mod tests {
         assert!(!s.set_session_title("Thor session"));
 
         assert_eq!(s.session_title.as_deref(), None);
+    }
+
+    #[test]
+    fn user_prompt_sets_task_session_title_immediately() {
+        let mut s = AppState::new();
+
+        s.record_user_prompt("  \"Fix the Thor progress title\"  ".into());
+
+        assert_eq!(
+            s.session_title.as_deref(),
+            Some("Fix the Thor progress title")
+        );
+    }
+
+    #[test]
+    fn user_prompt_replaces_generic_thor_session_title() {
+        let mut s = AppState::new();
+        s.session_title = Some("Thor session".to_string());
+
+        assert!(s.set_session_title_from_user_prompt("Debug blank progress"));
+
+        assert_eq!(s.session_title.as_deref(), Some("Debug blank progress"));
+    }
+
+    #[test]
+    fn later_user_prompt_does_not_rename_existing_task_session() {
+        let mut s = AppState::new();
+
+        assert!(s.set_session_title_from_user_prompt("First task"));
+        assert!(!s.set_session_title_from_user_prompt("Second task"));
+
+        assert_eq!(s.session_title.as_deref(), Some("First task"));
     }
 
     #[test]

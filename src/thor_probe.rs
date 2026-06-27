@@ -27,6 +27,7 @@ pub struct AgentValidation {
     pub agent_version: Option<String>,
     pub session_started: bool,
     pub prompt_sent: bool,
+    pub prompt_cancel_requested: bool,
     pub prompt_completed: bool,
     pub prompt_stop_reason: Option<String>,
     pub config_advertised: bool,
@@ -116,6 +117,16 @@ pub async fn validate_agent_with_prompt(
     timeout: Duration,
     prompt: Option<String>,
 ) -> AgentValidation {
+    validate_agent_with_prompt_and_cancel(agent, cwd, timeout, prompt, None).await
+}
+
+pub async fn validate_agent_with_prompt_and_cancel(
+    agent: SelectedAgent,
+    cwd: PathBuf,
+    timeout: Duration,
+    prompt: Option<String>,
+    cancel_after: Option<Duration>,
+) -> AgentValidation {
     let started_at = Instant::now();
     let source_id = agent.source_id.clone();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -140,6 +151,7 @@ pub async fn validate_agent_with_prompt(
         agent_version: None,
         session_started: false,
         prompt_sent: false,
+        prompt_cancel_requested: false,
         prompt_completed: false,
         prompt_stop_reason: None,
         config_advertised: false,
@@ -151,8 +163,10 @@ pub async fn validate_agent_with_prompt(
     };
 
     let prompt_cmd_tx = cmd_tx.clone();
+    let cancel_cmd_tx = cmd_tx.clone();
     let probe = async {
         let mut prompt = prompt;
+        let mut cancel_after = cancel_after;
         while let Some(event) = event_rx.recv().await {
             match event {
                 UiEvent::Connected {
@@ -181,6 +195,14 @@ pub async fn validate_agent_with_prompt(
                             validation.error =
                                 Some("ACP validation could not send session/prompt".to_string());
                             break;
+                        }
+                        if let Some(cancel_delay) = cancel_after.take() {
+                            validation.prompt_cancel_requested = true;
+                            let cancel_cmd_tx = cancel_cmd_tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(cancel_delay).await;
+                                let _ = cancel_cmd_tx.send(UiCommand::CancelPrompt);
+                            });
                         }
                     } else {
                         break;
@@ -961,6 +983,55 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":nul
         assert!(validation.error.is_none(), "{validation:?}");
     }
 
+    #[tokio::test]
+    async fn validation_with_prompt_can_request_cancel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join(if cfg!(windows) {
+            "mock_cancel_acp.py"
+        } else {
+            "mock-cancel-acp"
+        });
+        std::fs::write(&script, prompt_cancel_mock_acp_script()).expect("write mock acp");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).expect("chmod");
+        }
+
+        let mut args = Vec::new();
+        let program = if cfg!(windows) {
+            args.push(script.display().to_string());
+            PathBuf::from("python")
+        } else {
+            script
+        };
+        let agent = SelectedAgent {
+            source_id: "mock-cancel".to_string(),
+            program,
+            args,
+            env: HashMap::new(),
+        };
+
+        let validation = validate_agent_with_prompt_and_cancel(
+            agent,
+            std::env::current_dir().expect("cwd"),
+            Duration::from_secs(3),
+            Some("hang until cancelled".to_string()),
+            Some(Duration::from_millis(20)),
+        )
+        .await;
+
+        assert!(validation.usable, "{validation:?}");
+        assert!(validation.session_started);
+        assert!(validation.prompt_sent);
+        assert!(validation.prompt_cancel_requested);
+        assert!(validation.prompt_completed);
+        assert_eq!(validation.prompt_stop_reason.as_deref(), Some("Cancelled"));
+        assert!(validation.error.is_none(), "{validation:?}");
+    }
+
     fn prompt_smoke_mock_acp_script() -> &'static str {
         r#"#!/usr/bin/env python3
 import json
@@ -998,6 +1069,48 @@ while True:
         result = {}
     if "id" in message:
         write_message({"jsonrpc": "2.0", "id": message["id"], "result": result})
+"#
+    }
+
+    fn prompt_cancel_mock_acp_script() -> &'static str {
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+pending_prompt_id = None
+
+def read_message():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
+def write_message(message):
+    sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "promptCapabilities": {"image": False, "audio": False, "embeddedContext": False},
+                "sessionCapabilities": {}
+            },
+            "agentInfo": {"name": "Mock Cancel ACP", "version": "1.0.0"}
+        }
+        write_message({"jsonrpc": "2.0", "id": message["id"], "result": result})
+    elif method == "session/new":
+        write_message({"jsonrpc": "2.0", "id": message["id"], "result": {"sessionId": "mock-session"}})
+    elif method == "session/prompt":
+        pending_prompt_id = message.get("id")
+    elif method == "session/cancel" and pending_prompt_id is not None:
+        write_message({"jsonrpc": "2.0", "id": pending_prompt_id, "result": {"stopReason": "cancelled"}})
+        pending_prompt_id = None
 "#
     }
 }

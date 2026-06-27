@@ -35,11 +35,13 @@ changed and how much each harness/model used.
 - Thor presents an execution plan before doing work.
 - Thor is instructed to keep the transcript alive with short visible progress
   updates while it gathers facts and runs implementation/review/correction
-  phases. `mj` also emits distinct elapsed heartbeat lines during long host
-  turns so the TUI and remote/browser transcript do not look frozen when the
-  host has not produced text yet. This still needs real-provider validation on
-  long turns because host models can ignore progress instructions or fail to
-  delegate.
+  phases. `mj` also titles local sessions from the submitted user task and
+  emits distinct elapsed heartbeat lines during long host turns so the TUI and
+  remote/browser transcript do not look frozen when the host has not produced
+  text yet. The remote-control server path also receives the Thor MCP worker
+  progress side channel, not only the local TUI path. This still needs
+  real-provider validation on long turns because live use reported generic Thor
+  session names and no visible transcript updates over a multi-minute turn.
 - `mj thor-mcp` mirrors visible worker lifecycle, tool, permission, completion,
   timeout, and error events through an out-of-band progress stream consumed by
   the interactive UI and remote tracker, so the transcript continues to update
@@ -51,7 +53,8 @@ changed and how much each harness/model used.
 - `mj acp-smoke` is the repeatable compatibility probe. It is no-token by
   default, stopping after initialize plus `session/new`; `--prompt <text>` is
   the explicit path for exercising one `session/prompt` turn when token spend
-  or a deterministic mock agent is acceptable.
+  or a deterministic mock agent is acceptable. `--cancel-after-ms <ms>` requests
+  `session/cancel` during that prompt and requires a cancelled stop reason.
 
 ## Initial routing rules
 
@@ -131,7 +134,8 @@ changed and how much each harness/model used.
     remaining inferred setup labels with registry-provided exact commands/links
     where possible, manually smoke-test the setup UI across terminal sizes, and
     run real long-turn Thor smoke covering task-derived titles, local
-    heartbeats, worker progress mirroring, and final recap.
+    heartbeats, worker progress mirroring, transcript freshness in the UI the
+    user is watching, and final recap.
 
 ## Quota reads
 
