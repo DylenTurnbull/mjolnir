@@ -39,7 +39,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use crate::app::UiExitReason;
@@ -1394,13 +1394,18 @@ async fn run_session(
     let (runtime_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel();
     let mut ui_event_rx = ui_event_rx;
+    let thor_progress_path = thor_progress_path();
+    let _ = std::fs::remove_file(&thor_progress_path);
 
     let runtime_cfg = acp::AcpRuntimeConfig {
         command: agent.program.clone(),
         args: agent.args.clone(),
         cwd: cwd.clone(),
         additional_directories: runtime_options.additional_directories.clone(),
-        mcp_servers: thor_mcp::mcp_servers(config::default_config_path())?,
+        mcp_servers: thor_mcp::mcp_servers_with_progress(
+            config::default_config_path(),
+            Some(thor_progress_path.clone()),
+        )?,
         resume_session,
         env: agent.env.clone(),
         agent_stderr: runtime_options.agent_stderr.clone(),
@@ -1417,6 +1422,9 @@ async fn run_session(
             tracing::error!("runtime error: {e:#}");
         }
     });
+    let progress_ui_tx = ui_event_tx.clone();
+    let progress_path_for_task = thor_progress_path.clone();
+    let progress_proxy = tokio::spawn(poll_thor_progress(progress_path_for_task, progress_ui_tx));
 
     let hist_path = history_path();
     let export_dir = transcript_export_dir();
@@ -1634,8 +1642,72 @@ async fn run_session(
 
     wait_for_task("remote-control event proxy", event_proxy).await;
     wait_for_task("remote-control command proxy", cmd_proxy).await;
+    progress_proxy.abort();
+    let _ = progress_proxy.await;
+    let _ = std::fs::remove_file(thor_progress_path);
 
     ui_result
+}
+
+fn thor_progress_path() -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "mj-thor-progress-{}-{now}.jsonl",
+        std::process::id()
+    ))
+}
+
+async fn poll_thor_progress(path: PathBuf, ui_tx: mpsc::UnboundedSender<UiEvent>) {
+    let mut offset = 0usize;
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        tick.tick().await;
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if body.len() < offset {
+            offset = 0;
+        }
+        let Some(new_body) = body.get(offset..) else {
+            offset = body.len();
+            continue;
+        };
+        offset = body.len();
+        for line in new_body.lines() {
+            if let Some(message) = thor_progress_message(line) {
+                let _ = ui_tx.send(UiEvent::Info(message));
+            }
+        }
+    }
+}
+
+fn thor_progress_message(line: &str) -> Option<String> {
+    let record: serde_json::Value = serde_json::from_str(line).ok()?;
+    let kind = record.get("kind").and_then(serde_json::Value::as_str)?;
+    let detail = record.get("detail").and_then(serde_json::Value::as_str)?;
+    Some(format!(
+        "Thor worker {}: {}",
+        thor_progress_kind_label(kind),
+        detail
+    ))
+}
+
+fn thor_progress_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "session_started" => "started",
+        "prompt_sent" => "prompt sent",
+        "tool_call" => "tool",
+        "tool_update" => "tool update",
+        "permission" => "permission",
+        "prompt_done" => "done",
+        "timeout" => "timeout",
+        "error" => "error",
+        "worker_closed" => "closed",
+        _ => "progress",
+    }
 }
 
 fn thor_task_title(prompt: &str) -> String {
@@ -1829,6 +1901,26 @@ mod tests {
 
         assert!(title.ends_with("..."));
         assert!(title.chars().count() <= 83);
+    }
+
+    #[test]
+    fn thor_progress_message_formats_visible_worker_update() {
+        let message =
+            thor_progress_message(r#"{"kind":"tool_call","detail":"cargo test (execute)"}"#);
+
+        assert_eq!(
+            message.as_deref(),
+            Some("Thor worker tool: cargo test (execute)")
+        );
+    }
+
+    #[test]
+    fn thor_progress_message_ignores_invalid_json() {
+        assert_eq!(thor_progress_message("not json"), None);
+        assert_eq!(
+            thor_progress_message(r#"{"kind":"tool_call","message":"missing detail"}"#),
+            None
+        );
     }
 
     #[test]

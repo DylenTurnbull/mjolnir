@@ -1,6 +1,7 @@
 //! MCP bridge exposed to the ACP host running Thor.
 
 use std::collections::HashSet;
+use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -23,6 +24,7 @@ use crate::thor_probe::{self, AgentValidation, QuotaSnapshot};
 
 const DEFAULT_WORKER_TIMEOUT: Duration = Duration::from_secs(900);
 const MAX_WORKER_TIMEOUT_SECONDS: u64 = 7_200;
+const THOR_PROGRESS_PATH_ENV: &str = "MJ_THOR_PROGRESS";
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -285,20 +287,39 @@ impl WorkflowState {
 }
 
 pub fn mcp_servers(config_path: PathBuf) -> Result<Vec<McpServer>> {
+    mcp_servers_with_progress(config_path, None)
+}
+
+pub fn mcp_servers_with_progress(
+    config_path: PathBuf,
+    progress_path: Option<PathBuf>,
+) -> Result<Vec<McpServer>> {
     Ok(vec![stdio_mcp_server(
         std::env::current_exe().context("resolve current mj executable")?,
         config_path,
+        progress_path,
     )])
 }
 
-fn stdio_mcp_server(command: PathBuf, config_path: PathBuf) -> McpServer {
+fn stdio_mcp_server(
+    command: PathBuf,
+    config_path: PathBuf,
+    progress_path: Option<PathBuf>,
+) -> McpServer {
+    let mut env = vec![EnvVariable::new(
+        "MJ_THOR_CONFIG",
+        config_path.to_string_lossy().into_owned(),
+    )];
+    if let Some(progress_path) = progress_path {
+        env.push(EnvVariable::new(
+            THOR_PROGRESS_PATH_ENV,
+            progress_path.to_string_lossy().into_owned(),
+        ));
+    }
     McpServer::Stdio(
         McpServerStdio::new(thor::THOR_MCP_SERVER_NAME, command)
             .args(vec!["thor-mcp".to_string()])
-            .env(vec![EnvVariable::new(
-                "MJ_THOR_CONFIG",
-                config_path.to_string_lossy().into_owned(),
-            )]),
+            .env(env),
     )
 }
 
@@ -1193,11 +1214,45 @@ fn push_progress(
     kind: impl Into<String>,
     detail: impl Into<String>,
 ) {
+    let kind = kind.into();
+    let detail = detail.into();
+    emit_progress_if_visible(&kind, &detail);
     progress.push(ProgressEvent {
         sequence: progress.len() + 1,
-        kind: kind.into(),
-        detail: detail.into(),
+        kind,
+        detail,
     });
+}
+
+fn emit_progress_if_visible(kind: &str, detail: &str) {
+    if !progress_kind_is_user_visible(kind) {
+        return;
+    }
+    let Some(path) = std::env::var_os(THOR_PROGRESS_PATH_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let record = json!({
+        "kind": kind,
+        "detail": detail,
+    });
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{record}");
+    }
+}
+
+fn progress_kind_is_user_visible(kind: &str) -> bool {
+    matches!(
+        kind,
+        "session_started"
+            | "prompt_sent"
+            | "tool_call"
+            | "tool_update"
+            | "permission"
+            | "prompt_done"
+            | "timeout"
+            | "error"
+            | "worker_closed"
+    )
 }
 
 fn context_usage_summary(update: UsageUpdate) -> ContextUsageSummary {
@@ -1377,7 +1432,11 @@ mod tests {
 
     #[test]
     fn stdio_mcp_server_uses_current_binary_entrypoint_shape() {
-        let server = stdio_mcp_server(PathBuf::from("/tmp/mj"), PathBuf::from("/tmp/config.toml"));
+        let server = stdio_mcp_server(
+            PathBuf::from("/tmp/mj"),
+            PathBuf::from("/tmp/config.toml"),
+            Some(PathBuf::from("/tmp/progress.jsonl")),
+        );
         let McpServer::Stdio(stdio) = server else {
             panic!("expected stdio MCP server");
         };
@@ -1386,6 +1445,16 @@ mod tests {
         assert_eq!(stdio.args, vec!["thor-mcp"]);
         assert_eq!(stdio.env[0].name, "MJ_THOR_CONFIG");
         assert_eq!(stdio.env[0].value, "/tmp/config.toml");
+        assert_eq!(stdio.env[1].name, THOR_PROGRESS_PATH_ENV);
+        assert_eq!(stdio.env[1].value, "/tmp/progress.jsonl");
+    }
+
+    #[test]
+    fn progress_visibility_filter_omits_chatty_text_chunks() {
+        assert!(progress_kind_is_user_visible("tool_call"));
+        assert!(progress_kind_is_user_visible("prompt_done"));
+        assert!(!progress_kind_is_user_visible("agent_message"));
+        assert!(!progress_kind_is_user_visible("agent_thought"));
     }
 
     #[test]

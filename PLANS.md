@@ -126,9 +126,11 @@ usage.
 
 The interactive Thor runtime now sets the session title from the user's raw task
 before wrapping it in the Thor coordinator prompt, ignores later generic Thor
-host titles when a task title already exists, and immediately records a visible
-`Thor is planning...` status line so the transcript does not sit silent while
-the host gathers facts.
+host titles when a task title already exists, immediately records a visible
+`Thor is planning...` status line, and consumes the Thor MCP bridge's
+out-of-band worker progress stream so delegated ACP tool/permission/completion
+events keep appearing in the transcript while the host waits for long worker
+calls.
 
 Initial routing policy:
 
@@ -536,6 +538,11 @@ Fixed in this PR:
   is sent, and tightened the Thor host prompt so it must emit concise progress
   updates around long-running fact gathering and implementation/review/correction
   phases.
+- [x] Added a live Thor worker progress side channel from `mj thor-mcp` back to
+  the interactive UI. Visible worker lifecycle, tool, permission, completion,
+  timeout, and error events are mirrored into the transcript, so a delegated ACP
+  run should no longer look frozen while the host Thor agent is blocked waiting
+  for a worker result.
 
 Still not production-grade:
 

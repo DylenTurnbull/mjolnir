@@ -33,6 +33,10 @@ changed and how much each harness/model used.
 - Thor presents an execution plan before doing work.
 - Thor keeps the transcript alive with short visible progress updates while it
   gathers facts and runs implementation/review/correction phases.
+- `mj thor-mcp` mirrors visible worker lifecycle, tool, permission, completion,
+  timeout, and error events through an out-of-band progress stream consumed by
+  the interactive UI, so the transcript continues to update while the Thor host
+  waits for a delegated ACP worker call to return.
 - The MCP bridge is provided to the Thor host as an ACP `mcpServers` stdio
   entry that launches `mj thor-mcp`.
 - The final response includes a concise recap, validation, unresolved risks,
@@ -79,7 +83,8 @@ changed and how much each harness/model used.
 5. Done: add a local model catalog cache populated from LM Arena and OpenRouter
    data when Thor requests a refresh.
 6. Done: support concurrent ACP worker sessions with aggregated progress and
-   usage through the Thor MCP bridge.
+   usage through the Thor MCP bridge, including live UI mirroring for visible
+   worker progress during long-running delegated calls.
 7. Done: return structured worker progress/tool/usage views instead of relying
    on raw worker transcript dumps.
 8. Done: validate ACP worker candidates during onboarding and expose Thor MCP
