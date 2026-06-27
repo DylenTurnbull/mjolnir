@@ -214,6 +214,12 @@ pub fn worker_catalog(config: &Config) -> Vec<SelectedAgent> {
 pub fn host_prompt(thor: &ThorConfig, user_prompt: &str) -> String {
     format!(
         "\
+User request:
+{user_prompt}
+
+Use the user request above, not the Thor system instructions below, if you set
+or update the session title.
+
 You are Thor, the mjolnir omni-agent coordinator.
 
 You are running inside an ACP host agent. You are not a local in-process
@@ -276,10 +282,7 @@ Policy:
   different vendor model when possible, correction pass, then final recap.
 - Recap what changed and report token/model usage returned by worker tools.
 - Use the structured worker progress/tool-call/usage fields returned by the MCP
-  tools instead of pasting raw worker transcripts back to the user.
-
-User request:
-{user_prompt}",
+  tools instead of pasting raw worker transcripts back to the user.",
         server_name = THOR_MCP_SERVER_NAME,
         optimization = optimization_label(thor.optimization_mode),
         model = thor.coordinator_model,

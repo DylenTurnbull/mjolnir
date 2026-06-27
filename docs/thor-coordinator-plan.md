@@ -34,11 +34,13 @@ changed and how much each harness/model used.
 - The normal prompt flow has no visible model picker or agent picker.
 - Thor presents an execution plan before doing work.
 - Thor keeps the transcript alive with short visible progress updates while it
-  gathers facts and runs implementation/review/correction phases.
+  gathers facts and runs implementation/review/correction phases. `mj` also
+  emits a local heartbeat during long host turns so the TUI and remote/browser
+  transcript do not look frozen when the host has not produced text yet.
 - `mj thor-mcp` mirrors visible worker lifecycle, tool, permission, completion,
   timeout, and error events through an out-of-band progress stream consumed by
-  the interactive UI, so the transcript continues to update while the Thor host
-  waits for a delegated ACP worker call to return.
+  the interactive UI and remote tracker, so the transcript continues to update
+  while the Thor host waits for a delegated ACP worker call to return.
 - The MCP bridge is provided to the Thor host as an ACP `mcpServers` stdio
   entry that launches `mj thor-mcp`.
 - The final response includes a concise recap, validation, unresolved risks,

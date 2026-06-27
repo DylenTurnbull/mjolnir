@@ -124,13 +124,15 @@ single-worker delegation, and
 concurrent multi-worker delegation with structured progress and aggregate
 usage.
 
-The interactive Thor runtime now sets the session title from the user's raw task
-before wrapping it in the Thor coordinator prompt, ignores later generic Thor
-host titles when a task title already exists, immediately records a visible
-`Thor is planning...` status line, and consumes the Thor MCP bridge's
-out-of-band worker progress stream so delegated ACP tool/permission/completion
-events keep appearing in the transcript while the host waits for long worker
-calls.
+The interactive Thor runtime now starts the host prompt with the user's raw task
+so ACP hosts are less likely to name saved sessions after the Thor persona. The
+local UI and remote/browser transcript both derive the session name from the
+first real task, ignore later generic Thor host titles when a task title already
+exists, immediately record a visible `Thor is planning...` status line, publish
+periodic `Thor is still working...` heartbeats during long host planning, and
+consume the Thor MCP bridge's out-of-band worker progress stream so delegated
+ACP tool/permission/completion events keep appearing while the host waits for
+long worker calls.
 
 Initial routing policy:
 
@@ -344,12 +346,13 @@ Near-term:
   resource text fallbacks; structured tool-call output for diff/terminal).
 - Compatibility smoke tests against more non-Brokk ACP agents (one done in
   M1; see the Compatibility section).
-- Production-grade Thor first-run onboarding: still the top product blocker.
-  Setup now starts with architect/accountant mode, lets users choose which ready
-  agents Thor may use, and supports custom/registry agent setup from the flow.
-  Richer registry/auth guidance, more real-provider recovery testing, and manual
-  visual smoke across more terminal sizes remain before it is production-grade;
-  tracked in [#252](https://github.com/BrokkAi/mjolnir/issues/252).
+- Production-grade Thor first-run onboarding: the old advanced picker is gone,
+  and setup now starts with architect/accountant mode, lets users choose which
+  ready agents Thor may use, and supports custom/known-agent setup from the
+  flow. The remaining blocker is not the basic path; it is proving recovery
+  quality with real providers, exact registry/auth guidance, and more
+  real-terminal smoke. Tracked in
+  [#252](https://github.com/BrokkAi/mjolnir/issues/252).
 
 (M1 closed: fatal/error rendering, child-process cleanup, transcript
 scrolling.)
@@ -537,6 +540,13 @@ Fixed in this PR:
   from the user's raw task before `mj` wraps it in the Thor coordinator prompt,
   and later generic Thor host titles no longer overwrite an existing task
   title.
+- [x] Moved the raw user task to the top of the Thor host prompt and instructed
+  host agents to use that task, not the Thor persona preamble, when setting a
+  saved session title.
+- [x] Fixed the remote/browser transcript title path: the remote tracker now
+  names a session from the first real task when the current name is blank, a
+  raw session id, or a generic Thor title, and ignores later generic Thor host
+  titles after a task name exists.
 - [x] Added an immediate user-visible Thor planning status when the first task
   is sent, and tightened the Thor host prompt so it must emit concise progress
   updates around long-running fact gathering and implementation/review/correction
@@ -546,6 +556,9 @@ Fixed in this PR:
   timeout, and error events are mirrored into the transcript, so a delegated ACP
   run should no longer look frozen while the host Thor agent is blocked waiting
   for a worker result.
+- [x] Made local Thor status events remote-visible. Planning, long-running
+  heartbeats, and worker side-channel progress are now recorded as `system`
+  entries in the remote/browser transcript instead of only appearing in the TUI.
 - [x] Removed the remaining registry/custom-command/ACP jargon from the main
   first-run setup screen. The visible path now says `known agent` for registry
   choices and `installed agent` for pasted commands, while implementation terms
@@ -587,14 +600,13 @@ Still not production-grade:
    and exact registry setup hints are preferred when present, but broad upstream
    metadata coverage is still the target. Tracked in
    [#250](https://github.com/BrokkAi/mjolnir/issues/250).
-3. **The current onboarding process still needs production UX validation.**
-   The setup flow now starts with architect/accountant mode, exposes selected
-   worker agents, and lets the user choose Thor's host without the old model
-   picker. Step summaries now include explicit next-action guidance for the
-   main setup and recovery paths. It still needs an end-user pass over copy,
-   action ordering, failure recovery, terminal sizes, and real provider
-   success/failure combinations before it can be called production-grade.
-   Tracked in [#252](https://github.com/BrokkAi/mjolnir/issues/252).
+3. **Thor setup still needs a real end-user recovery pass.** The main path is
+   now the intended Thor setup path: choose work style, choose agents Thor may
+   use, choose where Thor runs, optionally add/fix an agent, then start. What
+   still needs production validation is the unhappy path: exact copy, action
+   ordering, failure recovery, terminal sizes, and real provider
+   success/failure combinations. Tracked in
+   [#252](https://github.com/BrokkAi/mjolnir/issues/252).
 4. **The setup UI has only been manually smoked for a few terminal scenarios.**
    Unit tests cover state transitions, list windowing, small/large recovery
    rendering, and every setup step at 50x16 and 40x12; manual smoke now covers

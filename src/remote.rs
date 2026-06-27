@@ -368,8 +368,28 @@ impl TrackerState {
             self.total_messages = self.total_messages.saturating_add(1);
             self.agent_message_open = false;
             self.prompt_in_flight = true;
+            self.set_name_from_user_prompt(text);
             self.push_transcript_entry("user", text.clone());
             self.touch();
+        }
+    }
+
+    fn set_name_from_user_prompt(&mut self, prompt: &str) {
+        if !self.name_is_replaceable() {
+            return;
+        }
+        let title = task_title_from_prompt(prompt);
+        if title.is_empty() {
+            return;
+        }
+        self.name = Some(title);
+    }
+
+    fn name_is_replaceable(&self) -> bool {
+        match self.name.as_deref() {
+            None => true,
+            Some(name) if is_generic_thor_title(name) => true,
+            Some(name) => self.session_id.as_deref() == Some(name),
         }
     }
 
@@ -433,12 +453,20 @@ impl TrackerState {
                 self.pending_permissions.clear();
                 self.touch();
             }
+            UiEvent::Info(message) => {
+                self.agent_message_open = false;
+                self.push_transcript_entry("system", message.clone());
+                self.touch();
+            }
+            UiEvent::Warning(message) => {
+                self.agent_message_open = false;
+                self.push_transcript_entry("system", format!("warning: {message}"));
+                self.touch();
+            }
             UiEvent::Connected { .. }
             | UiEvent::PermissionRequest(_)
             | UiEvent::RemotePermissionDecision { .. }
-            | UiEvent::Info(_)
-            | UiEvent::SessionForkFailed { .. }
-            | UiEvent::Warning(_) => {}
+            | UiEvent::SessionForkFailed { .. } => {}
         }
     }
 
@@ -481,8 +509,10 @@ impl TrackerState {
                 self.touch();
             }
             SessionUpdate::SessionInfoUpdate(info) => {
-                if let Some(title) = info.title.value() {
-                    self.name = Some(title.clone());
+                if let Some(title) = info.title.value()
+                    && !(is_generic_thor_title(title) && self.name.is_some())
+                {
+                    self.name = Some(task_title_from_prompt(title));
                 }
                 self.agent_message_open = false;
                 self.touch();
@@ -613,6 +643,31 @@ impl TrackerState {
         }
         self.session_id.clone()
     }
+}
+
+fn task_title_from_prompt(prompt: &str) -> String {
+    let sanitized = crate::notifications::sanitize_message(prompt);
+    let title = sanitized
+        .trim()
+        .trim_matches(|ch: char| ch == '"' || ch == '\'')
+        .to_string();
+    const MAX_TITLE_CHARS: usize = 80;
+    let mut chars = title.chars();
+    let truncated = chars.by_ref().take(MAX_TITLE_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn is_generic_thor_title(title: &str) -> bool {
+    let lower = title.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "thor" | "thor session" | "new thor session" | "thor task" | "new thor task"
+    ) || lower.starts_with("thor:")
+        || lower.starts_with("thor -")
 }
 
 impl RemoteSessionTracker {
@@ -2889,8 +2944,8 @@ fn rfc3339_before(age: Duration) -> String {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        PermissionOption, Terminal, TerminalExitStatus, TerminalId, ToolCall, ToolCallContent,
-        ToolCallUpdate, ToolCallUpdateFields,
+        PermissionOption, SessionInfoUpdate, Terminal, TerminalExitStatus, TerminalId, ToolCall,
+        ToolCallContent, ToolCallUpdate, ToolCallUpdateFields,
     };
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
@@ -3022,6 +3077,56 @@ mod tests {
         assert_eq!(snapshot.transcript[1].kind, "agent");
         assert_eq!(snapshot.transcript[1].text, "hi there");
         assert!(!snapshot.transcript[1].timestamp.is_empty());
+    }
+
+    #[test]
+    fn tracker_names_session_from_first_user_task() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.observe_command(&UiCommand::SendPrompt {
+            text: "Fix the flaky parser test".to_string(),
+            images: Vec::new(),
+        });
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.name, "Fix the flaky parser test");
+    }
+
+    #[test]
+    fn tracker_keeps_user_task_name_over_generic_thor_title() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.observe_command(&UiCommand::SendPrompt {
+            text: "Fix the flaky parser test".to_string(),
+            images: Vec::new(),
+        });
+        state.observe_session_update(&SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().title("Thor session"),
+        ));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.name, "Fix the flaky parser test");
+    }
+
+    #[test]
+    fn tracker_records_status_messages_in_remote_transcript() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.observe_event(&UiEvent::Info("Thor is still working...".to_string()));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.transcript.len(), 1);
+        assert_eq!(snapshot.transcript[0].kind, "system");
+        assert_eq!(snapshot.transcript[0].text, "Thor is still working...");
     }
 
     #[test]

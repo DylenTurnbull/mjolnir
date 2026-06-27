@@ -39,6 +39,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -1427,10 +1431,6 @@ async fn run_session(
             tracing::error!("runtime error: {e:#}");
         }
     });
-    let progress_ui_tx = ui_event_tx.clone();
-    let progress_path_for_task = thor_progress_path.clone();
-    let progress_proxy = tokio::spawn(poll_thor_progress(progress_path_for_task, progress_ui_tx));
-
     let hist_path = history_path();
     let export_dir = transcript_export_dir();
     let config_path = config::default_config_path();
@@ -1447,9 +1447,27 @@ async fn run_session(
         Some(cmd_tx.clone()),
         Some(ui_event_tx.clone()),
     );
+    let progress_ui_tx = ui_event_tx.clone();
+    let progress_tracker = remote_tracker.clone();
+    let progress_path_for_task = thor_progress_path.clone();
+    let progress_proxy = tokio::spawn(poll_thor_progress(
+        progress_path_for_task,
+        progress_ui_tx,
+        progress_tracker,
+    ));
+    let thor_turn_active = Arc::new(AtomicBool::new(false));
+    let heartbeat_ui_tx = ui_event_tx.clone();
+    let heartbeat_tracker = remote_tracker.clone();
+    let heartbeat_active = thor_turn_active.clone();
+    let progress_heartbeat = tokio::spawn(thor_activity_heartbeat(
+        heartbeat_active,
+        heartbeat_ui_tx,
+        heartbeat_tracker,
+    ));
 
     let event_tracker = remote_tracker.clone();
     let ui_event_tx_for_events = ui_event_tx.clone();
+    let event_thor_turn_active = thor_turn_active.clone();
     let event_proxy = tokio::spawn(async move {
         let mut runtime_event_rx = runtime_event_rx;
         while let Some(event) = runtime_event_rx.recv().await {
@@ -1458,6 +1476,12 @@ async fn run_session(
             // the pending request.
             let event = event_tracker.intercept_event(event);
             event_tracker.observe_event(&event);
+            match &event {
+                UiEvent::PromptDone { .. } | UiEvent::PromptFailed { .. } | UiEvent::Fatal(_) => {
+                    event_thor_turn_active.store(false, Ordering::Relaxed);
+                }
+                _ => {}
+            }
             if ui_event_tx_for_events.send(event).is_err() {
                 break;
             }
@@ -1465,25 +1489,40 @@ async fn run_session(
     });
 
     let cmd_tracker = remote_tracker.clone();
+    let cmd_thor_turn_active = thor_turn_active.clone();
     let cmd_proxy = tokio::spawn(async move {
         let mut sent_thor_preamble = false;
         while let Some(command) = ui_cmd_rx.recv().await {
             cmd_tracker.observe_command(&command);
             let runtime_command = match command {
                 UiCommand::SendPrompt { text, images } => {
+                    cmd_thor_turn_active.store(true, Ordering::Relaxed);
                     let text = if sent_thor_preamble {
+                        publish_local_ui_event(
+                            &cmd_tracker,
+                            &ui_event_tx,
+                            UiEvent::Info("Thor is working on the next request...".to_string()),
+                        );
                         text
                     } else {
                         sent_thor_preamble = true;
-                        let _ = ui_event_tx.send(UiEvent::SessionUpdate(
-                            agent_client_protocol::schema::v1::SessionUpdate::SessionInfoUpdate(
-                                agent_client_protocol::schema::v1::SessionInfoUpdate::new()
-                                    .title(thor_task_title(&text)),
+                        publish_local_ui_event(
+                            &cmd_tracker,
+                            &ui_event_tx,
+                            UiEvent::SessionUpdate(
+                                agent_client_protocol::schema::v1::SessionUpdate::SessionInfoUpdate(
+                                    agent_client_protocol::schema::v1::SessionInfoUpdate::new()
+                                        .title(thor_task_title(&text)),
+                                ),
                             ),
-                        ));
-                        let _ = ui_event_tx.send(UiEvent::Info(
-                            "Thor is planning and checking available agents...".to_string(),
-                        ));
+                        );
+                        publish_local_ui_event(
+                            &cmd_tracker,
+                            &ui_event_tx,
+                            UiEvent::Info(
+                                "Thor is planning and checking available agents...".to_string(),
+                            ),
+                        );
                         thor::host_prompt(&thor_config, &text)
                     };
                     UiCommand::SendPrompt { text, images }
@@ -1649,6 +1688,8 @@ async fn run_session(
     wait_for_task("remote-control command proxy", cmd_proxy).await;
     progress_proxy.abort();
     let _ = progress_proxy.await;
+    progress_heartbeat.abort();
+    let _ = progress_heartbeat.await;
     let _ = std::fs::remove_file(thor_progress_path);
 
     ui_result
@@ -1665,7 +1706,11 @@ fn thor_progress_path() -> PathBuf {
     ))
 }
 
-async fn poll_thor_progress(path: PathBuf, ui_tx: mpsc::UnboundedSender<UiEvent>) {
+async fn poll_thor_progress(
+    path: PathBuf,
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
+    tracker: remote::RemoteSessionTracker,
+) {
     let mut offset = 0usize;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     loop {
@@ -1683,10 +1728,36 @@ async fn poll_thor_progress(path: PathBuf, ui_tx: mpsc::UnboundedSender<UiEvent>
         offset = body.len();
         for line in new_body.lines() {
             if let Some(message) = thor_progress_message(line) {
-                let _ = ui_tx.send(UiEvent::Info(message));
+                publish_local_ui_event(&tracker, &ui_tx, UiEvent::Info(message));
             }
         }
     }
+}
+
+async fn thor_activity_heartbeat(
+    active: Arc<AtomicBool>,
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
+    tracker: remote::RemoteSessionTracker,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        if active.load(Ordering::Relaxed) {
+            publish_local_ui_event(
+                &tracker,
+                &ui_tx,
+                UiEvent::Info("Thor is still working...".to_string()),
+            );
+        }
+    }
+}
+
+fn publish_local_ui_event(
+    tracker: &remote::RemoteSessionTracker,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    event: UiEvent,
+) {
+    tracker.observe_event(&event);
+    let _ = ui_tx.send(event);
 }
 
 fn thor_progress_message(line: &str) -> Option<String> {
