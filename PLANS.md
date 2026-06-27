@@ -508,6 +508,11 @@ Fixed in this PR:
 - [x] Fixed a Thor onboarding completion bug found during that smoke: the Thor
   completion marker was previously written only after the later spinner picker,
   so cancelling theme/spinner could make completed Thor setup repeat.
+- [x] Reworked the first-run setup sequence so it starts with an end-user work
+  style choice (`Architect` or `Accountant`), then shows ready agents with
+  explicit include toggles for the agents Thor may use, and lets Enter choose
+  the ACP agent that hosts Thor. The summary now states the work style, selected
+  worker agents, and Thor host instead of implying hidden defaults.
 
 Still not production-grade:
 
@@ -521,12 +526,12 @@ Still not production-grade:
    OpenCode, Goose, Cursor, GitHub Copilot, `npx`, and `uvx`, but production UX
    should use registry/auth metadata for exact commands and links when
    available.
-3. **The current onboarding process is still a release-blocking UX problem.**
-   The first screen now has a readiness summary and retry action, but the setup
-   still reads like an implementation diagnostic. It needs an end-user pass over
-   copy, action ordering, failure recovery, and the exact sequence for selecting
-   available agents, choosing architect/accountant mode, and choosing Thor's
-   host/model/reasoning without exposing raw routing internals.
+3. **The current onboarding process still needs production UX validation.**
+   The setup flow now starts with architect/accountant mode, exposes selected
+   worker agents, and lets the user choose Thor's host without the old model
+   picker. It still needs an end-user pass over copy, action ordering, failure
+   recovery, terminal sizes, and real provider success/failure combinations
+   before it can be called production-grade.
 4. **The setup UI has only been manually smoked for one terminal scenario.**
    Unit tests cover state transitions, list windowing, and small/large render
    output; manual smoke now covers the no-working-agent 80-column path and a
