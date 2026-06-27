@@ -58,15 +58,17 @@ written to visible `[thor]` configuration. The previous agent picker is no
 longer part of the normal user path.
 
 The remaining startup gap is onboarding quality. This is the top release
-blocker, not polish. The current first-run flow validates candidates and avoids
-the old model/agent picker, but it is still unacceptable as an end-user
-experience: it feels like a developer validation screen instead of a guided
-setup wizard. It now lets a user add a custom ACP command or registry-backed ACP
-server from setup and reruns validation before Thor uses it, but the user still
-has to understand too much about ACP commands, installed programs, auth state,
-and what to do after a failed check. Exact install/auth guidance beyond
-available registry links and the first provider-specific cases, plus manual
-visual smoke, are required before this is production-grade.
+blocker, not polish. The current first-run process is still too confusing for
+end users: it feels like a developer validation screen instead of a guided
+Thor setup wizard, and it still expects the user to understand too much about
+ACP commands, installed programs, auth state, and recovery after failed checks.
+It now avoids the old model/agent picker, validates candidates, lets a user add
+a custom ACP command or registry-backed ACP server from setup, and reruns
+validation before Thor uses the agent. That is necessary infrastructure, but it
+is not enough. Production-grade onboarding means the user can understand what
+Thor needs, see which agents are ready, fix missing setup through clear actions,
+choose Thor's host/work style, and enter the chat without feeling exposed to
+internal routing machinery.
 
 M1 hardening landed (PR #34): an explicit `ConnectionState` lifecycle drives
 the header label, a `LaunchError` enum surfaces spawn / initialize /
@@ -496,6 +498,16 @@ Fixed in this PR:
   reran validation. The registry count dropped from 37 to 36 and OpenCode
   returned as a configured-but-not-ready row with provider-specific recovery
   guidance.
+- [x] Manually smoke-tested the successful configured-agent path at 80 columns
+  with a deterministic local mock ACP command under `/tmp/mj-mock-acp.py` and
+  isolated macOS config under `/tmp/mj-thor-success-mock/Library/Application Support/mj/config.toml`.
+  The setup screen showed `Mock ACP / ready`, `Ready to use: Mock ACP`, and
+  `Run Thor in: Mock ACP`; confirming `Start Thor` saved the configured host,
+  selected worker, and `onboarding_complete = true` before handing off to the
+  later theme picker.
+- [x] Fixed a Thor onboarding completion bug found during that smoke: the Thor
+  completion marker was previously written only after the later spinner picker,
+  so cancelling theme/spinner could make completed Thor setup repeat.
 
 Still not production-grade:
 
@@ -509,15 +521,18 @@ Still not production-grade:
    OpenCode, Goose, Cursor, GitHub Copilot, `npx`, and `uvx`, but production UX
    should use registry/auth metadata for exact commands and links when
    available.
-3. **The guided setup path still needs a full end-to-end polish pass.** The
-   first screen now has a readiness summary and retry action, but the setup flow
-   still needs manual tuning for action ordering and failure recovery across
-   more real terminal sizes and success/failure combinations.
+3. **The current onboarding process is still a release-blocking UX problem.**
+   The first screen now has a readiness summary and retry action, but the setup
+   still reads like an implementation diagnostic. It needs an end-user pass over
+   copy, action ordering, failure recovery, and the exact sequence for selecting
+   available agents, choosing architect/accountant mode, and choosing Thor's
+   host/model/reasoning without exposing raw routing internals.
 4. **The setup UI has only been manually smoked for one terminal scenario.**
    Unit tests cover state transitions, list windowing, and small/large render
    output; manual smoke now covers the no-working-agent 80-column path and a
-   configured-but-broken 80-column path plus a registry-add path, but still
-   needs at least one successful configured agent.
+   configured-but-broken 80-column path, a registry-add path, and a successful
+   configured-agent path. Broader terminal-size smoke is still useful before
+   calling onboarding production-grade.
 
 ## Risks and open questions
 

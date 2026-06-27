@@ -995,6 +995,7 @@ async fn run_thor_onboarding(
     cfg.thor.optimization_mode = selection.optimization_mode;
     cfg.thor.coordinator_model = selection.coordinator_model;
     cfg.thor.coordinator_reasoning = selection.coordinator_reasoning;
+    cfg.thor.onboarding_complete = true;
     let agent = setup_agents
         .iter()
         .find(|setup_agent| setup_agent.agent.source_id == selection.host_source_id)
@@ -1016,7 +1017,6 @@ async fn run_thor_onboarding(
         return Ok(None);
     };
     cfg.spinner = spinner_style;
-    cfg.thor.onboarding_complete = true;
     cfg.save(config_path)
         .with_context(|| format!("save {}", config_path.display()))?;
     Ok(Some(agent))
@@ -1875,6 +1875,36 @@ mod tests {
                     ..Default::default()
                 },
                 agent: Some(configured),
+                favorite_agents: Vec::new(),
+                custom_agents: Vec::new(),
+            },
+            None
+        ));
+        assert!(!should_open_thor_onboarding(
+            &Config {
+                theme: Default::default(),
+                spinner: Default::default(),
+                thor: thor::ThorConfig {
+                    onboarding_complete: true,
+                    configured_acp_servers: vec![ConfiguredAcpServer {
+                        source_id: "custom:Mock ACP".to_string(),
+                        name: "Mock ACP".to_string(),
+                        program: PathBuf::from("/tmp/mj-mock-acp.py"),
+                        args: Vec::new(),
+                        env: Default::default(),
+                        description: "Local mock ACP server".to_string(),
+                        setup_url: String::new(),
+                        quota_backend: ThorQuotaBackend::None,
+                    }],
+                    enabled_worker_source_ids: vec!["custom:Mock ACP".to_string()],
+                    ..Default::default()
+                },
+                agent: Some(SelectedAgent {
+                    source_id: "custom:Mock ACP".to_string(),
+                    program: PathBuf::from("/tmp/mj-mock-acp.py"),
+                    args: Vec::new(),
+                    env: Default::default(),
+                }),
                 favorite_agents: Vec::new(),
                 custom_agents: Vec::new(),
             },
