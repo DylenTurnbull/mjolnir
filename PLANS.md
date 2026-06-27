@@ -58,8 +58,8 @@ The remaining startup gap is onboarding quality. The current first-run flow
 validates candidates and avoids the old model/agent picker, but it still does
 not fully feel like an end-user setup wizard. It now lets a user add a custom
 ACP command from setup and reruns validation before Thor uses it, but exact
-install/auth guidance and manual visual smoke are still required before this is
-production-grade.
+install/auth guidance beyond the first provider-specific cases and manual
+visual smoke are still required before this is production-grade.
 
 M1 hardening landed (PR #34): an explicit `ConnectionState` lifecycle drives
 the header label, a `LaunchError` enum surfaces spawn / initialize /
@@ -387,6 +387,8 @@ Fixed in this PR:
   the normal configured-server path sees it.
 - [x] Kept failed candidates visible while making the add-command row reachable
   in long or mostly broken setup lists.
+- [x] Added provider-specific failed-row guidance for Anvil, Claude ACP, Codex
+  ACP, `npx`, and `uvx` failures, including clearer install/sign-in next steps.
 
 Still not production-grade:
 
@@ -394,9 +396,10 @@ Still not production-grade:
    Custom ACP commands can now be added from onboarding, but registry entries
    still need first-class setup actions when their provider CLI, package
    manager, or auth is missing.
-2. **Validation feedback is still mostly inferred, not agent-specific.** Rows now offer
-   broad actions like install/sign-in/configure, but production UX should use
-   registry/auth metadata for exact commands and links when available.
+2. **Validation feedback is still partly inferred, not registry-metadata-driven.**
+   Rows now offer provider-specific actions for Anvil, Claude, Codex, `npx`,
+   and `uvx`, but production UX should use registry/auth metadata for exact
+   commands and links when available.
 3. **Empty and broken states need real user-facing recovery.** If no usable
    Thor host validates, setup can now add a custom ACP command, but it should
    also drive the user through installing/signing into the default path with

@@ -767,6 +767,13 @@ fn command_label(agent: &SelectedAgent) -> String {
 }
 
 fn setup_agent_description(setup_agent: &ThorSetupAgent) -> String {
+    if let Some(validation) = setup_agent
+        .validation
+        .as_ref()
+        .filter(|validation| !validation.usable)
+    {
+        return validation_detail_label(setup_agent, validation);
+    }
     if !setup_agent.description.trim().is_empty() {
         truncate_label(&setup_agent.description, 72)
     } else {
@@ -814,6 +821,33 @@ fn validation_action_label(setup_agent: &ThorSetupAgent, validation: &AgentValid
     format!("setup needed: {}", truncate_label(error, 48))
 }
 
+fn validation_detail_label(setup_agent: &ThorSetupAgent, validation: &AgentValidation) -> String {
+    let Some(error) = validation.error.as_deref() else {
+        return format!(
+            "Command: {}",
+            truncate_label(&command_label(&setup_agent.agent), 72)
+        );
+    };
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("not found")
+        || lower.contains("no such file")
+        || lower.contains("missing command")
+        || lower.contains("permission denied")
+    {
+        return install_detail_label(setup_agent);
+    }
+    if lower.contains("auth")
+        || lower.contains("login")
+        || lower.contains("api key")
+        || lower.contains("missing key")
+        || lower.contains("token")
+        || lower.contains("credential")
+    {
+        return auth_detail_label(setup_agent);
+    }
+    format!("Last error: {}", truncate_label(error, 72))
+}
+
 fn install_action_label(setup_agent: &ThorSetupAgent) -> String {
     match setup_agent.agent.source_id.as_str() {
         "anvil" => "install uv".to_string(),
@@ -827,11 +861,43 @@ fn install_action_label(setup_agent: &ThorSetupAgent) -> String {
     }
 }
 
+fn install_detail_label(setup_agent: &ThorSetupAgent) -> String {
+    match setup_agent.agent.source_id.as_str() {
+        "anvil" => "Install uv; Thor starts Anvil with `uvx brokk acp`".to_string(),
+        "claude-acp" => {
+            "Install Node.js/npm and Claude Code; setup starts `npx ... claude-agent-acp`"
+                .to_string()
+        }
+        "codex-acp" => {
+            "Install Node.js/npm and Codex; setup starts `npx ... codex-acp`".to_string()
+        }
+        _ => match setup_agent.agent.program.to_string_lossy().as_ref() {
+            "npx" => "Install Node.js/npm, then retry this ACP server".to_string(),
+            "uvx" => "Install uv, then retry this ACP server".to_string(),
+            _ => format!(
+                "Command: {}",
+                truncate_label(&command_label(&setup_agent.agent), 72)
+            ),
+        },
+    }
+}
+
 fn auth_action_label(setup_agent: &ThorSetupAgent) -> String {
     match setup_agent.agent.source_id.as_str() {
         "claude-acp" => "sign in with Claude Code".to_string(),
         "codex-acp" => "sign in with Codex".to_string(),
         _ => "sign in or add key".to_string(),
+    }
+}
+
+fn auth_detail_label(setup_agent: &ThorSetupAgent) -> String {
+    match setup_agent.agent.source_id.as_str() {
+        "claude-acp" => "Run Claude Code sign-in, then retry Thor setup".to_string(),
+        "codex-acp" => "Run Codex sign-in, then retry Thor setup".to_string(),
+        _ => format!(
+            "Command: {}",
+            truncate_label(&command_label(&setup_agent.agent), 72)
+        ),
     }
 }
 
@@ -890,6 +956,10 @@ mod tests {
     }
 
     fn setup_agent_with_validation(source_id: &str, usable: bool) -> ThorSetupAgent {
+        setup_agent_with_error(source_id, (!usable).then(|| "missing key".to_string()))
+    }
+
+    fn setup_agent_with_error(source_id: &str, error: Option<String>) -> ThorSetupAgent {
         ThorSetupAgent {
             agent: agent(source_id),
             name: source_id.to_string(),
@@ -897,14 +967,14 @@ mod tests {
             quota_backend: ThorQuotaBackend::None,
             validation: Some(AgentValidation {
                 source_id: source_id.to_string(),
-                usable,
+                usable: error.is_none(),
                 agent_name: None,
                 agent_version: None,
-                session_started: usable,
+                session_started: error.is_none(),
                 config_advertised: false,
                 prompt_images_supported: false,
                 session_fork_supported: false,
-                error: (!usable).then(|| "missing key".to_string()),
+                error,
                 elapsed_ms: 10,
                 checked_at_unix: 1,
             }),
@@ -1013,6 +1083,42 @@ mod tests {
         let setup_agent = setup_agent_with_validation("claude", false);
 
         assert_eq!(host_status_label(&setup_agent), "sign in or add key");
+    }
+
+    #[test]
+    fn validation_error_gives_provider_specific_auth_guidance() {
+        let setup_agent = setup_agent_with_error("claude-acp", Some("auth required".to_string()));
+
+        assert_eq!(host_status_label(&setup_agent), "sign in with Claude Code");
+        assert_eq!(
+            setup_agent_description(&setup_agent),
+            "Run Claude Code sign-in, then retry Thor setup"
+        );
+    }
+
+    #[test]
+    fn validation_error_gives_provider_specific_install_guidance() {
+        let mut setup_agent =
+            setup_agent_with_error("codex-acp", Some("npx not found".to_string()));
+        setup_agent.agent.program = PathBuf::from("npx");
+
+        assert_eq!(host_status_label(&setup_agent), "install Node.js and Codex");
+        assert_eq!(
+            setup_agent_description(&setup_agent),
+            "Install Node.js/npm and Codex; setup starts `npx ... codex-acp`"
+        );
+    }
+
+    #[test]
+    fn validation_error_gives_anvil_install_guidance() {
+        let mut setup_agent = setup_agent_with_error("anvil", Some("uvx not found".to_string()));
+        setup_agent.agent.program = PathBuf::from("uvx");
+
+        assert_eq!(host_status_label(&setup_agent), "install uv");
+        assert_eq!(
+            setup_agent_description(&setup_agent),
+            "Install uv; Thor starts Anvil with `uvx brokk acp`"
+        );
     }
 
     #[test]
