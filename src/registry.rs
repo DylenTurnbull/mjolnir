@@ -71,6 +71,7 @@ pub struct BinaryTarget {
 pub enum DistributionKind {
     Npx,
     Uvx,
+    Binary,
 }
 
 impl Agent {
@@ -79,6 +80,8 @@ impl Agent {
             Some(DistributionKind::Npx)
         } else if self.distribution.uvx.is_some() {
             Some(DistributionKind::Uvx)
+        } else if self.binary_target_for_current_platform().is_some() {
+            Some(DistributionKind::Binary)
         } else {
             None
         }
@@ -116,6 +119,19 @@ impl Agent {
                     quota_backend: quota_backend_for_registry_id(&self.id),
                 })
             }
+            DistributionKind::Binary => {
+                let target = self.binary_target_for_current_platform()?;
+                Some(ConfiguredAcpServer {
+                    source_id: self.id.clone(),
+                    name: self.name.clone(),
+                    program: binary_command_name(&target.cmd),
+                    args: target.args.clone(),
+                    env: HashMap::new(),
+                    description: self.description.clone(),
+                    setup_url: self.setup_url(),
+                    quota_backend: quota_backend_for_registry_id(&self.id),
+                })
+            }
         }
     }
 
@@ -126,6 +142,31 @@ impl Agent {
             self.repository.clone()
         }
     }
+
+    fn binary_target_for_current_platform(&self) -> Option<&BinaryTarget> {
+        let key = current_binary_platform_key()?;
+        self.distribution.binary.as_ref()?.get(key)
+    }
+}
+
+fn current_binary_platform_key() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("darwin-aarch64"),
+        ("macos", "x86_64") => Some("darwin-x86_64"),
+        ("linux", "aarch64") => Some("linux-aarch64"),
+        ("linux", "x86_64") => Some("linux-x86_64"),
+        ("windows", "aarch64") => Some("windows-aarch64"),
+        ("windows", "x86_64") => Some("windows-x86_64"),
+        _ => None,
+    }
+}
+
+fn binary_command_name(cmd: &str) -> PathBuf {
+    let normalized = cmd.trim().trim_start_matches("./").replace('\\', "/");
+    Path::new(&normalized)
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(cmd))
 }
 
 fn quota_backend_for_registry_id(id: &str) -> ThorQuotaBackend {
@@ -269,11 +310,38 @@ mod tests {
                 "id": "binary-only",
                 "name": "Binary",
                 "version": "1.0.0",
+                "website": "https://example.com/binary",
                 "distribution": {
                     "binary": {
                         "darwin-aarch64": {
                             "archive": "https://example.com/bin.tar.gz",
-                            "cmd": "./bin"
+                            "cmd": "./bin",
+                            "args": ["acp"]
+                        },
+                        "darwin-x86_64": {
+                            "archive": "https://example.com/bin.tar.gz",
+                            "cmd": "./bin",
+                            "args": ["acp"]
+                        },
+                        "linux-aarch64": {
+                            "archive": "https://example.com/bin.tar.gz",
+                            "cmd": "./bin",
+                            "args": ["acp"]
+                        },
+                        "linux-x86_64": {
+                            "archive": "https://example.com/bin.tar.gz",
+                            "cmd": "./bin",
+                            "args": ["acp"]
+                        },
+                        "windows-aarch64": {
+                            "archive": "https://example.com/bin.zip",
+                            "cmd": ".\\package\\bin.exe",
+                            "args": ["acp"]
+                        },
+                        "windows-x86_64": {
+                            "archive": "https://example.com/bin.zip",
+                            "cmd": ".\\package\\bin.exe",
+                            "args": ["acp"]
                         }
                     }
                 }
@@ -315,11 +383,17 @@ mod tests {
         assert_eq!(generic.quota_backend, ThorQuotaBackend::None);
         assert_eq!(generic.setup_url, "https://example.com/generic");
 
-        assert!(
-            !servers
-                .iter()
-                .any(|server| server.source_id == "binary-only")
-        );
+        let binary = servers
+            .iter()
+            .find(|server| server.source_id == "binary-only")
+            .expect("binary");
+        if cfg!(windows) {
+            assert_eq!(binary.program, PathBuf::from("bin.exe"));
+        } else {
+            assert_eq!(binary.program, PathBuf::from("bin"));
+        }
+        assert_eq!(binary.args, vec!["acp"]);
+        assert_eq!(binary.setup_url, "https://example.com/binary");
     }
 
     #[tokio::test]

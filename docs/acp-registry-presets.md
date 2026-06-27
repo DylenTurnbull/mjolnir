@@ -12,7 +12,10 @@ presets should make already-configured servers reusable and readable.
 
 `mj` can load the ACP registry, show entries during Thor onboarding, persist a
 selected entry into `[thor.configured_acp_servers]`, and validate it before Thor
-can use it. Custom commands can also be saved as named local agents.
+can use it. `npx`, `uvx`, and current-platform binary distributions are shown;
+binary distributions resolve to the expected installed command name and are not
+downloaded or executed automatically during setup. Custom commands can also be
+saved as named local agents.
 
 The runtime worker inventory is intentionally the configured server set, not the
 full registry. Thor must never assume a registry entry is usable until `mj`
@@ -70,6 +73,8 @@ Useful future registry metadata:
 
 1. Keep registry entries out of worker inventory until selected and persisted.
 2. Show launch command plus inferred setup hints in onboarding.
-3. Add exact metadata when the registry provides it.
-4. Add named preset editing only after first-run setup is production-grade.
-5. Add update/uninstall flows only if users actually need them.
+3. Use local provider setup profiles for known agents until the registry
+   exposes exact install/auth metadata.
+4. Add exact metadata when the registry provides it.
+5. Add named preset editing only after first-run setup is production-grade.
+6. Add update/uninstall flows only if users actually need them.

@@ -96,11 +96,14 @@ changed and how much each harness/model used.
     failed agents as available workers. Small and large setup render tests cover
     the recovery rows and no-ready-host summary. The first setup screen now
     summarizes ready/broken agents in plain language, registry rows show the
-    command they will add when known plus inferred install/auth expectations,
-    and a "Retry checks" action reruns ACP validation after install/sign-in
-    fixes. Remaining: continue polishing the guided setup progression, replace
-    inferred setup labels with richer metadata-driven exact commands/links where
-    possible, and manually smoke-test the setup UI across terminal sizes.
+    command they will add when known plus setup expectations, current-platform
+    binary registry entries are represented as installed-command candidates
+    instead of being dropped, and a "Retry checks" action reruns ACP validation
+    after install/sign-in fixes. Local provider setup profiles fill known
+    auth/install gaps until the upstream registry exposes exact metadata.
+    Remaining: continue polishing the guided setup progression, replace
+    remaining inferred setup labels with registry-provided exact commands/links
+    where possible, and manually smoke-test the setup UI across terminal sizes.
 
 ## Quota reads
 

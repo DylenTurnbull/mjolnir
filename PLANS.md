@@ -441,6 +441,14 @@ Fixed in this PR:
 - [x] Show inferred install/auth expectations for registry rows before adding
   them, such as Node.js/npm, uv, Claude Code sign-in, Codex sign-in, Gemini CLI
   auth, OpenCode config, Cursor auth, or GitHub Copilot auth when known.
+- [x] Registry-backed onboarding now includes current-platform binary
+  distributions as installed-command candidates instead of dropping binary-only
+  agents such as OpenCode, Goose, and Cursor. `mj` does not download or execute
+  registry binaries during setup; validation still proves whether the command
+  is actually installed and usable.
+- [x] Added local provider setup profiles for known registry entries so setup
+  rows can say which companion CLI or provider configuration is required when
+  the upstream registry does not expose exact auth metadata.
 - [x] Replaced first-run summary labels that exposed internal source IDs,
   model defaults, and reasoning defaults with friendly agent names and a simple
   work-style summary. Model selection remains automatic during onboarding.
@@ -464,13 +472,14 @@ Still not production-grade:
 
 1. **Registry-backed agent setup still needs richer install/configure metadata.**
    Registry entries can now be added from onboarding, and website/repository
-   links, launch commands, and inferred install/auth expectations are shown,
-   but the registry itself does not currently expose exact auth/install steps
-   for every agent.
+   links, launch commands, binary installed-command candidates, and local
+   provider setup profiles are shown, but the registry itself does not
+   currently expose exact auth/install steps for every agent.
 2. **Validation feedback is still partly inferred, not registry-metadata-driven.**
-   Rows now offer provider-specific actions for Anvil, Claude, Codex, `npx`,
-   `uvx`, and known registry providers, but production UX should use
-   registry/auth metadata for exact commands and links when available.
+   Rows now offer provider-specific actions for Anvil, Claude, Codex, Gemini,
+   OpenCode, Goose, Cursor, GitHub Copilot, `npx`, and `uvx`, but production UX
+   should use registry/auth metadata for exact commands and links when
+   available.
 3. **The guided setup path still needs a full end-to-end polish pass.** The
    first screen now has a readiness summary and retry action, but the setup flow
    still needs manual tuning for copy, action ordering, and failure recovery

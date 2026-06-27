@@ -1046,25 +1046,29 @@ fn selected_agent_command_label(agent: &SelectedAgent) -> String {
 }
 
 fn registry_setup_hint(server: &ConfiguredAcpServer) -> String {
-    let install_hint = match server.program.to_string_lossy().as_ref() {
-        "npx" => Some("requires Node.js/npm"),
-        "uvx" => Some("requires uv"),
+    if let Some(hint) = known_registry_setup_hint(server) {
+        return hint.to_string();
+    }
+    match server.program.to_string_lossy().as_ref() {
+        "npx" => "requires Node.js/npm".to_string(),
+        "uvx" => "requires uv".to_string(),
+        program if !program.trim().is_empty() => format!("install `{program}` first"),
+        _ => String::new(),
+    }
+}
+
+fn known_registry_setup_hint(server: &ConfiguredAcpServer) -> Option<&'static str> {
+    match server.source_id.as_str() {
+        "anvil" => Some("install uv; Brokk/Anvil signs in when required"),
+        "claude-acp" => Some("install Node.js/npm; install and sign in to Claude Code"),
+        "codex-acp" => Some("install Node.js/npm; sign in to Codex"),
+        "gemini" => Some("install Node.js/npm; sign in with Gemini CLI"),
+        "opencode" => Some("install OpenCode CLI; configure OpenCode provider credentials"),
+        "goose" => Some("install Goose; configure a Goose provider"),
+        "cursor" => Some("install Cursor Agent; sign in to Cursor"),
+        "github-copilot-cli" => Some("install Node.js/npm; sign in to GitHub Copilot"),
         _ => None,
-    };
-    let auth_hint = match server.source_id.as_str() {
-        "claude-acp" => Some("uses Claude Code sign-in"),
-        "codex-acp" => Some("uses Codex sign-in"),
-        "gemini" => Some("uses Gemini CLI auth"),
-        "opencode" => Some("uses OpenCode auth/config"),
-        "cursor" => Some("uses Cursor auth"),
-        "github-copilot-cli" => Some("uses GitHub Copilot auth"),
-        _ => None,
-    };
-    [install_hint, auth_hint]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("; ")
+    }
 }
 
 fn unique_custom_agent_name(cfg: &Config, requested: &str) -> String {
@@ -2051,9 +2055,31 @@ mod tests {
 
         assert_eq!(
             registry_setup_hint(&gemini),
-            "requires Node.js/npm; uses Gemini CLI auth"
+            "install Node.js/npm; sign in with Gemini CLI"
         );
-        assert_eq!(registry_setup_hint(&anvil), "requires uv");
+        assert_eq!(
+            registry_setup_hint(&anvil),
+            "install uv; Brokk/Anvil signs in when required"
+        );
+    }
+
+    #[test]
+    fn registry_setup_hint_describes_binary_agent_setup() {
+        let opencode = ConfiguredAcpServer {
+            source_id: "opencode".to_string(),
+            name: "OpenCode".to_string(),
+            program: PathBuf::from("opencode"),
+            args: vec!["acp".to_string()],
+            env: Default::default(),
+            description: String::new(),
+            setup_url: "https://opencode.ai".to_string(),
+            quota_backend: ThorQuotaBackend::None,
+        };
+
+        assert_eq!(
+            registry_setup_hint(&opencode),
+            "install OpenCode CLI; configure OpenCode provider credentials"
+        );
     }
 
     #[test]
