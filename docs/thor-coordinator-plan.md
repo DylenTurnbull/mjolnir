@@ -48,6 +48,10 @@ changed and how much each harness/model used.
   entry that launches `mj thor-mcp`.
 - The final response includes a concise recap, validation, unresolved risks,
   and usage by harness/model when available.
+- `mj acp-smoke` is the repeatable compatibility probe. It is no-token by
+  default, stopping after initialize plus `session/new`; `--prompt <text>` is
+  the explicit path for exercising one `session/prompt` turn when token spend
+  or a deterministic mock agent is acceptable.
 
 ## Initial routing rules
 

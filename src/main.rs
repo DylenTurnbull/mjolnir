@@ -147,11 +147,12 @@ struct Cli {
 enum Commands {
     #[command(hide = true)]
     ThorMcp,
-    /// Run a no-prompt ACP compatibility smoke check.
+    /// Run an ACP compatibility smoke check.
     ///
     /// Starts the command, completes ACP initialize plus `session/new`, prints
-    /// observed capabilities, then shuts the agent down. It does not send
-    /// `session/prompt` and should not consume model tokens.
+    /// observed capabilities, then shuts the agent down. By default it does not
+    /// send `session/prompt` and should not consume model tokens. Pass
+    /// `--prompt` to explicitly exercise a prompt turn.
     AcpSmoke(AcpSmokeArgs),
     /// Resume an existing ACP session.
     ///
@@ -235,6 +236,13 @@ struct AcpSmokeArgs {
     /// Maximum seconds to wait for initialize plus `session/new`.
     #[arg(long, default_value_t = 8, value_parser = parse_positive_u64)]
     timeout_seconds: u64,
+
+    /// Optional prompt to send after `session/new`.
+    ///
+    /// This can consume model tokens with real agents. Omit it for the default
+    /// no-token compatibility check.
+    #[arg(long, value_name = "TEXT")]
+    prompt: Option<String>,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = HeadlessOutputFormat::Text)]
@@ -447,6 +455,9 @@ async fn main() -> Result<()> {
 }
 
 async fn run_acp_smoke(args: AcpSmokeArgs, default_cwd: PathBuf) -> Result<()> {
+    if args.list_configured && args.prompt.is_some() {
+        anyhow::bail!("--prompt cannot be used with --list-configured");
+    }
     if args.list_configured {
         return list_configured_acp_smoke_servers(args.format);
     }
@@ -456,16 +467,16 @@ async fn run_acp_smoke(args: AcpSmokeArgs, default_cwd: PathBuf) -> Result<()> {
     };
     let agents = selected_agents_for_acp_smoke(&args)?;
     let timeout = Duration::from_secs(args.timeout_seconds);
-    let validations = futures::future::join_all(
-        agents
-            .into_iter()
-            .map(|agent| thor_probe::validate_agent(agent, cwd.clone(), timeout)),
-    )
+    let validations = futures::future::join_all(agents.into_iter().map(|agent| {
+        thor_probe::validate_agent_with_prompt(agent, cwd.clone(), timeout, args.prompt.clone())
+    }))
     .await;
     print_acp_smoke_results(&validations, args.format)?;
     let failed = validations
         .iter()
-        .filter(|validation| !validation.usable)
+        .filter(|validation| {
+            !validation.usable || (args.prompt.is_some() && !validation.prompt_completed)
+        })
         .map(|validation| {
             format!(
                 "{}: {}",
@@ -473,7 +484,11 @@ async fn run_acp_smoke(args: AcpSmokeArgs, default_cwd: PathBuf) -> Result<()> {
                 validation
                     .error
                     .as_deref()
-                    .unwrap_or("agent did not reach session/new")
+                    .unwrap_or(if args.prompt.is_some() {
+                        "agent did not complete session/prompt"
+                    } else {
+                        "agent did not reach session/new"
+                    })
             )
         })
         .collect::<Vec<_>>();
@@ -647,6 +662,7 @@ fn print_acp_smoke_text_result(validation: &thor_probe::AgentValidation) {
         }
     }
     println!("session/new: {}", yes_no(validation.session_started));
+    println!("session/prompt: {}", acp_smoke_prompt_status(validation));
     println!("config options: {}", yes_no(validation.config_advertised));
     println!(
         "image prompts: {}",
@@ -659,6 +675,21 @@ fn print_acp_smoke_text_result(validation: &thor_probe::AgentValidation) {
     println!("elapsed: {}ms", validation.elapsed_ms);
     if let Some(error) = &validation.error {
         println!("error: {error}");
+    }
+}
+
+fn acp_smoke_prompt_status(validation: &thor_probe::AgentValidation) -> String {
+    if validation.prompt_completed {
+        return validation
+            .prompt_stop_reason
+            .as_deref()
+            .map(|reason| format!("completed ({reason})"))
+            .unwrap_or_else(|| "completed".to_string());
+    }
+    if validation.prompt_sent {
+        "sent, not completed".to_string()
+    } else {
+        "not requested".to_string()
     }
 }
 
@@ -2900,6 +2931,8 @@ mod tests {
             "/tmp/agent-cwd",
             "--timeout-seconds",
             "12",
+            "--prompt",
+            "ping",
             "--format",
             "json",
         ])
@@ -2918,10 +2951,39 @@ mod tests {
                 assert_eq!(args.source_id, "example");
                 assert_eq!(args.cwd, Some(PathBuf::from("/tmp/agent-cwd")));
                 assert_eq!(args.timeout_seconds, 12);
+                assert_eq!(args.prompt.as_deref(), Some("ping"));
                 assert!(matches!(args.format, HeadlessOutputFormat::Json));
             }
             _ => panic!("expected AcpSmoke subcommand"),
         }
+    }
+
+    #[test]
+    fn acp_smoke_prompt_status_labels_prompt_completion() {
+        let mut validation = thor_probe::AgentValidation {
+            source_id: "test".to_string(),
+            usable: true,
+            agent_name: None,
+            agent_version: None,
+            session_started: true,
+            prompt_sent: false,
+            prompt_completed: false,
+            prompt_stop_reason: None,
+            config_advertised: false,
+            prompt_images_supported: false,
+            session_fork_supported: false,
+            error: None,
+            elapsed_ms: 1,
+            checked_at_unix: 1,
+        };
+        assert_eq!(acp_smoke_prompt_status(&validation), "not requested");
+
+        validation.prompt_sent = true;
+        assert_eq!(acp_smoke_prompt_status(&validation), "sent, not completed");
+
+        validation.prompt_completed = true;
+        validation.prompt_stop_reason = Some("EndTurn".to_string());
+        assert_eq!(acp_smoke_prompt_status(&validation), "completed (EndTurn)");
     }
 
     #[test]

@@ -47,8 +47,9 @@ Current command-line surface:
 - `mj --agent-stderr /path/to/agent.err` for child-process stderr.
 - `mj thor-mcp` is the internal stdio MCP bridge injected into the Thor host
   ACP session.
-- `mj acp-smoke ...` validates configured or ad-hoc ACP launch commands without
-  sending a model prompt.
+- `mj acp-smoke ...` validates configured or ad-hoc ACP launch commands. By
+  default it stops after initialize plus `session/new`; `--prompt <text>` is an
+  explicit opt-in for exercising `session/prompt`.
 
 There is no `--command` / `--agent` flag. Startup creates an `anvil` backend
 default automatically when the platform config file has no `agent` block
@@ -257,13 +258,15 @@ Deliverables:
 - ✅ Track compatibility quirks discovered with at least two non-Brokk ACP
   agents — `@agentclientprotocol/claude-agent-acp` 0.36.1 and OpenCode
   1.17.11 are recorded in the Compatibility section below.
-- ✅ Add a repeatable no-token compatibility smoke path — `mj acp-smoke
+- ✅ Add a repeatable compatibility smoke path — `mj acp-smoke
   --command "<agent acp command>"` or `mj acp-smoke --configured-source-id
   <id>` runs initialize plus `session/new`, prints text/json capability
   evidence, and exits non-zero if the agent is not usable. `mj acp-smoke
   --list-configured` shows the persisted Thor source IDs, and
   `mj acp-smoke --all-configured` validates the whole persisted Thor worker set
-  after onboarding or config edits.
+  after onboarding or config edits. By default this is no-token; passing
+  `--prompt <text>` explicitly sends one prompt turn, records completion and
+  stop reason, and fails if `session/prompt` does not complete.
 - Explore session rewind as an ACP extension paired with Anvil. The current
   proposal is documented in [docs/session-rewind-extension.md](docs/session-rewind-extension.md):
   model rewind as fork-from-checkpoint using `session/fork` `_meta`, not as
@@ -671,8 +674,9 @@ command/env Thor will use after onboarding, run `mj acp-smoke
 `mj acp-smoke --all-configured` to validate every persisted Thor worker in one
 pass. The smoke starts the ACP server, validates initialize plus
 `session/new`, records advertised capabilities, and shuts down without sending
-`session/prompt`. Add `--format json` when preserving machine-readable
-evidence.
+`session/prompt` unless `--prompt <text>` is supplied. Add `--format json` when
+preserving machine-readable evidence. Use `--prompt` only when token spend is
+acceptable or when testing a deterministic mock ACP agent.
 
 ### `@agentclientprotocol/claude-agent-acp` 0.36.1 — 2026-05-20
 

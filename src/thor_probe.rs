@@ -26,6 +26,9 @@ pub struct AgentValidation {
     pub agent_name: Option<String>,
     pub agent_version: Option<String>,
     pub session_started: bool,
+    pub prompt_sent: bool,
+    pub prompt_completed: bool,
+    pub prompt_stop_reason: Option<String>,
     pub config_advertised: bool,
     pub prompt_images_supported: bool,
     pub session_fork_supported: bool,
@@ -104,6 +107,15 @@ pub async fn validate_agent(
     cwd: PathBuf,
     timeout: Duration,
 ) -> AgentValidation {
+    validate_agent_with_prompt(agent, cwd, timeout, None).await
+}
+
+pub async fn validate_agent_with_prompt(
+    agent: SelectedAgent,
+    cwd: PathBuf,
+    timeout: Duration,
+    prompt: Option<String>,
+) -> AgentValidation {
     let started_at = Instant::now();
     let source_id = agent.source_id.clone();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -127,6 +139,9 @@ pub async fn validate_agent(
         agent_name: None,
         agent_version: None,
         session_started: false,
+        prompt_sent: false,
+        prompt_completed: false,
+        prompt_stop_reason: None,
         config_advertised: false,
         prompt_images_supported: false,
         session_fork_supported: false,
@@ -135,7 +150,9 @@ pub async fn validate_agent(
         checked_at_unix: now_unix(),
     };
 
+    let prompt_cmd_tx = cmd_tx.clone();
     let probe = async {
+        let mut prompt = prompt;
         while let Some(event) = event_rx.recv().await {
             match event {
                 UiEvent::Connected {
@@ -152,10 +169,30 @@ pub async fn validate_agent(
                 UiEvent::SessionStarted { .. } => {
                     validation.session_started = true;
                     validation.usable = true;
-                    break;
+                    if let Some(prompt_text) = prompt.take() {
+                        validation.prompt_sent = true;
+                        if prompt_cmd_tx
+                            .send(UiCommand::SendPrompt {
+                                text: prompt_text,
+                                images: Vec::new(),
+                            })
+                            .is_err()
+                        {
+                            validation.error =
+                                Some("ACP validation could not send session/prompt".to_string());
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
                 }
                 UiEvent::SessionConfigOptions => {
                     validation.config_advertised = true;
+                }
+                UiEvent::PromptDone { stop_reason, .. } => {
+                    validation.prompt_completed = true;
+                    validation.prompt_stop_reason = Some(format!("{stop_reason:?}"));
+                    break;
                 }
                 UiEvent::Fatal(message) | UiEvent::PromptFailed { message } => {
                     validation.error = Some(message);
@@ -875,5 +912,92 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":nul
         assert!(!validation.usable);
         assert!(!validation.session_started);
         assert!(validation.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn validation_with_prompt_records_prompt_completion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join(if cfg!(windows) {
+            "mock_acp.py"
+        } else {
+            "mock-acp"
+        });
+        std::fs::write(&script, prompt_smoke_mock_acp_script()).expect("write mock acp");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).expect("chmod");
+        }
+
+        let mut args = Vec::new();
+        let program = if cfg!(windows) {
+            args.push(script.display().to_string());
+            PathBuf::from("python")
+        } else {
+            script
+        };
+        let agent = SelectedAgent {
+            source_id: "mock-prompt".to_string(),
+            program,
+            args,
+            env: HashMap::new(),
+        };
+
+        let validation = validate_agent_with_prompt(
+            agent,
+            std::env::current_dir().expect("cwd"),
+            Duration::from_secs(3),
+            Some("ping".to_string()),
+        )
+        .await;
+
+        assert!(validation.usable, "{validation:?}");
+        assert!(validation.session_started);
+        assert!(validation.prompt_sent);
+        assert!(validation.prompt_completed);
+        assert_eq!(validation.prompt_stop_reason.as_deref(), Some("EndTurn"));
+        assert!(validation.error.is_none(), "{validation:?}");
+    }
+
+    fn prompt_smoke_mock_acp_script() -> &'static str {
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+def read_message():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
+def write_message(message):
+    sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "promptCapabilities": {"image": False, "audio": False, "embeddedContext": False},
+                "sessionCapabilities": {}
+            },
+            "agentInfo": {"name": "Mock ACP", "version": "1.0.0"}
+        }
+    elif method == "session/new":
+        result = {"sessionId": "mock-session"}
+    elif method == "session/prompt":
+        result = {"stopReason": "end_turn"}
+    else:
+        result = {}
+    if "id" in message:
+        write_message({"jsonrpc": "2.0", "id": message["id"], "result": result})
+"#
     }
 }
