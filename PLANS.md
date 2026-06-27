@@ -487,6 +487,15 @@ Fixed in this PR:
   this does not close the successful configured-agent smoke requirement. It did
   verify the improved failed row: `OpenCode / set OpenCode provider / Set
   provider, retry; docs: opencode`.
+- [x] Manually smoke-tested the registry-add path at 80 columns with a copied
+  registry cache under `/tmp/mj-thor-registry-smoke/Library/Caches/mj/registry.json`.
+  The flow opened `Add agent from registry`, showed the step-aware `Will add /
+  Runs / Setup` summary, selected the binary OpenCode entry without fetching
+  `npx` code, persisted it to
+  `/tmp/mj-thor-registry-smoke/Library/Application Support/mj/config.toml`, and
+  reran validation. The registry count dropped from 37 to 36 and OpenCode
+  returned as a configured-but-not-ready row with provider-specific recovery
+  guidance.
 
 Still not production-grade:
 
@@ -507,8 +516,8 @@ Still not production-grade:
 4. **The setup UI has only been manually smoked for one terminal scenario.**
    Unit tests cover state transitions, list windowing, and small/large render
    output; manual smoke now covers the no-working-agent 80-column path and a
-   configured-but-broken 80-column path, but still needs at least one successful
-   configured agent and one registry-add flow.
+   configured-but-broken 80-column path plus a registry-add path, but still
+   needs at least one successful configured agent.
 
 ## Risks and open questions
 
