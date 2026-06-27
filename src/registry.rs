@@ -172,16 +172,36 @@ impl Agent {
         if !self.setup.hint.trim().is_empty() {
             return self.setup.hint.clone();
         }
-        [self.setup.install.trim(), self.setup.auth.trim()]
+        let exact_hint = [self.setup.install.trim(), self.setup.auth.trim()]
             .into_iter()
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
-            .join("; ")
+            .join("; ");
+        if !exact_hint.trim().is_empty() {
+            return exact_hint;
+        }
+        known_provider_setup_hint(&self.id)
+            .unwrap_or_default()
+            .to_string()
     }
 
     fn binary_target_for_current_platform(&self) -> Option<&BinaryTarget> {
         let key = current_binary_platform_key()?;
         self.distribution.binary.as_ref()?.get(key)
+    }
+}
+
+fn known_provider_setup_hint(id: &str) -> Option<&'static str> {
+    match id {
+        "anvil" => Some("install uv; Brokk/Anvil signs in when required"),
+        "claude-acp" => Some("install Node.js/npm; install and sign in to Claude Code"),
+        "codex-acp" => Some("install Node.js/npm; sign in to Codex"),
+        "gemini" => Some("install Node.js/npm; sign in with Gemini CLI"),
+        "opencode" => Some("install OpenCode CLI; configure OpenCode provider credentials"),
+        "goose" => Some("install Goose; configure a Goose provider"),
+        "cursor" => Some("install Cursor Agent; sign in to Cursor"),
+        "github-copilot-cli" => Some("install Node.js/npm; sign in to GitHub Copilot"),
+        _ => None,
     }
 }
 
@@ -334,6 +354,16 @@ mod tests {
                 }
             },
             {
+                "id": "gemini",
+                "name": "Gemini CLI",
+                "version": "0.49.0",
+                "description": "Gemini ACP agent",
+                "website": "https://geminicli.com",
+                "distribution": {
+                    "npx": { "package": "@google/gemini-cli@0.49.0", "args": ["--acp"] }
+                }
+            },
+            {
                 "id": "generic-acp",
                 "name": "Generic",
                 "version": "1.0.0",
@@ -408,12 +438,27 @@ mod tests {
             claude.setup_url,
             "https://github.com/agentclientprotocol/claude-agent-acp"
         );
+        assert_eq!(
+            claude.setup_hint,
+            "install Node.js/npm; install and sign in to Claude Code"
+        );
 
         let codex = servers
             .iter()
             .find(|server| server.source_id == "codex-acp")
             .expect("codex");
         assert_eq!(codex.quota_backend, ThorQuotaBackend::CodexAppserver);
+        assert_eq!(codex.setup_hint, "install Node.js/npm; sign in to Codex");
+
+        let gemini = servers
+            .iter()
+            .find(|server| server.source_id == "gemini")
+            .expect("gemini");
+        assert_eq!(
+            gemini.setup_hint,
+            "install Node.js/npm; sign in with Gemini CLI"
+        );
+        assert_eq!(gemini.setup_url, "https://geminicli.com");
 
         let generic = servers
             .iter()
@@ -438,6 +483,39 @@ mod tests {
         assert_eq!(binary.setup_url, "https://example.com/binary");
     }
 
+    #[test]
+    fn registry_exact_setup_metadata_overrides_known_provider_fallback() {
+        let registry = Registry::from_json(
+            r#"{
+                "agents": [{
+                    "id": "gemini",
+                    "name": "Gemini CLI",
+                    "setup": {
+                        "install": "install exact Gemini package",
+                        "auth": "run exact Gemini login",
+                        "docsUrl": "https://example.com/exact-gemini"
+                    },
+                    "distribution": {
+                        "npx": { "package": "@google/gemini-cli@0.49.0", "args": ["--acp"] }
+                    }
+                }]
+            }"#,
+        )
+        .expect("parse");
+
+        let server = registry
+            .configured_servers()
+            .into_iter()
+            .next()
+            .expect("server");
+
+        assert_eq!(
+            server.setup_hint,
+            "install exact Gemini package; run exact Gemini login"
+        );
+        assert_eq!(server.setup_url, "https://example.com/exact-gemini");
+    }
+
     #[tokio::test]
     async fn load_with_cache_uses_fresh_cache_without_network() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -447,7 +525,7 @@ mod tests {
         let registry = load_with_cache(&path, Duration::from_secs(3600), "http://127.0.0.1:1/")
             .await
             .expect("load");
-        assert_eq!(registry.agents.len(), 4);
+        assert_eq!(registry.agents.len(), 5);
     }
 
     #[tokio::test]
@@ -466,6 +544,6 @@ mod tests {
         let registry = load_with_cache(&path, Duration::from_secs(3600), "http://127.0.0.1:1/")
             .await
             .expect("load stale");
-        assert_eq!(registry.agents.len(), 4);
+        assert_eq!(registry.agents.len(), 5);
     }
 }

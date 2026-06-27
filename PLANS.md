@@ -608,6 +608,11 @@ Fixed in this PR:
   agents. Registry entries can now carry setup hints and setup-doc URLs into
   persisted Thor server config, and onboarding prefers those exact hints over
   local inferred provider profiles when present.
+- [x] Persisted known-provider setup fallback hints from registry resolution
+  when upstream registry entries omit exact setup metadata. Claude, Codex,
+  Gemini, OpenCode, Goose, Cursor, GitHub Copilot, and Anvil now carry install
+  and auth expectations into saved Thor server config instead of relying only on
+  transient onboarding inference; exact registry setup metadata still wins.
 - [x] Added automated provider recovery matrix coverage for Anvil, Claude,
   Codex, Gemini, OpenCode, Goose, Cursor, and GitHub Copilot rows, and made
   Gemini generic exits/timeouts resolve to Gemini sign-in guidance instead of
@@ -630,17 +635,19 @@ Still not production-grade:
 1. **Registry-backed agent setup still needs richer install/configure metadata.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider
-   setup profiles, and exact setup metadata fields are shown when available,
-   but the registry itself does not currently expose exact auth/install steps
-   for every agent. Tracked in
+   setup profiles, and exact setup metadata fields are shown when available.
+   Known-provider fallback hints are now persisted into saved Thor server config
+   when upstream registry entries omit setup metadata, but the registry itself
+   still does not expose exact auth/install steps for every agent. Tracked in
    [#250](https://github.com/BrokkAi/mjolnir/issues/250).
 2. **Validation feedback is still partly inferred, not registry-metadata-driven.**
    Rows now offer provider-specific actions for Anvil, Claude, Codex, Gemini,
    OpenCode, Goose, Cursor, GitHub Copilot, `npx`, and `uvx`, but production UX
    should use registry/auth metadata for exact commands and links when
-   available. Inferred setup hints now carry into generic validation failures,
-   and exact registry setup hints are preferred when present, but broad upstream
-   metadata coverage is still the target. Tracked in
+   available. Inferred known-provider setup hints now carry into persisted
+   configured servers and generic validation failures, and exact registry setup
+   hints are preferred when present, but broad upstream metadata coverage is
+   still the target. Tracked in
    [#250](https://github.com/BrokkAi/mjolnir/issues/250).
 3. **Thor setup still needs a real end-user recovery pass.** The main path is
    now the intended Thor setup path: choose work style, choose agents Thor may

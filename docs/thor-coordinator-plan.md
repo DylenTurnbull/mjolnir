@@ -129,7 +129,9 @@ changed and how much each harness/model used.
     upstream registry exposes exact metadata, and those inferred hints are also
     used for generic configured-agent validation failures. Registry-provided
     exact setup hints and setup-doc URLs are persisted and preferred when
-    present.
+    present; when they are absent, known-provider fallback hints are now
+    persisted into saved Thor server config instead of remaining only transient
+    onboarding UI text.
     Remaining: continue polishing the guided setup progression, replace
     remaining inferred setup labels with registry-provided exact commands/links
     where possible, manually smoke-test the setup UI across terminal sizes, and
