@@ -577,6 +577,9 @@ Fixed in this PR:
 - [x] Made local Thor status events remote-visible. Planning, long-running
   heartbeats, and worker side-channel progress are now recorded as `system`
   entries in the remote/browser transcript instead of only appearing in the TUI.
+- [x] Added regression coverage for distinct Thor heartbeat messages so long
+  host turns do not lose progress lines to transcript dedupe; inactive periods
+  reset the elapsed timer before the next turn.
 - [x] Removed the remaining registry/custom-command/ACP jargon from the main
   first-run setup screen. The visible path now says `known agent` for registry
   choices and `installed agent` for pasted commands, while implementation terms
@@ -607,7 +610,8 @@ Still not production-grade:
    Generic Thor host titles are now ignored locally and in the remote/browser
    transcript, and long host turns emit distinct elapsed heartbeat lines so the
    transcript does not look frozen solely because repeated status text was
-   deduped. This still needs a real-provider smoke where Thor runs long enough
+   deduped; this elapsed heartbeat behavior now has deterministic unit
+   coverage. What remains is a real-provider smoke where Thor runs long enough
    to delegate work, mirror worker progress, and produce a final recap. Track
    this alongside the broader Thor runtime hardening work before calling the
    coordinator production-grade.

@@ -2052,19 +2052,29 @@ async fn thor_activity_heartbeat(
     let mut elapsed_seconds = 0u64;
     loop {
         tokio::time::sleep(Duration::from_secs(15)).await;
-        if active.load(Ordering::Relaxed) {
-            elapsed_seconds = elapsed_seconds.saturating_add(15);
-            publish_local_ui_event(
-                &tracker,
-                &ui_tx,
-                UiEvent::Info(format!(
-                    "Thor is still working... {elapsed_seconds}s elapsed"
-                )),
-            );
-        } else {
-            elapsed_seconds = 0;
+        if let Some(message) =
+            thor_heartbeat_tick(active.load(Ordering::Relaxed), &mut elapsed_seconds, 15)
+        {
+            publish_local_ui_event(&tracker, &ui_tx, UiEvent::Info(message));
         }
     }
+}
+
+fn thor_heartbeat_tick(
+    active: bool,
+    elapsed_seconds: &mut u64,
+    step_seconds: u64,
+) -> Option<String> {
+    if !active {
+        *elapsed_seconds = 0;
+        return None;
+    }
+    *elapsed_seconds = elapsed_seconds.saturating_add(step_seconds);
+    Some(thor_heartbeat_message(*elapsed_seconds))
+}
+
+fn thor_heartbeat_message(elapsed_seconds: u64) -> String {
+    format!("Thor is still working... {elapsed_seconds}s elapsed")
 }
 
 fn publish_local_ui_event(
@@ -2312,6 +2322,26 @@ mod tests {
         assert_eq!(
             thor_progress_message(r#"{"kind":"tool_call","message":"missing detail"}"#),
             None
+        );
+    }
+
+    #[test]
+    fn thor_heartbeat_tick_emits_distinct_elapsed_messages_and_resets() {
+        let mut elapsed = 0;
+
+        assert_eq!(
+            thor_heartbeat_tick(true, &mut elapsed, 15).as_deref(),
+            Some("Thor is still working... 15s elapsed")
+        );
+        assert_eq!(
+            thor_heartbeat_tick(true, &mut elapsed, 15).as_deref(),
+            Some("Thor is still working... 30s elapsed")
+        );
+        assert_eq!(thor_heartbeat_tick(false, &mut elapsed, 15), None);
+        assert_eq!(elapsed, 0);
+        assert_eq!(
+            thor_heartbeat_tick(true, &mut elapsed, 15).as_deref(),
+            Some("Thor is still working... 15s elapsed")
         );
     }
 
