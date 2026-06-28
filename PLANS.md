@@ -737,9 +737,11 @@ Still not production-grade:
    Known-provider and package-manager fallback labels are now persisted into
    saved Thor server config when upstream registry entries omit setup metadata,
    and validation recovery rows prefer exact structured install/auth text over
-   hardcoded generic copy. What remains is broader upstream registry coverage
-   for agents outside the known-provider and distribution fallback set. Tracked
-   in
+   hardcoded generic copy. A live registry check on 2026-06-28 found 37 entries
+   and no `setup` or `setupHint` metadata, so the remaining exact-metadata gap
+   is upstream registry content rather than an unparsed current field. What
+   remains is broader upstream registry coverage for agents outside the
+   known-provider and distribution fallback set. Tracked in
    [#250](https://github.com/BrokkAi/mjolnir/issues/250).
 3. **Thor setup still needs a real end-user recovery pass.** The main path is
    now the intended Thor setup path: choose work style, choose agents Thor may
