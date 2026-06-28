@@ -131,9 +131,9 @@ usage.
 
 The interactive Thor runtime is still the active hardening area. Current code
 sets the visible local title from the submitted user task, keeps that
-task-derived title sticky after submit, rejects generic Thor/coordinator host
-titles locally and in the remote transcript, and strips those generic titles
-from session listings. The Thor host prompt now starts with an explicit
+task-derived title sticky after submit, rejects generic Thor/coordinator/persona
+host titles locally and in the remote transcript, and strips those generic
+titles from session listings. The Thor host prompt now starts with an explicit
 `Task title:` line before any Thor persona instructions, so ACP hosts that
 auto-title from prompt text have a user-task title source instead of seeing the
 coordinator instructions first. `mj` also persists a local session-title
@@ -143,19 +143,22 @@ covers ACP hosts that omit or mangle saved titles. `mj` no longer synthesizes a
 `SessionInfoUpdate` just to seed a Thor title, and the fullscreen header hides
 the redundant `Thor` agent label once a task title exists.
 
-Progress plumbing is present but not yet proven in the user's observed path.
-Prompt submission records an immediate `Thor is preparing a plan...` status in
-the local transcript, and the remote tracker records the same status when it
+Progress plumbing is present but still needs real user-path proof. Prompt
+submission records an immediate `Thor is preparing a plan...` status in the
+local transcript, and the remote tracker records the same status when it
 observes the command. The UI state machine can append distinct elapsed
 heartbeat lines during long host turns, and `mj` consumes the Thor MCP bridge's
 out-of-band worker progress stream so delegated ACP
 tool/permission/completion events can appear while the host waits for worker
 calls. The remote-control server path receives the same Thor MCP progress side
-channel and heartbeat stream as the local TUI path. However, live use on
-2026-06-28 still reported generic Thor session naming and no visible transcript
-updates during a multi-minute turn. Treat title/progress as open until a real
-interactive or remote long-turn smoke proves the exact transcript the user is
-watching updates correctly.
+channel and heartbeat stream as the local TUI path. A 2026-06-28 live report
+still found generic Thor session naming and a transcript that appeared frozen
+for several minutes. The current branch addresses the likely UI causes by
+rejecting broader Thor persona placeholder titles (`Thor Architect`, `Thor
+orchestrator ...`, etc.) and keeping the inline full-transcript reader pinned to
+new live updates until the user intentionally scrolls or filters. Treat
+title/progress as open until a real interactive or remote long-turn smoke proves
+the exact transcript the user is watching updates correctly.
 
 The headless `--print --output-format stream-json` path runs the same Thor MCP
 bridge with a progress side channel and emits `info` stream records for worker
@@ -717,19 +720,22 @@ Still not production-grade:
 
 1. **Thor runtime progress and titles need real long-turn validation.**
    Live use on 2026-06-28 found generic Thor session naming and a transcript
-   that appeared frozen for several minutes. Current code keeps user-task
-   titles sticky, rejects broader Thor/coordinator host titles locally and in
-   the remote/browser transcript and session lists, no longer emits a synthetic
-   Thor title update at first prompt, adds a `Task title:` line before the Thor
-   persona in the host prompt, persists local task-title overrides for
-   interactive/headless sessions and applies them to future session listings,
-   hides the redundant `Thor` header label once a task title exists, records
-   immediate local and remote planning status, records a UI-state fallback
-   heartbeat during active local turns, keeps the remote-control heartbeat,
-   mirrors Thor MCP worker progress, and exposes the same progress stream
-   through headless
+   that appeared frozen for several minutes. Current branch code keeps
+   user-task titles sticky, rejects broader Thor/coordinator/persona host
+   titles locally and in the remote/browser transcript and session lists, no
+   longer emits a synthetic Thor title update at first prompt, adds a `Task
+   title:` line before the Thor persona in the host prompt, persists local
+   task-title overrides for interactive/headless sessions and applies them to
+   future session listings, hides the redundant `Thor` header label once a task
+   title exists, records immediate local and remote planning status, records a
+   UI-state fallback heartbeat during active local turns, keeps the
+   remote-control heartbeat, mirrors Thor MCP worker progress, keeps the inline
+   full-transcript reader pinned to live updates until manual scroll/filter,
+   and exposes the same progress stream through headless
    `--print --output-format stream-json` for repeatable smoke capture.
-   Deterministic tests cover those local/remote/headless/listing plumbing paths.
+   Deterministic tests cover those local/remote/headless/listing plumbing paths,
+   including broader Thor persona-title rejection and transcript-reader
+   tail-follow behavior.
    A deterministic mock-host/mock-worker headless smoke now proves the real Thor
    MCP bridge can list workers, load a cached model catalog, accept a structured
    plan, run implementation/review/correction worker phases, mirror all three

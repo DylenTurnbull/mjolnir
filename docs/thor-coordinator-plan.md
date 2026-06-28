@@ -41,10 +41,15 @@ changed and how much each harness/model used.
   logic sees the user's task before the coordinator instructions. `mj` also
   persists local task-title overrides keyed by ACP session id after
   interactive and headless runs, then applies those overrides to session
-  listings for hosts that omit or mangle saved titles. The local UI state
-  machine emits distinct elapsed heartbeat lines during long host turns, and
-  the remote/browser transcript receives its own heartbeat stream, so neither
-  path depends only on host text when the host has not produced output yet. The
+  listings for hosts that omit or mangle saved titles. Generic-title filtering
+  now includes Thor persona placeholders such as `Thor Architect` and `Thor
+  orchestrator ...`, not just the earlier exact coordinator strings. The local
+  UI state machine emits distinct elapsed heartbeat lines during long host
+  turns, and the remote/browser transcript receives its own heartbeat stream,
+  so neither path depends only on host text when the host has not produced
+  output yet. The inline full-transcript reader follows live updates by default
+  until the user scrolls or filters, so opening the reader during a turn should
+  not hide new heartbeat or worker-progress lines below the viewport. The
   remote-control server path also receives the Thor MCP worker progress side
   channel, not only the local TUI path. This still needs real interactive and
   remote-provider validation on long turns because live use reported generic
@@ -154,10 +159,12 @@ changed and how much each harness/model used.
     remaining inferred setup labels with registry-provided exact commands/links
     where possible, manually smoke-test the setup UI across terminal sizes, and
     run a successful real long-turn Thor smoke covering sticky task-derived
-    titles, sanitized session-list titles, provider-saved/local-title behavior
-    after the `Task title:` prompt and title-store changes, local, remote, and
-    headless-stream heartbeats, worker progress mirroring, transcript freshness
-    in the UI or stream the user is watching, and final recap. A deterministic
+    titles, sanitized session-list titles, broader Thor persona-title
+    rejection, provider-saved/local-title behavior after the `Task title:`
+    prompt and title-store changes, local, remote, and headless-stream
+    heartbeats, worker progress mirroring, transcript-reader tailing,
+    transcript freshness in the UI or stream the user is watching, and final
+    recap. A deterministic
     mock-host/mock-worker headless smoke proved the real Thor MCP bridge,
     structured plan submission, implementation/review/correction delegation,
     mirrored worker progress, and final recap/result text without token spend.

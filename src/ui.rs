@@ -2628,7 +2628,8 @@ fn toggle_transcript_expansion(state: &mut AppState, mode: UiMode) {
 /// Keyboard handling while the inline full-transcript reader is open. The
 /// reader reuses `scroll_offset` as the index of the top visible line (0 =
 /// top); it is clamped to the last screen of content during draw, so adding
-/// past the end and `usize::MAX` (jump to bottom) are both safe here.
+/// past the end and `usize::MAX` (jump to bottom) are both safe here. While
+/// `transcript_viewer_follow_tail` is true, draw keeps the newest lines in view.
 fn handle_transcript_viewer_key(
     state: &mut AppState,
     modifiers: KeyModifiers,
@@ -2650,25 +2651,41 @@ fn handle_transcript_viewer_key(
     }
 
     match code {
-        KeyCode::Up => state.scroll_offset = state.scroll_offset.saturating_sub(1),
-        KeyCode::Down => state.scroll_offset = state.scroll_offset.saturating_add(1),
+        KeyCode::Up => {
+            state.transcript_viewer_follow_tail = false;
+            state.scroll_offset = state.scroll_offset.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            state.transcript_viewer_follow_tail = false;
+            state.scroll_offset = state.scroll_offset.saturating_add(1);
+        }
         KeyCode::PageUp => {
+            state.transcript_viewer_follow_tail = false;
             state.scroll_offset = state
                 .scroll_offset
                 .saturating_sub(TRANSCRIPT_SCROLL_PAGE_STEP)
         }
         KeyCode::PageDown => {
+            state.transcript_viewer_follow_tail = false;
             state.scroll_offset = state
                 .scroll_offset
                 .saturating_add(TRANSCRIPT_SCROLL_PAGE_STEP)
         }
-        KeyCode::Home => state.scroll_offset = 0,
-        KeyCode::End => state.scroll_offset = usize::MAX,
+        KeyCode::Home => {
+            state.transcript_viewer_follow_tail = false;
+            state.scroll_offset = 0;
+        }
+        KeyCode::End => {
+            state.transcript_viewer_follow_tail = true;
+            state.scroll_offset = usize::MAX;
+        }
         KeyCode::Backspace if state.transcript_filter.pop().is_some() => {
+            state.transcript_viewer_follow_tail = false;
             state.scroll_offset = 0;
         }
         KeyCode::Char(c) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
             state.transcript_filter.push(c);
+            state.transcript_viewer_follow_tail = false;
             state.scroll_offset = 0;
         }
         _ => {}
@@ -3990,7 +4007,11 @@ fn draw_inline_transcript_viewer(f: &mut ratatui::Frame, area: Rect, state: &mut
             .wrap(Wrap { trim: false })
             .line_count(inner.width);
         let max_offset = total.saturating_sub(usize::from(inner.height));
-        state.scroll_offset = state.scroll_offset.min(max_offset);
+        if state.transcript_viewer_follow_tail {
+            state.scroll_offset = max_offset;
+        } else {
+            state.scroll_offset = state.scroll_offset.min(max_offset);
+        }
         let top = state.scroll_offset.min(u16::MAX as usize) as u16;
         f.render_widget(
             Paragraph::new(lines)
@@ -8597,9 +8618,11 @@ mod tests {
             usize::MAX,
             "reader opens at the bottom"
         );
+        assert!(state.transcript_viewer_follow_tail);
 
         handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::Home));
         assert_eq!(state.scroll_offset, 0);
+        assert!(!state.transcript_viewer_follow_tail);
         handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::Down));
         assert_eq!(state.scroll_offset, 1);
         handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::PageDown));
@@ -8608,11 +8631,13 @@ mod tests {
         assert_eq!(state.scroll_offset, TRANSCRIPT_SCROLL_PAGE_STEP);
         handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::End));
         assert_eq!(state.scroll_offset, usize::MAX);
+        assert!(state.transcript_viewer_follow_tail);
         // Typing while the reader owns the keyboard filters the transcript
         // without editing the prompt.
         handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('a')));
         assert!(state.input.is_empty());
         assert_eq!(state.transcript_filter, "a");
+        assert!(!state.transcript_viewer_follow_tail);
         handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::Backspace));
         assert!(state.transcript_filter.is_empty());
 
@@ -8623,6 +8648,49 @@ mod tests {
         assert!(
             terminal_request_forces_inline_repair(request),
             "closing the reader must repair the shrunken inline viewport"
+        );
+    }
+
+    #[test]
+    fn transcript_reader_follow_tail_renders_new_live_updates() {
+        let mut state = AppState::new();
+        for idx in 0..20 {
+            state
+                .transcript
+                .push(Entry::System(format!("older status {idx}")));
+        }
+        state.open_transcript_viewer();
+
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_inline_chat(frame, &mut state))
+            .expect("draw");
+
+        state.transcript.push(Entry::System(
+            "Thor is still working... 30s elapsed".to_string(),
+        ));
+        terminal
+            .draw(|frame| draw_inline_chat(frame, &mut state))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(
+            rendered.contains("Thor is still working... 30s elapsed"),
+            "reader should keep tailing live progress while pinned:\n{rendered}"
+        );
+
+        handle_inline_crossterm(&mut state, &mpsc::unbounded_channel().0, key(KeyCode::Home));
+        state
+            .transcript
+            .push(Entry::System("hidden after manual scroll".to_string()));
+        terminal
+            .draw(|frame| draw_inline_chat(frame, &mut state))
+            .expect("draw");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(
+            !rendered.contains("hidden after manual scroll"),
+            "manual scroll should stop automatic tailing:\n{rendered}"
         );
     }
 

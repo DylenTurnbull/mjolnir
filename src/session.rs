@@ -73,16 +73,32 @@ fn is_generic_thor_title(title: &str) -> bool {
             | "thor task"
             | "new thor task"
             | "thor coordinator"
+            | "thor architect"
+            | "thor accountant"
+            | "thor planner"
+            | "thor planning"
+            | "thor orchestrator"
+            | "thor agent"
+            | "thor worker"
             | "mjolnir thor"
             | "thor omni-agent coordinator"
             | "thor omni agent coordinator"
     ) || lower.starts_with("thor:")
         || lower.starts_with("thor -")
+        || lower.starts_with("thor architect ")
+        || lower.starts_with("thor accountant ")
+        || lower.starts_with("thor planner ")
+        || lower.starts_with("thor planning ")
+        || lower.starts_with("thor orchestrator ")
+        || lower.starts_with("thor agent ")
+        || lower.starts_with("thor worker ")
         || lower.starts_with("thor session ")
         || lower.starts_with("new thor session ")
+        || lower.starts_with("new thor task ")
         || lower.starts_with("mjolnir thor ")
         || (lower.contains("thor")
             && (lower.contains("coordinator")
+                || lower.contains("orchestrator")
                 || lower.contains("omni-agent")
                 || lower.contains("omni agent")))
 }
@@ -772,6 +788,11 @@ mod tests {
         };
 
         assert_eq!(entry.title, None);
+        assert_eq!(sanitize_session_title(Some("Thor Architect".into())), None);
+        assert_eq!(
+            sanitize_session_title(Some("Thor orchestrator planning".into())),
+            None
+        );
     }
 
     #[test]

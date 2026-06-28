@@ -566,6 +566,9 @@ pub struct AppState {
     /// Case-insensitive filter query applied inside the inline transcript
     /// reader. Empty means show the full transcript.
     pub transcript_filter: String,
+    /// True while the inline transcript reader should keep the newest lines in
+    /// view. Cleared as soon as the user scrolls or filters.
+    pub transcript_viewer_follow_tail: bool,
     pub exit_reason: Option<UiExitReason>,
     /// True once the runtime has stopped accepting commands.
     pub runtime_closed: bool,
@@ -742,6 +745,7 @@ impl AppState {
             expand_tool_outputs: false,
             transcript_viewer: false,
             transcript_filter: String::new(),
+            transcript_viewer_follow_tail: false,
             exit_reason: None,
             runtime_closed: false,
             status_line: None,
@@ -1000,6 +1004,7 @@ impl AppState {
         self.transcript_viewer = true;
         self.transcript_filter.clear();
         self.scroll_offset = usize::MAX;
+        self.transcript_viewer_follow_tail = true;
     }
 
     /// Close the inline full-transcript reader and reset its scroll position.
@@ -1007,6 +1012,7 @@ impl AppState {
         self.transcript_viewer = false;
         self.transcript_filter.clear();
         self.scroll_offset = 0;
+        self.transcript_viewer_follow_tail = false;
     }
 
     /// Extract the text of the most recent agent message from the transcript.
@@ -1970,16 +1976,32 @@ fn is_generic_thor_title(title: &str) -> bool {
             | "thor task"
             | "new thor task"
             | "thor coordinator"
+            | "thor architect"
+            | "thor accountant"
+            | "thor planner"
+            | "thor planning"
+            | "thor orchestrator"
+            | "thor agent"
+            | "thor worker"
             | "mjolnir thor"
             | "thor omni-agent coordinator"
             | "thor omni agent coordinator"
     ) || lower.starts_with("thor:")
         || lower.starts_with("thor -")
+        || lower.starts_with("thor architect ")
+        || lower.starts_with("thor accountant ")
+        || lower.starts_with("thor planner ")
+        || lower.starts_with("thor planning ")
+        || lower.starts_with("thor orchestrator ")
+        || lower.starts_with("thor agent ")
+        || lower.starts_with("thor worker ")
         || lower.starts_with("thor session ")
         || lower.starts_with("new thor session ")
+        || lower.starts_with("new thor task ")
         || lower.starts_with("mjolnir thor ")
         || (lower.contains("thor")
             && (lower.contains("coordinator")
+                || lower.contains("orchestrator")
                 || lower.contains("omni-agent")
                 || lower.contains("omni agent")))
 }
@@ -2043,6 +2065,8 @@ mod tests {
 
         assert!(s.set_session_title("Fix flaky parser test"));
         assert!(!s.set_session_title("Thor session"));
+        assert!(!s.set_session_title("Thor Architect"));
+        assert!(!s.set_session_title("Thor orchestrator planning"));
         assert!(!s.set_session_title("Mjolnir Thor Coordinator"));
         assert!(!s.set_session_title("Thor omni-agent coordinator"));
 
@@ -2054,6 +2078,7 @@ mod tests {
         let mut s = AppState::new();
 
         assert!(!s.set_session_title("Thor session"));
+        assert!(!s.set_session_title("Thor Architect"));
 
         assert_eq!(s.session_title.as_deref(), None);
     }
@@ -2088,6 +2113,16 @@ mod tests {
         assert!(s.set_session_title_from_user_prompt("Debug blank progress"));
 
         assert_eq!(s.session_title.as_deref(), Some("Debug blank progress"));
+    }
+
+    #[test]
+    fn user_prompt_replaces_broader_thor_persona_title() {
+        let mut s = AppState::new();
+        s.session_title = Some("Thor Architect".to_string());
+
+        assert!(s.set_session_title_from_user_prompt("Fix stale session names"));
+
+        assert_eq!(s.session_title.as_deref(), Some("Fix stale session names"));
     }
 
     #[test]

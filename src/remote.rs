@@ -673,16 +673,32 @@ fn is_generic_thor_title(title: &str) -> bool {
             | "thor task"
             | "new thor task"
             | "thor coordinator"
+            | "thor architect"
+            | "thor accountant"
+            | "thor planner"
+            | "thor planning"
+            | "thor orchestrator"
+            | "thor agent"
+            | "thor worker"
             | "mjolnir thor"
             | "thor omni-agent coordinator"
             | "thor omni agent coordinator"
     ) || lower.starts_with("thor:")
         || lower.starts_with("thor -")
+        || lower.starts_with("thor architect ")
+        || lower.starts_with("thor accountant ")
+        || lower.starts_with("thor planner ")
+        || lower.starts_with("thor planning ")
+        || lower.starts_with("thor orchestrator ")
+        || lower.starts_with("thor agent ")
+        || lower.starts_with("thor worker ")
         || lower.starts_with("thor session ")
         || lower.starts_with("new thor session ")
+        || lower.starts_with("new thor task ")
         || lower.starts_with("mjolnir thor ")
         || (lower.contains("thor")
             && (lower.contains("coordinator")
+                || lower.contains("orchestrator")
                 || lower.contains("omni-agent")
                 || lower.contains("omni agent")))
 }
@@ -2178,6 +2194,11 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
 }
 
 fn remote_control_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("MJ_REMOTE_CONTROL_DIR")
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from(".config"))
         .join("mj")
@@ -3071,6 +3092,8 @@ fn rfc3339_before(age: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
     use agent_client_protocol::schema::v1::{
         PermissionOption, SessionInfoUpdate, Terminal, TerminalExitStatus, TerminalId, ToolCall,
         ToolCallContent, ToolCallUpdate, ToolCallUpdateFields,
@@ -3082,6 +3105,11 @@ mod tests {
 
     /// Build a `PermissionPrompt` and keep the original responder receiver
     /// so tests can assert what decision was forwarded to the runtime.
+    fn env_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
     fn permission_prompt(
         call_id: &str,
     ) -> (
@@ -3262,6 +3290,9 @@ mod tests {
             SessionInfoUpdate::new().title("Thor session"),
         ));
         state.observe_session_update(&SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().title("Thor Architect"),
+        ));
+        state.observe_session_update(&SessionUpdate::SessionInfoUpdate(
             SessionInfoUpdate::new().title("Mjolnir Thor Coordinator"),
         ));
 
@@ -3297,6 +3328,9 @@ mod tests {
         });
         state.observe_session_update(&SessionUpdate::SessionInfoUpdate(
             SessionInfoUpdate::new().title("Thor session"),
+        ));
+        state.observe_session_update(&SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().title("Thor Architect"),
         ));
         state.observe_session_update(&SessionUpdate::SessionInfoUpdate(
             SessionInfoUpdate::new().title("Thor omni-agent coordinator"),
@@ -4459,6 +4493,26 @@ mod tests {
             server_listen_config(Some("   ")).expect("config"),
             server_listen_config(None).expect("config")
         );
+    }
+
+    #[test]
+    fn remote_control_dir_honors_env_override() {
+        let _guard = env_lock().lock().expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let override_dir = dir.path().join("remote-state");
+        let original = std::env::var_os("MJ_REMOTE_CONTROL_DIR");
+        unsafe {
+            std::env::set_var("MJ_REMOTE_CONTROL_DIR", &override_dir);
+        }
+
+        assert_eq!(remote_control_dir(), override_dir);
+
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var("MJ_REMOTE_CONTROL_DIR", value),
+                None => std::env::remove_var("MJ_REMOTE_CONTROL_DIR"),
+            }
+        }
     }
 
     #[test]
