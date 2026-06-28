@@ -1046,6 +1046,7 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
                 apply_worker_session_update(
                     update,
                     prompt_sent,
+                    &job_label,
                     &mut collecting_turn_output,
                     &mut final_text,
                     &mut progress,
@@ -1140,9 +1141,11 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_worker_session_update(
     update: SessionUpdate,
     prompt_sent: bool,
+    job_label: &str,
     collecting_turn_output: &mut bool,
     final_text: &mut String,
     progress: &mut Vec<ProgressEvent>,
@@ -1171,7 +1174,11 @@ fn apply_worker_session_update(
             push_progress(
                 progress,
                 "tool_call",
-                format!("{} ({})", tool_call.title, tool_kind_label(tool_call.kind)),
+                format!(
+                    "{job_label}: {} ({})",
+                    tool_call.title,
+                    tool_kind_label(tool_call.kind)
+                ),
             );
             upsert_tool_call_summary(tool_calls, &tool_call);
             if prompt_sent {
@@ -1181,7 +1188,7 @@ fn apply_worker_session_update(
         SessionUpdate::ToolCallUpdate(update) => {
             upsert_tool_update_summary(tool_calls, &update);
             if let Some(title) = update.fields.title {
-                push_progress(progress, "tool_update", title);
+                push_progress(progress, "tool_update", format!("{job_label}: {title}"));
             }
             if prompt_sent {
                 *collecting_turn_output = true;
@@ -1766,6 +1773,7 @@ mod tests {
                 TextContent::new("worker answer".to_string()),
             ))),
             true,
+            "impl on worker-a",
             &mut collecting_turn_output,
             &mut final_text,
             &mut progress,
@@ -1780,6 +1788,29 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == "agent_message" && event.detail == "worker answer")
         );
+    }
+
+    #[test]
+    fn delegated_worker_tool_progress_includes_job_label() {
+        let mut collecting_turn_output = false;
+        let mut final_text = String::new();
+        let mut progress = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut context_usage = None;
+
+        apply_worker_session_update(
+            SessionUpdate::ToolCall(ToolCall::new("tool-1", "run checks").kind(ToolKind::Execute)),
+            true,
+            "review on worker-b",
+            &mut collecting_turn_output,
+            &mut final_text,
+            &mut progress,
+            &mut tool_calls,
+            &mut context_usage,
+        );
+
+        assert!(progress.iter().any(|event| event.kind == "tool_call"
+            && event.detail == "review on worker-b: run checks (execute)"));
     }
 
     #[test]
