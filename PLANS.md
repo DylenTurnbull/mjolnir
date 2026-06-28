@@ -136,7 +136,10 @@ titles locally and in the remote transcript, and strips those generic titles
 from session listings. The Thor host prompt now starts with an explicit
 `Task title:` line before any Thor persona instructions, so ACP hosts that
 auto-title from prompt text have a user-task title source instead of seeing the
-coordinator instructions first. `mj` no longer synthesizes a
+coordinator instructions first. `mj` also persists a local session-title
+override keyed by ACP session id after interactive and headless runs, then
+applies that override in `resume --list` and the in-app session picker. This
+covers ACP hosts that omit or mangle saved titles. `mj` no longer synthesizes a
 `SessionInfoUpdate` just to seed a Thor title, and the fullscreen header hides
 the redundant `Thor` agent label once a task title exists.
 
@@ -160,16 +163,22 @@ progress and elapsed heartbeats. A deterministic mock-host/mock-worker smoke has
 now proven newline-delimited MCP bridge calls, plan submission, delegated
 implementation/review/correction worker runs, mirrored worker progress, final
 recap text, and non-empty final `result.text` through the real configured Thor
-host path. A real configured Anvil-backed smoke has proven heartbeat emission
-and bounded timeout reporting, but it did not produce a Thor plan, worker
-progress, final recap, or usage before timing out. Headless `--print` supports
-`--print-timeout-seconds` so real-provider smoke runs fail cleanly instead of
-hanging indefinitely.
+host path. A real Codex-host/Anvil-worker smoke has now proven real-provider
+Thor MCP bridge use, worker validation, model catalog loading, structured plan
+submission, implementation and adversarial-review delegation, mirrored worker
+progress, elapsed heartbeats, final recap text, and usage reporting. The
+correction worker timed out, but that timeout was mirrored and recapped instead
+of freezing the transcript. A real configured Anvil-backed smoke has proven
+heartbeat emission and bounded timeout reporting, but it did not produce a Thor
+plan, worker progress, final recap, or usage before timing out. Headless
+`--print` supports `--print-timeout-seconds` so real-provider smoke runs fail
+cleanly instead of hanging indefinitely.
 
 Session listing also strips generic Thor/coordinator titles reported by ACP
-hosts and uses the locally known task title for the active session row, so the
-session picker no longer reinforces host-saved "Thor session" placeholders when
-the user opens `/load` during a task.
+hosts, applies persisted local task-title overrides by session id, and uses the
+locally known task title for the active session row, so the session picker no
+longer reinforces host-saved "Thor session" placeholders when the user opens
+`/load` during or after a task.
 
 Initial routing policy:
 
@@ -712,25 +721,32 @@ Still not production-grade:
    titles sticky, rejects broader Thor/coordinator host titles locally and in
    the remote/browser transcript and session lists, no longer emits a synthetic
    Thor title update at first prompt, adds a `Task title:` line before the Thor
-   persona in the host prompt, hides the redundant `Thor` header label once a
-   task title exists, records immediate local and remote planning status,
-   records a UI-state fallback heartbeat during active local turns, keeps the
-   remote-control heartbeat, mirrors Thor MCP worker progress, and exposes the
-   same progress stream through headless
+   persona in the host prompt, persists local task-title overrides for
+   interactive/headless sessions and applies them to future session listings,
+   hides the redundant `Thor` header label once a task title exists, records
+   immediate local and remote planning status, records a UI-state fallback
+   heartbeat during active local turns, keeps the remote-control heartbeat,
+   mirrors Thor MCP worker progress, and exposes the same progress stream
+   through headless
    `--print --output-format stream-json` for repeatable smoke capture.
    Deterministic tests cover those local/remote/headless/listing plumbing paths.
    A deterministic mock-host/mock-worker headless smoke now proves the real Thor
    MCP bridge can list workers, load a cached model catalog, accept a structured
    plan, run implementation/review/correction worker phases, mirror all three
    phases into stream `info` records, and return a non-empty final recap in
-   `result.text`. A bounded real-provider Anvil-backed headless smoke proves
-   heartbeat emission and structured timeout handling, but it timed out before
-   Thor produced a plan, worker progress, or recap. What remains is a
-   real-provider smoke where Thor runs long enough to delegate work, mirror
-   worker progress, show heartbeat entries in the same transcript or stream the
-   user is watching, keep the visible session title task-derived rather than
-   generic Thor text, and produce a final recap. This item is open until that
-   successful real-provider smoke is recorded.
+   `result.text`. A real-provider Codex-host/Anvil-worker headless smoke now
+   proves bridge use, worker validation, model catalog loading, plan
+   submission, implementation delegation, adversarial-review delegation,
+   mirrored worker progress, elapsed heartbeats, final recap, and usage
+   reporting in the watched stream; a follow-up title-persistence smoke proved
+   `resume --list` displays the locally persisted task title for a Codex host
+   session whose provider title would otherwise be absent. A bounded
+   real-provider Anvil-backed headless smoke proves heartbeat emission and
+   structured timeout handling, but it timed out before Thor produced a plan,
+   worker progress, or recap. What remains is real interactive and remote
+   browser validation of the same behavior, plus a real-provider correction
+   phase that completes instead of timing out. This item stays open until those
+   paths are recorded.
 2. **Registry-backed agent setup still needs broader upstream metadata coverage.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider
@@ -836,6 +852,58 @@ the smoke: headless/delegated output collection no longer drops immediate
 `agent_message_chunk` text, and headless drains final progress-file lines before
 emitting the final stream result. It does not replace the required successful
 real-provider long-turn smoke.
+
+### Thor real-provider Codex-host smoke — 2026-06-28
+
+Source: isolated Thor config with Codex ACP as the Thor host
+(`custom:codex alt`, `@agentclientprotocol/codex-acp 0.0.46`) and the
+configured Anvil/Codex workers available through `mj thor-mcp`. The run used
+the real installed providers and auth, not deterministic mocks. The task was
+read-only and bounded by `--print-timeout-seconds 240`.
+
+Launch:
+
+```text
+MJ_CONFIG=/tmp/mj-thor-codex-host-smoke/config.toml target/debug/mj --agent-stderr /tmp/mj-thor-codex-host-smoke.err --output-format stream-json --permission-mode acceptEdits --print-timeout-seconds 240 --print "Task title smoke: identify repo name. Do not modify files. Use Thor MCP tools. First call thor_list_acp_agents with refreshQuota=true and validate=true, then call thor_get_model_catalog. Submit a concise structured plan with exactly three jobs: implementation by custom:codex alt, review by anvil, correction by custom:codex alt. Reuse each job prompt exactly when calling thor_run_acp_agent. Set timeoutSeconds to 30 and permissionMode to reject for every worker run. Implementation prompt: identify the repository name from the current working directory path only and answer repo: <name-or-unknown>. Review prompt: adversarially check whether repo: mjolnir is consistent with the current working directory path only; avoid commands. Correction prompt: reconcile implementation and review; if no issue, answer no correction needed; repo: mjolnir. After all three phases, finish with a short recap including workers used, visible worker progress, and any usage reported."
+```
+
+Observed stream evidence:
+
+| Feature | Result |
+| --- | --- |
+| ACP host connection | `connected` stream record emitted for `@agentclientprotocol/codex-acp 0.0.46` |
+| session start | `session_started` stream record emitted with session `019f0bba-9bde-78f0-ab8b-5f33c9075776` |
+| worker inventory | host called `thor_list_acp_agents` with validation/quota refresh and reported Codex/Anvil usable |
+| model catalog | host called `thor_get_model_catalog` before planning |
+| plan and workflow | host submitted a three-job implementation/review/correction plan accepted by `thor_submit_plan` |
+| heartbeat | stream emitted elapsed `info` records through 120s |
+| implementation progress | stream emitted started, prompt-sent, and done records for `implementation-repo-name` on `custom:codex alt` |
+| review progress | stream emitted started, prompt-sent, and done records for `review-repo-name` on `anvil` |
+| correction progress | stream emitted started and prompt-sent records plus visible tool-attempt records for `correction-repo-name` on `custom:codex alt` |
+| correction outcome | delegated worker timed out after 30s; timeout was mirrored into stream `info` and included in the final recap |
+| final recap | final `result.text` contained a recap with workers used, visible worker progress, timeout note, and usage |
+| usage reporting | final recap reported 14,694 total tokens for implementation and 8,850 total tokens for review; final stream usage reported 62,734 total host tokens |
+
+Follow-up title persistence smoke:
+
+```text
+MJ_CONFIG=/tmp/mj-thor-codex-host-smoke/config.toml target/debug/mj --agent-stderr /tmp/mj-thor-title-store-smoke.err --output-format stream-json --permission-mode acceptEdits --print-timeout-seconds 20 --print "Title persistence smoke unique 1782608290. Answer with ok and do not modify files."
+MJ_CONFIG=/tmp/mj-thor-codex-host-smoke/config.toml target/debug/mj resume --list --format json
+```
+
+Observed result: the new Codex host session
+`019f0bc0-03b3-7ff3-8c42-9c99014fbb8c` listed with title
+`Title persistence smoke unique 1782608290. Answer with ok and do not modify file...`,
+proving the local session-title override is applied when listing sessions.
+
+Known gaps:
+
+- This proves the headless stream path, not the fullscreen TUI transcript or
+  browser remote transcript.
+- The correction phase timed out instead of completing normally, though the
+  timeout was visible and recapped.
+- Anvil-hosted Thor still needs a successful bridge-use smoke; the earlier
+  Anvil-hosted run only proved heartbeat and bounded timeout behavior.
 
 ### Thor headless runtime smoke — 2026-06-28
 

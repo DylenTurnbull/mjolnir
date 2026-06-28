@@ -19,6 +19,7 @@ mod registry;
 mod remote;
 mod self_update;
 mod session;
+mod session_titles;
 mod speech;
 mod spinner;
 mod spinner_picker;

@@ -218,7 +218,7 @@ pub fn worker_catalog(config: &Config) -> Vec<SelectedAgent> {
 }
 
 pub fn host_prompt(thor: &ThorConfig, user_prompt: &str) -> String {
-    let task_title = task_title_from_prompt(user_prompt);
+    let task_title = crate::session_titles::title_from_prompt(user_prompt).unwrap_or_default();
     format!(
         "\
 Task title: {task_title}
@@ -301,22 +301,6 @@ Policy:
         leaderboard = thor.leaderboard_url,
         pricing = thor.pricing_url,
     )
-}
-
-fn task_title_from_prompt(prompt: &str) -> String {
-    let sanitized = crate::notifications::sanitize_message(prompt);
-    let title = sanitized
-        .trim()
-        .trim_matches(|ch: char| ch == '"' || ch == '\'')
-        .to_string();
-    const MAX_TITLE_CHARS: usize = 80;
-    let mut chars = title.chars();
-    let truncated = chars.by_ref().take(MAX_TITLE_CHARS).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
-    }
 }
 
 fn optimization_label(mode: ThorOptimizationMode) -> &'static str {

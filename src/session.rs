@@ -28,8 +28,9 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use unicode_width::UnicodeWidthStr;
 
 use crate::acp;
-use crate::config::SelectedAgent;
+use crate::config::{self, SelectedAgent};
 use crate::palette::TerminalTheme;
+use crate::session_titles;
 use crate::version::mjolnir_version_label;
 
 /// One row in the session picker.
@@ -161,7 +162,10 @@ pub async fn list_sessions_with_capabilities(
 
     acp::kill_agent_tree(&mut child, agent_pid).await;
 
-    sessions
+    let mut listing = sessions?;
+    let title_path = session_titles::path_for_config(&config::default_config_path());
+    session_titles::apply_to_entries(&title_path, &mut listing.sessions);
+    Ok(listing)
 }
 
 /// Delete a session through the configured agent.
@@ -183,9 +187,16 @@ pub async fn delete_session(
     let agent_pid = child.id();
 
     let transport = ByteStreams::new(child_stdin.compat_write(), child_stdout.compat());
-    let result = delete_session_via_transport(transport, session_id).await;
+    let result = delete_session_via_transport(transport, session_id.clone()).await;
 
     acp::kill_agent_tree(&mut child, agent_pid).await;
+
+    if result.is_ok() {
+        let title_path = session_titles::path_for_config(&config::default_config_path());
+        if let Err(error) = session_titles::forget(&title_path, &session_id) {
+            tracing::warn!("forget session title {session_id}: {error:#}");
+        }
+    }
 
     result
 }

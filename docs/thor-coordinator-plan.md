@@ -38,13 +38,16 @@ changed and how much each harness/model used.
   phases. `mj` also titles local sessions from the submitted user task and
   keeps that task title sticky after submit. The host prompt starts with an
   explicit `Task title:` line before the Thor persona so provider auto-title
-  logic sees the user's task before the coordinator instructions. The local UI
-  state machine emits distinct elapsed heartbeat lines during long host turns,
-  and the remote/browser transcript receives its own heartbeat stream, so
-  neither path depends only on host text when the host has not produced output
-  yet. The remote-control server path also receives the Thor MCP worker
-  progress side channel, not only the local TUI path. This still needs
-  real-provider validation on long turns because live use reported generic
+  logic sees the user's task before the coordinator instructions. `mj` also
+  persists local task-title overrides keyed by ACP session id after
+  interactive and headless runs, then applies those overrides to session
+  listings for hosts that omit or mangle saved titles. The local UI state
+  machine emits distinct elapsed heartbeat lines during long host turns, and
+  the remote/browser transcript receives its own heartbeat stream, so neither
+  path depends only on host text when the host has not produced output yet. The
+  remote-control server path also receives the Thor MCP worker progress side
+  channel, not only the local TUI path. This still needs real interactive and
+  remote-provider validation on long turns because live use reported generic
   Thor session names and no visible transcript updates over a multi-minute
   turn.
 - `mj thor-mcp` mirrors visible worker lifecycle, tool, permission, completion,
@@ -151,15 +154,22 @@ changed and how much each harness/model used.
     remaining inferred setup labels with registry-provided exact commands/links
     where possible, manually smoke-test the setup UI across terminal sizes, and
     run a successful real long-turn Thor smoke covering sticky task-derived
-    titles, sanitized session-list titles, provider-saved title behavior after
-    the `Task title:` prompt change, local, remote, and headless-stream
-    heartbeats, worker progress mirroring, transcript freshness in the UI or
-    stream the user is watching, and final recap. A deterministic
+    titles, sanitized session-list titles, provider-saved/local-title behavior
+    after the `Task title:` prompt and title-store changes, local, remote, and
+    headless-stream heartbeats, worker progress mirroring, transcript freshness
+    in the UI or stream the user is watching, and final recap. A deterministic
     mock-host/mock-worker headless smoke proved the real Thor MCP bridge,
     structured plan submission, implementation/review/correction delegation,
     mirrored worker progress, and final recap/result text without token spend.
     A bounded Anvil-backed headless smoke proved heartbeat and timeout output
     but timed out before plan, delegation, worker progress, and recap.
+    A real-provider Codex-host/Anvil-worker headless smoke proved bridge use,
+    worker validation, model catalog loading, plan submission,
+    implementation/review delegation, mirrored worker progress, elapsed
+    heartbeat output, final recap, and usage reporting; its correction worker
+    timed out and was recapped as a timeout. A follow-up Codex-host title smoke
+    proved `resume --list` applies the local task-title override for a host
+    session with no provider title.
 
 ## Quota reads
 

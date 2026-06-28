@@ -362,6 +362,16 @@ pub async fn run(
     {
         tracing::warn!("save_history {path:?}: {e:#}");
     }
+    if let (Some(config_path), Some(session_id), Some(title)) = (
+        options.persistence.config_path,
+        session_id.as_deref(),
+        session_title.as_deref(),
+    ) {
+        let title_path = crate::session_titles::path_for_config(config_path);
+        if let Err(e) = crate::session_titles::remember_title(&title_path, session_id, title) {
+            tracing::warn!("remember session title {session_id}: {e:#}");
+        }
+    }
     Ok(UiRunResult {
         reason,
         session_id,

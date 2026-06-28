@@ -339,6 +339,15 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let _ = std::fs::remove_file(thor_progress_path);
     remote_tracker.shutdown().await;
 
+    if !resumed && let Some(session_id) = session_id.as_deref() {
+        let title_path = crate::session_titles::path_for_config(&config_path);
+        if let Err(error) =
+            crate::session_titles::remember_prompt_title(&title_path, session_id, &cfg.prompt)
+        {
+            tracing::warn!("remember headless session title {session_id}: {error:#}");
+        }
+    }
+
     let stop_reason_label = stop_reason.map(stop_reason_label).unwrap_or_else(|| {
         if terminal_error.is_some() {
             "error"
