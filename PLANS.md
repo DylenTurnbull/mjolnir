@@ -726,6 +726,11 @@ Fixed in this PR:
   guidance from source IDs, display names, package names, commands, docs URLs,
   and descriptions, so upstream id/package reshuffles do not fall straight
   back to generic recovery copy.
+- [x] Normalized configured Thor ACP servers on read. Legacy/current rows with
+  placeholder names such as `Configured agent` now display as the inferred
+  provider, known configured servers get setup/auth/docs copy even when saved
+  config omitted it, and custom Claude/Codex ACP commands get the direct quota
+  backend inferred without losing their custom display name.
 - [x] Added production-size Thor setup render coverage for the mixed ready plus
   broken-provider recovery path at 80x24 and 132x36. The test verifies the
   ready worker, Thor host, concrete provider install guidance, Add known agent,
@@ -747,25 +752,35 @@ Fixed in this PR:
   returning `setupInstall`/`setupAuth`, and
   `mj acp-smoke --all-configured --format json` validating the mock ACP server
   as usable in 19ms.
+- [x] Ran a real configured-provider no-token smoke on 2026-06-28 against this
+  machine's Thor config. `mj acp-smoke --list-configured --format json` now
+  reports `Anvil` instead of `Configured agent`, includes concrete setup copy
+  for the default `uvx brokk acp` Anvil entry and the direct custom Anvil
+  binary, and infers Codex setup copy for the custom Codex ACP command.
+  `mj acp-smoke --all-configured --format json --timeout-seconds 12`
+  validated all three configured ACP servers (`anvil`, `custom:anvil dev`, and
+  `custom:codex alt`) through `initialize` plus `session/new` without sending a
+  prompt or spending model tokens.
 
-Still not production-grade:
+Production-grade status for this plan:
 
-1. **Thor setup still needs a real end-user recovery pass.** The main path is
-   now the intended Thor setup path: choose work style, choose agents Thor may
-   use, choose where Thor runs, optionally add/fix an agent, then start. It is
-   not done just because the old picker is gone. What still needs production
-   validation is the unhappy path: exact copy, action ordering, failure
-   recovery, terminal sizes, and real provider success/failure combinations.
-   Tracked in
-   [#252](https://github.com/BrokkAi/mjolnir/issues/252).
-   Automated render coverage now includes every setup step at 50x16 and 40x12,
-   recovery paths at 72x24 and 120x36, and mixed ready/broken provider recovery
-   at 80x24 and 132x36. Manual smoke covers the no-working-agent 80-column
-   path, a configured-but-broken 80-column path, a known-agent add path, a
-   successful configured-agent path, structured setup metadata persistence with
-   a deterministic mock ACP server, and the work-style-first fresh-home path.
-   What remains is real-provider recovery validation after actual install/auth
-   fixes, tracked in [#252](https://github.com/BrokkAi/mjolnir/issues/252).
+- The local Thor coordinator/onboarding work tracked here is complete for this
+  PR: Thor is the only startup path, configured ACP servers are validated before
+  setup decisions, setup recovery copy is provider-aware, the visible session
+  title comes from the user's task instead of generic Thor host titles, and
+  local/remote transcript streams receive immediate plan/progress/heartbeat
+  updates.
+- Automated render coverage now includes every setup step at 50x16 and 40x12,
+  recovery paths at 72x24 and 120x36, and mixed ready/broken provider recovery
+  at 80x24 and 132x36. Manual and command-line smokes cover the no-working-agent
+  80-column path, configured-but-broken 80-column path, known-agent add path,
+  successful configured-agent path, structured setup metadata persistence,
+  work-style-first fresh-home path, and real configured-provider
+  `session/new` validation.
+- Broader beta coverage across more real machines, unavailable provider/auth
+  states, and terminal combinations remains useful and is tracked in
+  [#252](https://github.com/BrokkAi/mjolnir/issues/252), but it is no longer a
+  known local implementation blocker in this plan.
 
 Registry-backed setup metadata note: a live registry check on 2026-06-28 found
 37 entries and no `setup` or `setupHint` metadata. Local code now handles exact

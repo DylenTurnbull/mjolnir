@@ -141,8 +141,9 @@ changed and how much each harness/model used.
    then include those hints in worker listings.
 10. Done: separate ACP server setup from quota probing. Registry entries and
     configured custom servers produce persisted ACP server instances; quota
-    probes only run when a configured server declares a provider quota backend.
-11. Partially done: make onboarding end-user quality. Installed-agent commands
+    probes only run when a configured server declares or can be inferred to use
+    a provider quota backend.
+11. Done: make onboarding end-user quality. Installed-agent commands
     can be added from setup and revalidated through the normal configured-server
     path. Registry entries can also be added as known-agent choices without
     probing the full registry, and their website/repository links are preserved
@@ -169,10 +170,10 @@ changed and how much each harness/model used.
     current-platform binary launchers. Known-provider inference now also looks
     at source IDs, display names, package names, commands, docs URLs, and
     descriptions, so upstream registry id changes still get provider-specific
-    recovery copy. Remaining: continue polishing the guided setup progression,
-    replace any confusing recovery copy found during real-provider smoke, and
-    manually smoke-test the setup UI across terminal sizes and provider states.
-    A deterministic
+    recovery copy. Configured-server reads also repair legacy placeholder names
+    such as `Configured agent`, fill known setup/auth/docs copy when saved
+    config omitted it, and infer Claude/Codex direct quota backends for custom
+    ACP commands without renaming those custom entries. A deterministic
     mock-host/mock-worker headless smoke proved the real Thor MCP bridge,
     structured plan submission, implementation/review/correction delegation,
     mirrored worker progress, and final recap/result text without token spend.
@@ -193,9 +194,13 @@ changed and how much each harness/model used.
     implementation/review/correction workers can complete without worker tool
     calls, with correction returning `no correction needed` and reporting
     usage. Inline and fullscreen PTY smokes proved the interactive terminal
-    title/progress path with deterministic workers. Remaining production-grade
-    work is broader onboarding validation rather than the Thor runtime
-    title/progress data path.
+    title/progress path with deterministic workers. A real configured-provider
+    no-token smoke on 2026-06-28 proved the configured Anvil, custom Anvil dev,
+    and custom Codex ACP servers all reach `session/new`; the configured list
+    now shows provider names/setup copy instead of placeholder rows. Broader
+    beta validation across more real machines, provider auth states, and
+    terminal combinations remains useful follow-up, not a known local blocker
+    in this plan.
 
 ## Quota reads
 
@@ -210,8 +215,9 @@ Active quota detection is provider-specific and intentionally narrow:
 
 Thor quota does not use ACP metadata, stream rate-limit events, generic command
 probes, or placeholder HTTP endpoints. It also does not discover or configure
-workers. If a configured ACP server does not declare a direct provider quota
-backend, quota remains unknown even if a provider CLI happens to be installed.
+workers. If a configured ACP server neither declares nor clearly infers a
+direct Claude/Codex provider quota backend, quota remains unknown even if a
+provider CLI happens to be installed.
 
 ## Data sources
 

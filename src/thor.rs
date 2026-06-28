@@ -136,7 +136,13 @@ pub fn available_worker_catalog(config: &Config) -> Vec<SelectedAgent> {
 
 pub fn configured_acp_servers(config: &Config) -> Vec<ConfiguredAcpServer> {
     if !config.thor.configured_acp_servers.is_empty() {
-        return config.thor.configured_acp_servers.clone();
+        return config
+            .thor
+            .configured_acp_servers
+            .iter()
+            .cloned()
+            .map(apply_known_server_defaults)
+            .collect();
     }
     let mut agents = Vec::new();
     if let Some(agent) = config.agent.clone() {
@@ -170,6 +176,9 @@ pub fn configured_acp_servers(config: &Config) -> Vec<ConfiguredAcpServer> {
         agents.push(default_anvil_server());
     }
     agents
+        .into_iter()
+        .map(apply_known_server_defaults)
+        .collect()
 }
 
 fn configured_from_selected(
@@ -191,6 +200,242 @@ fn configured_from_selected(
         setup_url: String::new(),
         quota_backend,
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum KnownServerProvider {
+    Anvil,
+    Claude,
+    Codex,
+    Gemini,
+    OpenCode,
+    Goose,
+    Cursor,
+    GitHubCopilot,
+}
+
+fn apply_known_server_defaults(mut server: ConfiguredAcpServer) -> ConfiguredAcpServer {
+    let Some(provider) = known_server_provider(&server) else {
+        return server;
+    };
+    let defaults = known_server_defaults(provider);
+    let setup_hint = known_server_setup_hint(provider, &server, defaults.setup_hint);
+    let setup_install = known_server_setup_install(provider, &server, defaults.setup_install);
+    let description = known_server_description(provider, &server, defaults.description);
+    if server_name_is_placeholder(&server) {
+        server.name = defaults.name.to_string();
+    }
+    if server.description.trim().is_empty() {
+        server.description = description.to_string();
+    }
+    if server.setup_hint.trim().is_empty() {
+        server.setup_hint = setup_hint.to_string();
+    }
+    if server.setup_install.trim().is_empty() {
+        server.setup_install = setup_install.to_string();
+    }
+    if server.setup_auth.trim().is_empty() {
+        server.setup_auth = defaults.setup_auth.to_string();
+    }
+    if server.setup_url.trim().is_empty() {
+        server.setup_url = defaults.setup_url.to_string();
+    }
+    if server.quota_backend == ThorQuotaBackend::None {
+        server.quota_backend = defaults.quota_backend;
+    }
+    server
+}
+
+fn known_server_description<'a>(
+    provider: KnownServerProvider,
+    server: &ConfiguredAcpServer,
+    default: &'a str,
+) -> &'a str {
+    if provider == KnownServerProvider::Anvil && !anvil_server_uses_uvx_brokk(server) {
+        "Anvil ACP server"
+    } else {
+        default
+    }
+}
+
+fn known_server_setup_hint<'a>(
+    provider: KnownServerProvider,
+    server: &ConfiguredAcpServer,
+    default: &'a str,
+) -> &'a str {
+    if provider == KnownServerProvider::Anvil && !anvil_server_uses_uvx_brokk(server) {
+        "install Anvil; Brokk/Anvil signs in when required"
+    } else {
+        default
+    }
+}
+
+fn known_server_setup_install<'a>(
+    provider: KnownServerProvider,
+    server: &ConfiguredAcpServer,
+    default: &'a str,
+) -> &'a str {
+    if provider == KnownServerProvider::Anvil && !anvil_server_uses_uvx_brokk(server) {
+        "install Anvil"
+    } else {
+        default
+    }
+}
+
+fn anvil_server_uses_uvx_brokk(server: &ConfiguredAcpServer) -> bool {
+    let program = server
+        .program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    program == "uvx" && server.args.iter().any(|arg| arg == "brokk")
+}
+
+fn server_name_is_placeholder(server: &ConfiguredAcpServer) -> bool {
+    let name = server.name.trim();
+    name.is_empty() || name == "Configured agent" || name == server.source_id
+}
+
+struct KnownServerDefaults {
+    name: &'static str,
+    description: &'static str,
+    setup_hint: &'static str,
+    setup_install: &'static str,
+    setup_auth: &'static str,
+    setup_url: &'static str,
+    quota_backend: ThorQuotaBackend,
+}
+
+fn known_server_defaults(provider: KnownServerProvider) -> KnownServerDefaults {
+    match provider {
+        KnownServerProvider::Anvil => KnownServerDefaults {
+            name: "Anvil",
+            description: "Brokk ACP server via uvx",
+            setup_hint: "install uv; Brokk/Anvil signs in when required",
+            setup_install: "install uv",
+            setup_auth: "Brokk/Anvil signs in when required",
+            setup_url: "https://github.com/BrokkAi/brokk",
+            quota_backend: ThorQuotaBackend::None,
+        },
+        KnownServerProvider::Claude => KnownServerDefaults {
+            name: "Claude Code",
+            description: "Claude Code ACP server",
+            setup_hint: "install Node.js/npm; install and sign in to Claude Code",
+            setup_install: "install Node.js/npm",
+            setup_auth: "install and sign in to Claude Code",
+            setup_url: "https://docs.anthropic.com/en/docs/claude-code",
+            quota_backend: ThorQuotaBackend::ClaudeCli,
+        },
+        KnownServerProvider::Codex => KnownServerDefaults {
+            name: "Codex",
+            description: "Codex ACP server",
+            setup_hint: "install Node.js/npm; sign in to Codex",
+            setup_install: "install Node.js/npm",
+            setup_auth: "sign in to Codex",
+            setup_url: "https://developers.openai.com/codex",
+            quota_backend: ThorQuotaBackend::CodexAppserver,
+        },
+        KnownServerProvider::Gemini => KnownServerDefaults {
+            name: "Gemini",
+            description: "Gemini CLI ACP server",
+            setup_hint: "install Node.js/npm; sign in with Gemini CLI",
+            setup_install: "install Node.js/npm",
+            setup_auth: "sign in with Gemini CLI",
+            setup_url: "https://github.com/google-gemini/gemini-cli",
+            quota_backend: ThorQuotaBackend::None,
+        },
+        KnownServerProvider::OpenCode => KnownServerDefaults {
+            name: "OpenCode",
+            description: "OpenCode ACP server",
+            setup_hint: "install OpenCode CLI; configure OpenCode provider credentials",
+            setup_install: "install OpenCode CLI",
+            setup_auth: "configure OpenCode provider credentials",
+            setup_url: "https://opencode.ai",
+            quota_backend: ThorQuotaBackend::None,
+        },
+        KnownServerProvider::Goose => KnownServerDefaults {
+            name: "Goose",
+            description: "Goose ACP server",
+            setup_hint: "install Goose; configure a Goose provider",
+            setup_install: "install Goose",
+            setup_auth: "configure a Goose provider",
+            setup_url: "https://block.github.io/goose",
+            quota_backend: ThorQuotaBackend::None,
+        },
+        KnownServerProvider::Cursor => KnownServerDefaults {
+            name: "Cursor Agent",
+            description: "Cursor Agent ACP server",
+            setup_hint: "install Cursor Agent; sign in to Cursor",
+            setup_install: "install Cursor Agent",
+            setup_auth: "sign in to Cursor",
+            setup_url: "https://cursor.com",
+            quota_backend: ThorQuotaBackend::None,
+        },
+        KnownServerProvider::GitHubCopilot => KnownServerDefaults {
+            name: "GitHub Copilot",
+            description: "GitHub Copilot ACP server",
+            setup_hint: "install Node.js/npm; sign in to GitHub Copilot",
+            setup_install: "install Node.js/npm",
+            setup_auth: "sign in to GitHub Copilot",
+            setup_url: "https://github.com/features/copilot",
+            quota_backend: ThorQuotaBackend::None,
+        },
+    }
+}
+
+fn known_server_provider(server: &ConfiguredAcpServer) -> Option<KnownServerProvider> {
+    let mut parts = vec![
+        server.source_id.as_str(),
+        server.name.as_str(),
+        server.description.as_str(),
+        server.setup_url.as_str(),
+    ];
+    if let Some(program) = server.program.to_str() {
+        parts.push(program);
+    }
+    parts.extend(server.args.iter().map(String::as_str));
+    known_server_provider_from_parts(parts)
+}
+
+fn known_server_provider_from_parts<'a>(
+    parts: impl IntoIterator<Item = &'a str>,
+) -> Option<KnownServerProvider> {
+    let haystack = parts
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if haystack.is_empty() {
+        return None;
+    }
+    if haystack.contains("github-copilot") || haystack.contains("copilot-cli") {
+        return Some(KnownServerProvider::GitHubCopilot);
+    }
+    if haystack.contains("claude") {
+        return Some(KnownServerProvider::Claude);
+    }
+    if haystack.contains("codex") {
+        return Some(KnownServerProvider::Codex);
+    }
+    if haystack.contains("gemini") {
+        return Some(KnownServerProvider::Gemini);
+    }
+    if haystack.contains("opencode") || haystack.contains("open-code") {
+        return Some(KnownServerProvider::OpenCode);
+    }
+    if haystack.contains("goose") {
+        return Some(KnownServerProvider::Goose);
+    }
+    if haystack.contains("cursor") {
+        return Some(KnownServerProvider::Cursor);
+    }
+    if haystack.contains("anvil") || haystack.contains("brokk") {
+        return Some(KnownServerProvider::Anvil);
+    }
+    None
 }
 
 pub fn worker_catalog(config: &Config) -> Vec<SelectedAgent> {
@@ -400,6 +645,106 @@ mod tests {
 
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].source_id, "claude-acp");
+    }
+
+    #[test]
+    fn configured_acp_servers_repair_known_provider_placeholders() {
+        let config = Config {
+            thor: ThorConfig {
+                configured_acp_servers: vec![ConfiguredAcpServer {
+                    source_id: "anvil".to_string(),
+                    name: "Configured agent".to_string(),
+                    program: PathBuf::from("uvx"),
+                    args: vec!["brokk".to_string(), "acp".to_string()],
+                    env: HashMap::new(),
+                    description: String::new(),
+                    setup_hint: String::new(),
+                    setup_install: String::new(),
+                    setup_auth: String::new(),
+                    setup_url: String::new(),
+                    quota_backend: ThorQuotaBackend::None,
+                }],
+                ..ThorConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let servers = configured_acp_servers(&config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "Anvil");
+        assert_eq!(servers[0].setup_install, "install uv");
+        assert_eq!(servers[0].setup_auth, "Brokk/Anvil signs in when required");
+        assert_eq!(servers[0].setup_url, "https://github.com/BrokkAi/brokk");
+    }
+
+    #[test]
+    fn configured_acp_servers_infer_quota_backend_without_renaming_custom_agent() {
+        let config = Config {
+            thor: ThorConfig {
+                configured_acp_servers: vec![ConfiguredAcpServer {
+                    source_id: "custom:codex alt".to_string(),
+                    name: "codex alt".to_string(),
+                    program: PathBuf::from("npx"),
+                    args: vec![
+                        "npm".to_string(),
+                        "run".to_string(),
+                        "start".to_string(),
+                        "--prefix".to_string(),
+                        "/Users/example/code/acp-upstream/codex-acp".to_string(),
+                    ],
+                    env: HashMap::new(),
+                    description: String::new(),
+                    setup_hint: String::new(),
+                    setup_install: String::new(),
+                    setup_auth: String::new(),
+                    setup_url: String::new(),
+                    quota_backend: ThorQuotaBackend::None,
+                }],
+                ..ThorConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let servers = configured_acp_servers(&config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "codex alt");
+        assert_eq!(servers[0].quota_backend, ThorQuotaBackend::CodexAppserver);
+        assert_eq!(servers[0].setup_auth, "sign in to Codex");
+    }
+
+    #[test]
+    fn configured_acp_servers_use_command_specific_anvil_setup_copy() {
+        let config = Config {
+            thor: ThorConfig {
+                configured_acp_servers: vec![ConfiguredAcpServer {
+                    source_id: "custom:anvil dev".to_string(),
+                    name: "anvil dev".to_string(),
+                    program: PathBuf::from("/Users/example/.cargo/bin/anvil"),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    description: String::new(),
+                    setup_hint: String::new(),
+                    setup_install: String::new(),
+                    setup_auth: String::new(),
+                    setup_url: String::new(),
+                    quota_backend: ThorQuotaBackend::None,
+                }],
+                ..ThorConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let servers = configured_acp_servers(&config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "anvil dev");
+        assert_eq!(servers[0].setup_install, "install Anvil");
+        assert_eq!(
+            servers[0].setup_hint,
+            "install Anvil; Brokk/Anvil signs in when required"
+        );
     }
 
     #[test]
