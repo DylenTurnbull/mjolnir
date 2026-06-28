@@ -982,6 +982,7 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
         fs_max_text_bytes: acp::DEFAULT_FS_TEXT_BYTES,
     };
     let runtime = tokio::spawn(acp::run(runtime_cfg, event_tx, cmd_rx));
+    let job_label = format!("{} on {}", args.job_id, source_id);
 
     let mut final_text = String::new();
     let mut collecting_turn_output = false;
@@ -1005,14 +1006,14 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
                     push_progress(
                         &mut progress,
                         "worker_closed",
-                        "worker event channel closed",
+                        format!("{job_label}: worker event channel closed"),
                     );
                 }
                 break;
             }
             Err(_) => {
                 let message = format!(
-                    "delegated worker timed out after {}s",
+                    "{job_label}: delegated worker timed out after {}s",
                     worker_timeout.as_secs()
                 );
                 stop_reason_text = Some("timeout".to_string());
@@ -1024,55 +1025,33 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
         match event {
             UiEvent::SessionStarted { .. } if !prompt_sent => {
                 prompt_sent = true;
-                push_progress(&mut progress, "session_started", "worker session ready");
+                push_progress(
+                    &mut progress,
+                    "session_started",
+                    format!("{job_label}: worker session ready"),
+                );
                 cmd_tx
                     .send(UiCommand::SendPrompt {
                         text: args.prompt.clone(),
                         images: Vec::new(),
                     })
                     .context("send delegated prompt")?;
-                push_progress(&mut progress, "prompt_sent", "delegated prompt sent");
-            }
-            UiEvent::SessionUpdate(SessionUpdate::UserMessageChunk(_)) if prompt_sent => {
-                collecting_turn_output = true;
-            }
-            UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(chunk)) if prompt_sent => {
-                collecting_turn_output = true;
                 push_progress(
                     &mut progress,
-                    "agent_thought",
-                    preview(&content_block_text(&chunk.content), 160),
+                    "prompt_sent",
+                    format!("{job_label}: delegated prompt sent"),
                 );
             }
-            UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(chunk))
-                if collecting_turn_output =>
-            {
-                let text = content_block_text(&chunk.content);
-                final_text.push_str(&text);
-                push_progress(&mut progress, "agent_message", preview(&text, 160));
-            }
-            UiEvent::SessionUpdate(SessionUpdate::ToolCall(tool_call)) => {
-                push_progress(
+            UiEvent::SessionUpdate(update) => {
+                apply_worker_session_update(
+                    update,
+                    prompt_sent,
+                    &mut collecting_turn_output,
+                    &mut final_text,
                     &mut progress,
-                    "tool_call",
-                    format!("{} ({})", tool_call.title, tool_kind_label(tool_call.kind)),
+                    &mut tool_calls,
+                    &mut context_usage,
                 );
-                upsert_tool_call_summary(&mut tool_calls, &tool_call);
-                if prompt_sent {
-                    collecting_turn_output = true;
-                }
-            }
-            UiEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(update)) => {
-                upsert_tool_update_summary(&mut tool_calls, &update);
-                if let Some(title) = update.fields.title {
-                    push_progress(&mut progress, "tool_update", title);
-                }
-                if prompt_sent {
-                    collecting_turn_output = true;
-                }
-            }
-            UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(update)) => {
-                context_usage = Some(context_usage_summary(update));
             }
             UiEvent::PermissionRequest(prompt) => {
                 let decision =
@@ -1090,7 +1069,7 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
                     &mut progress,
                     "permission",
                     format!(
-                        "{} {}",
+                        "{job_label}: {} {}",
                         prompt.tool_call.tool_call_id,
                         if decision.is_some() {
                             "accepted"
@@ -1113,13 +1092,14 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
                 push_progress(
                     &mut progress,
                     "prompt_done",
-                    stop_reason_label(reason).to_string(),
+                    format!("{job_label}: {}", stop_reason_label(reason)),
                 );
                 break;
             }
             UiEvent::PromptFailed { message }
             | UiEvent::SessionForkFailed { message }
             | UiEvent::Fatal(message) => {
+                let message = format!("{job_label}: {message}");
                 push_progress(&mut progress, "error", message.clone());
                 error = Some(message);
                 break;
@@ -1132,7 +1112,6 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::Warning(_)
             | UiEvent::Info(_) => {}
-            UiEvent::SessionUpdate(_) => {}
         }
     }
 
@@ -1159,6 +1138,60 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
         permissions,
         error,
     })
+}
+
+fn apply_worker_session_update(
+    update: SessionUpdate,
+    prompt_sent: bool,
+    collecting_turn_output: &mut bool,
+    final_text: &mut String,
+    progress: &mut Vec<ProgressEvent>,
+    tool_calls: &mut Vec<ToolSummary>,
+    context_usage: &mut Option<ContextUsageSummary>,
+) {
+    match update {
+        SessionUpdate::UserMessageChunk(_) if prompt_sent => {
+            *collecting_turn_output = true;
+        }
+        SessionUpdate::AgentThoughtChunk(chunk) if prompt_sent => {
+            *collecting_turn_output = true;
+            push_progress(
+                progress,
+                "agent_thought",
+                preview(&content_block_text(&chunk.content), 160),
+            );
+        }
+        SessionUpdate::AgentMessageChunk(chunk) if prompt_sent => {
+            *collecting_turn_output = true;
+            let text = content_block_text(&chunk.content);
+            final_text.push_str(&text);
+            push_progress(progress, "agent_message", preview(&text, 160));
+        }
+        SessionUpdate::ToolCall(tool_call) => {
+            push_progress(
+                progress,
+                "tool_call",
+                format!("{} ({})", tool_call.title, tool_kind_label(tool_call.kind)),
+            );
+            upsert_tool_call_summary(tool_calls, &tool_call);
+            if prompt_sent {
+                *collecting_turn_output = true;
+            }
+        }
+        SessionUpdate::ToolCallUpdate(update) => {
+            upsert_tool_update_summary(tool_calls, &update);
+            if let Some(title) = update.fields.title {
+                push_progress(progress, "tool_update", title);
+            }
+            if prompt_sent {
+                *collecting_turn_output = true;
+            }
+        }
+        SessionUpdate::UsageUpdate(update) => {
+            *context_usage = Some(context_usage_summary(update));
+        }
+        _ => {}
+    }
 }
 
 impl From<RunAgentJob> for RunAgentArgs {
@@ -1425,6 +1458,7 @@ fn write_message(writer: &mut impl Write, body: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
 
     #[test]
     fn stdio_mcp_server_uses_current_binary_entrypoint_shape() {
@@ -1716,6 +1750,35 @@ mod tests {
         assert_eq!(
             worker_timeout(Some(MAX_WORKER_TIMEOUT_SECONDS + 1)),
             Duration::from_secs(MAX_WORKER_TIMEOUT_SECONDS)
+        );
+    }
+
+    #[test]
+    fn delegated_worker_collects_agent_text_after_prompt_without_user_echo() {
+        let mut collecting_turn_output = false;
+        let mut final_text = String::new();
+        let mut progress = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut context_usage = None;
+
+        apply_worker_session_update(
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new("worker answer".to_string()),
+            ))),
+            true,
+            &mut collecting_turn_output,
+            &mut final_text,
+            &mut progress,
+            &mut tool_calls,
+            &mut context_usage,
+        );
+
+        assert_eq!(final_text, "worker answer");
+        assert!(collecting_turn_output);
+        assert!(
+            progress
+                .iter()
+                .any(|event| event.kind == "agent_message" && event.detail == "worker answer")
         );
     }
 

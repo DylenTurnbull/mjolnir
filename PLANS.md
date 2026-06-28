@@ -155,11 +155,15 @@ smoke proves the transcript the user is watching updates correctly.
 
 The headless `--print --output-format stream-json` path runs the same Thor MCP
 bridge with a progress side channel and emits `info` stream records for worker
-progress and elapsed heartbeats. A real configured Anvil-backed smoke has
-proven heartbeat emission and bounded timeout reporting, but it did not produce
-a Thor plan, worker progress, final recap, or usage before timing out.
-Headless `--print` supports `--print-timeout-seconds` so real-provider smoke
-runs fail cleanly instead of hanging indefinitely.
+progress and elapsed heartbeats. A deterministic mock-host/mock-worker smoke has
+now proven newline-delimited MCP bridge calls, plan submission, delegated
+implementation/review/correction worker runs, mirrored worker progress, final
+recap text, and non-empty final `result.text` through the real configured Thor
+host path. A real configured Anvil-backed smoke has proven heartbeat emission
+and bounded timeout reporting, but it did not produce a Thor plan, worker
+progress, final recap, or usage before timing out. Headless `--print` supports
+`--print-timeout-seconds` so real-provider smoke runs fail cleanly instead of
+hanging indefinitely.
 
 Session listing also strips generic Thor/coordinator titles reported by ACP
 hosts and uses the locally known task title for the active session row, so the
@@ -637,6 +641,15 @@ Fixed in this PR:
 - [x] Added regression coverage for distinct Thor heartbeat messages so long
   host turns do not lose progress lines to transcript dedupe; inactive periods
   reset the elapsed timer before the next turn.
+- [x] Fixed headless and Thor delegated-worker text collection so an ACP agent
+  that streams `agent_message_chunk` immediately after a prompt, without first
+  echoing a user chunk or tool event, still contributes to the final answer.
+- [x] Added a final headless progress-file drain before emitting the final
+  stream `result`, so worker progress written just before `PromptDone` is not
+  lost when the progress polling task is stopped.
+- [x] Made visible delegated-worker progress include the planned job id and
+  worker source, so implementation/review/correction phases no longer collapse
+  into duplicate-looking `worker session ready` / `end_turn` messages.
 - [x] Removed the remaining registry/custom-command/ACP jargon from the main
   first-run setup screen. The visible path now says `known agent` for registry
   choices and `installed agent` for pasted commands, while implementation terms
@@ -704,14 +717,18 @@ Still not production-grade:
    same progress stream through headless
    `--print --output-format stream-json` for repeatable smoke capture.
    Deterministic tests cover those local/remote/headless/listing plumbing paths.
-   A bounded real-provider Anvil-backed headless smoke proves heartbeat
-   emission and structured timeout handling, but it timed out before Thor
-   produced a plan, worker progress, or recap. What remains is a real-provider
-   smoke where Thor runs long enough to delegate work, mirror worker progress,
-   show heartbeat entries in the same transcript or stream the user is watching,
-   keep the visible session title task-derived rather than generic Thor text,
-   and produce a final recap. This item is open until that successful smoke is
-   recorded.
+   A deterministic mock-host/mock-worker headless smoke now proves the real Thor
+   MCP bridge can list workers, load a cached model catalog, accept a structured
+   plan, run implementation/review/correction worker phases, mirror all three
+   phases into stream `info` records, and return a non-empty final recap in
+   `result.text`. A bounded real-provider Anvil-backed headless smoke proves
+   heartbeat emission and structured timeout handling, but it timed out before
+   Thor produced a plan, worker progress, or recap. What remains is a
+   real-provider smoke where Thor runs long enough to delegate work, mirror
+   worker progress, show heartbeat entries in the same transcript or stream the
+   user is watching, keep the visible session title task-derived rather than
+   generic Thor text, and produce a final recap. This item is open until that
+   successful real-provider smoke is recorded.
 2. **Registry-backed agent setup still needs broader upstream metadata coverage.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider
@@ -779,6 +796,41 @@ only when token spend is acceptable or when testing a deterministic mock ACP
 agent. Use the top-level `--agent-stderr <path>` before `acp-smoke` when a
 server exits before initialize and the JSON result needs subprocess stderr for
 diagnosis.
+
+### Thor deterministic MCP delegation smoke — 2026-06-28
+
+Source: isolated configured Thor host path with two local deterministic ACP
+scripts: `/tmp/mj-thor-mcp-host.py` as the Thor host and
+`/tmp/mj-thor-mcp-worker.py` as the configured worker. The host mock reads the
+`mcpServers` entry passed through ACP `session/new`, starts `mj thor-mcp`, calls
+Thor MCP tools over newline-delimited JSON, submits a structured plan, delegates
+implementation/review/correction prompts, and returns a final recap. The worker
+mock returns deterministic text without model or network use.
+
+Launch:
+
+```text
+HOME=/tmp/mj-thor-mcp-smoke XDG_CONFIG_HOME=/tmp/mj-thor-mcp-smoke/config XDG_CACHE_HOME=/tmp/mj-thor-mcp-smoke/cache target/debug/mj --output-format stream-json --permission-mode acceptEdits --print-timeout-seconds 20 --print "deterministic Thor MCP delegation smoke"
+```
+
+Observed stream evidence:
+
+| Feature | Result |
+| --- | --- |
+| ACP host connection | `connected` stream record emitted for `Mock Thor Host 1.0.0` |
+| session start | `session_started` stream record emitted with session `mock-thor-host-session` |
+| MCP bridge framing | host mock successfully called `tools/list` and Thor tools over newline-delimited JSON |
+| model catalog | loaded from an isolated seeded cache, avoiding network/model spend |
+| plan and workflow | host submitted an implementation/review/correction plan accepted by `thor_submit_plan` |
+| worker progress | stream emitted distinct `info` records for `impl`, `review`, and `correction` jobs: started, prompt sent, and done |
+| final recap | `agent_message` and final `result.text` contained `Thor deterministic recap` plus implementation/review/correction worker text |
+| usage reporting | not expected; deterministic mocks do not emit usage |
+
+This proves the no-token Thor bridge/runtime path and fixed two bugs found by
+the smoke: headless/delegated output collection no longer drops immediate
+`agent_message_chunk` text, and headless drains final progress-file lines before
+emitting the final stream result. It does not replace the required successful
+real-provider long-turn smoke.
 
 ### Thor headless runtime smoke — 2026-06-28
 

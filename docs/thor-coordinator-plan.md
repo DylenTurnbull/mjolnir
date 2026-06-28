@@ -150,9 +150,12 @@ changed and how much each harness/model used.
     run a successful real long-turn Thor smoke covering sticky task-derived
     titles, sanitized session-list titles, local, remote, and headless-stream
     heartbeats, worker progress mirroring, transcript freshness in the UI or
-    stream the user is watching, and final recap. A bounded Anvil-backed
-    headless smoke proved heartbeat and timeout output but timed out before
-    plan, delegation, worker progress, and recap.
+    stream the user is watching, and final recap. A deterministic
+    mock-host/mock-worker headless smoke proved the real Thor MCP bridge,
+    structured plan submission, implementation/review/correction delegation,
+    mirrored worker progress, and final recap/result text without token spend.
+    A bounded Anvil-backed headless smoke proved heartbeat and timeout output
+    but timed out before plan, delegation, worker progress, and recap.
 
 ## Quota reads
 

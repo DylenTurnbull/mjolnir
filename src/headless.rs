@@ -4,7 +4,7 @@
 //! small event collector. Thor-enabled runs default to the Anvil ACP backend
 //! when `~/.config/mj/config.toml` has no configured backend yet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -200,6 +200,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let mut terminal_error = None;
     let mut prompt_sent = false;
     let mut collecting_turn_output = false;
+    let mut seen_progress_messages = HashSet::new();
 
     while let Some(event) = event_rx.recv().await {
         let event = remote_tracker.intercept_event(event);
@@ -302,7 +303,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     eprintln!("warning: {message}");
                 }
             }
-            UiEvent::Info(_) => {}
+            UiEvent::Info(message) => {
+                seen_progress_messages.insert(message);
+            }
             UiEvent::CancelPendingPermissions => {}
             // Headless runs never receive remote decisions (no UI event
             // channel is registered with the tracker).
@@ -330,6 +333,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     }
     let _ = progress_proxy.await;
     let _ = progress_heartbeat.await;
+    if matches!(cfg.output_format, OutputFormat::StreamJson) {
+        drain_thor_progress_stream(&thor_progress_path, &mut seen_progress_messages)?;
+    }
     let _ = std::fs::remove_file(thor_progress_path);
     remote_tracker.shutdown().await;
 
@@ -416,6 +422,23 @@ async fn poll_thor_progress(path: PathBuf, event_tx: mpsc::UnboundedSender<UiEve
     }
 }
 
+fn drain_thor_progress_stream(path: &std::path::Path, seen: &mut HashSet<String>) -> Result<()> {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    for message in unseen_thor_progress_messages(&body, seen) {
+        emit_json(&StreamRecord::Info { message: &message })?;
+    }
+    Ok(())
+}
+
+fn unseen_thor_progress_messages(body: &str, seen: &mut HashSet<String>) -> Vec<String> {
+    body.lines()
+        .filter_map(thor_progress_message)
+        .filter(|message| seen.insert(message.clone()))
+        .collect()
+}
+
 async fn thor_activity_heartbeat(
     active: Arc<AtomicBool>,
     event_tx: mpsc::UnboundedSender<UiEvent>,
@@ -485,7 +508,8 @@ fn apply_session_update(
         SessionUpdate::AgentThoughtChunk(_) if prompt_sent => {
             *collecting_turn_output = true;
         }
-        SessionUpdate::AgentMessageChunk(chunk) if *collecting_turn_output => {
+        SessionUpdate::AgentMessageChunk(chunk) if prompt_sent => {
+            *collecting_turn_output = true;
             state
                 .final_text
                 .push_str(&content_block_text(&chunk.content));
@@ -633,7 +657,9 @@ fn tool_status_label(status: ToolCallStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::ToolCallUpdateFields;
+    use agent_client_protocol::schema::v1::{
+        ContentBlock, ContentChunk, TextContent, ToolCallUpdateFields,
+    };
 
     fn permission_options() -> Vec<agent_client_protocol::schema::v1::PermissionOption> {
         vec![
@@ -693,5 +719,40 @@ mod tests {
         );
         assert_eq!(thor_heartbeat_tick(false, &mut elapsed, 15), None);
         assert_eq!(elapsed, 0);
+    }
+
+    #[test]
+    fn headless_collects_agent_text_after_prompt_without_user_echo() {
+        let mut state = HeadlessState::default();
+        let mut collecting_turn_output = false;
+
+        apply_session_update(
+            &mut state,
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new("final answer".to_string()),
+            ))),
+            true,
+            &mut collecting_turn_output,
+        );
+
+        assert_eq!(state.final_text, "final answer");
+        assert!(collecting_turn_output);
+    }
+
+    #[test]
+    fn final_progress_drain_skips_seen_messages_and_keeps_new_tail() {
+        let mut seen = HashSet::from(["Thor worker done: first".to_string()]);
+        let body = r#"
+{"kind":"prompt_done","detail":"first"}
+{"kind":"prompt_sent","detail":"tail"}
+not json
+"#;
+
+        assert_eq!(
+            unseen_thor_progress_messages(body, &mut seen),
+            vec!["Thor worker prompt sent: tail".to_string()]
+        );
+        assert!(seen.contains("Thor worker done: first"));
+        assert!(seen.contains("Thor worker prompt sent: tail"));
     }
 }
