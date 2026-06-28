@@ -51,10 +51,12 @@ changed and how much each harness/model used.
   until the user scrolls or filters, so opening the reader during a turn should
   not hide new heartbeat or worker-progress lines below the viewport. The
   remote-control server path also receives the Thor MCP worker progress side
-  channel, not only the local TUI path. This still needs real interactive and
-  remote-provider validation on long turns because live use reported generic
-  Thor session names and no visible transcript updates over a multi-minute
-  turn.
+  channel, not only the local TUI path. A remote-control browser API smoke now
+  proves task-derived naming, immediate plan status, heartbeat updates, Thor
+  MCP calls, worker lifecycle/progress, visible timeout reporting, and final
+  recap in the remote transcript. Fullscreen/inline TUI rendering still needs
+  real interactive validation because live use reported generic Thor session
+  names and no visible transcript updates over a multi-minute turn.
 - `mj thor-mcp` mirrors visible worker lifecycle, tool, permission, completion,
   timeout, and error events through an out-of-band progress stream consumed by
   the interactive UI and remote tracker, so the transcript continues to update
@@ -176,7 +178,12 @@ changed and how much each harness/model used.
     heartbeat output, final recap, and usage reporting; its correction worker
     timed out and was recapped as a timeout. A follow-up Codex-host title smoke
     proved `resume --list` applies the local task-title override for a host
-    session with no provider title.
+    session with no provider title. A remote-control browser API smoke proved
+    task-derived naming, immediate plan status, heartbeat updates through 150s,
+    Thor MCP calls, implementation/review worker progress, correction worker
+    timeout progress, final recap, and usage reporting in the watched remote
+    transcript. Real fullscreen/inline TUI validation and a real-provider
+    correction phase that completes normally remain open.
 
 ## Quota reads
 

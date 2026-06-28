@@ -749,10 +749,13 @@ Still not production-grade:
    session whose provider title would otherwise be absent. A bounded
    real-provider Anvil-backed headless smoke proves heartbeat emission and
    structured timeout handling, but it timed out before Thor produced a plan,
-   worker progress, or recap. What remains is real interactive and remote
-   browser validation of the same behavior, plus a real-provider correction
-   phase that completes instead of timing out. This item stays open until those
-   paths are recorded.
+   worker progress, or recap. A real remote-control browser API smoke now
+   proves the watched remote transcript path receives task-derived naming,
+   immediate plan status, heartbeat updates, Thor MCP tool calls, worker
+   lifecycle/progress, visible timeout reporting, final recap, and usage
+   reporting. What remains is real fullscreen/inline interactive validation of
+   the same behavior, plus a real-provider correction phase that completes
+   instead of timing out. This item stays open until those paths are recorded.
 2. **Registry-backed agent setup still needs broader upstream metadata coverage.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider
@@ -902,12 +905,51 @@ Observed result: the new Codex host session
 `Title persistence smoke unique 1782608290. Answer with ok and do not modify file...`,
 proving the local session-title override is applied when listing sessions.
 
+### Thor remote-control browser API smoke — 2026-06-28
+
+Source: same isolated Thor config as the Codex-host smoke, launched through the
+remote-control server with isolated state via `MJ_REMOTE_CONTROL_DIR`. This
+exercises the browser/API transcript path the user watches, not the headless
+stream output. The queued task was read-only and used unique title
+`Remote Thor progress validation unique 1782620100`.
+
+Launch:
+
+```text
+MJ_CONFIG=/tmp/mj-thor-codex-host-smoke/config.toml MJ_REMOTE_CONTROL_DIR=/tmp/mj-remote-control-smoke-2 target/debug/mj server --history-days 0
+```
+
+Prompt was queued through `POST /api/queued-prompts` for session
+`019f0bd4-1bd0-7ac0-b134-f5aa39245a5b`, then evidence was collected from
+`GET /live/sessions`.
+
+Observed remote transcript evidence:
+
+| Feature | Result |
+| --- | --- |
+| task-derived session name | remote session name changed from raw id to `Remote Thor progress validation unique 1782620100...` |
+| immediate planning status | transcript showed `Thor is preparing a plan...` immediately after the user prompt |
+| heartbeat | transcript showed elapsed heartbeats at 15s, 30s, 45s, 60s, 75s, 90s, 105s, 120s, 135s, and 150s |
+| Thor MCP tools | transcript showed `thor_list_acp_agents`, `thor_get_model_catalog`, `thor_submit_plan`, and `thor_run_acp_agents` tool calls |
+| plan gate | host submitted a plan; the bridge rejected an all-at-once run and Thor continued one phase at a time through the required gate |
+| implementation worker | `custom:codex alt` worker emitted started, prompt-sent, and done progress; host reported `repo: mjolnir` and 14,639 total tokens |
+| adversarial review worker | `anvil` worker emitted started, prompt-sent, and done progress; host reported the repo name was plausible and 8,506 total tokens |
+| correction worker | `anvil` worker emitted started, prompt-sent, tool-attempt progress, and timeout after 45s |
+| final recap | host recapped implementation, review, correction timeout, usage, and the phase-gated rerun path in the remote transcript |
+
+This proves the remote/browser watched transcript path no longer stays blank
+during a long Thor turn and that the task-derived title appears there. It does
+not prove fullscreen/inline TUI rendering with a human watching the terminal,
+and it does not close the real-provider correction-completion gap because the
+correction worker timed out.
+
 Known gaps:
 
-- This proves the headless stream path, not the fullscreen TUI transcript or
-  browser remote transcript.
-- The correction phase timed out instead of completing normally, though the
-  timeout was visible and recapped.
+- The Codex-host smoke proves the headless stream path, and the remote-control
+  API smoke proves the browser/remote transcript path. Fullscreen/inline TUI
+  rendering with a human watching the terminal still needs real validation.
+- The correction phase timed out instead of completing normally in both real
+  provider smokes, though the timeout was visible and recapped.
 - Anvil-hosted Thor still needs a successful bridge-use smoke; the earlier
   Anvil-hosted run only proved heartbeat and bounded timeout behavior.
 
