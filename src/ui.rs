@@ -4039,7 +4039,7 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         Span::raw("   "),
     ];
     let agent_label = state.agent_label.trim();
-    if !agent_label.is_empty() {
+    if should_show_header_agent_label(agent_label, state.session_title.as_deref()) {
         spans.push(Span::styled(
             agent_label.to_string(),
             Style::default().fg(state.theme.primary),
@@ -4099,6 +4099,19 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     }
     let p = Paragraph::new(Line::from(spans));
     f.render_widget(p, inner);
+}
+
+fn should_show_header_agent_label(agent_label: &str, session_title: Option<&str>) -> bool {
+    if agent_label.is_empty() {
+        return false;
+    }
+    let Some(title) = session_title else {
+        return true;
+    };
+    if title.trim().is_empty() {
+        return true;
+    }
+    agent_label != "Thor"
 }
 
 fn compact_middle_display(text: &str, max_width: usize) -> String {
@@ -6561,6 +6574,43 @@ mod tests {
             rendered.contains("Review payment flow"),
             "rendered:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn header_hides_redundant_thor_label_when_task_title_exists() {
+        let mut state = AppState::new();
+        state.agent_label = "Thor".to_string();
+        state.project_label = "~/code/mjolnir".to_string();
+        state.session_title = Some("Fix blank runtime progress".to_string());
+        let backend = TestBackend::new(100, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_header(frame, frame.area(), &state))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(!rendered.contains("Thor"), "rendered:\n{rendered}");
+        assert!(
+            rendered.contains("Fix blank runtime progress"),
+            "rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn header_keeps_thor_label_before_task_title_exists() {
+        let mut state = AppState::new();
+        state.agent_label = "Thor".to_string();
+        state.project_label = "~/code/mjolnir".to_string();
+        let backend = TestBackend::new(100, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_header(frame, frame.area(), &state))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Thor"), "rendered:\n{rendered}");
     }
 
     #[test]

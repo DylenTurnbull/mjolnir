@@ -136,20 +136,22 @@ that task-derived title sticky after the prompt is submitted, and both local
 and remote transcript paths reject generic Thor/coordinator host titles instead
 of accepting them as placeholders. `mj` no longer synthesizes a
 `SessionInfoUpdate` just to seed a Thor title; title state should come from the
-actual user prompt or from non-generic provider metadata. Prompt submission now
-records an immediate `Thor is preparing a plan...` status in the local
-transcript, and the remote tracker records the same status when it observes the
-command. The UI state machine can append distinct elapsed heartbeat lines
-during long host turns, and `mj` consumes the Thor MCP bridge's out-of-band
-worker progress stream so delegated ACP tool/permission/completion events can
-appear while the host waits for worker calls. The remote-control server path
-receives the same Thor MCP progress side channel and heartbeat stream as the
-local TUI path, so browser transcripts are not left dependent on host text
-alone. This is still not production-proven: live use on 2026-06-28 still
-reported generic Thor session naming and no visible transcript updates during a
-multi-minute turn, so the title/progress fixes remain open until a real
-interactive or remote long-turn smoke proves the transcript the user is
-watching updates correctly.
+actual user prompt or from non-generic provider metadata. The fullscreen header
+also hides the redundant `Thor` agent label once a task-derived title exists, so
+the only title-like text after submission is the task title instead of a
+coordinator placeholder. Prompt submission now records an immediate `Thor is
+preparing a plan...` status in the local transcript, and the remote tracker
+records the same status when it observes the command. The UI state machine can
+append distinct elapsed heartbeat lines during long host turns, and `mj`
+consumes the Thor MCP bridge's out-of-band worker progress stream so delegated
+ACP tool/permission/completion events can appear while the host waits for
+worker calls. The remote-control server path receives the same Thor MCP
+progress side channel and heartbeat stream as the local TUI path, so browser
+transcripts are not left dependent on host text alone. This is still not
+production-proven: live use on 2026-06-28 still reported generic Thor session
+naming and no visible transcript updates during a multi-minute turn, so the
+title/progress fixes remain open until a real interactive or remote long-turn
+smoke proves the transcript the user is watching updates correctly.
 
 The headless `--print --output-format stream-json` path runs the same Thor MCP
 bridge with a progress side channel and emits `info` stream records for worker
@@ -600,6 +602,9 @@ Fixed in this PR:
 - [x] Removed the synthetic first-turn `SessionInfoUpdate` that was used only
   to seed a Thor title. The runtime now relies on the real submitted prompt for
   local/remote task naming and ignores generic Thor host titles.
+- [x] Hid the redundant `Thor` header agent label after a task title exists, so
+  users do not see a title-like Thor placeholder competing with the actual
+  session title in the main header.
 - [x] Added an immediate user-visible Thor planning status when a task is
   submitted or a queued task drains. The local transcript and remote tracker
   both record `Thor is preparing a plan...` before the host model has to stream
@@ -672,6 +677,18 @@ Fixed in this PR:
   Codex, Gemini, OpenCode, Goose, Cursor, and GitHub Copilot rows, and made
   Gemini generic exits/timeouts resolve to Gemini sign-in guidance instead of
   generic `agent exited` / `timeout` copy.
+- [x] Manually smoke-tested the structured setup metadata path at 80x24 with a
+  deterministic mock ACP command under `/tmp/mj-mock-acp.py` and isolated macOS
+  home `/tmp/mj-thor-structured-smoke`. The setup flow showed `1 ready, 1 need
+  setup`, listed `Mock ACP / ready` as both an available worker and Thor host,
+  showed the broken Anvil row with install/setup recovery text, confirmed
+  `Start Thor`, saved `onboarding_complete = true`, selected
+  `custom:Mock ACP`, preserved `setup_install = "install Python 3"` and
+  `setup_auth = "no sign-in required"`, then handed off to the theme picker.
+  Follow-up checks showed `mj acp-smoke --list-configured --format json`
+  returning `setupInstall`/`setupAuth`, and
+  `mj acp-smoke --all-configured --format json` validating the mock ACP server
+  as usable in 19ms.
 
 Still not production-grade:
 
@@ -680,10 +697,11 @@ Still not production-grade:
    that appeared frozen for several minutes. Current code keeps user-task
    titles sticky, rejects broader Thor/coordinator host titles locally and in
    the remote/browser transcript and session lists, no longer emits a synthetic
-   Thor title update at first prompt, records immediate local and remote
-   planning status, records a UI-state fallback heartbeat during active local
-   turns, keeps the remote-control heartbeat, mirrors Thor MCP worker progress,
-   and exposes the same progress stream through headless
+   Thor title update at first prompt, hides the redundant `Thor` header label
+   once a task title exists, records immediate local and remote planning status,
+   records a UI-state fallback heartbeat during active local turns, keeps the
+   remote-control heartbeat, mirrors Thor MCP worker progress, and exposes the
+   same progress stream through headless
    `--print --output-format stream-json` for repeatable smoke capture.
    Deterministic tests cover those local/remote/headless/listing plumbing paths.
    A bounded real-provider Anvil-backed headless smoke proves heartbeat
@@ -691,6 +709,7 @@ Still not production-grade:
    produced a plan, worker progress, or recap. What remains is a real-provider
    smoke where Thor runs long enough to delegate work, mirror worker progress,
    show heartbeat entries in the same transcript or stream the user is watching,
+   keep the visible session title task-derived rather than generic Thor text,
    and produce a final recap. This item is open until that successful smoke is
    recorded.
 2. **Registry-backed agent setup still needs broader upstream metadata coverage.**
@@ -715,9 +734,10 @@ Still not production-grade:
 4. **The setup UI has only been manually smoked for a few terminal scenarios.**
    Unit tests cover state transitions, list windowing, small/large recovery
    rendering, and every setup step at 50x16 and 40x12; manual smoke now covers
-   the no-working-agent 80-column path and a configured-but-broken 80-column
-   path, a known-agent add path, and a successful configured-agent path, plus
-   the work-style-first fresh-home path. Broader real-terminal smoke is still
+   the no-working-agent 80-column path, a configured-but-broken 80-column path,
+   a known-agent add path, a successful configured-agent path, structured
+   setup metadata persistence with a deterministic mock ACP server, and the
+   work-style-first fresh-home path. Broader real-terminal smoke is still
    useful before calling onboarding
    production-grade. Tracked in
    [#252](https://github.com/BrokkAi/mjolnir/issues/252).
