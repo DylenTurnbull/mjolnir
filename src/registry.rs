@@ -117,6 +117,8 @@ impl Agent {
                     env: package.env.clone(),
                     description: self.description.clone(),
                     setup_hint: self.setup_hint(),
+                    setup_install: self.setup_install(),
+                    setup_auth: self.setup_auth(),
                     setup_url: self.setup_url(),
                     quota_backend: quota_backend_for_registry_id(&self.id),
                 })
@@ -133,6 +135,8 @@ impl Agent {
                     env: package.env.clone(),
                     description: self.description.clone(),
                     setup_hint: self.setup_hint(),
+                    setup_install: self.setup_install(),
+                    setup_auth: self.setup_auth(),
                     setup_url: self.setup_url(),
                     quota_backend: quota_backend_for_registry_id(&self.id),
                 })
@@ -147,6 +151,8 @@ impl Agent {
                     env: HashMap::new(),
                     description: self.description.clone(),
                     setup_hint: self.setup_hint(),
+                    setup_install: self.setup_install(),
+                    setup_auth: self.setup_auth(),
                     setup_url: self.setup_url(),
                     quota_backend: quota_backend_for_registry_id(&self.id),
                 })
@@ -186,17 +192,60 @@ impl Agent {
         self.distribution_setup_hint()
     }
 
+    fn setup_install(&self) -> String {
+        if !self.setup.install.trim().is_empty() {
+            return self.setup.install.clone();
+        }
+        if let Some((install, _auth)) = known_provider_setup_parts(&self.id) {
+            return install.to_string();
+        }
+        self.distribution_install_hint()
+    }
+
+    fn setup_auth(&self) -> String {
+        if !self.setup.auth.trim().is_empty() {
+            return self.setup.auth.clone();
+        }
+        if let Some((_install, auth)) = known_provider_setup_parts(&self.id) {
+            return auth.to_string();
+        }
+        self.distribution_auth_hint()
+    }
+
     fn distribution_setup_hint(&self) -> String {
+        [
+            self.distribution_install_hint(),
+            self.distribution_auth_hint(),
+        ]
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+    }
+
+    fn distribution_install_hint(&self) -> String {
         let name = self.name.trim();
         let name = if name.is_empty() { "this agent" } else { name };
         if self.distribution.npx.is_some() {
-            return format!("install Node.js/npm; configure or sign in to {name} if prompted");
+            return "install Node.js/npm".to_string();
         }
         if self.distribution.uvx.is_some() {
-            return format!("install uv; configure or sign in to {name} if prompted");
+            return "install uv".to_string();
         }
         if self.binary_target_for_current_platform().is_some() {
-            return format!("install {name}; configure or sign in if prompted");
+            return format!("install {name}");
+        }
+        String::new()
+    }
+
+    fn distribution_auth_hint(&self) -> String {
+        let name = self.name.trim();
+        let name = if name.is_empty() { "this agent" } else { name };
+        if self.distribution.npx.is_some() || self.distribution.uvx.is_some() {
+            return format!("configure or sign in to {name} if prompted");
+        }
+        if self.binary_target_for_current_platform().is_some() {
+            return "configure or sign in if prompted".to_string();
         }
         String::new()
     }
@@ -208,6 +257,8 @@ impl Agent {
 }
 
 fn known_provider_setup_hint(id: &str) -> Option<&'static str> {
+    let _ = known_provider_setup_parts(id)?;
+    // Keep the legacy combined hint stable for existing UI and configs.
     match id {
         "anvil" => Some("install uv; Brokk/Anvil signs in when required"),
         "claude-acp" => Some("install Node.js/npm; install and sign in to Claude Code"),
@@ -217,6 +268,23 @@ fn known_provider_setup_hint(id: &str) -> Option<&'static str> {
         "goose" => Some("install Goose; configure a Goose provider"),
         "cursor" => Some("install Cursor Agent; sign in to Cursor"),
         "github-copilot-cli" => Some("install Node.js/npm; sign in to GitHub Copilot"),
+        _ => None,
+    }
+}
+
+fn known_provider_setup_parts(id: &str) -> Option<(&'static str, &'static str)> {
+    match id {
+        "anvil" => Some(("install uv", "Brokk/Anvil signs in when required")),
+        "claude-acp" => Some(("install Node.js/npm", "install and sign in to Claude Code")),
+        "codex-acp" => Some(("install Node.js/npm", "sign in to Codex")),
+        "gemini" => Some(("install Node.js/npm", "sign in with Gemini CLI")),
+        "opencode" => Some((
+            "install OpenCode CLI",
+            "configure OpenCode provider credentials",
+        )),
+        "goose" => Some(("install Goose", "configure a Goose provider")),
+        "cursor" => Some(("install Cursor Agent", "sign in to Cursor")),
+        "github-copilot-cli" => Some(("install Node.js/npm", "sign in to GitHub Copilot")),
         _ => None,
     }
 }
@@ -466,6 +534,8 @@ mod tests {
             claude.setup_hint,
             "install Node.js/npm; install and sign in to Claude Code"
         );
+        assert_eq!(claude.setup_install, "install Node.js/npm");
+        assert_eq!(claude.setup_auth, "install and sign in to Claude Code");
 
         let codex = servers
             .iter()
@@ -473,6 +543,8 @@ mod tests {
             .expect("codex");
         assert_eq!(codex.quota_backend, ThorQuotaBackend::CodexAppserver);
         assert_eq!(codex.setup_hint, "install Node.js/npm; sign in to Codex");
+        assert_eq!(codex.setup_install, "install Node.js/npm");
+        assert_eq!(codex.setup_auth, "sign in to Codex");
 
         let gemini = servers
             .iter()
@@ -482,6 +554,8 @@ mod tests {
             gemini.setup_hint,
             "install Node.js/npm; sign in with Gemini CLI"
         );
+        assert_eq!(gemini.setup_install, "install Node.js/npm");
+        assert_eq!(gemini.setup_auth, "sign in with Gemini CLI");
         assert_eq!(gemini.setup_url, "https://geminicli.com");
 
         let generic_npx = servers
@@ -491,6 +565,11 @@ mod tests {
         assert_eq!(
             generic_npx.setup_hint,
             "install Node.js/npm; configure or sign in to Generic NPM Agent if prompted"
+        );
+        assert_eq!(generic_npx.setup_install, "install Node.js/npm");
+        assert_eq!(
+            generic_npx.setup_auth,
+            "configure or sign in to Generic NPM Agent if prompted"
         );
 
         let generic = servers
@@ -502,6 +581,8 @@ mod tests {
         assert_eq!(generic.quota_backend, ThorQuotaBackend::None);
         assert_eq!(generic.setup_url, "https://example.com/generic/setup");
         assert_eq!(generic.setup_hint, "install Generic CLI; run generic login");
+        assert_eq!(generic.setup_install, "install Generic CLI");
+        assert_eq!(generic.setup_auth, "run generic login");
 
         let binary = servers
             .iter()
@@ -518,6 +599,8 @@ mod tests {
             binary.setup_hint,
             "install Binary; configure or sign in if prompted"
         );
+        assert_eq!(binary.setup_install, "install Binary");
+        assert_eq!(binary.setup_auth, "configure or sign in if prompted");
     }
 
     #[test]
@@ -550,6 +633,8 @@ mod tests {
             server.setup_hint,
             "install exact Gemini package; run exact Gemini login"
         );
+        assert_eq!(server.setup_install, "install exact Gemini package");
+        assert_eq!(server.setup_auth, "run exact Gemini login");
         assert_eq!(server.setup_url, "https://example.com/exact-gemini");
     }
 

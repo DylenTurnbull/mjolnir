@@ -651,6 +651,14 @@ Fixed in this PR:
   agents. Registry entries can now carry setup hints and setup-doc URLs into
   persisted Thor server config, and onboarding prefers those exact hints over
   local inferred provider profiles when present.
+- [x] Split registry-backed setup metadata into structured install and auth
+  labels (`setup_install` / `setup_auth`) while keeping the legacy combined
+  `setup_hint`. Exact registry `setup.install`, `setup.auth`, and
+  `setup.docsUrl` now persist into Thor server config, `mj acp-smoke
+  --list-configured` JSON, known-agent setup summaries, and validation
+  recovery labels. Known-provider and distribution fallbacks also populate the
+  structured fields so recovery rows no longer have to parse a combined hint to
+  decide whether the user needs install or auth/setup work.
 - [x] Persisted known-provider setup fallback hints from registry resolution
   when upstream registry entries omit exact setup metadata. Claude, Codex,
   Gemini, OpenCode, Goose, Cursor, GitHub Copilot, and Anvil now carry install
@@ -685,32 +693,26 @@ Still not production-grade:
    show heartbeat entries in the same transcript or stream the user is watching,
    and produce a final recap. This item is open until that successful smoke is
    recorded.
-2. **Registry-backed agent setup still needs richer install/configure metadata.**
+2. **Registry-backed agent setup still needs broader upstream metadata coverage.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider
-   setup profiles, distribution-based fallback hints, and exact setup metadata
-   fields are shown when available. Known-provider and package-manager fallback
-   hints are now persisted into saved Thor server config when upstream registry
-   entries omit setup metadata, but the registry itself still does not expose
-   exact auth/install steps for every agent. Tracked in
+   setup profiles, distribution-based fallback hints, exact setup metadata
+   fields, and structured install/auth labels are shown when available.
+   Known-provider and package-manager fallback labels are now persisted into
+   saved Thor server config when upstream registry entries omit setup metadata,
+   and validation recovery rows prefer exact structured install/auth text over
+   hardcoded generic copy. What remains is broader upstream registry coverage
+   for agents outside the known-provider and distribution fallback set. Tracked
+   in
    [#250](https://github.com/BrokkAi/mjolnir/issues/250).
-3. **Validation feedback is still partly inferred, not registry-metadata-driven.**
-   Rows now offer provider-specific actions for Anvil, Claude, Codex, Gemini,
-   OpenCode, Goose, Cursor, GitHub Copilot, `npx`, and `uvx`, but production UX
-   should use registry/auth metadata for exact commands and links when
-   available. Inferred known-provider and distribution-based setup hints now
-   carry into persisted configured servers and generic validation failures, and
-   exact registry setup hints are preferred when present, but broad upstream
-   metadata coverage is still the target. Tracked in
-   [#250](https://github.com/BrokkAi/mjolnir/issues/250).
-4. **Thor setup still needs a real end-user recovery pass.** The main path is
+3. **Thor setup still needs a real end-user recovery pass.** The main path is
    now the intended Thor setup path: choose work style, choose agents Thor may
    use, choose where Thor runs, optionally add/fix an agent, then start. What
    still needs production validation is the unhappy path: exact copy, action
    ordering, failure recovery, terminal sizes, and real provider
    success/failure combinations. Tracked in
    [#252](https://github.com/BrokkAi/mjolnir/issues/252).
-5. **The setup UI has only been manually smoked for a few terminal scenarios.**
+4. **The setup UI has only been manually smoked for a few terminal scenarios.**
    Unit tests cover state transitions, list windowing, small/large recovery
    rendering, and every setup step at 50x16 and 40x12; manual smoke now covers
    the no-working-agent 80-column path and a configured-but-broken 80-column

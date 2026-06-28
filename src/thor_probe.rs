@@ -893,6 +893,8 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":nul
             env: HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]),
             description: String::new(),
             setup_hint: String::new(),
+            setup_install: String::new(),
+            setup_auth: String::new(),
             setup_url: String::new(),
             quota_backend: ThorQuotaBackend::CodexAppserver,
         };
@@ -918,6 +920,8 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","limitName":nul
             env: HashMap::new(),
             description: String::new(),
             setup_hint: String::new(),
+            setup_install: String::new(),
+            setup_auth: String::new(),
             setup_url: String::new(),
             quota_backend: ThorQuotaBackend::None,
         };

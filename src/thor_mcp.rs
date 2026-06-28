@@ -1539,6 +1539,8 @@ mod tests {
             env: Default::default(),
             description: String::new(),
             setup_hint: String::new(),
+            setup_install: String::new(),
+            setup_auth: String::new(),
             setup_url: String::new(),
             quota_backend: config::ThorQuotaBackend::None,
         }

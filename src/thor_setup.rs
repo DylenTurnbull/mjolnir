@@ -24,6 +24,8 @@ pub struct ThorSetupAgent {
     pub name: String,
     pub description: String,
     pub setup_hint: String,
+    pub setup_install: String,
+    pub setup_auth: String,
     pub setup_url: String,
     pub quota_backend: ThorQuotaBackend,
     pub validation: Option<AgentValidation>,
@@ -37,6 +39,8 @@ pub struct ThorSetupRegistryAgent {
     pub setup_url: String,
     pub command: String,
     pub setup_hint: String,
+    pub setup_install: String,
+    pub setup_auth: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +137,8 @@ impl ThorSetupState {
                 name: "Anvil".to_string(),
                 description: "Brokk agent via uv".to_string(),
                 setup_hint: "install uv; Brokk/Anvil signs in when required".to_string(),
+                setup_install: "install uv".to_string(),
+                setup_auth: "Brokk/Anvil signs in when required".to_string(),
                 setup_url: "https://github.com/BrokkAi/brokk".to_string(),
                 quota_backend: ThorQuotaBackend::None,
                 validation: None,
@@ -1037,15 +1043,21 @@ fn registry_summary_lines(state: &ThorSetupState, theme: TerminalTheme) -> Vec<L
             theme,
         )];
     };
-    let setup = if registry_agent.setup_hint.trim().is_empty() {
-        "open provider docs if setup is required".to_string()
+    let install = if registry_agent.setup_install.trim().is_empty() {
+        "open provider docs if install is required".to_string()
     } else {
-        registry_agent.setup_hint.clone()
+        registry_agent.setup_install.clone()
+    };
+    let auth = if registry_agent.setup_auth.trim().is_empty() {
+        "configure or sign in if prompted".to_string()
+    } else {
+        registry_agent.setup_auth.clone()
     };
     vec![
         detail_line("Will add", registry_agent.name.clone(), theme),
         detail_line("Runs", truncate_label(&registry_agent.command, 72), theme),
-        detail_line("Setup", truncate_label(&setup, 72), theme),
+        detail_line("Install", truncate_label(&install, 72), theme),
+        detail_line("Setup", truncate_label(&auth, 72), theme),
         detail_line(
             "Next",
             "Press Enter to add it, then mj checks it".to_string(),
@@ -1304,6 +1316,9 @@ fn with_setup_url(detail: String, setup_agent: &ThorSetupAgent) -> String {
 }
 
 fn install_action_label(setup_agent: &ThorSetupAgent) -> String {
+    if !setup_agent.setup_install.trim().is_empty() {
+        return truncate_label(&setup_agent.setup_install, 32);
+    }
     match setup_agent.agent.source_id.as_str() {
         "anvil" => "install uv".to_string(),
         "claude-acp" => "install Node.js and Claude Code".to_string(),
@@ -1322,6 +1337,9 @@ fn install_action_label(setup_agent: &ThorSetupAgent) -> String {
 }
 
 fn install_detail_label(setup_agent: &ThorSetupAgent) -> String {
+    if !setup_agent.setup_install.trim().is_empty() {
+        return format!("{}; retry", truncate_label(&setup_agent.setup_install, 56));
+    }
     match setup_agent.agent.source_id.as_str() {
         "anvil" => "Install uv; `uvx brokk acp`".to_string(),
         "claude-acp" => {
@@ -1347,6 +1365,9 @@ fn install_detail_label(setup_agent: &ThorSetupAgent) -> String {
 }
 
 fn auth_action_label(setup_agent: &ThorSetupAgent) -> String {
+    if !setup_agent.setup_auth.trim().is_empty() {
+        return truncate_label(&setup_agent.setup_auth, 32);
+    }
     match setup_agent.agent.source_id.as_str() {
         "claude-acp" => "sign in with Claude Code".to_string(),
         "codex-acp" => "sign in with Codex".to_string(),
@@ -1360,6 +1381,9 @@ fn auth_action_label(setup_agent: &ThorSetupAgent) -> String {
 }
 
 fn auth_detail_label(setup_agent: &ThorSetupAgent) -> String {
+    if !setup_agent.setup_auth.trim().is_empty() {
+        return format!("{}; retry", truncate_label(&setup_agent.setup_auth, 56));
+    }
     match setup_agent.agent.source_id.as_str() {
         "claude-acp" => "Run Claude Code sign-in, then retry Thor setup".to_string(),
         "codex-acp" => "Run Codex sign-in, then retry Thor setup".to_string(),
@@ -1463,6 +1487,8 @@ mod tests {
                 name: String::new(),
                 description: String::new(),
                 setup_hint: String::new(),
+                setup_install: String::new(),
+                setup_auth: String::new(),
                 setup_url: String::new(),
                 quota_backend: ThorQuotaBackend::None,
                 validation: None,
@@ -1480,6 +1506,8 @@ mod tests {
             name: source_id.to_string(),
             description: String::new(),
             setup_hint: String::new(),
+            setup_install: String::new(),
+            setup_auth: String::new(),
             setup_url: String::new(),
             quota_backend: ThorQuotaBackend::None,
             validation: Some(AgentValidation {
@@ -1510,6 +1538,8 @@ mod tests {
             setup_url: format!("https://example.com/{source_id}"),
             command: format!("npx -y {source_id}"),
             setup_hint: "requires Node.js/npm".to_string(),
+            setup_install: "install Node.js/npm".to_string(),
+            setup_auth: format!("sign in to {source_id} if prompted"),
         }
     }
 
@@ -1695,7 +1725,8 @@ mod tests {
 
         assert!(rendered.contains("Will add: gemini"));
         assert!(rendered.contains("Runs: npx -y gemini"));
-        assert!(rendered.contains("Setup: requires Node.js/npm"));
+        assert!(rendered.contains("Install: install Node.js/npm"));
+        assert!(rendered.contains("Setup: sign in to gemini if prompted"));
         assert!(rendered.contains("Next: Press Enter to add it, then mj checks it"));
     }
 

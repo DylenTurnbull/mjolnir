@@ -606,6 +606,8 @@ struct AcpSmokeConfiguredServer {
     name: String,
     command: String,
     setup_hint: String,
+    setup_install: String,
+    setup_auth: String,
     setup_url: String,
 }
 
@@ -639,6 +641,8 @@ fn configured_acp_smoke_server_records() -> Result<Vec<AcpSmokeConfiguredServer>
             name: server.name.clone(),
             command: selected_agent_command_label(&server.selected_agent()),
             setup_hint: server.setup_hint.clone(),
+            setup_install: server.setup_install.clone(),
+            setup_auth: server.setup_auth.clone(),
             setup_url: server.setup_url.clone(),
         })
         .collect())
@@ -1255,6 +1259,8 @@ async fn run_thor_onboarding(
                 setup_url: server.setup_url.clone(),
                 command: selected_agent_command_label(&server.selected_agent()),
                 setup_hint: registry_setup_hint(server),
+                setup_install: registry_setup_install(server),
+                setup_auth: registry_setup_auth(server),
             })
             .collect::<Vec<_>>();
         let available_agents = available_servers
@@ -1273,6 +1279,8 @@ async fn run_thor_onboarding(
                     name: server.name.clone(),
                     description: server.description.clone(),
                     setup_hint: registry_setup_hint(server),
+                    setup_install: registry_setup_install(server),
+                    setup_auth: registry_setup_auth(server),
                     setup_url: server.setup_url.clone(),
                     quota_backend: server.quota_backend,
                     validation: validations
@@ -1416,16 +1424,63 @@ fn registry_setup_hint(server: &ConfiguredAcpServer) -> String {
     }
 }
 
+fn registry_setup_install(server: &ConfiguredAcpServer) -> String {
+    if !server.setup_install.trim().is_empty() {
+        return server.setup_install.clone();
+    }
+    if let Some((install, _auth)) = known_registry_setup_parts(server) {
+        return install.to_string();
+    }
+    match server.program.to_string_lossy().as_ref() {
+        "npx" => "install Node.js/npm".to_string(),
+        "uvx" => "install uv".to_string(),
+        program if !program.trim().is_empty() => format!("install `{program}` first"),
+        _ => String::new(),
+    }
+}
+
+fn registry_setup_auth(server: &ConfiguredAcpServer) -> String {
+    if !server.setup_auth.trim().is_empty() {
+        return server.setup_auth.clone();
+    }
+    if let Some((_install, auth)) = known_registry_setup_parts(server) {
+        return auth.to_string();
+    }
+    if !server.name.trim().is_empty() {
+        return format!("configure or sign in to {} if prompted", server.name);
+    }
+    String::new()
+}
+
 fn known_registry_setup_hint(server: &ConfiguredAcpServer) -> Option<&'static str> {
+    known_registry_setup_parts(server).map(|_parts| match server.source_id.as_str() {
+        "anvil" => "install uv; Brokk/Anvil signs in when required",
+        "claude-acp" => "install Node.js/npm; install and sign in to Claude Code",
+        "codex-acp" => "install Node.js/npm; sign in to Codex",
+        "gemini" => "install Node.js/npm; sign in with Gemini CLI",
+        "opencode" => "install OpenCode CLI; configure OpenCode provider credentials",
+        "goose" => "install Goose; configure a Goose provider",
+        "cursor" => "install Cursor Agent; sign in to Cursor",
+        "github-copilot-cli" => "install Node.js/npm; sign in to GitHub Copilot",
+        _ => unreachable!("known_registry_setup_parts returned unknown provider"),
+    })
+}
+
+fn known_registry_setup_parts(
+    server: &ConfiguredAcpServer,
+) -> Option<(&'static str, &'static str)> {
     match server.source_id.as_str() {
-        "anvil" => Some("install uv; Brokk/Anvil signs in when required"),
-        "claude-acp" => Some("install Node.js/npm; install and sign in to Claude Code"),
-        "codex-acp" => Some("install Node.js/npm; sign in to Codex"),
-        "gemini" => Some("install Node.js/npm; sign in with Gemini CLI"),
-        "opencode" => Some("install OpenCode CLI; configure OpenCode provider credentials"),
-        "goose" => Some("install Goose; configure a Goose provider"),
-        "cursor" => Some("install Cursor Agent; sign in to Cursor"),
-        "github-copilot-cli" => Some("install Node.js/npm; sign in to GitHub Copilot"),
+        "anvil" => Some(("install uv", "Brokk/Anvil signs in when required")),
+        "claude-acp" => Some(("install Node.js/npm", "install and sign in to Claude Code")),
+        "codex-acp" => Some(("install Node.js/npm", "sign in to Codex")),
+        "gemini" => Some(("install Node.js/npm", "sign in with Gemini CLI")),
+        "opencode" => Some((
+            "install OpenCode CLI",
+            "configure OpenCode provider credentials",
+        )),
+        "goose" => Some(("install Goose", "configure a Goose provider")),
+        "cursor" => Some(("install Cursor Agent", "sign in to Cursor")),
+        "github-copilot-cli" => Some(("install Node.js/npm", "sign in to GitHub Copilot")),
         _ => None,
     }
 }
@@ -1479,6 +1534,8 @@ async fn thor_onboarding_servers(cfg: &Config) -> Vec<ConfiguredAcpServer> {
                 env: Default::default(),
                 description: custom.description.clone(),
                 setup_hint: String::new(),
+                setup_install: String::new(),
+                setup_auth: String::new(),
                 setup_url: String::new(),
                 quota_backend: ThorQuotaBackend::None,
             },
@@ -2440,6 +2497,8 @@ mod tests {
                         env: configured.env.clone(),
                         description: String::new(),
                         setup_hint: String::new(),
+                        setup_install: String::new(),
+                        setup_auth: String::new(),
                         setup_url: String::new(),
                         quota_backend: ThorQuotaBackend::ClaudeCli,
                     }],
@@ -2465,6 +2524,8 @@ mod tests {
                         env: Default::default(),
                         description: "Local mock ACP server".to_string(),
                         setup_hint: String::new(),
+                        setup_install: String::new(),
+                        setup_auth: String::new(),
                         setup_url: String::new(),
                         quota_backend: ThorQuotaBackend::None,
                     }],
@@ -2513,6 +2574,8 @@ mod tests {
                     env: Default::default(),
                     description: String::new(),
                     setup_hint: String::new(),
+                    setup_install: String::new(),
+                    setup_auth: String::new(),
                     setup_url: String::new(),
                     quota_backend: ThorQuotaBackend::ClaudeCli,
                 }],
@@ -2621,6 +2684,8 @@ mod tests {
             env: Default::default(),
             description: "Google Gemini ACP".to_string(),
             setup_hint: "install Node.js/npm; sign in with Gemini CLI".to_string(),
+            setup_install: "install Node.js/npm".to_string(),
+            setup_auth: "sign in with Gemini CLI".to_string(),
             setup_url: "https://geminicli.com".to_string(),
             quota_backend: ThorQuotaBackend::None,
         }];
@@ -2644,6 +2709,8 @@ mod tests {
             env: Default::default(),
             description: String::new(),
             setup_hint: String::new(),
+            setup_install: String::new(),
+            setup_auth: String::new(),
             setup_url: String::new(),
             quota_backend: ThorQuotaBackend::None,
         };
@@ -2655,6 +2722,8 @@ mod tests {
             env: Default::default(),
             description: String::new(),
             setup_hint: String::new(),
+            setup_install: String::new(),
+            setup_auth: String::new(),
             setup_url: String::new(),
             quota_backend: ThorQuotaBackend::None,
         };
@@ -2663,9 +2732,16 @@ mod tests {
             registry_setup_hint(&gemini),
             "install Node.js/npm; sign in with Gemini CLI"
         );
+        assert_eq!(registry_setup_install(&gemini), "install Node.js/npm");
+        assert_eq!(registry_setup_auth(&gemini), "sign in with Gemini CLI");
         assert_eq!(
             registry_setup_hint(&anvil),
             "install uv; Brokk/Anvil signs in when required"
+        );
+        assert_eq!(registry_setup_install(&anvil), "install uv");
+        assert_eq!(
+            registry_setup_auth(&anvil),
+            "Brokk/Anvil signs in when required"
         );
     }
 
@@ -2679,6 +2755,8 @@ mod tests {
             env: Default::default(),
             description: String::new(),
             setup_hint: String::new(),
+            setup_install: String::new(),
+            setup_auth: String::new(),
             setup_url: "https://opencode.ai".to_string(),
             quota_backend: ThorQuotaBackend::None,
         };
@@ -2686,6 +2764,11 @@ mod tests {
         assert_eq!(
             registry_setup_hint(&opencode),
             "install OpenCode CLI; configure OpenCode provider credentials"
+        );
+        assert_eq!(registry_setup_install(&opencode), "install OpenCode CLI");
+        assert_eq!(
+            registry_setup_auth(&opencode),
+            "configure OpenCode provider credentials"
         );
     }
 
@@ -2703,6 +2786,8 @@ mod tests {
             env: Default::default(),
             description: String::new(),
             setup_hint: "install from exact registry metadata; run exact auth".to_string(),
+            setup_install: "install from exact registry metadata".to_string(),
+            setup_auth: "run exact auth".to_string(),
             setup_url: "https://example.com/exact-setup".to_string(),
             quota_backend: ThorQuotaBackend::None,
         };
@@ -2711,6 +2796,11 @@ mod tests {
             registry_setup_hint(&gemini),
             "install from exact registry metadata; run exact auth"
         );
+        assert_eq!(
+            registry_setup_install(&gemini),
+            "install from exact registry metadata"
+        );
+        assert_eq!(registry_setup_auth(&gemini), "run exact auth");
     }
 
     #[test]
@@ -2725,6 +2815,8 @@ mod tests {
                     env: Default::default(),
                     description: String::new(),
                     setup_hint: String::new(),
+                    setup_install: String::new(),
+                    setup_auth: String::new(),
                     setup_url: "https://geminicli.com".to_string(),
                     quota_backend: ThorQuotaBackend::None,
                 }],

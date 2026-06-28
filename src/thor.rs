@@ -120,6 +120,8 @@ pub fn default_anvil_server() -> ConfiguredAcpServer {
         env: agent.env,
         description: "Brokk ACP server via uvx".to_string(),
         setup_hint: "install uv; Brokk/Anvil signs in when required".to_string(),
+        setup_install: "install uv".to_string(),
+        setup_auth: "Brokk/Anvil signs in when required".to_string(),
         setup_url: "https://github.com/BrokkAi/brokk".to_string(),
         quota_backend: ThorQuotaBackend::None,
     }
@@ -158,6 +160,8 @@ pub fn configured_acp_servers(config: &Config) -> Vec<ConfiguredAcpServer> {
             env: HashMap::new(),
             description: custom.description.clone(),
             setup_hint: String::new(),
+            setup_install: String::new(),
+            setup_auth: String::new(),
             setup_url: String::new(),
             quota_backend: ThorQuotaBackend::None,
         });
@@ -182,6 +186,8 @@ fn configured_from_selected(
         env: agent.env,
         description,
         setup_hint: String::new(),
+        setup_install: String::new(),
+        setup_auth: String::new(),
         setup_url: String::new(),
         quota_backend,
     }
@@ -367,6 +373,8 @@ mod tests {
                     env: HashMap::new(),
                     description: String::new(),
                     setup_hint: String::new(),
+                    setup_install: String::new(),
+                    setup_auth: String::new(),
                     setup_url: String::new(),
                     quota_backend: ThorQuotaBackend::ClaudeCli,
                 }],

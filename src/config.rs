@@ -37,6 +37,14 @@ pub struct ConfiguredAcpServer {
     pub description: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub setup_hint: String,
+    #[serde(
+        default,
+        alias = "setupInstall",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub setup_install: String,
+    #[serde(default, alias = "setupAuth", skip_serializing_if = "String::is_empty")]
+    pub setup_auth: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub setup_url: String,
     #[serde(default, skip_serializing_if = "ThorQuotaBackend::is_none")]
@@ -621,6 +629,8 @@ args = ["--flag", "$HOME/data"]
                     env: HashMap::new(),
                     description: "Claude ACP".to_string(),
                     setup_hint: String::new(),
+                    setup_install: String::new(),
+                    setup_auth: String::new(),
                     setup_url: String::new(),
                     quota_backend: ThorQuotaBackend::ClaudeCli,
                 }],
