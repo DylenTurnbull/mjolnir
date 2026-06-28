@@ -218,13 +218,17 @@ pub fn worker_catalog(config: &Config) -> Vec<SelectedAgent> {
 }
 
 pub fn host_prompt(thor: &ThorConfig, user_prompt: &str) -> String {
+    let task_title = task_title_from_prompt(user_prompt);
     format!(
         "\
+Task title: {task_title}
+
 User request:
 {user_prompt}
 
-Use the user request above, not the Thor system instructions below, if you set
-or update the session title.
+Use `Task title` above, not the Thor system instructions below, if you set,
+infer, or update the saved session title. Never title the saved session after
+Thor, mjolnir, coordination, or these instructions.
 
 You are Thor, the mjolnir omni-agent coordinator.
 
@@ -290,12 +294,29 @@ Policy:
 - Use the structured worker progress/tool-call/usage fields returned by the MCP
   tools instead of pasting raw worker transcripts back to the user.",
         server_name = THOR_MCP_SERVER_NAME,
+        task_title = task_title,
         optimization = optimization_label(thor.optimization_mode),
         model = thor.coordinator_model,
         reasoning = reasoning_label(thor.coordinator_reasoning),
         leaderboard = thor.leaderboard_url,
         pricing = thor.pricing_url,
     )
+}
+
+fn task_title_from_prompt(prompt: &str) -> String {
+    let sanitized = crate::notifications::sanitize_message(prompt);
+    let title = sanitized
+        .trim()
+        .trim_matches(|ch: char| ch == '"' || ch == '\'')
+        .to_string();
+    const MAX_TITLE_CHARS: usize = 80;
+    let mut chars = title.chars();
+    let truncated = chars.by_ref().take(MAX_TITLE_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 fn optimization_label(mode: ThorOptimizationMode) -> &'static str {
@@ -329,15 +350,16 @@ mod tests {
     #[test]
     fn host_prompt_makes_mcp_bridge_the_coordination_surface() {
         let prompt = host_prompt(&ThorConfig::default(), "fix the parser");
+        assert!(prompt.starts_with("Task title: fix the parser\n\nUser request:\nfix the parser"));
         assert!(prompt.contains("running inside an ACP host agent"));
         assert!(prompt.contains(THOR_MCP_SERVER_NAME));
         assert!(prompt.contains("listing configured ACP workers"));
         assert!(prompt.contains("Rust-enforced workflow"));
         assert!(prompt.contains("thor_submit_plan"));
         assert!(prompt.contains("coordinator reasoning: high"));
+        assert!(prompt.contains("Never title the saved session after"));
         assert!(prompt.contains("Always bake in adversarial review and correction"));
         assert!(prompt.contains("Keep the transcript alive while you coordinate"));
-        assert!(prompt.contains("User request:\nfix the parser"));
     }
 
     #[test]

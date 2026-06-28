@@ -192,6 +192,11 @@ impl Config {
 /// `~/Library/Application Support/mj/config.toml` on macOS, and
 /// `%APPDATA%\mj\config.toml` on Windows.
 pub fn default_config_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("MJ_CONFIG")
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from(".config"))
         .join("mj")
@@ -251,6 +256,12 @@ pub fn save_history(path: &Path, entries: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn load_history_returns_empty_for_missing_file() {
@@ -598,6 +609,26 @@ args = ["--flag", "$HOME/data"]
             body.contains("optimization_mode = \"balanced\""),
             "Thor optimization default should be visible: {body:?}"
         );
+    }
+
+    #[test]
+    fn default_config_path_honors_mj_config_override() {
+        let _guard = env_lock().lock().expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("isolated.toml");
+        let original = std::env::var_os("MJ_CONFIG");
+        unsafe {
+            std::env::set_var("MJ_CONFIG", &path);
+        }
+
+        assert_eq!(default_config_path(), path);
+
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var("MJ_CONFIG", value),
+                None => std::env::remove_var("MJ_CONFIG"),
+            }
+        }
     }
 
     #[test]

@@ -36,14 +36,17 @@ changed and how much each harness/model used.
 - Thor is instructed to keep the transcript alive with short visible progress
   updates while it gathers facts and runs implementation/review/correction
   phases. `mj` also titles local sessions from the submitted user task and
-  keeps that task title sticky after submit. The local UI state machine emits
-  distinct elapsed heartbeat lines during long host turns, and the
-  remote/browser transcript receives its own heartbeat stream, so neither path
-  depends only on host text when the host has not produced output yet. The
-  remote-control server path also receives the Thor MCP worker progress side
-  channel, not only the local TUI path. This still needs real-provider
-  validation on long turns because live use reported generic Thor session names
-  and no visible transcript updates over a multi-minute turn.
+  keeps that task title sticky after submit. The host prompt starts with an
+  explicit `Task title:` line before the Thor persona so provider auto-title
+  logic sees the user's task before the coordinator instructions. The local UI
+  state machine emits distinct elapsed heartbeat lines during long host turns,
+  and the remote/browser transcript receives its own heartbeat stream, so
+  neither path depends only on host text when the host has not produced output
+  yet. The remote-control server path also receives the Thor MCP worker
+  progress side channel, not only the local TUI path. This still needs
+  real-provider validation on long turns because live use reported generic
+  Thor session names and no visible transcript updates over a multi-minute
+  turn.
 - `mj thor-mcp` mirrors visible worker lifecycle, tool, permission, completion,
   timeout, and error events through an out-of-band progress stream consumed by
   the interactive UI and remote tracker, so the transcript continues to update
@@ -148,7 +151,8 @@ changed and how much each harness/model used.
     remaining inferred setup labels with registry-provided exact commands/links
     where possible, manually smoke-test the setup UI across terminal sizes, and
     run a successful real long-turn Thor smoke covering sticky task-derived
-    titles, sanitized session-list titles, local, remote, and headless-stream
+    titles, sanitized session-list titles, provider-saved title behavior after
+    the `Task title:` prompt change, local, remote, and headless-stream
     heartbeats, worker progress mirroring, transcript freshness in the UI or
     stream the user is watching, and final recap. A deterministic
     mock-host/mock-worker headless smoke proved the real Thor MCP bridge,
