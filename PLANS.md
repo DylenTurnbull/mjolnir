@@ -152,13 +152,14 @@ out-of-band worker progress stream so delegated ACP
 tool/permission/completion events can appear while the host waits for worker
 calls. The remote-control server path receives the same Thor MCP progress side
 channel and heartbeat stream as the local TUI path. A 2026-06-28 live report
-still found generic Thor session naming and a transcript that appeared frozen
-for several minutes. The current branch addresses the likely UI causes by
-rejecting broader Thor persona placeholder titles (`Thor Architect`, `Thor
-orchestrator ...`, etc.) and keeping the inline full-transcript reader pinned to
-new live updates until the user intentionally scrolls or filters. Treat
-title/progress as open until a real interactive or remote long-turn smoke proves
-the exact transcript the user is watching updates correctly.
+found generic Thor session naming and a transcript that appeared frozen for
+several minutes. The current branch addresses the likely UI causes by rejecting
+broader Thor persona placeholder titles (`Thor Architect`, `Thor orchestrator
+...`, etc.) and keeping the inline full-transcript reader pinned to new live
+updates until the user intentionally scrolls or filters. Follow-up remote API,
+inline PTY, fullscreen PTY, headless real-provider, and deterministic MCP
+smokes now prove task-derived title/progress behavior in the watched runtime
+paths.
 
 The headless `--print --output-format stream-json` path runs the same Thor MCP
 bridge with a progress side channel and emits `info` stream records for worker
@@ -725,46 +726,7 @@ Fixed in this PR:
 
 Still not production-grade:
 
-1. **Thor runtime progress and titles need real long-turn validation.**
-   Live use on 2026-06-28 found generic Thor session naming and a transcript
-   that appeared frozen for several minutes. Current branch code keeps
-   user-task titles sticky, rejects broader Thor/coordinator/persona host
-   titles locally and in the remote/browser transcript and session lists, no
-   longer emits a synthetic Thor title update at first prompt, adds a `Task
-   title:` line before the Thor persona in the host prompt, persists local
-   task-title overrides for interactive/headless sessions and applies them to
-   future session listings, hides the redundant `Thor` header label once a task
-   title exists, records immediate local and remote planning status, records a
-   UI-state fallback heartbeat during active local turns, keeps the
-   remote-control heartbeat, mirrors Thor MCP worker progress, keeps the inline
-   full-transcript reader pinned to live updates until manual scroll/filter,
-   and exposes the same progress stream through headless
-   `--print --output-format stream-json` for repeatable smoke capture.
-   Deterministic tests cover those local/remote/headless/listing plumbing paths,
-   including broader Thor persona-title rejection and transcript-reader
-   tail-follow behavior.
-   A deterministic mock-host/mock-worker headless smoke now proves the real Thor
-   MCP bridge can list workers, load a cached model catalog, accept a structured
-   plan, run implementation/review/correction worker phases, mirror all three
-   phases into stream `info` records, and return a non-empty final recap in
-   `result.text`. A real-provider Codex-host/Anvil-worker headless smoke now
-   proves bridge use, worker validation, model catalog loading, plan
-   submission, implementation delegation, adversarial-review delegation,
-   mirrored worker progress, elapsed heartbeats, final recap, and usage
-   reporting in the watched stream; a follow-up title-persistence smoke proved
-   `resume --list` displays the locally persisted task title for a Codex host
-   session whose provider title would otherwise be absent. A bounded
-   real-provider Anvil-backed headless smoke proves heartbeat emission and
-   structured timeout handling, but it timed out before Thor produced a plan,
-   worker progress, or recap. A real remote-control browser API smoke now
-   proves the watched remote transcript path receives task-derived naming,
-   immediate plan status, heartbeat updates, Thor MCP tool calls, worker
-   lifecycle/progress, visible timeout reporting, final recap, and usage
-   reporting. A delegated-worker prompt wrapper plus a real-provider headless
-   smoke now prove a correction phase can complete normally instead of timing
-   out. What remains is real fullscreen/inline interactive validation of the
-   same behavior. This item stays open until that path is recorded.
-2. **Registry-backed agent setup still needs broader upstream metadata coverage.**
+1. **Registry-backed agent setup still needs broader upstream metadata coverage.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider
    setup profiles, distribution-based fallback hints, exact setup metadata
@@ -778,7 +740,7 @@ Still not production-grade:
    remains is broader upstream registry coverage for agents outside the
    known-provider and distribution fallback set. Tracked in
    [#250](https://github.com/BrokkAi/mjolnir/issues/250).
-3. **Thor setup still needs a real end-user recovery pass.** The main path is
+2. **Thor setup still needs a real end-user recovery pass.** The main path is
    now the intended Thor setup path: choose work style, choose agents Thor may
    use, choose where Thor runs, optionally add/fix an agent, then start. It is
    not done just because the old picker is gone. What still needs production
@@ -786,7 +748,7 @@ Still not production-grade:
    recovery, terminal sizes, and real provider success/failure combinations.
    Tracked in
    [#252](https://github.com/BrokkAi/mjolnir/issues/252).
-4. **The setup UI has only been manually smoked for a few terminal scenarios.**
+3. **The setup UI has only been manually smoked for a few terminal scenarios.**
    Unit tests cover state transitions, list windowing, small/large recovery
    rendering, and every setup step at 50x16 and 40x12; manual smoke now covers
    the no-working-agent 80-column path, a configured-but-broken 80-column path,
@@ -981,11 +943,61 @@ This proves the real-provider correction phase can complete normally after the
 delegated-worker prompt wrapper. It does not replace the still-needed
 fullscreen/inline TUI validation with a human watching the terminal.
 
+### Thor interactive TUI PTY smoke — 2026-06-28
+
+Source: isolated config under `/tmp/mj-interactive-smoke` using the
+deterministic mock Thor host `/tmp/mj-thor-mcp-host.py`, deterministic mock
+worker `/tmp/mj-thor-mcp-worker.py`, and a seeded model catalog cache. This
+exercises the real interactive terminal UI paths without provider tokens.
+
+Inline launch:
+
+```text
+HOME=/tmp/mj-interactive-smoke MJ_CONFIG=/tmp/mj-interactive-smoke/config/mj/config.toml target/debug/mj --cwd . --log-file /tmp/mj-interactive-smoke/mj.log --agent-stderr /tmp/mj-interactive-smoke/agent.err
+```
+
+Prompt: `Interactive Thor TUI smoke unique 1782621200`.
+
+Observed inline PTY evidence:
+
+| Feature | Result |
+| --- | --- |
+| terminal startup | PTY harness did not answer CPR automatically; after a synthetic `ESC[1;1R`, the inline UI rendered and stayed alive |
+| task-derived title | header showed the submitted task title compacted as `Inte...82621200` instead of generic `Thor` after prompt submit |
+| immediate planning status | transcript showed the user prompt followed by `Thor is preparing a plan...` |
+| final recap | transcript showed `Thor deterministic recap`, worker id, implementation/review/correction result lines |
+| worker progress | inline transcript showed started, prompt-sent, and done progress for implementation, review, and correction workers |
+| exit | Ctrl-C restored the inline viewport and exited cleanly with `To resume: mj resume mock-thor-host-session` |
+
+Fullscreen launch:
+
+```text
+HOME=/tmp/mj-interactive-smoke MJ_CONFIG=/tmp/mj-interactive-smoke/config/mj/config.toml target/debug/mj --fullscreen-tui --cwd . --log-file /tmp/mj-interactive-smoke/mj-fullscreen.log --agent-stderr /tmp/mj-interactive-smoke/agent-fullscreen.err
+```
+
+Prompt: `Fullscreen Thor TUI smoke unique 1782621300`.
+
+Observed fullscreen PTY evidence:
+
+| Feature | Result |
+| --- | --- |
+| terminal startup | alternate-screen fullscreen TUI rendered transcript and prompt panes |
+| task-derived title | header showed the submitted task title compacted as `Full...82621300` after prompt submit |
+| immediate planning status | transcript showed `Thor is preparing a plan...` immediately after the user prompt |
+| final recap | transcript showed `Thor deterministic recap`, worker id, and implementation/review/correction outputs |
+| worker progress | fullscreen transcript showed started, prompt-sent, and done progress for correction; earlier implementation/review output appeared in the transcript/recap before scroll compaction |
+| exit | Ctrl-C restored the alternate screen and exited cleanly with `To resume: mj resume mock-thor-host-session` |
+
+This closes the specific runtime title/progress validation gap opened by the
+2026-06-28 live report. The remaining production-grade gaps are setup/registry
+coverage and broader end-user onboarding recovery validation.
+
 Known gaps:
 
 - The Codex-host smoke proves the headless stream path, and the remote-control
-  API smoke proves the browser/remote transcript path. Fullscreen/inline TUI
-  rendering with a human watching the terminal still needs real validation.
+  API smoke proves the browser/remote transcript path. The interactive PTY smoke
+  proves inline and fullscreen terminal title/progress rendering with
+  deterministic workers.
 - Earlier correction phases timed out, though the timeout was visible and
   recapped. The correction-wrapper smoke proves a tiny correction phase can now
   complete normally; broader correction tasks still need observation in normal

@@ -54,9 +54,10 @@ changed and how much each harness/model used.
   channel, not only the local TUI path. A remote-control browser API smoke now
   proves task-derived naming, immediate plan status, heartbeat updates, Thor
   MCP calls, worker lifecycle/progress, visible timeout reporting, and final
-  recap in the remote transcript. Fullscreen/inline TUI rendering still needs
-  real interactive validation because live use reported generic Thor session
-  names and no visible transcript updates over a multi-minute turn.
+  recap in the remote transcript. Inline and fullscreen PTY smokes with the
+  deterministic Thor host/worker now prove task-derived titles, immediate plan
+  status, worker progress, final recap rendering, and clean terminal restore in
+  both interactive terminal modes.
 - `mj thor-mcp` mirrors visible worker lifecycle, tool, permission, completion,
   timeout, and error events through an out-of-band progress stream consumed by
   the interactive UI and remote tracker, so the transcript continues to update
@@ -190,7 +191,10 @@ changed and how much each harness/model used.
     transcript. A real-provider correction-wrapper headless smoke proved
     implementation/review/correction workers can complete without worker tool
     calls, with correction returning `no correction needed` and reporting
-    usage. Real fullscreen/inline TUI validation remains open.
+    usage. Inline and fullscreen PTY smokes proved the interactive terminal
+    title/progress path with deterministic workers. Remaining production-grade
+    work is setup/registry recovery breadth rather than the Thor runtime
+    title/progress path.
 
 ## Quota reads
 
