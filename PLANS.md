@@ -147,19 +147,23 @@ titles. `mj` no longer synthesizes a `SessionInfoUpdate` just to seed a Thor
 title, and the fullscreen header hides the redundant `Thor` agent label once a
 task title exists.
 
-Progress plumbing is present, but a 2026-06-28 live user report says the
-watched transcript stayed unchanged for several minutes. Treat that as an open
-runtime regression until reproduced and fixed in the exact user path. Prompt
-submission records an immediate `Thor is preparing a plan...` status in the
-local transcript, and the remote tracker records the same status when it
-observes the command. The UI state machine can append distinct elapsed
-heartbeat lines during long host turns, and `mj` consumes the Thor MCP bridge's
-out-of-band worker progress stream so delegated ACP
-tool/permission/completion events can appear while the host waits for worker
-calls. The remote-control server path receives the same Thor MCP progress side
-channel and heartbeat stream as the local TUI path. Prior remote API, inline
-PTY, fullscreen PTY, headless real-provider, and deterministic MCP smokes are
-useful evidence but are not sufficient to close the latest report.
+Progress plumbing is present and the server-side watched transcript path has
+now been re-smoked after the latest live report. Prompt submission records an
+immediate `Thor is preparing a plan...` status in the local transcript, and the
+remote tracker records the same status when it observes the command. The
+remote-control queued-prompt path now uses the same tracker command observer as
+the local UI path, so a queued browser prompt requests an immediate publish
+flush instead of waiting for a later runtime event or heartbeat. The UI state
+machine can append distinct elapsed heartbeat lines during long host turns, and
+`mj` consumes the Thor MCP bridge's out-of-band worker progress stream so
+delegated ACP tool/permission/completion events can appear while the host waits
+for worker calls. The remote-control server path receives the same Thor MCP
+progress side channel and heartbeat stream as the local TUI path. A follow-up
+slow remote-control API smoke proved the live session data stream receives the
+user prompt, planning line, repeated heartbeats during a silent host turn,
+worker progress, and final recap without restarting the session. Browser DOM
+rendering was not separately automated in that smoke, but the viewer renders
+the `/live/sessions` transcript entries that the smoke verified.
 
 The headless `--print --output-format stream-json` path runs the same Thor MCP
 bridge with a progress side channel and emits `info` stream records for worker
@@ -676,6 +680,10 @@ Fixed in this PR:
   from becoming the local and remote Thor session title. Regression coverage:
   `first_user_prompt_replaces_carried_provider_title` and
   `tracker_first_user_task_replaces_prior_provider_title`.
+- [x] Fixed the remote-control queued-prompt publish gap: claimed browser
+  prompts now go through `RemoteSessionTracker::observe_command`, which records
+  the user prompt, task title, planning line, and immediate publish flush before
+  the Thor host has to stream any ACP update.
 - [x] Removed the remaining registry/custom-command/ACP jargon from the main
   first-run setup screen. The visible path now says `known agent` for registry
   choices and `installed agent` for pasted commands, while implementation terms
@@ -731,15 +739,7 @@ Fixed in this PR:
 
 Still not production-grade:
 
-1. **Thor transcript progress is still not proven in the watched user path.**
-   A 2026-06-28 live report found a transcript left open for several minutes
-   with no visible Thor updates. The code has local/remote planning messages,
-   elapsed heartbeats, and MCP worker progress mirroring, but the exact path
-   the user watched must be reproduced before this can be called fixed. Done
-   means a fresh smoke against the same path shows the immediate planning line,
-   repeated elapsed heartbeats during a silent host turn, delegated worker
-   progress, and final recap without needing refresh/reopen/manual polling.
-2. **Registry-backed agent setup still needs broader upstream metadata coverage.**
+1. **Registry-backed agent setup still needs broader upstream metadata coverage.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider
    setup profiles, distribution-based fallback hints, exact setup metadata
@@ -753,7 +753,7 @@ Still not production-grade:
    remains is broader upstream registry coverage for agents outside the
    known-provider and distribution fallback set. Tracked in
    [#250](https://github.com/BrokkAi/mjolnir/issues/250).
-3. **Thor setup still needs a real end-user recovery pass.** The main path is
+2. **Thor setup still needs a real end-user recovery pass.** The main path is
    now the intended Thor setup path: choose work style, choose agents Thor may
    use, choose where Thor runs, optionally add/fix an agent, then start. It is
    not done just because the old picker is gone. What still needs production
@@ -761,7 +761,7 @@ Still not production-grade:
    recovery, terminal sizes, and real provider success/failure combinations.
    Tracked in
    [#252](https://github.com/BrokkAi/mjolnir/issues/252).
-4. **The setup UI has only been manually smoked for a few terminal scenarios.**
+3. **The setup UI has only been manually smoked for a few terminal scenarios.**
    Unit tests cover state transitions, list windowing, small/large recovery
    rendering, and every setup step at 50x16 and 40x12; manual smoke now covers
    the no-working-agent 80-column path, a configured-but-broken 80-column path,
@@ -920,11 +920,46 @@ Observed remote transcript evidence:
 | correction worker | `anvil` worker emitted started, prompt-sent, tool-attempt progress, and timeout after 45s |
 | final recap | host recapped implementation, review, correction timeout, usage, and the phase-gated rerun path in the remote transcript |
 
-This proves the remote/browser watched transcript path no longer stays blank
-during a long Thor turn and that the task-derived title appears there. It does
-not prove fullscreen/inline TUI rendering with a human watching the terminal,
-and it does not close the real-provider correction-completion gap because the
-correction worker timed out.
+This proved that remote API snapshots can carry task-derived titles, progress,
+and final recap during a long Thor turn. A later live report still found a
+watched transcript that appeared frozen, so the queued-prompt publish path was
+rechecked and fixed below.
+
+Follow-up slow deterministic remote-control API smoke after the queued-prompt
+publish fix:
+
+Source: isolated Thor config with `/tmp/mj-thor-mcp-host-slow.py` as the Thor
+host and `/tmp/mj-thor-mcp-worker.py` as the configured worker. The host sleeps
+for 34 seconds before calling Thor MCP tools, forcing the remote transcript to
+depend on mj's own planning/heartbeat path during a silent host turn. The
+queued task used unique title
+`Slow remote watched transcript smoke unique 1782630100`.
+
+Launch:
+
+```text
+MJ_CONFIG=/tmp/mj-remote-progress-slow-smoke/config.toml MJ_REMOTE_CONTROL_DIR=/tmp/mj-remote-progress-slow-smoke/remote target/debug/mj server --history-days 0
+```
+
+Prompt was queued through `POST /api/queued-prompts` for session
+`mock-slow-thor-host-session`, then evidence was collected from repeated
+`GET /live/sessions` calls against the same running server.
+
+Observed remote transcript evidence:
+
+| Feature | Result |
+| --- | --- |
+| task-derived session name | remote session name changed from raw id to `Slow remote watched transcript smoke unique 1782630100` |
+| immediate planning status | early poll while host was sleeping showed the user prompt and `Thor is preparing a plan...` |
+| heartbeat during silent host turn | early/mid-turn polls showed `Thor is still working... 15s elapsed`, then 30s and 45s elapsed |
+| worker progress | same live session later showed implementation, review, and correction worker started, prompt-sent, and done events |
+| final recap | final transcript contained `Thor slow deterministic recap` with implementation/review/correction text |
+
+This proves the server-side data stream that the browser viewer polls no
+longer stays blank during the silent host window. Browser DOM rendering was not
+separately automated in this smoke because the in-app browser tool was not
+available in this session; the viewer's transcript renderer consumes these
+same `/live/sessions` entries.
 
 ### Thor real-provider correction-wrapper smoke — 2026-06-28
 

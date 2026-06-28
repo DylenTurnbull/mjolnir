@@ -51,10 +51,14 @@ changed and how much each harness/model used.
   until the user scrolls or filters, so opening the reader during a turn should
   not hide new heartbeat or worker-progress lines below the viewport. The
   remote-control server path also receives the Thor MCP worker progress side
-  channel, not only the local TUI path. A remote-control browser API smoke now
-  proves task-derived naming, immediate plan status, heartbeat updates, Thor
-  MCP calls, worker lifecycle/progress, visible timeout reporting, and final
-  recap in the remote transcript. Inline and fullscreen PTY smokes with the
+  channel, not only the local TUI path. The remote-control queued-prompt path
+  now records prompts through the same tracker command observer as the local UI
+  path, so browser-queued prompts publish the task title and planning line
+  immediately instead of waiting for the next runtime event. Remote-control API
+  smokes now prove task-derived naming, immediate plan status, repeated
+  heartbeat updates during a silent host turn, Thor MCP calls, worker
+  lifecycle/progress, visible timeout reporting, and final recap in the live
+  remote transcript data. Inline and fullscreen PTY smokes with the
   deterministic Thor host/worker now prove task-derived titles, immediate plan
   status, worker progress, final recap rendering, and clean terminal restore in
   both interactive terminal modes.
@@ -184,17 +188,18 @@ changed and how much each harness/model used.
     heartbeat output, final recap, and usage reporting; its correction worker
     timed out and was recapped as a timeout. A follow-up Codex-host title smoke
     proved `resume --list` applies the local task-title override for a host
-    session with no provider title. A remote-control browser API smoke proved
-    task-derived naming, immediate plan status, heartbeat updates through 150s,
-    Thor MCP calls, implementation/review worker progress, correction worker
-    timeout progress, final recap, and usage reporting in the watched remote
-    transcript. A real-provider correction-wrapper headless smoke proved
+    session with no provider title. Remote-control API smokes proved
+    task-derived naming, immediate plan status, heartbeat updates through a
+    silent host turn, Thor MCP calls, implementation/review/correction worker
+    progress, visible correction timeout progress in the real-provider run,
+    final recap, and usage reporting in the live remote transcript data. A
+    real-provider correction-wrapper headless smoke proved
     implementation/review/correction workers can complete without worker tool
     calls, with correction returning `no correction needed` and reporting
     usage. Inline and fullscreen PTY smokes proved the interactive terminal
     title/progress path with deterministic workers. Remaining production-grade
-    work is setup/registry recovery breadth rather than the Thor runtime
-    title/progress path.
+    work is setup/registry recovery breadth and broader onboarding validation
+    rather than the Thor runtime title/progress data path.
 
 ## Quota reads
 

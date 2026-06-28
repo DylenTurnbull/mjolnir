@@ -1171,9 +1171,7 @@ impl RemoteSessionTracker {
                             text: prompt.text,
                             images: Vec::new(),
                         };
-                        if let Ok(mut guard) = state.lock() {
-                            guard.observe_command(&command);
-                        }
+                        tracker.observe_command(&command);
                         if command_tx.send(command).is_err() {
                             break;
                         }
