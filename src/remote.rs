@@ -289,6 +289,7 @@ pub struct RemoteSessionTracker {
 struct TrackerState {
     session_id: Option<String>,
     name: Option<String>,
+    name_from_user_prompt: bool,
     start_time: Option<String>,
     last_update: Option<String>,
     total_messages: u64,
@@ -347,6 +348,7 @@ impl TrackerState {
         Self {
             session_id: None,
             name: None,
+            name_from_user_prompt: false,
             start_time: None,
             last_update: None,
             total_messages: 0,
@@ -376,7 +378,7 @@ impl TrackerState {
     }
 
     fn set_name_from_user_prompt(&mut self, prompt: &str) {
-        if !self.name_is_replaceable() {
+        if self.name_from_user_prompt {
             return;
         }
         let title = task_title_from_prompt(prompt);
@@ -384,9 +386,13 @@ impl TrackerState {
             return;
         }
         self.name = Some(title);
+        self.name_from_user_prompt = true;
     }
 
     fn name_is_replaceable(&self) -> bool {
+        if self.name_from_user_prompt {
+            return false;
+        }
         match self.name.as_deref() {
             None => true,
             Some(name) if is_generic_thor_title(name) => true,
@@ -397,6 +403,7 @@ impl TrackerState {
     fn reset_for_session_change(&mut self, new_session_id: &str, now: &str) {
         self.session_id = Some(new_session_id.to_string());
         self.name = Some(new_session_id.to_string());
+        self.name_from_user_prompt = false;
         self.start_time = Some(now.to_string());
         self.total_messages = 0;
         self.agent_message_open = false;
@@ -515,6 +522,7 @@ impl TrackerState {
                     && self.name_is_replaceable()
                 {
                     self.name = Some(task_title_from_prompt(title));
+                    self.name_from_user_prompt = false;
                 }
                 self.agent_message_open = false;
                 self.touch();
@@ -3317,6 +3325,25 @@ mod tests {
 
         let snapshot = state.snapshot().expect("snapshot");
         assert_eq!(snapshot.name, "Fix transcript progress");
+    }
+
+    #[test]
+    fn tracker_first_user_task_replaces_prior_provider_title() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.observe_session_update(&SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().title("Provider setup title"),
+        ));
+        state.observe_command(&UiCommand::SendPrompt {
+            text: "Fix live Thor updates".to_string(),
+            images: Vec::new(),
+        });
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.name, "Fix live Thor updates");
     }
 
     #[test]

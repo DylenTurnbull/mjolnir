@@ -130,20 +130,26 @@ concurrent multi-worker delegation with structured progress and aggregate
 usage.
 
 The interactive Thor runtime is still the active hardening area. Current code
-sets the visible local title from the submitted user task, keeps that
-task-derived title sticky after submit, rejects generic Thor/coordinator/persona
-host titles locally and in the remote transcript, and strips those generic
-titles from session listings. The Thor host prompt now starts with an explicit
-`Task title:` line before any Thor persona instructions, so ACP hosts that
-auto-title from prompt text have a user-task title source instead of seeing the
-coordinator instructions first. `mj` also persists a local session-title
-override keyed by ACP session id after interactive and headless runs, then
-applies that override in `resume --list` and the in-app session picker. This
-covers ACP hosts that omit or mangle saved titles. `mj` no longer synthesizes a
-`SessionInfoUpdate` just to seed a Thor title, and the fullscreen header hides
-the redundant `Thor` agent label once a task title exists.
+is intended to set the visible local and remote title from the submitted user
+task, keep that task-derived title sticky after submit, reject generic
+Thor/coordinator/persona host titles locally and in the remote transcript, and
+strip those generic titles from session listings. The latest title fix tracks
+whether the title came from a real submitted user prompt; provider, resume, or
+setup titles may display before the first task, but the first task submitted in
+the running UI must replace them and then become sticky. The Thor host prompt
+now starts with an explicit `Task title:` line before any Thor persona
+instructions, so ACP hosts that auto-title from prompt text have a user-task
+title source instead of seeing the coordinator instructions first. `mj` also
+persists a local session-title override keyed by ACP session id after
+interactive and headless runs, then applies that override in `resume --list`
+and the in-app session picker. This covers ACP hosts that omit or mangle saved
+titles. `mj` no longer synthesizes a `SessionInfoUpdate` just to seed a Thor
+title, and the fullscreen header hides the redundant `Thor` agent label once a
+task title exists.
 
-Progress plumbing is present but still needs real user-path proof. Prompt
+Progress plumbing is present, but a 2026-06-28 live user report says the
+watched transcript stayed unchanged for several minutes. Treat that as an open
+runtime regression until reproduced and fixed in the exact user path. Prompt
 submission records an immediate `Thor is preparing a plan...` status in the
 local transcript, and the remote tracker records the same status when it
 observes the command. The UI state machine can append distinct elapsed
@@ -151,15 +157,9 @@ heartbeat lines during long host turns, and `mj` consumes the Thor MCP bridge's
 out-of-band worker progress stream so delegated ACP
 tool/permission/completion events can appear while the host waits for worker
 calls. The remote-control server path receives the same Thor MCP progress side
-channel and heartbeat stream as the local TUI path. A 2026-06-28 live report
-found generic Thor session naming and a transcript that appeared frozen for
-several minutes. The current branch addresses the likely UI causes by rejecting
-broader Thor persona placeholder titles (`Thor Architect`, `Thor orchestrator
-...`, etc.) and keeping the inline full-transcript reader pinned to new live
-updates until the user intentionally scrolls or filters. Follow-up remote API,
-inline PTY, fullscreen PTY, headless real-provider, and deterministic MCP
-smokes now prove task-derived title/progress behavior in the watched runtime
-paths.
+channel and heartbeat stream as the local TUI path. Prior remote API, inline
+PTY, fullscreen PTY, headless real-provider, and deterministic MCP smokes are
+useful evidence but are not sufficient to close the latest report.
 
 The headless `--print --output-format stream-json` path runs the same Thor MCP
 bridge with a progress side channel and emits `info` stream records for worker
@@ -671,6 +671,11 @@ Fixed in this PR:
 - [x] Made visible delegated-worker progress include the planned job id and
   worker source, so implementation/review/correction phases no longer collapse
   into duplicate-looking `worker session ready` / `end_turn` messages.
+- [x] Fixed another session-title source bug found from live usage: a
+  provider/resume/setup title can no longer block the first submitted user task
+  from becoming the local and remote Thor session title. Regression coverage:
+  `first_user_prompt_replaces_carried_provider_title` and
+  `tracker_first_user_task_replaces_prior_provider_title`.
 - [x] Removed the remaining registry/custom-command/ACP jargon from the main
   first-run setup screen. The visible path now says `known agent` for registry
   choices and `installed agent` for pasted commands, while implementation terms
@@ -726,7 +731,15 @@ Fixed in this PR:
 
 Still not production-grade:
 
-1. **Registry-backed agent setup still needs broader upstream metadata coverage.**
+1. **Thor transcript progress is still not proven in the watched user path.**
+   A 2026-06-28 live report found a transcript left open for several minutes
+   with no visible Thor updates. The code has local/remote planning messages,
+   elapsed heartbeats, and MCP worker progress mirroring, but the exact path
+   the user watched must be reproduced before this can be called fixed. Done
+   means a fresh smoke against the same path shows the immediate planning line,
+   repeated elapsed heartbeats during a silent host turn, delegated worker
+   progress, and final recap without needing refresh/reopen/manual polling.
+2. **Registry-backed agent setup still needs broader upstream metadata coverage.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider
    setup profiles, distribution-based fallback hints, exact setup metadata
@@ -740,7 +753,7 @@ Still not production-grade:
    remains is broader upstream registry coverage for agents outside the
    known-provider and distribution fallback set. Tracked in
    [#250](https://github.com/BrokkAi/mjolnir/issues/250).
-2. **Thor setup still needs a real end-user recovery pass.** The main path is
+3. **Thor setup still needs a real end-user recovery pass.** The main path is
    now the intended Thor setup path: choose work style, choose agents Thor may
    use, choose where Thor runs, optionally add/fix an agent, then start. It is
    not done just because the old picker is gone. What still needs production
@@ -748,7 +761,7 @@ Still not production-grade:
    recovery, terminal sizes, and real provider success/failure combinations.
    Tracked in
    [#252](https://github.com/BrokkAi/mjolnir/issues/252).
-3. **The setup UI has only been manually smoked for a few terminal scenarios.**
+4. **The setup UI has only been manually smoked for a few terminal scenarios.**
    Unit tests cover state transitions, list windowing, small/large recovery
    rendering, and every setup step at 50x16 and 40x12; manual smoke now covers
    the no-working-agent 80-column path, a configured-but-broken 80-column path,

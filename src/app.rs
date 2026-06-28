@@ -494,6 +494,7 @@ pub struct AppState {
     pub agent_label: String,
     pub session_id: Option<String>,
     pub session_title: Option<String>,
+    session_title_from_user_prompt: bool,
     /// Current connection lifecycle state. Private to enforce the invariant
     /// that it and `connection_state_started_at` change together: mutate only
     /// via `set_connection_state`, read via `connection_state()`.
@@ -714,6 +715,7 @@ impl AppState {
             agent_label: String::new(),
             session_id: None,
             session_title: None,
+            session_title_from_user_prompt: false,
             connection_state: ConnectionState::Launching,
             current_mode: None,
             available_commands: {
@@ -1085,10 +1087,14 @@ impl AppState {
             return false;
         }
         self.session_title = Some(sanitized);
+        self.session_title_from_user_prompt = false;
         true
     }
 
     fn session_title_is_replaceable(&self) -> bool {
+        if self.session_title_from_user_prompt {
+            return false;
+        }
         match self.session_title.as_deref() {
             None => true,
             Some(title) if is_generic_thor_title(title) => true,
@@ -1097,10 +1103,7 @@ impl AppState {
     }
 
     pub fn set_session_title_from_user_prompt(&mut self, raw: &str) -> bool {
-        if self.session_title.as_deref().is_some_and(|title| {
-            let title = title.trim();
-            !title.is_empty() && !is_generic_thor_title(title)
-        }) {
+        if self.session_title_from_user_prompt {
             return false;
         }
         let title = task_title_from_prompt(raw);
@@ -1108,6 +1111,7 @@ impl AppState {
             return false;
         }
         self.session_title = Some(title);
+        self.session_title_from_user_prompt = true;
         true
     }
 
@@ -2123,6 +2127,19 @@ mod tests {
         assert!(s.set_session_title_from_user_prompt("Fix stale session names"));
 
         assert_eq!(s.session_title.as_deref(), Some("Fix stale session names"));
+    }
+
+    #[test]
+    fn first_user_prompt_replaces_carried_provider_title() {
+        let mut s = AppState::new();
+
+        assert!(s.set_session_title("A provider-generated setup title"));
+        assert!(s.set_session_title_from_user_prompt("Make transcript progress visible"));
+
+        assert_eq!(
+            s.session_title.as_deref(),
+            Some("Make transcript progress visible")
+        );
     }
 
     #[test]
