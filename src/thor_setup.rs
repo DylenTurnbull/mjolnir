@@ -2212,6 +2212,80 @@ mod tests {
     }
 
     #[test]
+    fn setup_screen_renders_mixed_ready_and_recovery_path_at_production_sizes() {
+        let mut ready = setup_agent_with_validation("mock-ready", true);
+        ready.name = "Mock Ready".to_string();
+        ready.description = "ready deterministic agent".to_string();
+        let mut broken = setup_agent_with_error(
+            "claude-acp",
+            Some("command not found: claude-agent-acp".to_string()),
+        );
+        broken.name = "Claude".to_string();
+        broken.setup_install = "install Claude Code".to_string();
+        broken.setup_auth = "sign in with Claude Code".to_string();
+        broken.setup_hint = "install Claude Code; sign in with Claude Code".to_string();
+        broken.setup_url = "https://docs.anthropic.com/claude-code".to_string();
+        let agents = vec![ready, broken];
+        let registry_agents = vec![registry_agent("gemini")];
+        let initial_host = agents[0].agent.clone();
+        let mut state = ThorSetupState::new(
+            &ThorConfig::default(),
+            &agents,
+            &registry_agents,
+            &initial_host,
+        );
+        state.set_step(SetupStep::Host);
+
+        for (width, height) in [(80, 24), (132, 36)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|f| draw(f, &state, crate::theme::TerminalThemeKind::Dark.palette()))
+                .expect("draw setup");
+            let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+            assert!(
+                rendered.contains("1 ready, 1 need setup"),
+                "status should summarize ready and broken agents:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("Mock Ready") && rendered.contains("ready"),
+                "ready row should be visible:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("Thor host"),
+                "host row should identify where Thor runs:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("Claude") && rendered.contains("install Claude Code"),
+                "broken provider row should include concrete install guidance:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("Add known agent"),
+                "rendered:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("Add installed agent"),
+                "rendered:\n{rendered}"
+            );
+            assert!(rendered.contains("Retry checks"), "rendered:\n{rendered}");
+            assert!(
+                rendered.contains("Agents Thor may use: Mock Ready"),
+                "summary should name selected workers:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("Run Thor in: Mock Ready"),
+                "summary should name Thor host:\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("custom command"),
+                "rendered:\n{rendered}"
+            );
+            assert!(!rendered.contains("registry"), "rendered:\n{rendered}");
+        }
+    }
+
+    #[test]
     fn setup_screen_draws_every_step_on_small_terminals() {
         let agents = vec![setup_agent_with_validation("mock-agent", true)];
         let registry_agents = vec![registry_agent("gemini")];

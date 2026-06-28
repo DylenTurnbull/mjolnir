@@ -120,7 +120,7 @@ impl Agent {
                     setup_install: self.setup_install(),
                     setup_auth: self.setup_auth(),
                     setup_url: self.setup_url(),
-                    quota_backend: quota_backend_for_registry_id(&self.id),
+                    quota_backend: self.quota_backend(),
                 })
             }
             DistributionKind::Uvx => {
@@ -138,7 +138,7 @@ impl Agent {
                     setup_install: self.setup_install(),
                     setup_auth: self.setup_auth(),
                     setup_url: self.setup_url(),
-                    quota_backend: quota_backend_for_registry_id(&self.id),
+                    quota_backend: self.quota_backend(),
                 })
             }
             DistributionKind::Binary => {
@@ -154,7 +154,7 @@ impl Agent {
                     setup_install: self.setup_install(),
                     setup_auth: self.setup_auth(),
                     setup_url: self.setup_url(),
-                    quota_backend: quota_backend_for_registry_id(&self.id),
+                    quota_backend: self.quota_backend(),
                 })
             }
         }
@@ -186,7 +186,7 @@ impl Agent {
         if !exact_hint.trim().is_empty() {
             return exact_hint;
         }
-        if let Some(hint) = known_provider_setup_hint(&self.id) {
+        if let Some(hint) = known_provider_setup_hint(self.known_provider()) {
             return hint.to_string();
         }
         self.distribution_setup_hint()
@@ -196,7 +196,7 @@ impl Agent {
         if !self.setup.install.trim().is_empty() {
             return self.setup.install.clone();
         }
-        if let Some((install, _auth)) = known_provider_setup_parts(&self.id) {
+        if let Some((install, _auth)) = known_provider_setup_parts(self.known_provider()) {
             return install.to_string();
         }
         self.distribution_install_hint()
@@ -206,7 +206,7 @@ impl Agent {
         if !self.setup.auth.trim().is_empty() {
             return self.setup.auth.clone();
         }
-        if let Some((_install, auth)) = known_provider_setup_parts(&self.id) {
+        if let Some((_install, auth)) = known_provider_setup_parts(self.known_provider()) {
             return auth.to_string();
         }
         self.distribution_auth_hint()
@@ -254,39 +254,124 @@ impl Agent {
         let key = current_binary_platform_key()?;
         self.distribution.binary.as_ref()?.get(key)
     }
-}
 
-fn known_provider_setup_hint(id: &str) -> Option<&'static str> {
-    let _ = known_provider_setup_parts(id)?;
-    // Keep the legacy combined hint stable for existing UI and configs.
-    match id {
-        "anvil" => Some("install uv; Brokk/Anvil signs in when required"),
-        "claude-acp" => Some("install Node.js/npm; install and sign in to Claude Code"),
-        "codex-acp" => Some("install Node.js/npm; sign in to Codex"),
-        "gemini" => Some("install Node.js/npm; sign in with Gemini CLI"),
-        "opencode" => Some("install OpenCode CLI; configure OpenCode provider credentials"),
-        "goose" => Some("install Goose; configure a Goose provider"),
-        "cursor" => Some("install Cursor Agent; sign in to Cursor"),
-        "github-copilot-cli" => Some("install Node.js/npm; sign in to GitHub Copilot"),
-        _ => None,
+    fn quota_backend(&self) -> ThorQuotaBackend {
+        match self.known_provider() {
+            Some(KnownProvider::Claude) => ThorQuotaBackend::ClaudeCli,
+            Some(KnownProvider::Codex) => ThorQuotaBackend::CodexAppserver,
+            _ => ThorQuotaBackend::None,
+        }
+    }
+
+    fn known_provider(&self) -> Option<KnownProvider> {
+        let mut haystacks = vec![
+            self.id.as_str(),
+            self.name.as_str(),
+            self.repository.as_str(),
+            self.website.as_str(),
+        ];
+        if let Some(package) = self.distribution.npx.as_ref() {
+            haystacks.push(package.package.as_str());
+            haystacks.extend(package.args.iter().map(String::as_str));
+        }
+        if let Some(package) = self.distribution.uvx.as_ref() {
+            haystacks.push(package.package.as_str());
+            haystacks.extend(package.args.iter().map(String::as_str));
+        }
+        if let Some(binary) = self.binary_target_for_current_platform() {
+            haystacks.push(binary.cmd.as_str());
+            haystacks.extend(binary.args.iter().map(String::as_str));
+        }
+        known_provider_from_parts(haystacks)
     }
 }
 
-fn known_provider_setup_parts(id: &str) -> Option<(&'static str, &'static str)> {
-    match id {
-        "anvil" => Some(("install uv", "Brokk/Anvil signs in when required")),
-        "claude-acp" => Some(("install Node.js/npm", "install and sign in to Claude Code")),
-        "codex-acp" => Some(("install Node.js/npm", "sign in to Codex")),
-        "gemini" => Some(("install Node.js/npm", "sign in with Gemini CLI")),
-        "opencode" => Some((
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum KnownProvider {
+    Anvil,
+    Claude,
+    Codex,
+    Gemini,
+    OpenCode,
+    Goose,
+    Cursor,
+    GitHubCopilot,
+}
+
+fn known_provider_setup_hint(provider: Option<KnownProvider>) -> Option<&'static str> {
+    let _ = known_provider_setup_parts(provider)?;
+    // Keep the legacy combined hint stable for existing UI and configs.
+    match provider? {
+        KnownProvider::Anvil => Some("install uv; Brokk/Anvil signs in when required"),
+        KnownProvider::Claude => Some("install Node.js/npm; install and sign in to Claude Code"),
+        KnownProvider::Codex => Some("install Node.js/npm; sign in to Codex"),
+        KnownProvider::Gemini => Some("install Node.js/npm; sign in with Gemini CLI"),
+        KnownProvider::OpenCode => {
+            Some("install OpenCode CLI; configure OpenCode provider credentials")
+        }
+        KnownProvider::Goose => Some("install Goose; configure a Goose provider"),
+        KnownProvider::Cursor => Some("install Cursor Agent; sign in to Cursor"),
+        KnownProvider::GitHubCopilot => Some("install Node.js/npm; sign in to GitHub Copilot"),
+    }
+}
+
+fn known_provider_setup_parts(
+    provider: Option<KnownProvider>,
+) -> Option<(&'static str, &'static str)> {
+    match provider? {
+        KnownProvider::Anvil => Some(("install uv", "Brokk/Anvil signs in when required")),
+        KnownProvider::Claude => {
+            Some(("install Node.js/npm", "install and sign in to Claude Code"))
+        }
+        KnownProvider::Codex => Some(("install Node.js/npm", "sign in to Codex")),
+        KnownProvider::Gemini => Some(("install Node.js/npm", "sign in with Gemini CLI")),
+        KnownProvider::OpenCode => Some((
             "install OpenCode CLI",
             "configure OpenCode provider credentials",
         )),
-        "goose" => Some(("install Goose", "configure a Goose provider")),
-        "cursor" => Some(("install Cursor Agent", "sign in to Cursor")),
-        "github-copilot-cli" => Some(("install Node.js/npm", "sign in to GitHub Copilot")),
-        _ => None,
+        KnownProvider::Goose => Some(("install Goose", "configure a Goose provider")),
+        KnownProvider::Cursor => Some(("install Cursor Agent", "sign in to Cursor")),
+        KnownProvider::GitHubCopilot => Some(("install Node.js/npm", "sign in to GitHub Copilot")),
     }
+}
+
+fn known_provider_from_parts<'a>(
+    parts: impl IntoIterator<Item = &'a str>,
+) -> Option<KnownProvider> {
+    let haystack = parts
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if haystack.is_empty() {
+        return None;
+    }
+    if haystack.contains("github-copilot") || haystack.contains("copilot-cli") {
+        return Some(KnownProvider::GitHubCopilot);
+    }
+    if haystack.contains("claude") {
+        return Some(KnownProvider::Claude);
+    }
+    if haystack.contains("codex") {
+        return Some(KnownProvider::Codex);
+    }
+    if haystack.contains("gemini") {
+        return Some(KnownProvider::Gemini);
+    }
+    if haystack.contains("opencode") || haystack.contains("open-code") {
+        return Some(KnownProvider::OpenCode);
+    }
+    if haystack.contains("goose") {
+        return Some(KnownProvider::Goose);
+    }
+    if haystack.contains("cursor") {
+        return Some(KnownProvider::Cursor);
+    }
+    if haystack.contains("anvil") || haystack.contains("brokk") {
+        return Some(KnownProvider::Anvil);
+    }
+    None
 }
 
 fn current_binary_platform_key() -> Option<&'static str> {
@@ -307,14 +392,6 @@ fn binary_command_name(cmd: &str) -> PathBuf {
         .file_name()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(cmd))
-}
-
-fn quota_backend_for_registry_id(id: &str) -> ThorQuotaBackend {
-    match id {
-        "claude-acp" => ThorQuotaBackend::ClaudeCli,
-        "codex-acp" => ThorQuotaBackend::CodexAppserver,
-        _ => ThorQuotaBackend::None,
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -636,6 +713,48 @@ mod tests {
         assert_eq!(server.setup_install, "install exact Gemini package");
         assert_eq!(server.setup_auth, "run exact Gemini login");
         assert_eq!(server.setup_url, "https://example.com/exact-gemini");
+    }
+
+    #[test]
+    fn registry_provider_setup_survives_source_id_changes() {
+        let registry = Registry::from_json(
+            r#"{
+                "agents": [
+                    {
+                        "id": "anthropic-claude",
+                        "name": "Anthropic Claude",
+                        "repository": "https://github.com/agentclientprotocol/claude-agent-acp",
+                        "distribution": {
+                            "npx": { "package": "@agentclientprotocol/claude-agent-acp@0.40.0" }
+                        }
+                    },
+                    {
+                        "id": "openai-codex",
+                        "name": "OpenAI Codex",
+                        "distribution": {
+                            "npx": { "package": "@zed-industries/codex-acp@0.20.0" }
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse");
+        let servers = registry.configured_servers();
+        let claude = servers
+            .iter()
+            .find(|server| server.source_id == "anthropic-claude")
+            .expect("claude");
+        assert_eq!(claude.quota_backend, ThorQuotaBackend::ClaudeCli);
+        assert_eq!(claude.setup_install, "install Node.js/npm");
+        assert_eq!(claude.setup_auth, "install and sign in to Claude Code");
+
+        let codex = servers
+            .iter()
+            .find(|server| server.source_id == "openai-codex")
+            .expect("codex");
+        assert_eq!(codex.quota_backend, ThorQuotaBackend::CodexAppserver);
+        assert_eq!(codex.setup_install, "install Node.js/npm");
+        assert_eq!(codex.setup_auth, "sign in to Codex");
     }
 
     #[tokio::test]

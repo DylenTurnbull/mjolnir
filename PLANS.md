@@ -720,6 +720,17 @@ Fixed in this PR:
   entries outside the known-provider list. Registry-backed `npx`, `uvx`, and
   current-platform binary agents now persist package-manager/install guidance
   plus "configure or sign in if prompted" text instead of blank setup metadata.
+- [x] Broadened known-provider fallback detection beyond exact registry source
+  IDs. Registry resolution and persisted-server recovery now infer Claude,
+  Codex, Gemini, OpenCode, Goose, Cursor, GitHub Copilot, and Anvil setup
+  guidance from source IDs, display names, package names, commands, docs URLs,
+  and descriptions, so upstream id/package reshuffles do not fall straight
+  back to generic recovery copy.
+- [x] Added production-size Thor setup render coverage for the mixed ready plus
+  broken-provider recovery path at 80x24 and 132x36. The test verifies the
+  ready worker, Thor host, concrete provider install guidance, Add known agent,
+  Add installed agent, Retry checks, and summary wording without exposing old
+  registry/custom-command jargon.
 - [x] Added automated provider recovery matrix coverage for Anvil, Claude,
   Codex, Gemini, OpenCode, Goose, Cursor, and GitHub Copilot rows, and made
   Gemini generic exits/timeouts resolve to Gemini sign-in guidance instead of
@@ -739,21 +750,7 @@ Fixed in this PR:
 
 Still not production-grade:
 
-1. **Registry-backed agent setup still needs broader upstream metadata coverage.**
-   Registry entries can now be added from onboarding, and website/repository
-   links, launch commands, binary installed-command candidates, local provider
-   setup profiles, distribution-based fallback hints, exact setup metadata
-   fields, and structured install/auth labels are shown when available.
-   Known-provider and package-manager fallback labels are now persisted into
-   saved Thor server config when upstream registry entries omit setup metadata,
-   and validation recovery rows prefer exact structured install/auth text over
-   hardcoded generic copy. A live registry check on 2026-06-28 found 37 entries
-   and no `setup` or `setupHint` metadata, so the remaining exact-metadata gap
-   is upstream registry content rather than an unparsed current field. What
-   remains is broader upstream registry coverage for agents outside the
-   known-provider and distribution fallback set. Tracked in
-   [#250](https://github.com/BrokkAi/mjolnir/issues/250).
-2. **Thor setup still needs a real end-user recovery pass.** The main path is
+1. **Thor setup still needs a real end-user recovery pass.** The main path is
    now the intended Thor setup path: choose work style, choose agents Thor may
    use, choose where Thor runs, optionally add/fix an agent, then start. It is
    not done just because the old picker is gone. What still needs production
@@ -761,16 +758,22 @@ Still not production-grade:
    recovery, terminal sizes, and real provider success/failure combinations.
    Tracked in
    [#252](https://github.com/BrokkAi/mjolnir/issues/252).
-3. **The setup UI has only been manually smoked for a few terminal scenarios.**
-   Unit tests cover state transitions, list windowing, small/large recovery
-   rendering, and every setup step at 50x16 and 40x12; manual smoke now covers
-   the no-working-agent 80-column path, a configured-but-broken 80-column path,
-   a known-agent add path, a successful configured-agent path, structured
-   setup metadata persistence with a deterministic mock ACP server, and the
-   work-style-first fresh-home path. Broader real-terminal smoke is still
-   useful before calling onboarding
-   production-grade. Tracked in
-   [#252](https://github.com/BrokkAi/mjolnir/issues/252).
+   Automated render coverage now includes every setup step at 50x16 and 40x12,
+   recovery paths at 72x24 and 120x36, and mixed ready/broken provider recovery
+   at 80x24 and 132x36. Manual smoke covers the no-working-agent 80-column
+   path, a configured-but-broken 80-column path, a known-agent add path, a
+   successful configured-agent path, structured setup metadata persistence with
+   a deterministic mock ACP server, and the work-style-first fresh-home path.
+   What remains is real-provider recovery validation after actual install/auth
+   fixes, tracked in [#252](https://github.com/BrokkAi/mjolnir/issues/252).
+
+Registry-backed setup metadata note: a live registry check on 2026-06-28 found
+37 entries and no `setup` or `setupHint` metadata. Local code now handles exact
+metadata when present, known-provider inference, package-manager fallback, and
+current-platform binary fallback. Remaining exact metadata for unknown future
+providers belongs upstream in the ACP registry and is tracked in
+[#250](https://github.com/BrokkAi/mjolnir/issues/250), not as a local
+production-grade blocker.
 
 ## Risks and open questions
 

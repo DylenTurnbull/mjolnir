@@ -1454,36 +1454,110 @@ fn registry_setup_auth(server: &ConfiguredAcpServer) -> String {
 }
 
 fn known_registry_setup_hint(server: &ConfiguredAcpServer) -> Option<&'static str> {
-    known_registry_setup_parts(server).map(|_parts| match server.source_id.as_str() {
-        "anvil" => "install uv; Brokk/Anvil signs in when required",
-        "claude-acp" => "install Node.js/npm; install and sign in to Claude Code",
-        "codex-acp" => "install Node.js/npm; sign in to Codex",
-        "gemini" => "install Node.js/npm; sign in with Gemini CLI",
-        "opencode" => "install OpenCode CLI; configure OpenCode provider credentials",
-        "goose" => "install Goose; configure a Goose provider",
-        "cursor" => "install Cursor Agent; sign in to Cursor",
-        "github-copilot-cli" => "install Node.js/npm; sign in to GitHub Copilot",
-        _ => unreachable!("known_registry_setup_parts returned unknown provider"),
+    known_registry_setup_parts(server).map(|_parts| match known_registry_provider(server) {
+        Some(KnownRegistryProvider::Anvil) => "install uv; Brokk/Anvil signs in when required",
+        Some(KnownRegistryProvider::Claude) => {
+            "install Node.js/npm; install and sign in to Claude Code"
+        }
+        Some(KnownRegistryProvider::Codex) => "install Node.js/npm; sign in to Codex",
+        Some(KnownRegistryProvider::Gemini) => "install Node.js/npm; sign in with Gemini CLI",
+        Some(KnownRegistryProvider::OpenCode) => {
+            "install OpenCode CLI; configure OpenCode provider credentials"
+        }
+        Some(KnownRegistryProvider::Goose) => "install Goose; configure a Goose provider",
+        Some(KnownRegistryProvider::Cursor) => "install Cursor Agent; sign in to Cursor",
+        Some(KnownRegistryProvider::GitHubCopilot) => {
+            "install Node.js/npm; sign in to GitHub Copilot"
+        }
+        None => unreachable!("known_registry_setup_parts returned unknown provider"),
     })
 }
 
 fn known_registry_setup_parts(
     server: &ConfiguredAcpServer,
 ) -> Option<(&'static str, &'static str)> {
-    match server.source_id.as_str() {
-        "anvil" => Some(("install uv", "Brokk/Anvil signs in when required")),
-        "claude-acp" => Some(("install Node.js/npm", "install and sign in to Claude Code")),
-        "codex-acp" => Some(("install Node.js/npm", "sign in to Codex")),
-        "gemini" => Some(("install Node.js/npm", "sign in with Gemini CLI")),
-        "opencode" => Some((
+    match known_registry_provider(server)? {
+        KnownRegistryProvider::Anvil => Some(("install uv", "Brokk/Anvil signs in when required")),
+        KnownRegistryProvider::Claude => {
+            Some(("install Node.js/npm", "install and sign in to Claude Code"))
+        }
+        KnownRegistryProvider::Codex => Some(("install Node.js/npm", "sign in to Codex")),
+        KnownRegistryProvider::Gemini => Some(("install Node.js/npm", "sign in with Gemini CLI")),
+        KnownRegistryProvider::OpenCode => Some((
             "install OpenCode CLI",
             "configure OpenCode provider credentials",
         )),
-        "goose" => Some(("install Goose", "configure a Goose provider")),
-        "cursor" => Some(("install Cursor Agent", "sign in to Cursor")),
-        "github-copilot-cli" => Some(("install Node.js/npm", "sign in to GitHub Copilot")),
-        _ => None,
+        KnownRegistryProvider::Goose => Some(("install Goose", "configure a Goose provider")),
+        KnownRegistryProvider::Cursor => Some(("install Cursor Agent", "sign in to Cursor")),
+        KnownRegistryProvider::GitHubCopilot => {
+            Some(("install Node.js/npm", "sign in to GitHub Copilot"))
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum KnownRegistryProvider {
+    Anvil,
+    Claude,
+    Codex,
+    Gemini,
+    OpenCode,
+    Goose,
+    Cursor,
+    GitHubCopilot,
+}
+
+fn known_registry_provider(server: &ConfiguredAcpServer) -> Option<KnownRegistryProvider> {
+    let mut parts = vec![
+        server.source_id.as_str(),
+        server.name.as_str(),
+        server.description.as_str(),
+        server.setup_url.as_str(),
+    ];
+    if let Some(program) = server.program.to_str() {
+        parts.push(program);
+    }
+    parts.extend(server.args.iter().map(String::as_str));
+    known_registry_provider_from_parts(parts)
+}
+
+fn known_registry_provider_from_parts<'a>(
+    parts: impl IntoIterator<Item = &'a str>,
+) -> Option<KnownRegistryProvider> {
+    let haystack = parts
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if haystack.is_empty() {
+        return None;
+    }
+    if haystack.contains("github-copilot") || haystack.contains("copilot-cli") {
+        return Some(KnownRegistryProvider::GitHubCopilot);
+    }
+    if haystack.contains("claude") {
+        return Some(KnownRegistryProvider::Claude);
+    }
+    if haystack.contains("codex") {
+        return Some(KnownRegistryProvider::Codex);
+    }
+    if haystack.contains("gemini") {
+        return Some(KnownRegistryProvider::Gemini);
+    }
+    if haystack.contains("opencode") || haystack.contains("open-code") {
+        return Some(KnownRegistryProvider::OpenCode);
+    }
+    if haystack.contains("goose") {
+        return Some(KnownRegistryProvider::Goose);
+    }
+    if haystack.contains("cursor") {
+        return Some(KnownRegistryProvider::Cursor);
+    }
+    if haystack.contains("anvil") || haystack.contains("brokk") {
+        return Some(KnownRegistryProvider::Anvil);
+    }
+    None
 }
 
 fn unique_custom_agent_name(cfg: &Config, requested: &str) -> String {
@@ -2771,6 +2845,54 @@ mod tests {
             registry_setup_auth(&opencode),
             "configure OpenCode provider credentials"
         );
+    }
+
+    #[test]
+    fn registry_setup_hint_infers_known_provider_from_name_and_command() {
+        let claude = ConfiguredAcpServer {
+            source_id: "anthropic-claude".to_string(),
+            name: "Anthropic Claude".to_string(),
+            program: PathBuf::from("npx"),
+            args: vec![
+                "-y".to_string(),
+                "@agentclientprotocol/claude-agent-acp".to_string(),
+            ],
+            env: Default::default(),
+            description: String::new(),
+            setup_hint: String::new(),
+            setup_install: String::new(),
+            setup_auth: String::new(),
+            setup_url: String::new(),
+            quota_backend: ThorQuotaBackend::None,
+        };
+        let copilot = ConfiguredAcpServer {
+            source_id: "copilot".to_string(),
+            name: "Copilot".to_string(),
+            program: PathBuf::from("npx"),
+            args: vec!["-y".to_string(), "@github/copilot-cli".to_string()],
+            env: Default::default(),
+            description: String::new(),
+            setup_hint: String::new(),
+            setup_install: String::new(),
+            setup_auth: String::new(),
+            setup_url: String::new(),
+            quota_backend: ThorQuotaBackend::None,
+        };
+
+        assert_eq!(
+            registry_setup_hint(&claude),
+            "install Node.js/npm; install and sign in to Claude Code"
+        );
+        assert_eq!(registry_setup_install(&claude), "install Node.js/npm");
+        assert_eq!(
+            registry_setup_auth(&claude),
+            "install and sign in to Claude Code"
+        );
+        assert_eq!(
+            registry_setup_hint(&copilot),
+            "install Node.js/npm; sign in to GitHub Copilot"
+        );
+        assert_eq!(registry_setup_auth(&copilot), "sign in to GitHub Copilot");
     }
 
     #[test]

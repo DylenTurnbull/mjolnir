@@ -166,17 +166,13 @@ changed and how much each harness/model used.
     persisted into saved Thor server config instead of remaining only transient
     onboarding UI text. Other registry entries now get conservative
     distribution-based fallback setup hints for `npx`, `uvx`, and
-    current-platform binary launchers.
-    Remaining: continue polishing the guided setup progression, replace
-    remaining inferred setup labels with registry-provided exact commands/links
-    where possible, manually smoke-test the setup UI across terminal sizes, and
-    run a successful real long-turn Thor smoke covering sticky task-derived
-    titles, sanitized session-list titles, broader Thor persona-title
-    rejection, provider-saved/local-title behavior after the `Task title:`
-    prompt and title-store changes, local, remote, and headless-stream
-    heartbeats, worker progress mirroring, transcript-reader tailing,
-    transcript freshness in the UI or stream the user is watching, and final
-    recap. A deterministic
+    current-platform binary launchers. Known-provider inference now also looks
+    at source IDs, display names, package names, commands, docs URLs, and
+    descriptions, so upstream registry id changes still get provider-specific
+    recovery copy. Remaining: continue polishing the guided setup progression,
+    replace any confusing recovery copy found during real-provider smoke, and
+    manually smoke-test the setup UI across terminal sizes and provider states.
+    A deterministic
     mock-host/mock-worker headless smoke proved the real Thor MCP bridge,
     structured plan submission, implementation/review/correction delegation,
     mirrored worker progress, and final recap/result text without token spend.
@@ -198,8 +194,8 @@ changed and how much each harness/model used.
     calls, with correction returning `no correction needed` and reporting
     usage. Inline and fullscreen PTY smokes proved the interactive terminal
     title/progress path with deterministic workers. Remaining production-grade
-    work is setup/registry recovery breadth and broader onboarding validation
-    rather than the Thor runtime title/progress data path.
+    work is broader onboarding validation rather than the Thor runtime
+    title/progress data path.
 
 ## Quota reads
 
