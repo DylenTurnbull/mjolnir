@@ -1030,9 +1030,10 @@ async fn run_agent_prompt(agent: SelectedAgent, args: RunAgentArgs) -> Result<De
                     "session_started",
                     format!("{job_label}: worker session ready"),
                 );
+                let delegated_prompt = delegated_worker_prompt(&args);
                 cmd_tx
                     .send(UiCommand::SendPrompt {
-                        text: args.prompt.clone(),
+                        text: delegated_prompt,
                         images: Vec::new(),
                     })
                     .context("send delegated prompt")?;
@@ -1243,6 +1244,31 @@ fn worker_timeout(timeout_seconds: Option<u64>) -> Duration {
         .map(|seconds| seconds.clamp(1, MAX_WORKER_TIMEOUT_SECONDS))
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_WORKER_TIMEOUT)
+}
+
+fn delegated_worker_prompt(args: &RunAgentArgs) -> String {
+    let phase = workflow_phase_label(args.phase);
+    format!(
+        "You are a delegated ACP worker called by Thor.\n\
+\n\
+Worker contract:\n\
+- Complete only this {phase} assignment and keep the answer concise.\n\
+- Do not broaden scope beyond the assignment.\n\
+- Do not modify files unless the assignment explicitly asks you to modify files.\n\
+- If the assignment asks for a direct answer, says to avoid commands, or says not to modify files, answer directly without running tools.\n\
+- For correction assignments, only correct issues identified by the implementation/review results; if there is no concrete issue to correct, answer exactly `no correction needed`.\n\
+\n\
+Assignment:\n{}",
+        args.prompt.trim()
+    )
+}
+
+fn workflow_phase_label(phase: WorkflowPhase) -> &'static str {
+    match phase {
+        WorkflowPhase::Implementation => "implementation",
+        WorkflowPhase::Review => "adversarial review",
+        WorkflowPhase::Correction => "correction",
+    }
 }
 
 fn push_progress(
@@ -1758,6 +1784,52 @@ mod tests {
             worker_timeout(Some(MAX_WORKER_TIMEOUT_SECONDS + 1)),
             Duration::from_secs(MAX_WORKER_TIMEOUT_SECONDS)
         );
+    }
+
+    #[test]
+    fn delegated_worker_prompt_wraps_correction_with_direct_answer_contract() {
+        let args = RunAgentArgs {
+            job_id: "correction".to_string(),
+            phase: WorkflowPhase::Correction,
+            source_id: "worker-a".to_string(),
+            prompt: "if implementation and review agree, answer exactly no correction needed"
+                .to_string(),
+            cwd: None,
+            timeout_seconds: None,
+            permission_mode: BridgePermissionMode::Reject,
+        };
+
+        let prompt = delegated_worker_prompt(&args);
+
+        assert!(prompt.contains("Complete only this correction assignment"));
+        assert!(prompt.contains("answer directly without running tools"));
+        assert!(prompt.contains("answer exactly `no correction needed`"));
+        assert!(
+            prompt.ends_with(
+                "if implementation and review agree, answer exactly no correction needed"
+            )
+        );
+    }
+
+    #[test]
+    fn delegated_worker_prompt_preserves_explicit_implementation_edits() {
+        let args = RunAgentArgs {
+            job_id: "implementation".to_string(),
+            phase: WorkflowPhase::Implementation,
+            source_id: "worker-a".to_string(),
+            prompt: "modify src/lib.rs to fix the parser".to_string(),
+            cwd: None,
+            timeout_seconds: None,
+            permission_mode: BridgePermissionMode::AcceptEdits,
+        };
+
+        let prompt = delegated_worker_prompt(&args);
+
+        assert!(prompt.contains("Complete only this implementation assignment"));
+        assert!(prompt.contains(
+            "Do not modify files unless the assignment explicitly asks you to modify files"
+        ));
+        assert!(prompt.ends_with("modify src/lib.rs to fix the parser"));
     }
 
     #[test]

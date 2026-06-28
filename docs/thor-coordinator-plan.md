@@ -61,6 +61,11 @@ changed and how much each harness/model used.
   timeout, and error events through an out-of-band progress stream consumed by
   the interactive UI and remote tracker, so the transcript continues to update
   while the Thor host waits for a delegated ACP worker call to return.
+- Delegated worker prompts are wrapped with a phase-aware worker contract before
+  they are sent to ACP workers. The wrapper keeps workers inside the assignment,
+  tells them not to modify files unless explicitly asked, tells direct-answer
+  and no-edit assignments to answer without tools, and tells correction workers
+  to return `no correction needed` when there is no concrete issue to correct.
 - Headless `--print --output-format stream-json` uses the same progress-enabled
   Thor MCP bridge and emits `info` records for worker progress and elapsed
   heartbeats, giving long-turn runtime smoke tests a repeatable non-TUI capture
@@ -182,8 +187,10 @@ changed and how much each harness/model used.
     task-derived naming, immediate plan status, heartbeat updates through 150s,
     Thor MCP calls, implementation/review worker progress, correction worker
     timeout progress, final recap, and usage reporting in the watched remote
-    transcript. Real fullscreen/inline TUI validation and a real-provider
-    correction phase that completes normally remain open.
+    transcript. A real-provider correction-wrapper headless smoke proved
+    implementation/review/correction workers can complete without worker tool
+    calls, with correction returning `no correction needed` and reporting
+    usage. Real fullscreen/inline TUI validation remains open.
 
 ## Quota reads
 

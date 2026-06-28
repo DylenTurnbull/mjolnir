@@ -169,13 +169,20 @@ recap text, and non-empty final `result.text` through the real configured Thor
 host path. A real Codex-host/Anvil-worker smoke has now proven real-provider
 Thor MCP bridge use, worker validation, model catalog loading, structured plan
 submission, implementation and adversarial-review delegation, mirrored worker
-progress, elapsed heartbeats, final recap text, and usage reporting. The
-correction worker timed out, but that timeout was mirrored and recapped instead
-of freezing the transcript. A real configured Anvil-backed smoke has proven
-heartbeat emission and bounded timeout reporting, but it did not produce a Thor
-plan, worker progress, final recap, or usage before timing out. Headless
-`--print` supports `--print-timeout-seconds` so real-provider smoke runs fail
-cleanly instead of hanging indefinitely.
+progress, elapsed heartbeats, final recap text, and usage reporting. The first
+real correction workers timed out, but those timeouts were mirrored and recapped
+instead of freezing the transcript. Delegated worker prompts are now wrapped
+with a small phase-aware contract that tells workers to stay within the
+assignment, avoid tools for direct-answer/no-edit tasks, and answer correction
+assignments with `no correction needed` when there is no concrete issue to
+correct. A follow-up real-provider headless smoke proved implementation,
+review, and correction all completing, with the correction worker returning
+`no correction needed`, reporting usage, and making no tool calls or permission
+requests. A real configured Anvil-backed smoke has proven heartbeat emission
+and bounded timeout reporting, but it did not produce a Thor plan, worker
+progress, final recap, or usage before timing out. Headless `--print` supports
+`--print-timeout-seconds` so real-provider smoke runs fail cleanly instead of
+hanging indefinitely.
 
 Session listing also strips generic Thor/coordinator titles reported by ACP
 hosts, applies persisted local task-title overrides by session id, and uses the
@@ -753,9 +760,10 @@ Still not production-grade:
    proves the watched remote transcript path receives task-derived naming,
    immediate plan status, heartbeat updates, Thor MCP tool calls, worker
    lifecycle/progress, visible timeout reporting, final recap, and usage
-   reporting. What remains is real fullscreen/inline interactive validation of
-   the same behavior, plus a real-provider correction phase that completes
-   instead of timing out. This item stays open until those paths are recorded.
+   reporting. A delegated-worker prompt wrapper plus a real-provider headless
+   smoke now prove a correction phase can complete normally instead of timing
+   out. What remains is real fullscreen/inline interactive validation of the
+   same behavior. This item stays open until that path is recorded.
 2. **Registry-backed agent setup still needs broader upstream metadata coverage.**
    Registry entries can now be added from onboarding, and website/repository
    links, launch commands, binary installed-command candidates, local provider
@@ -943,13 +951,45 @@ not prove fullscreen/inline TUI rendering with a human watching the terminal,
 and it does not close the real-provider correction-completion gap because the
 correction worker timed out.
 
+### Thor real-provider correction-wrapper smoke — 2026-06-28
+
+Source: same isolated Thor config as the Codex-host smoke, after adding the
+delegated-worker prompt wrapper. This run used the headless stream path to
+validate whether a tiny real-provider correction assignment completes instead
+of drifting into tool calls and timing out.
+
+Launch:
+
+```text
+MJ_CONFIG=/tmp/mj-thor-codex-host-smoke/config.toml target/debug/mj --agent-stderr /tmp/mj-thor-correction-wrapper-smoke.err --output-format stream-json --permission-mode acceptEdits --print-timeout-seconds 180 --print "Correction wrapper smoke unique 1782620600. Do not modify files. Use Thor MCP tools. First call thor_list_acp_agents with refreshQuota=true and validate=true, then thor_get_model_catalog, then thor_submit_plan with exactly three phases. Implementation job on custom:codex alt prompt: answer exactly repo: mjolnir. Review job on anvil prompt: answer exactly review agrees repo: mjolnir. Correction job on anvil prompt: if implementation and review agree, answer exactly no correction needed. Run phases one at a time if required. Use permissionMode reject and timeoutSeconds 30 for each worker. Finish with a short recap including correction result and usage."
+```
+
+Observed stream evidence:
+
+| Feature | Result |
+| --- | --- |
+| session start | `session_started` stream record emitted with session `019f0bdb-401d-7390-82c4-0be4b704944c` |
+| worker inventory/model catalog | host called `thor_list_acp_agents` with validation/quota refresh, then `thor_get_model_catalog` |
+| plan and workflow | host submitted an implementation/review/correction plan accepted by `thor_submit_plan` |
+| implementation worker | `custom:codex alt` worker emitted started, prompt-sent, and done; host reported `repo: mjolnir` and no tool calls or permission requests |
+| review worker | `anvil` worker emitted started, prompt-sent, and done; host reported no tool calls or permission requests |
+| correction worker | `anvil` worker emitted started, prompt-sent, and done; host reported correction result containing `no correction needed` |
+| usage reporting | final recap reported 14,750 implementation tokens, 8,532 review tokens, 8,553 correction tokens, and 31,835 aggregate worker tokens |
+| final recap | final `result.text` included correction result, usage, and `No worker made tool calls or permission requests.` |
+
+This proves the real-provider correction phase can complete normally after the
+delegated-worker prompt wrapper. It does not replace the still-needed
+fullscreen/inline TUI validation with a human watching the terminal.
+
 Known gaps:
 
 - The Codex-host smoke proves the headless stream path, and the remote-control
   API smoke proves the browser/remote transcript path. Fullscreen/inline TUI
   rendering with a human watching the terminal still needs real validation.
-- The correction phase timed out instead of completing normally in both real
-  provider smokes, though the timeout was visible and recapped.
+- Earlier correction phases timed out, though the timeout was visible and
+  recapped. The correction-wrapper smoke proves a tiny correction phase can now
+  complete normally; broader correction tasks still need observation in normal
+  interactive use.
 - Anvil-hosted Thor still needs a successful bridge-use smoke; the earlier
   Anvil-hosted run only proved heartbeat and bounded timeout behavior.
 
