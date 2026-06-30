@@ -1454,7 +1454,7 @@ async fn run_session(
     mut spinner_style: spinner::SpinnerStyle,
     score_store: scores::ScoreStore,
 ) -> Result<RunSessionResult> {
-    let mut terminal = setup_session_terminal(mode)?;
+    let mut terminal = SessionTerminal::fresh(mode)?;
 
     let (event_tx, runtime_event_rx) = mpsc::unbounded_channel();
     let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
@@ -1529,7 +1529,7 @@ async fn run_session(
     let mut header_labels = header_labels;
     let ui_result = loop {
         let ui_result = ui::run(
-            &mut terminal,
+            &mut terminal.term,
             &cmd_tx,
             &mut ui_event_rx,
             header_labels.clone(),
@@ -1549,28 +1549,28 @@ async fn run_session(
         )
         .await;
 
-        let restore_result = restore_session_terminal(&mut terminal, mode);
-        if let Err(e) = restore_result {
-            tracing::warn!("restore terminal failed: {e}");
-        }
+        // Adopt any theme/spinner the user changed during the session so the
+        // picker and any follow-on session inherit them.
         if let Ok(result) = ui_result.as_ref() {
             theme_kind = result.theme_kind;
             spinner_style = result.spinner_style;
         }
-        if matches!(
-            ui_result.as_ref().map(|result| result.reason),
-            Ok(UiExitReason::ClearSession)
-        ) && let Err(e) = ui::clear_terminal_screen(&mut terminal)
-        {
-            tracing::warn!("clear terminal for /clear failed: {e}");
-        }
 
-        let Ok(result) = ui_result else {
-            break ui_result.map(Into::into);
+        // Only the session picker (LoadSession) needs the active session UI
+        // torn down before it draws. Every other outcome — quit, /new, /clear,
+        // or an error — keeps the session UI on screen (the inline prompt, or
+        // the fullscreen alt-screen) while the runtime shuts down below; the
+        // terminal is restored just before we return, so the user never watches
+        // a cleared viewport or a bare primary buffer during teardown.
+        let result = match ui_result {
+            Ok(result) if result.reason == UiExitReason::LoadSession => result,
+            other => break other.map(Into::into),
         };
-        if result.reason != UiExitReason::LoadSession {
-            break Ok(result.into());
-        }
+
+        // LoadSession: restore now so the fullscreen session picker can take
+        // over the screen.
+        terminal.restore_once(mode);
+
         let current_session_id = result.session_id;
         let current_session_title = result.session_title;
 
@@ -1615,7 +1615,9 @@ async fn run_session(
         {
             LoadSessionResult::Switched => {
                 header_labels.session_title = target_title;
-                terminal = match setup_session_terminal(mode) {
+                // A fresh terminal starts unrestored, so the exit path will
+                // restore it again — no manual bookkeeping needed.
+                terminal = match SessionTerminal::fresh(mode) {
                     Ok(terminal) => terminal,
                     Err(e) => {
                         let _ = cmd_tx.send(UiCommand::Shutdown);
@@ -1680,6 +1682,20 @@ async fn run_session(
     wait_for_task("remote-control event proxy", event_proxy).await;
     wait_for_task("remote-control command proxy", cmd_proxy).await;
 
+    // Restore the terminal only now, after the runtime has finished tearing
+    // down, so the session UI stayed on screen through shutdown and is torn
+    // down moments before the process exits (or the next session draws) instead
+    // of leaving a blank gap during teardown. No-op if the LoadSession path
+    // already restored before showing the session picker.
+    terminal.restore_once(mode);
+    if matches!(
+        ui_result.as_ref().map(|result| result.reason),
+        Ok(UiExitReason::ClearSession)
+    ) && let Err(e) = ui::clear_terminal_screen(&mut terminal.term)
+    {
+        tracing::warn!("clear terminal for /clear failed: {e}");
+    }
+
     ui_result
 }
 
@@ -1701,6 +1717,39 @@ fn restore_session_terminal(
     match mode {
         UiMode::InlineChat => ui::restore_inline_chat_terminal(terminal),
         UiMode::FullscreenTui => ui::restore_fullscreen_terminal(terminal),
+    }
+}
+
+/// The session terminal paired with whether it has already been restored.
+///
+/// `run_session` must restore the terminal exactly once, but the moment varies
+/// by exit path (the LoadSession picker needs it restored eagerly; every other
+/// path defers until after runtime teardown). Binding the flag to the terminal
+/// value keeps the two in sync by construction: `fresh` always starts
+/// unrestored, and `restore_once` is idempotent, so every exit path can call it
+/// without tracking who restored first.
+struct SessionTerminal {
+    term: ratatui::Terminal<crate::term::TrackedBackend<std::io::Stdout>>,
+    restored: bool,
+}
+
+impl SessionTerminal {
+    fn fresh(mode: UiMode) -> Result<Self> {
+        Ok(Self {
+            term: setup_session_terminal(mode)?,
+            restored: false,
+        })
+    }
+
+    /// Restore the terminal if it hasn't been already; later calls are no-ops.
+    fn restore_once(&mut self, mode: UiMode) {
+        if self.restored {
+            return;
+        }
+        if let Err(e) = restore_session_terminal(&mut self.term, mode) {
+            tracing::warn!("restore terminal failed: {e}");
+        }
+        self.restored = true;
     }
 }
 
