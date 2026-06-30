@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use agent_client_protocol::schema::v1::{AvailableCommandInput, StopReason, ToolCallStatus};
+use agent_client_protocol::schema::v1::{
+    AvailableCommandInput, SessionConfigOption, StopReason, ToolCallStatus,
+};
 use anyhow::{Context, Result};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
@@ -281,12 +283,13 @@ pub struct UiPersistencePaths<'a> {
     pub config_path: Option<&'a Path>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct UiRunOptions<'a> {
     pub persistence: UiPersistencePaths<'a>,
     pub mode: UiMode,
     pub theme_kind: TerminalThemeKind,
     pub spinner_style: SpinnerStyle,
+    pub score_store: crate::scores::ScoreStore,
 }
 
 pub struct UiRunResult {
@@ -300,6 +303,8 @@ pub struct UiRunResult {
 struct UiInitialState {
     header_labels: HeaderLabels,
     agent_label: Option<String>,
+    agent_source_id: Option<String>,
+    score_store: crate::scores::ScoreStore,
     history: Vec<String>,
     transcript_export_dir: Option<PathBuf>,
     config_path: Option<PathBuf>,
@@ -324,6 +329,7 @@ pub async fn run(
     event_rx: &mut mpsc::UnboundedReceiver<UiEvent>,
     header_labels: HeaderLabels,
     initial_agent_label: Option<String>,
+    initial_agent_source_id: Option<String>,
     options: UiRunOptions<'_>,
 ) -> Result<UiRunResult> {
     let initial_history = options
@@ -345,6 +351,8 @@ pub async fn run(
         UiInitialState {
             header_labels,
             agent_label: initial_agent_label,
+            agent_source_id: initial_agent_source_id,
+            score_store: options.score_store.clone(),
             history: initial_history,
             transcript_export_dir: options
                 .persistence
@@ -456,6 +464,10 @@ async fn ui_loop(
     if let Some(label) = initial.agent_label {
         state.agent_label = label;
     }
+    if let Some(source_id) = initial.agent_source_id {
+        state.agent_source_id = source_id;
+    }
+    state.score_store = initial.score_store;
     state.transcript_export_dir = initial.transcript_export_dir;
     state.set_theme(initial.theme_kind);
     state.set_spinner_style(initial.spinner_style);
@@ -3866,6 +3878,9 @@ fn draw_inline_config_value_picker(f: &mut ratatui::Frame, area: Rect, state: &A
         .map(Line::from)
         .collect::<Vec<_>>();
     let detail_height = detail_lines.len().max(1).min(u16::MAX as usize) as u16;
+    // Score attribution, rendered as its own row just above the footer.
+    let legend = model_score_legend(state, option);
+    let legend_rows = u16::from(legend.is_some());
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -3874,6 +3889,7 @@ fn draw_inline_config_value_picker(f: &mut ratatui::Frame, area: Rect, state: &A
             Constraint::Length(detail_height),
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(legend_rows),
             Constraint::Length(1),
         ])
         .split(content);
@@ -3922,11 +3938,19 @@ fn draw_inline_config_value_picker(f: &mut ratatui::Frame, area: Rect, state: &A
                 let absolute = start + offset;
                 let marker = if absolute == selected { ">" } else { " " };
                 let choice = &choices[full_idx];
-                let line = config_value_row_text(choice);
+                let score = model_choice_score(state, option, choice);
+                let line = config_value_row_text(choice, score.as_deref(), layout[3].width);
                 truncate_line(line, layout[3].width, marker == ">", state.theme)
             })
             .collect::<Vec<ListItem>>();
         f.render_widget(List::new(items), layout[3]);
+    }
+
+    if let Some(legend) = legend {
+        f.render_widget(
+            Paragraph::new(legend).style(Style::default().fg(state.theme.muted)),
+            layout[4],
+        );
     }
 
     let footer = if picker.search_query.is_empty() {
@@ -3936,7 +3960,7 @@ fn draw_inline_config_value_picker(f: &mut ratatui::Frame, area: Rect, state: &A
     };
     f.render_widget(
         Paragraph::new(footer).style(Style::default().fg(state.theme.muted)),
-        layout[4],
+        layout[5],
     );
 }
 
@@ -3993,7 +4017,8 @@ fn inline_config_view_line_count(state: &AppState, width: u16) -> usize {
         .unwrap_or_else(|| config_option_current_value_label(option));
     let detail_rows = wrap_text_to_width(&detail, width).len().max(1);
     let option_rows = picker.filtered_indices.len().max(1);
-    1 + detail_rows + 1 + option_rows + 1
+    let legend_rows = usize::from(model_score_legend(state, option).is_some());
+    1 + detail_rows + 1 + option_rows + legend_rows + 1
 }
 
 fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
@@ -6127,6 +6152,8 @@ fn draw_config_value_picker_modal(f: &mut ratatui::Frame, area: Rect, state: &Ap
         .description
         .clone()
         .unwrap_or_else(|| config_option_current_value_label(option));
+    let legend = model_score_legend(state, option);
+    let legend_rows = u16::from(legend.is_some());
     let total = picker.filtered_indices.len();
     let selected = picker.selected_value;
     let rows = 8u16;
@@ -6141,7 +6168,7 @@ fn draw_config_value_picker_modal(f: &mut ratatui::Frame, area: Rect, state: &Ap
     } else {
         area.height.saturating_sub(4)
     };
-    let height = (desired_rows + 5).min(max_height);
+    let height = (desired_rows + 5 + legend_rows).min(max_height);
     if height < 6 {
         return;
     }
@@ -6161,18 +6188,22 @@ fn draw_config_value_picker_modal(f: &mut ratatui::Frame, area: Rect, state: &Ap
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(2 + legend_rows),
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
         ])
         .split(inner);
 
-    let header = Paragraph::new(vec![
-        Line::from(detail),
-        Line::from("Enter to apply | Esc cancel".to_string()),
-    ])
-    .wrap(Wrap { trim: false });
+    let mut header_lines = vec![Line::from(detail)];
+    if let Some(legend) = legend {
+        header_lines.push(Line::from(Span::styled(
+            legend,
+            Style::default().fg(state.theme.muted),
+        )));
+    }
+    header_lines.push(Line::from("Enter to apply | Esc cancel".to_string()));
+    let header = Paragraph::new(header_lines).wrap(Wrap { trim: false });
     f.render_widget(header, layout[0]);
 
     // Search input box
@@ -6215,7 +6246,8 @@ fn draw_config_value_picker_modal(f: &mut ratatui::Frame, area: Rect, state: &Ap
             let absolute = start + offset;
             let marker = if absolute == selected { ">" } else { " " };
             let choice = &choices[full_idx];
-            let line = config_value_row_text(choice);
+            let score = model_choice_score(state, option, choice);
+            let line = config_value_row_text(choice, score.as_deref(), layout[2].width);
             truncate_line(line, layout[2].width, marker == ">", state.theme)
         })
         .collect::<Vec<ListItem>>();
@@ -6385,7 +6417,7 @@ fn truncate_line(
     ListItem::new(line).style(style)
 }
 
-fn config_value_row_text(choice: &ConfigValueChoice) -> String {
+fn config_value_row_text(choice: &ConfigValueChoice, score: Option<&str>, width: u16) -> String {
     let mut line = if let Some(group) = choice.group.as_ref() {
         format!("{group} / {}", choice.name)
     } else {
@@ -6397,7 +6429,45 @@ fn config_value_row_text(choice: &ConfigValueChoice) -> String {
         line.push_str("  -- ");
         line.push_str(description.trim());
     }
-    line
+    let Some(score) = score else {
+        return line;
+    };
+    let suffix = format!("  {score}");
+    let suffix_width = suffix.width();
+    let width = usize::from(width);
+    if suffix_width >= width {
+        return truncate_text_to_width(score.to_string(), width as u16);
+    }
+    let prefix_width = width - suffix_width;
+    let prefix = truncate_text_to_width(line, prefix_width as u16);
+    format!("{prefix}{suffix}")
+}
+
+/// Attribution shown under a model-selection picker explaining the trailing
+/// number, or `None` when scores aren't being rendered (not a model option, or
+/// scoring disabled). Keeps a blank score readable as "not ranked".
+fn model_score_legend(state: &AppState, option: &SessionConfigOption) -> Option<&'static str> {
+    (crate::app::is_model_config_option(option) && state.score_store.is_active()).then_some(
+        "elo: LMArena text-arena rating, higher is better · https://lmarena.ai · blank = not ranked",
+    )
+}
+
+/// The score suffix for one model choice, or `None` when this option isn't a
+/// model option or scoring is disabled/uninstalled (so nothing is appended).
+fn model_choice_score(
+    state: &AppState,
+    option: &SessionConfigOption,
+    choice: &ConfigValueChoice,
+) -> Option<String> {
+    if !crate::app::is_model_config_option(option) {
+        return None;
+    }
+    state.score_store.score_suffix(
+        &state.agent_source_id,
+        &choice.value.to_string(),
+        &choice.name,
+        choice.description.as_deref().unwrap_or_default(),
+    )
 }
 
 #[cfg(test)]
@@ -6408,8 +6478,8 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
         AvailableCommand, ContentBlock, ContentChunk, PermissionOption, PermissionOptionKind,
-        SessionConfigOption, SessionConfigSelectOption, SessionUpdate, StopReason, TextContent,
-        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+        SessionConfigOption, SessionConfigSelectOption, SessionConfigValueId, SessionUpdate,
+        StopReason, TextContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::backend::{Backend, TestBackend};
@@ -6453,6 +6523,24 @@ mod tests {
             height: image.height,
             byte_len: image.byte_len,
         }
+    }
+
+    #[test]
+    fn config_value_row_keeps_score_visible_with_long_description() {
+        let choice = ConfigValueChoice {
+            value: SessionConfigValueId::new("gpt-5.5"),
+            name: "GPT-5.5".to_string(),
+            description: Some(
+                "A very long model description that would normally consume the whole row"
+                    .to_string(),
+            ),
+            group: None,
+        };
+
+        let row = config_value_row_text(&choice, Some("1463 elo"), 32);
+
+        assert!(row.ends_with("  1463 elo"), "{row}");
+        assert!(row.width() <= 32, "{row}");
     }
 
     fn write_test_png(path: &Path) {

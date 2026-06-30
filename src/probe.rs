@@ -39,6 +39,7 @@
 //! options are account/agent-level, not workspace-specific.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
@@ -51,6 +52,25 @@ use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo}
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::acp;
+
+type AgentTransport = ByteStreams<
+    tokio_util::compat::Compat<tokio::process::ChildStdin>,
+    tokio_util::compat::Compat<tokio::process::ChildStdout>,
+>;
+
+struct DetachedAgentLaunch {
+    program: PathBuf,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    cwd: PathBuf,
+    timeout: Duration,
+}
+
+struct DetachedAgentOutcomes<Missing, SpawnFailed, TimedOut> {
+    missing: Missing,
+    spawn_failed: SpawnFailed,
+    timed_out: TimedOut,
+}
 
 /// Process-global validation results, keyed by picker `source_id`. Written
 /// by the background probes, read by the picker each frame. A poisoned lock
@@ -118,12 +138,52 @@ pub async fn probe_agent(
     cwd: PathBuf,
     timeout: Duration,
 ) -> ProbeStatus {
+    run_detached_agent_session(
+        DetachedAgentLaunch {
+            program,
+            args,
+            env,
+            cwd,
+            timeout,
+        },
+        DetachedAgentOutcomes {
+            missing: || ProbeStatus::NotInstalled,
+            spawn_failed: ProbeStatus::Failed,
+            timed_out: || ProbeStatus::Unknown,
+        },
+        session_probe,
+    )
+    .await
+}
+
+async fn run_detached_agent_session<R, Missing, SpawnFailed, TimedOut, Handler, Fut>(
+    launch: DetachedAgentLaunch,
+    outcomes: DetachedAgentOutcomes<Missing, SpawnFailed, TimedOut>,
+    handler: Handler,
+) -> R
+where
+    Missing: FnOnce() -> R,
+    SpawnFailed: FnOnce(String) -> R,
+    TimedOut: FnOnce() -> R,
+    Handler: FnOnce(AgentTransport, PathBuf) -> Fut,
+    Fut: Future<Output = R>,
+{
+    let DetachedAgentLaunch {
+        program,
+        args,
+        env,
+        cwd,
+        timeout,
+    } = launch;
+    let DetachedAgentOutcomes {
+        missing,
+        spawn_failed,
+        timed_out,
+    } = outcomes;
     let Some(prepared) = acp::resolve_agent_command_no_install(&program, &env) else {
-        return ProbeStatus::NotInstalled;
+        return missing();
     };
 
-    // Detach the probe from the controlling terminal: a backgrounded agent
-    // must never touch the user's TTY while the picker owns it.
     let (mut child, child_stdin, child_stdout) = match acp::spawn_agent(
         &prepared.command,
         &args,
@@ -132,22 +192,18 @@ pub async fn probe_agent(
         acp::SpawnIsolation::DetachedSession,
     ) {
         Ok(spawned) => spawned,
-        Err(e) => return ProbeStatus::Failed(format!("spawn failed: {e}")),
+        Err(e) => return spawn_failed(format!("spawn failed: {e}")),
     };
     let agent_pid = child.id();
     let transport = ByteStreams::new(child_stdin.compat_write(), child_stdout.compat());
 
-    let status = match tokio::time::timeout(timeout, session_probe(transport, cwd)).await {
-        Ok(status) => status,
-        // A cold npx/uvx package fetch can outlast the budget; that is not a
-        // failure, just an indeterminate result.
-        Err(_) => ProbeStatus::Unknown,
+    let result = match tokio::time::timeout(timeout, handler(transport, cwd)).await {
+        Ok(result) => result,
+        Err(_) => timed_out(),
     };
 
-    // The probe subprocess (and its `npx`/`uvx` grandchildren) must not
-    // outlive the check.
     acp::kill_agent_tree(&mut child, agent_pid).await;
-    status
+    result
 }
 
 /// Drive `initialize` then `session/new` over `transport` and classify the
@@ -210,6 +266,117 @@ where
         })
         .await;
     result.unwrap_or_else(|e| ProbeStatus::Failed(format!("connection error: {e}")))
+}
+
+/// One model an agent exposes as a selectable session config value.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelOption {
+    pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// Launch the agent, open a session, and return its Model-category config
+/// options (the selectable models, with their `value`/`name`/`description`).
+/// Used by `mj dump-models` to read each agent's real model list. Never
+/// installs; kills the subprocess afterward. `Err` carries a short reason.
+pub async fn session_models(
+    program: PathBuf,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    cwd: PathBuf,
+    timeout: Duration,
+) -> std::result::Result<Vec<ModelOption>, String> {
+    run_detached_agent_session(
+        DetachedAgentLaunch {
+            program,
+            args,
+            env,
+            cwd,
+            timeout,
+        },
+        DetachedAgentOutcomes {
+            missing: || Err("not installed".to_string()),
+            spawn_failed: Err,
+            timed_out: || Err("timed out".to_string()),
+        },
+        session_model_options,
+    )
+    .await
+}
+
+/// Drive `initialize` + `session/new` and extract the Model-category options.
+async fn session_model_options<T>(
+    transport: T,
+    cwd: PathBuf,
+) -> std::result::Result<Vec<ModelOption>, String>
+where
+    T: ConnectTo<Client>,
+{
+    let result: std::result::Result<
+        std::result::Result<Vec<ModelOption>, String>,
+        agent_client_protocol::Error,
+    > = Client
+        .builder()
+        .connect_with(transport, move |conn: ConnectionTo<Agent>| async move {
+            let init_req = InitializeRequest::new(ProtocolVersion::V1)
+                .client_info(acp::client_implementation());
+            let init_resp = match conn.send_request(init_req).block_task().await {
+                Ok(resp) => resp,
+                Err(err) if err.code == ErrorCode::AuthRequired => {
+                    return Ok(Err("needs auth".to_string()));
+                }
+                Err(err) => return Ok(Err(format!("initialize failed: {err}"))),
+            };
+            if init_resp.protocol_version != ProtocolVersion::LATEST {
+                return Ok(Err(format!(
+                    "unsupported protocol {}",
+                    init_resp.protocol_version
+                )));
+            }
+
+            let session = match conn
+                .send_request(NewSessionRequest::new(cwd))
+                .block_task()
+                .await
+            {
+                Ok(session) => session,
+                Err(err) if err.code == ErrorCode::AuthRequired => {
+                    return Ok(Err("needs auth".to_string()));
+                }
+                Err(err) => return Ok(Err(format!("session/new failed: {err}"))),
+            };
+
+            let models = session
+                .config_options
+                .unwrap_or_default()
+                .iter()
+                .filter(|opt| crate::app::is_model_config_option(opt))
+                .filter_map(crate::app::config_option_choices)
+                .flatten()
+                .map(|choice| ModelOption {
+                    value: choice.value.to_string(),
+                    name: choice.name,
+                    description: choice.description,
+                })
+                .collect();
+
+            if init_resp
+                .agent_capabilities
+                .session_capabilities
+                .delete
+                .is_some()
+            {
+                let _ = conn
+                    .send_request(DeleteSessionRequest::new(session.session_id.clone()))
+                    .block_task()
+                    .await;
+            }
+
+            Ok(Ok(models))
+        })
+        .await;
+    result.unwrap_or_else(|e| Err(format!("connection error: {e}")))
 }
 
 #[cfg(test)]
