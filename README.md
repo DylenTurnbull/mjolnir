@@ -72,7 +72,8 @@ configured default agent are stored in `~/.config/mj/config.toml`.
 Use `/new` inside the TUI when you want to end the current chat and choose a
 harness again. The agent picker stays open for that explicit new-session flow
 until you select an agent or cancel it. Use `/load` to open the session picker
-for the current agent.
+for the current agent. Use `/ragnarok <task>` to have Thor run a read-only
+tournament across configured ACP agents and present the winning answer.
 
 ## Why Multiple Harnesses
 

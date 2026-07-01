@@ -23,6 +23,7 @@ mod paths;
 mod picker;
 mod probe;
 mod qr;
+mod ragnarok;
 mod registry;
 mod remote;
 mod scores;
@@ -1575,6 +1576,9 @@ async fn run_session(
         Some(ui_event_tx.clone()),
     );
 
+    let ragnarok_ui_tx = ui_event_tx.clone();
+    let ragnarok_cwd = cwd.clone();
+    let ragnarok_runtime_options = runtime_options.clone();
     let event_tracker = remote_tracker.clone();
     let event_proxy = tokio::spawn(async move {
         let mut runtime_event_rx = runtime_event_rx;
@@ -1598,9 +1602,26 @@ async fn run_session(
     let cmd_tracker = remote_tracker.clone();
     let cmd_proxy = tokio::spawn(async move {
         while let Some(command) = ui_cmd_rx.recv().await {
-            cmd_tracker.observe_command(&command);
-            if runtime_cmd_tx.send(command).is_err() {
-                break;
+            match command {
+                UiCommand::StartRagnarok { task } => {
+                    let ui_tx = ragnarok_ui_tx.clone();
+                    let cfg = ragnarok::RagnarokConfig {
+                        cwd: ragnarok_cwd.clone(),
+                        additional_directories: ragnarok_runtime_options
+                            .additional_directories
+                            .clone(),
+                        fs_max_text_bytes: ragnarok_runtime_options.fs_max_text_bytes,
+                    };
+                    tokio::spawn(async move {
+                        ragnarok::run(task, cfg, ui_tx).await;
+                    });
+                }
+                other => {
+                    cmd_tracker.observe_command(&other);
+                    if runtime_cmd_tx.send(other).is_err() {
+                        break;
+                    }
+                }
             }
         }
     });

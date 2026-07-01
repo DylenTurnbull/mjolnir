@@ -531,7 +531,10 @@ impl TrackerState {
                 self.pending_permissions.clear();
                 self.touch();
             }
-            UiEvent::ClaudeUsage(_) => {}
+            UiEvent::ClaudeUsage(_)
+            | UiEvent::RagnarokUpdate { .. }
+            | UiEvent::RagnarokFinished { .. }
+            | UiEvent::RagnarokFailed { .. } => {}
             UiEvent::CancelPendingPermissions => {
                 self.pending_permissions.clear();
                 self.touch();

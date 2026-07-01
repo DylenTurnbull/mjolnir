@@ -39,6 +39,7 @@ const BUILTIN_LOAD_COMMAND: &str = "load";
 const BUILTIN_FORK_COMMAND: &str = "fork";
 const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
+const BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
 
 fn builtin_new_command() -> AvailableCommand {
@@ -74,6 +75,13 @@ fn builtin_mjconfig_command() -> AvailableCommand {
     )
 }
 
+fn builtin_ragnarok_command() -> AvailableCommand {
+    AvailableCommand::new(
+        BUILTIN_RAGNAROK_COMMAND,
+        "run a Thor tournament across ACP agents",
+    )
+}
+
 fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: bool) {
     commands.retain(|command| {
         command.name != BUILTIN_NEW_COMMAND
@@ -82,10 +90,12 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
             && command.name != BUILTIN_FORK_COMMAND
             && command.name != BUILTIN_EXPORT_COMMAND
             && command.name != BUILTIN_MJCONFIG_COMMAND
+            && command.name != BUILTIN_RAGNAROK_COMMAND
     });
     if include_fork {
         commands.insert(0, builtin_fork_command());
     }
+    commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_mjconfig_command());
     commands.insert(0, builtin_export_command());
     commands.insert(0, builtin_load_command());
@@ -118,6 +128,8 @@ pub enum Entry {
     ToolCall(String),
     /// Latest plan posted by the agent.
     Plan(Vec<PlanEntry>),
+    /// Local Ragnarok tournament progress. Updated in place while active.
+    Ragnarok(String),
     /// System-level note (errors, warnings, mode changes).
     System(String),
     /// Visual separator inserted at local session boundaries so a freshly
@@ -597,6 +609,9 @@ pub struct AppState {
     /// Timing for the active or most recently completed prompt turn.
     turn_started_at: Option<Instant>,
     last_turn_elapsed: Option<Duration>,
+    /// True while a local Ragnarok tournament is running in separate ACP
+    /// sessions.
+    pub ragnarok_active: bool,
     /// Time since the current connection lifecycle state was entered.
     connection_state_started_at: Instant,
     /// Last token/context usage reported by the agent.
@@ -873,6 +888,7 @@ impl AppState {
             voice_input_level: None,
             turn_started_at: None,
             last_turn_elapsed: None,
+            ragnarok_active: false,
             connection_state_started_at: now,
             token_usage: TokenUsage::default(),
             claude_usage: None,
@@ -1139,6 +1155,7 @@ impl AppState {
             | Entry::AgentThought(_)
             | Entry::ToolCall(_)
             | Entry::Plan(_)
+            | Entry::Ragnarok(_)
             | Entry::System(_)
             | Entry::SessionBoundary(_) => None,
         })
@@ -1155,17 +1172,19 @@ impl AppState {
     /// placement — derived from `connection_state` so the turn-in-flight
     /// signal cannot drift from the lifecycle enum.
     pub fn is_streaming(&self) -> bool {
-        matches!(
-            self.connection_state,
-            ConnectionState::Streaming | ConnectionState::Cancelling
-        )
+        self.ragnarok_active
+            || matches!(
+                self.connection_state,
+                ConnectionState::Streaming | ConnectionState::Cancelling
+            )
     }
 
     pub fn is_busy(&self) -> bool {
-        matches!(
-            self.connection_state,
-            ConnectionState::Streaming | ConnectionState::Cancelling | ConnectionState::Forking
-        )
+        self.ragnarok_active
+            || matches!(
+                self.connection_state,
+                ConnectionState::Streaming | ConnectionState::Cancelling | ConnectionState::Forking
+            )
     }
 
     pub fn active_turn_elapsed(&self) -> Option<Duration> {
@@ -1248,6 +1267,7 @@ impl AppState {
         self.config_picker = None;
         self.autocomplete = Autocomplete::default();
         self.clear_queued_prompts();
+        self.ragnarok_active = false;
         // Preserve Fatal: a fatal event always supersedes a clean close,
         // since the channel-drop that triggers this method follows the
         // Fatal event by design.
@@ -1503,6 +1523,51 @@ impl AppState {
         // Sending the prompt clears the input; tear down any open
         // autocomplete popover so it doesn't linger over an empty buffer.
         self.autocomplete = Autocomplete::default();
+    }
+
+    /// Record a local Ragnarok command as a prompt-like turn without sending it
+    /// to the active ACP runtime.
+    pub fn start_ragnarok(&mut self, display_text: String) {
+        self.transcript
+            .push(Entry::UserPrompt(display_text.clone()));
+        if self.prompt_history.last().map(String::as_str) != Some(&display_text) {
+            self.prompt_history.push(display_text);
+        }
+        self.reset_history_navigation();
+        self.bump_transcript_revision();
+        self.ragnarok_active = true;
+        self.turn_started_at = Some(Instant::now());
+        self.last_turn_elapsed = None;
+        self.input_cursor = 0;
+        self.scroll_offset = 0;
+        self.autocomplete = Autocomplete::default();
+        self.set_status_line(StatusKind::Info, "Ragnarok begins...");
+    }
+
+    pub fn update_ragnarok(&mut self, text: String) {
+        match self.transcript.last_mut() {
+            Some(Entry::Ragnarok(existing)) => {
+                *existing = text;
+            }
+            _ => self.transcript.push(Entry::Ragnarok(text)),
+        }
+        self.bump_transcript_revision();
+    }
+
+    pub fn finish_ragnarok(&mut self, final_text: String) {
+        self.ragnarok_active = false;
+        self.finish_turn_timer();
+        self.transcript.push(Entry::AgentMessage(final_text));
+        self.bump_transcript_revision();
+        self.set_status_line(StatusKind::Info, "Ragnarok winner selected");
+        self.update_autocomplete();
+    }
+
+    pub fn fail_ragnarok(&mut self, message: String) {
+        self.ragnarok_active = false;
+        self.finish_turn_timer();
+        self.record_status_message(StatusKind::Warning, message);
+        self.update_autocomplete();
     }
 
     /// Open the value picker for one config option. Returns `true` if it
@@ -1847,6 +1912,15 @@ impl AppState {
             }
             UiEvent::ClaudeUsage(report) => {
                 self.claude_usage = Some(report);
+            }
+            UiEvent::RagnarokUpdate { text } => {
+                self.update_ragnarok(text);
+            }
+            UiEvent::RagnarokFinished { final_text } => {
+                self.finish_ragnarok(final_text);
+            }
+            UiEvent::RagnarokFailed { message } => {
+                self.fail_ragnarok(message);
             }
             UiEvent::PromptFailed { message } => {
                 self.finish_prompt_turn(true);
@@ -3570,6 +3644,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ragnarok_updates_replace_combat_frame_and_finish_as_agent_message() {
+        let mut s = AppState::new();
+
+        s.start_ragnarok("/ragnarok fix the arena".to_string());
+        assert!(s.ragnarok_active);
+        assert!(s.is_busy());
+
+        s.apply_event(UiEvent::RagnarokUpdate {
+            text: "frame one".to_string(),
+        });
+        s.apply_event(UiEvent::RagnarokUpdate {
+            text: "frame two".to_string(),
+        });
+
+        let frames: Vec<_> = s
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Ragnarok(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames, vec!["frame two"]);
+
+        s.apply_event(UiEvent::RagnarokFinished {
+            final_text: "winner".to_string(),
+        });
+        assert!(!s.ragnarok_active);
+        assert!(!s.is_busy());
+        assert!(matches!(
+            s.transcript.last(),
+            Some(Entry::AgentMessage(text)) if text == "winner"
+        ));
+    }
+
     fn cmd(name: &str) -> AvailableCommand {
         AvailableCommand::new(name, format!("does {name}"))
     }
@@ -4024,7 +4134,10 @@ mod tests {
             .iter()
             .map(|&i| s.available_commands[i].name.as_str())
             .collect();
-        assert_eq!(names, vec!["new", "clear", "load", "export", "mjconfig"]);
+        assert_eq!(
+            names,
+            vec!["new", "clear", "load", "export", "mjconfig", "ragnarok"]
+        );
     }
 
     #[test]
@@ -4048,7 +4161,9 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "clear", "load", "export", "mjconfig", "fork"]
+            vec![
+                "new", "clear", "load", "export", "mjconfig", "ragnarok", "fork"
+            ]
         );
     }
 
@@ -4084,6 +4199,7 @@ mod tests {
                 "load",
                 "export",
                 "mjconfig",
+                "ragnarok",
                 "fork",
                 "review_pr"
             ]
@@ -4107,6 +4223,10 @@ mod tests {
         );
         assert_eq!(
             s.available_commands[5].description,
+            "run a Thor tournament across ACP agents"
+        );
+        assert_eq!(
+            s.available_commands[6].description,
             "fork the current session (unstable ACP extension)"
         );
     }
@@ -4128,7 +4248,15 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "clear", "load", "export", "mjconfig", "review_pr"]
+            vec![
+                "new",
+                "clear",
+                "load",
+                "export",
+                "mjconfig",
+                "ragnarok",
+                "review_pr"
+            ]
         );
     }
 

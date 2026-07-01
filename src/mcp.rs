@@ -396,7 +396,10 @@ impl ConnState {
             // surface Claude Code's local quota scrape.
             UiEvent::TerminalOutput(_)
             | UiEvent::RemotePermissionDecision { .. }
-            | UiEvent::ClaudeUsage(_) => {}
+            | UiEvent::ClaudeUsage(_)
+            | UiEvent::RagnarokUpdate { .. }
+            | UiEvent::RagnarokFinished { .. }
+            | UiEvent::RagnarokFailed { .. } => {}
         }
     }
 
@@ -494,6 +497,193 @@ async fn teardown_connection(conn: &Connection) {
         {
             aborter.abort();
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedConnectResult {
+    pub agent_name: Option<String>,
+    pub agent_version: Option<String>,
+    pub session_id: Option<String>,
+    pub prompt_images_supported: bool,
+    pub session_fork_supported: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedTurnResult {
+    pub final_text: String,
+    pub final_text_truncated: bool,
+    pub stop_reason: Option<StopReason>,
+    pub usage: Option<Usage>,
+    pub error: Option<String>,
+}
+
+/// Internal connection handle used by local features that need the same
+/// multi-session ACP lifecycle as `mj mcp` without going through JSON tool
+/// calls.
+pub(crate) struct ManagedAcpConnection {
+    inner: Arc<Connection>,
+}
+
+pub(crate) async fn connect_managed(
+    runtime_cfg: AcpRuntimeConfig,
+) -> std::result::Result<(ManagedAcpConnection, ManagedConnectResult), String> {
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let state = Arc::new(Mutex::new(ConnState::new()));
+
+    let pump_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            pump_state.lock().await.fold(event);
+        }
+        let mut st = pump_state.lock().await;
+        if st.status == ConnStatus::Connecting {
+            st.status = ConnStatus::Failed;
+            st.status_message
+                .get_or_insert_with(|| "agent exited before the session started".to_string());
+        }
+    });
+
+    let runtime_task = tokio::spawn(async move {
+        let _ = acp::run(runtime_cfg, event_tx, cmd_rx).await;
+    });
+
+    let ready = wait_for(&state, CONNECT_TIMEOUT, |st| {
+        st.status != ConnStatus::Connecting
+    })
+    .await;
+
+    let result = {
+        let st = state.lock().await;
+        if !ready || st.status != ConnStatus::Ready {
+            let message = st
+                .status_message
+                .clone()
+                .unwrap_or_else(|| "agent did not start a session in time".to_string());
+            drop(st);
+            let _ = cmd_tx.send(UiCommand::Shutdown);
+            let aborter = runtime_task.abort_handle();
+            if tokio::time::timeout(TEARDOWN_TIMEOUT, runtime_task)
+                .await
+                .is_err()
+            {
+                aborter.abort();
+            }
+            return Err(message);
+        }
+        ManagedConnectResult {
+            agent_name: st.agent_name.clone(),
+            agent_version: st.agent_version.clone(),
+            session_id: st.session_id.clone(),
+            prompt_images_supported: st.prompt_images_supported,
+            session_fork_supported: st.session_fork_supported,
+        }
+    };
+
+    Ok((
+        ManagedAcpConnection {
+            inner: Arc::new(Connection {
+                cmd_tx,
+                state,
+                runtime_task: Mutex::new(Some(runtime_task)),
+            }),
+        },
+        result,
+    ))
+}
+
+impl ManagedAcpConnection {
+    pub(crate) async fn config_options(&self) -> Vec<SessionConfigOption> {
+        self.inner.state.lock().await.config_options.clone()
+    }
+
+    pub(crate) async fn submit_prompt(
+        &self,
+        text: String,
+        config_overrides: HashMap<String, String>,
+    ) -> std::result::Result<u64, String> {
+        let turn_id = {
+            let mut st = self.inner.state.lock().await;
+            if st.status != ConnStatus::Ready {
+                return Err(format!(
+                    "connection not ready (status: {})",
+                    st.status.label()
+                ));
+            }
+            if st.turn.status.is_active() {
+                return Err("a prompt turn is already in progress".to_string());
+            }
+            let next_id = st.turn.id + 1;
+            st.turn = TurnState::new(next_id);
+            st.turn.status = TurnStatus::Running;
+            st.turn.id
+        };
+
+        for (config_id, value) in config_overrides {
+            self.inner
+                .cmd_tx
+                .send(UiCommand::SetSessionConfigOption {
+                    target: SessionConfigTarget::ConfigOption {
+                        config_id: SessionConfigId::new(config_id),
+                    },
+                    value: SessionConfigValueId::new(value),
+                })
+                .map_err(|_| "connection is closed".to_string())?;
+        }
+
+        self.inner
+            .cmd_tx
+            .send(UiCommand::SendPrompt {
+                text,
+                images: Vec::new(),
+            })
+            .map_err(|_| "connection is closed".to_string())?;
+        Ok(turn_id)
+    }
+
+    pub(crate) async fn wait_result_rejecting_permissions(
+        &self,
+        timeout: Duration,
+    ) -> ManagedTurnResult {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                let mut st = self.inner.state.lock().await;
+                if !st.pending_permissions.is_empty() {
+                    st.drain_pending_permissions();
+                }
+                if matches!(st.turn.status, TurnStatus::Done | TurnStatus::Failed)
+                    || st.status == ConnStatus::Failed
+                {
+                    return ManagedTurnResult {
+                        final_text: st.turn.final_text.clone(),
+                        final_text_truncated: st.turn.final_text_truncated,
+                        stop_reason: st.turn.stop_reason,
+                        usage: st.turn.usage.clone(),
+                        error: st
+                            .turn
+                            .error_message
+                            .clone()
+                            .or_else(|| st.status_message.clone()),
+                    };
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return ManagedTurnResult {
+                    final_text: String::new(),
+                    final_text_truncated: false,
+                    stop_reason: None,
+                    usage: None,
+                    error: Some("timed out".to_string()),
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    pub(crate) async fn disconnect(&self) {
+        teardown_connection(&self.inner).await;
     }
 }
 

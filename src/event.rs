@@ -70,6 +70,14 @@ pub enum UiEvent {
     /// Latest Claude Code `/usage` quota scrape. This is UI-only side-channel
     /// data; it never goes through ACP.
     ClaudeUsage(crate::claude_usage::ClaudeUsageReport),
+    /// Progress from an in-process Ragnarok tournament. This is UI-only:
+    /// Ragnarok owns separate ACP sessions and reports combat/status frames
+    /// back into the transcript.
+    RagnarokUpdate { text: String },
+    /// Ragnarok selected a final answer.
+    RagnarokFinished { final_text: String },
+    /// Ragnarok failed before selecting a winner.
+    RagnarokFailed { message: String },
     /// The prompt request failed before returning a stop reason. UI can
     /// re-enable the input prompt and surface the error.
     PromptFailed { message: String },
@@ -162,6 +170,9 @@ pub enum UiCommand {
         text: String,
         images: Vec<PromptImage>,
     },
+    /// Start a local Ragnarok tournament. The session supervisor intercepts
+    /// this; it is not forwarded to the active ACP runtime.
+    StartRagnarok { task: String },
     /// Set a session configuration option to a new value.
     SetSessionConfigOption {
         target: SessionConfigTarget,

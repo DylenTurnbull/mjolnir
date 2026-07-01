@@ -237,6 +237,7 @@ fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bo
         Entry::UserPrompt(_) | Entry::System(_) | Entry::SessionBoundary(_) | Entry::Plan(_) => {
             true
         }
+        Entry::Ragnarok(_) => !(state.ragnarok_active && idx + 1 == state.transcript.len()),
         Entry::AgentMessage(_) | Entry::AgentThought(_) => {
             !(state.is_streaming() && idx + 1 == state.transcript.len())
         }
@@ -488,6 +489,9 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::CancelPendingPermissions
         | UiEvent::PromptDone { .. }
         | UiEvent::ClaudeUsage(_)
+        | UiEvent::RagnarokUpdate { .. }
+        | UiEvent::RagnarokFinished { .. }
+        | UiEvent::RagnarokFailed { .. }
         | UiEvent::PromptFailed { .. }
         | UiEvent::SessionForkFailed { .. }
         | UiEvent::RemotePermissionDecision { .. }
@@ -1114,6 +1118,9 @@ fn timer_driven_live_redraw(mode: UiMode, state: &AppState) -> bool {
 }
 
 fn should_show_spinner(state: &AppState) -> bool {
+    if state.ragnarok_active {
+        return true;
+    }
     matches!(
         state.connection_state(),
         ConnectionState::Launching
@@ -2932,6 +2939,42 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
+    if images.is_empty() && (text == "/ragnarok" || text.starts_with("/ragnarok ")) {
+        let task = text
+            .strip_prefix("/ragnarok")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if task.is_empty() {
+            state.record_status_message(
+                StatusKind::Warning,
+                "usage: /ragnarok <task for Thor to tournament>",
+            );
+            return;
+        }
+        if state.runtime_closed {
+            state.record_status_message(
+                StatusKind::Info,
+                "acp runtime closed; type /clear for the same agent, /new for the picker, or Ctrl-C to quit",
+            );
+            return;
+        }
+        if state.is_busy() {
+            state.record_status_message(
+                StatusKind::Warning,
+                "Ragnarok can only start while the current turn is idle",
+            );
+            return;
+        }
+        state.input.clear();
+        clear_attachments(state);
+        state.input_cursor = 0;
+        state.scroll_input_to_bottom();
+        state.start_ragnarok(format!("/ragnarok {task}"));
+        let _ = cmd_tx.send(UiCommand::StartRagnarok { task });
+        return;
+    }
+
     if images.is_empty() && text == "/export" {
         state.input.clear();
         clear_attachments(state);
@@ -3273,6 +3316,7 @@ fn transcript_export_markdown(state: &AppState) -> String {
             Entry::UserPrompt(text) => push_export_text(&mut out, "You", text),
             Entry::AgentMessage(text) => push_export_text(&mut out, "Agent", text),
             Entry::AgentThought(text) => push_export_text(&mut out, "Thought", text),
+            Entry::Ragnarok(text) => push_export_text(&mut out, "Ragnarok", text),
             Entry::System(text) => push_export_text(&mut out, "System", text),
             Entry::SessionBoundary(text) => push_export_text(&mut out, "Session", text),
             Entry::Plan(entries) => {
@@ -4384,6 +4428,9 @@ fn take_display_suffix(text: &str, max_width: usize) -> String {
 }
 
 fn turn_elapsed_value_label(state: &AppState) -> Option<String> {
+    if state.ragnarok_active {
+        return state.active_turn_elapsed().map(format_duration);
+    }
     match state.connection_state() {
         ConnectionState::Launching | ConnectionState::Initializing => {
             Some(format_duration(state.connection_state_elapsed()))
@@ -4640,6 +4687,9 @@ fn render_transcript_entry_range(
                     Style::default().fg(theme.accent),
                 )));
                 out.push(Line::from(""));
+            }
+            Entry::Ragnarok(text) => {
+                push_plain_block(&mut out, "ragnarok", theme.tool, text.clone());
             }
             Entry::SessionBoundary(text) => {
                 out.push(Line::from(""));
@@ -5851,6 +5901,14 @@ fn idle_prompt_title(
 fn busy_prompt_title(state: &AppState) -> Option<String> {
     let queued = state.queued_prompt_count();
     let label = prompt_title_label(state);
+    if state.ragnarok_active {
+        let hint = if queued > 0 {
+            format!("{queued} queued | Ragnarok running")
+        } else {
+            "Ragnarok running".to_string()
+        };
+        return Some(format!(" {label} ({hint}) "));
+    }
     // Matched exhaustively (no `_` arm) on purpose: this and
     // turn_elapsed_value_label must both be revisited when a variant is added,
     // and the missing-arm compile error is what forces that.
@@ -8908,6 +8966,46 @@ mod tests {
 
         assert!(state.mjconfig_menu.is_some(), "menu should be open");
         assert!(state.input.is_empty(), "input should be consumed");
+    }
+
+    #[test]
+    fn slash_ragnarok_starts_local_tournament_command() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::SessionStarted {
+            session_id: "s-1".to_string(),
+            resumed: false,
+        });
+        state.input = "/ragnarok make the best version".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert!(state.ragnarok_active);
+        assert!(state.input.is_empty(), "input should be consumed");
+        match cmd_rx.try_recv() {
+            Ok(UiCommand::StartRagnarok { task }) => {
+                assert_eq!(task, "make the best version");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(matches!(
+            state.transcript.first(),
+            Some(Entry::UserPrompt(text)) if text == "/ragnarok make the best version"
+        ));
+    }
+
+    #[test]
+    fn slash_ragnarok_without_task_warns_without_runtime_command() {
+        let mut state = AppState::new();
+        state.input = "/ragnarok".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert!(cmd_rx.try_recv().is_err());
+        let status = state.status_line.expect("status");
+        assert_eq!(status.kind, StatusKind::Warning);
+        assert!(status.text.contains("usage: /ragnarok"));
     }
 
     #[test]

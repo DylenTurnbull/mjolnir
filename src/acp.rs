@@ -1647,6 +1647,11 @@ async fn drive_session(
                     }
                 }
             }
+            UiCommand::StartRagnarok { .. } => {
+                let _ = ui_tx.send(UiEvent::Warning(
+                    "Ragnarok command was routed to the ACP runtime unexpectedly".to_string(),
+                ));
+            }
             UiCommand::CancelPrompt => {}
             UiCommand::Shutdown => break,
         }
@@ -1820,6 +1825,11 @@ async fn drive_fork_session(
                     Some(UiCommand::ForkSession) => {
                         let _ = ui_tx.send(UiEvent::Warning(
                             "session fork already in flight".to_string(),
+                        ));
+                    }
+                    Some(UiCommand::StartRagnarok { .. }) => {
+                        let _ = ui_tx.send(UiEvent::Warning(
+                            "Ragnarok cannot start while session fork is in flight".to_string(),
                         ));
                     }
                     Some(UiCommand::LoadSession { responder, .. }) => {
@@ -3140,6 +3150,11 @@ async fn drive_config_update(
                             "session fork is only supported while idle".to_string(),
                         ));
                     }
+                    Some(UiCommand::StartRagnarok { .. }) => {
+                        let _ = ui_tx.send(UiEvent::Warning(
+                            "Ragnarok cannot start while config update is in flight".to_string(),
+                        ));
+                    }
                     Some(UiCommand::LoadSession { responder, .. }) => {
                         let _ = responder.send(LoadSessionResult::Fallback {
                             message: "config update already in flight".to_string(),
@@ -3241,6 +3256,11 @@ async fn drive_prompt_turn(
                     Some(UiCommand::ForkSession) => {
                         let _ = ui_tx.send(UiEvent::Warning(
                             "session fork is only supported while idle".to_string(),
+                        ));
+                    }
+                    Some(UiCommand::StartRagnarok { .. }) => {
+                        let _ = ui_tx.send(UiEvent::Warning(
+                            "Ragnarok cannot start while prompt is in flight".to_string(),
                         ));
                     }
                     Some(UiCommand::LoadSession { responder, .. }) => {
