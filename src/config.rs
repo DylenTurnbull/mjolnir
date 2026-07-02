@@ -31,6 +31,36 @@ pub struct Config {
     /// Model strength score (LMArena Elo) display in the picker.
     #[serde(default, skip_serializing_if = "ScoresConfig::is_default")]
     pub scores: ScoresConfig,
+    /// `/ragnarok` battle knobs.
+    #[serde(default, skip_serializing_if = "RagnarokConfig::is_default")]
+    pub ragnarok: RagnarokConfig,
+}
+
+/// Knobs for `/ragnarok` battles.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RagnarokConfig {
+    /// Hard cap on how many champions Thor may field (2-10). Thor still
+    /// decides the count from task complexity; this caps the bill.
+    #[serde(default = "default_max_competitors")]
+    pub max_competitors: usize,
+}
+
+fn default_max_competitors() -> usize {
+    10
+}
+
+impl Default for RagnarokConfig {
+    fn default() -> Self {
+        Self {
+            max_competitors: default_max_competitors(),
+        }
+    }
+}
+
+impl RagnarokConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Controls the Elo strength scores shown next to selectable models.
@@ -288,6 +318,32 @@ mod tests {
     }
 
     #[test]
+    fn ragnarok_max_competitors_roundtrips_and_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+
+        // Default cap is omitted from the serialized form.
+        Config::default().save(&path).expect("save default");
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            !body.contains("ragnarok"),
+            "default ragnarok config should not be serialized: {body:?}"
+        );
+        assert_eq!(
+            Config::load(&path).expect("load").ragnarok.max_competitors,
+            10
+        );
+
+        // A custom cap survives the round trip.
+        std::fs::write(&path, "[ragnarok]\nmax_competitors = 3\n").expect("write");
+        let cfg = Config::load(&path).expect("load custom");
+        assert_eq!(cfg.ragnarok.max_competitors, 3);
+        cfg.save(&path).expect("save custom");
+        let body = std::fs::read_to_string(&path).expect("read saved");
+        assert!(body.contains("max_competitors = 3"), "body: {body:?}");
+    }
+
+    #[test]
     fn load_missing_file_returns_default() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nope.toml");
@@ -312,6 +368,7 @@ mod tests {
             favorite_agents: vec!["claude-acp".to_string(), "anvil".to_string()],
             custom_agents: Vec::new(),
             scores: ScoresConfig::default(),
+            ragnarok: RagnarokConfig::default(),
         };
         cfg.save(&path).expect("save");
         let loaded = Config::load(&path).expect("load");
@@ -340,6 +397,7 @@ mod tests {
             favorite_agents: Vec::new(),
             custom_agents: Vec::new(),
             scores: ScoresConfig::default(),
+            ragnarok: RagnarokConfig::default(),
         };
         cfg.save(&path).expect("save");
         assert!(path.exists());
@@ -432,6 +490,7 @@ args = ["--config", "$HOME/.config/agent.toml", "${HOME}/literal"]
                 },
             ],
             scores: ScoresConfig::default(),
+            ragnarok: RagnarokConfig::default(),
         };
         cfg.save(&path).expect("save");
         let loaded = Config::load(&path).expect("load");

@@ -7449,6 +7449,7 @@ fn start_ragnarok(
     tx: mpsc::UnboundedSender<ragnarok::RagnarokEvent>,
 ) {
     let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let (proceed_tx, proceed_rx) = tokio::sync::watch::channel(false);
     let cfg = ragnarok::BattleConfig {
         task: task.clone(),
         cwd: state.session_cwd.clone(),
@@ -7458,8 +7459,8 @@ fn start_ragnarok(
             .unwrap_or_else(config::default_config_path),
         score_store: state.score_store.clone(),
     };
-    state.ragnarok = Some(RagnarokUi::new(task, abort_tx));
-    tokio::spawn(ragnarok::run_battle(cfg, tx, abort_rx));
+    state.ragnarok = Some(RagnarokUi::new(task, abort_tx, proceed_tx));
+    tokio::spawn(ragnarok::run_battle(cfg, tx, abort_rx, proceed_rx));
 }
 
 fn handle_ragnarok_key(
@@ -7522,6 +7523,9 @@ fn handle_ragnarok_key(
         KeyCode::Enter | KeyCode::Char('q') if over => {
             state.close_ragnarok();
             return inline_repair_request(mode);
+        }
+        KeyCode::Enter if arena.awaiting_approval() => {
+            arena.unleash();
         }
         _ => {}
     }
@@ -7623,6 +7627,9 @@ fn ragnarok_footer_line(arena: &RagnarokUi, theme: TerminalTheme, width: u16) ->
                 .to_string(),
             None => "Enter/q close · Tab transcripts · ←/→ fighter · r review lane".to_string(),
         }
+    } else if arena.awaiting_approval() {
+        "⚔ Enter to UNLEASH RAGNAROK (nothing spent yet) · Esc Esc flee · Tab transcripts"
+            .to_string()
     } else {
         match arena.pane {
             ArenaPane::Arena => {
@@ -7633,6 +7640,12 @@ fn ragnarok_footer_line(arena: &RagnarokUi, theme: TerminalTheme, width: u16) ->
             }
         }
     };
+    if arena.awaiting_approval() && !arena.esc_armed {
+        let style = Style::default()
+            .fg(theme.warning)
+            .add_modifier(Modifier::BOLD);
+        return Line::from(Span::styled(fit_width(&hints, width as usize), style)).centered();
+    }
     let style = if arena.esc_armed {
         Style::default()
             .fg(theme.error)
@@ -13250,7 +13263,8 @@ mod tests {
     fn ragnarok_command_warns_when_battle_already_raging() {
         let mut state = AppState::new();
         let (abort_tx, _abort_rx) = tokio::sync::watch::channel(false);
-        state.ragnarok = Some(RagnarokUi::new("first".into(), abort_tx));
+        let (proceed_tx, _proceed_rx) = tokio::sync::watch::channel(false);
+        state.ragnarok = Some(RagnarokUi::new("first".into(), abort_tx, proceed_tx));
         state.input = "/ragnarok second task".to_string();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
         submit_prompt(&mut state, &cmd_tx);
@@ -13279,7 +13293,8 @@ mod tests {
     fn ragnarok_keys_drive_the_arena() {
         let mut state = AppState::new();
         let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
-        state.ragnarok = Some(RagnarokUi::new("task".into(), abort_tx));
+        let (proceed_tx, proceed_rx) = tokio::sync::watch::channel(false);
+        state.ragnarok = Some(RagnarokUi::new("task".into(), abort_tx, proceed_tx));
         state.apply_ragnarok_event(ragnarok::RagnarokEvent::Roster(vec![
             crate::ragnarok::FighterCard {
                 id: 0,
@@ -13316,6 +13331,19 @@ mod tests {
         );
         assert_eq!(state.ragnarok.as_ref().unwrap().selected_fighter, 1);
 
+        // Enter at the approval gate unleashes combat without closing.
+        state.apply_ragnarok_event(ragnarok::RagnarokEvent::Phase(ragnarok::Phase::Approval));
+        assert!(!*proceed_rx.borrow());
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Enter,
+            UiMode::InlineChat,
+        );
+        assert!(state.ragnarok.is_some(), "gate Enter must not close");
+        assert!(*proceed_rx.borrow(), "gate Enter fires the proceed watch");
+        state.apply_ragnarok_event(ragnarok::RagnarokEvent::Phase(ragnarok::Phase::Combat));
+
         // Esc arms, second Esc fires the abort watch.
         handle_ragnarok_key(
             &mut state,
@@ -13340,7 +13368,8 @@ mod tests {
     fn ragnarok_finalist_pick_and_close_after_verdict() {
         let mut state = AppState::new();
         let (abort_tx, _abort_rx) = tokio::sync::watch::channel(false);
-        state.ragnarok = Some(RagnarokUi::new("task".into(), abort_tx));
+        let (proceed_tx, _proceed_rx) = tokio::sync::watch::channel(false);
+        state.ragnarok = Some(RagnarokUi::new("task".into(), abort_tx, proceed_tx));
         state.apply_ragnarok_event(ragnarok::RagnarokEvent::Roster(vec![
             crate::ragnarok::FighterCard {
                 id: 0,

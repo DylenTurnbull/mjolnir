@@ -83,6 +83,9 @@ pub type FighterId = usize;
 pub enum Phase {
     Mustering,
     Routing,
+    /// The roster is chosen; combat waits for the user to unleash it (the
+    /// one moment to balk at the bill before champions start burning tokens).
+    Approval,
     Combat,
     Review,
     Judgment,
@@ -94,6 +97,7 @@ impl Phase {
         match self {
             Phase::Mustering => "MUSTERING THE CHAMPIONS",
             Phase::Routing => "THOR WEIGHS THE TASK",
+            Phase::Approval => "THE MUSTER AWAITS YOUR COMMAND",
             Phase::Combat => "COMBAT",
             Phase::Review => "ADVERSARIAL REVIEW",
             Phase::Judgment => "THOR SITS IN JUDGMENT",
@@ -254,13 +258,15 @@ pub struct BattleConfig {
 
 /// Run one full battle. Never panics the UI: any error surfaces as
 /// [`RagnarokEvent::Failed`], and [`RagnarokEvent::Done`] is always the final
-/// event.
+/// event. `proceed` is the user's pre-combat approval (see [`Phase::Approval`]);
+/// `abort` flees the battle at any point.
 pub async fn run_battle(
     cfg: BattleConfig,
     tx: mpsc::UnboundedSender<RagnarokEvent>,
     abort: watch::Receiver<bool>,
+    proceed: watch::Receiver<bool>,
 ) {
-    if let Err(e) = battle(&cfg, &tx, abort).await {
+    if let Err(e) = battle(&cfg, &tx, abort, proceed).await {
         let _ = tx.send(RagnarokEvent::Failed(format!("{e:#}")));
     }
     let _ = tx.send(RagnarokEvent::Done);
@@ -298,18 +304,40 @@ async fn wait_abort(mut abort: watch::Receiver<bool>) {
     }
 }
 
+/// Resolves only when the user unleashes combat. A vanished sender pends
+/// forever — the racing [`wait_abort`] handles a closed UI.
+async fn wait_proceed(mut proceed: watch::Receiver<bool>) {
+    loop {
+        if *proceed.borrow() {
+            return;
+        }
+        if proceed.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// How many champions actually take the field: Thor's routed count, bounded
+/// to 2-10 and further capped by the user's `[ragnarok] max_competitors`.
+pub fn field_size(routed: usize, cap: usize) -> usize {
+    let cap = cap.clamp(MIN_FIGHTERS, MAX_FIGHTERS);
+    routed.clamp(MIN_FIGHTERS, MAX_FIGHTERS).min(cap)
+}
+
 async fn battle(
     cfg: &BattleConfig,
     tx: &mpsc::UnboundedSender<RagnarokEvent>,
     abort: watch::Receiver<bool>,
+    proceed: watch::Receiver<bool>,
 ) -> Result<()> {
     // ---- Phase: muster -----------------------------------------------------
     emit(tx, RagnarokEvent::Phase(Phase::Mustering))?;
     feed(tx, None, "⚡ The Gjallarhorn sounds. Ragnarok begins.")?;
 
-    let store = ensure_scores(&cfg.score_store, &cfg.config_path).await;
+    let user_cfg = Config::load(&cfg.config_path).unwrap_or_default();
+    let store = ensure_scores(&cfg.score_store, &user_cfg).await;
     let pool = tokio::select! {
-        pool = muster(cfg, &store, tx) => pool?,
+        pool = muster(cfg, &user_cfg, &store, tx) => pool?,
         _ = wait_abort(abort.clone()) => bail!("the battle was called off"),
     };
     if pool.len() < MIN_FIGHTERS {
@@ -323,7 +351,8 @@ async fn battle(
         tx,
         None,
         format!(
-            "🛡 {} eligible champions answered the call (Elo-rated, battle-ready).",
+            "🛡 {} Elo-rated models stand in the candidate pool (across the ready agents; \
+             only the chosen few will fight).",
             pool.len()
         ),
     )?;
@@ -341,15 +370,25 @@ async fn battle(
     )?;
     let mut thor = Thor::summon(thor_pick, &cfg.cwd, abort.clone()).await?;
     let route = thor.route(&cfg.task, tx).await?;
-    let want = route.competitors.clamp(MIN_FIGHTERS, MAX_FIGHTERS);
+    let cap = user_cfg.ragnarok.max_competitors;
+    let want = field_size(route.competitors, cap);
     feed(
         tx,
         None,
         format!(
             "⚡ THOR decrees: this task is {} — {} champions shall battle. ({})",
-            route.complexity, want, route.rationale
+            route.complexity, route.competitors, route.rationale
         ),
     )?;
+    if want < route.competitors.clamp(MIN_FIGHTERS, MAX_FIGHTERS) {
+        feed(
+            tx,
+            None,
+            format!(
+                "💰 The coffers cap the field at {want} (config `[ragnarok] max_competitors`)."
+            ),
+        )?;
+    }
 
     let mut chosen = select_fighters(&pool, want);
     if chosen.len() < want {
@@ -377,6 +416,27 @@ async fn battle(
             format!("⚔ {} enters the arena!", card.tag()),
         )?;
     }
+
+    // ---- Phase: approval (the one chance to balk at the bill) ---------------
+    emit(tx, RagnarokEvent::Phase(Phase::Approval))?;
+    feed(
+        tx,
+        None,
+        format!(
+            "⚖ {} champions stand ready and nothing has been spent on combat yet. \
+             Unleash Ragnarok? [Enter to begin · Esc Esc to flee]",
+            cards.len()
+        ),
+    )?;
+    tokio::select! {
+        _ = wait_proceed(proceed.clone()) => {}
+        _ = wait_abort(abort.clone()) => bail!("the battle was called off at the gates"),
+    }
+    feed(
+        tx,
+        None,
+        "⚡ UNLEASHED! The horns of war thunder across the nine realms!",
+    )?;
 
     // ---- Phase: combat (parallel implementations) ---------------------------
     emit(tx, RagnarokEvent::Phase(Phase::Combat))?;
@@ -557,22 +617,26 @@ pub struct Launch {
 /// Use the session's score store when it has a catalog; otherwise load one
 /// (cache → network → bundled snapshot; never fails) so Ragnarok works even
 /// when the picker's score display is disabled.
-async fn ensure_scores(store: &ScoreStore, config_path: &Path) -> ScoreStore {
+async fn ensure_scores(store: &ScoreStore, user_cfg: &Config) -> ScoreStore {
     if store.has_catalog() {
         return store.clone();
     }
-    let cfg = Config::load(config_path).unwrap_or_default();
     let file = scores::load_scores_file(
         &scores::default_cache_path(),
         scores::CACHE_TTL,
-        cfg.scores
+        user_cfg
+            .scores
             .url
             .as_deref()
             .unwrap_or(scores::DEFAULT_SCORES_URL),
     )
     .await;
     let fresh = ScoreStore::default();
-    fresh.install(ScoreCatalog::build(&file, cfg.scores.overrides, true));
+    fresh.install(ScoreCatalog::build(
+        &file,
+        user_cfg.scores.overrides.clone(),
+        true,
+    ));
     fresh
 }
 
@@ -581,10 +645,10 @@ async fn ensure_scores(store: &ScoreStore, config_path: &Path) -> ScoreStore {
 /// the Elo-rated models. Result is sorted best-Elo-first.
 async fn muster(
     cfg: &BattleConfig,
+    user_cfg: &Config,
     store: &ScoreStore,
     tx: &mpsc::UnboundedSender<RagnarokEvent>,
 ) -> Result<Vec<Candidate>> {
-    let user_cfg = Config::load(&cfg.config_path).unwrap_or_default();
     let reg = registry::load_with_cache(
         &registry::default_cache_path(),
         registry::CACHE_TTL,
@@ -2242,6 +2306,20 @@ mod tests {
         assert_eq!(route.competitors, 2);
         assert!(parse_route("{\"competitors\":0}").is_none());
         assert!(parse_route("no json here").is_none());
+    }
+
+    #[test]
+    fn field_size_honors_thor_bounds_and_user_cap() {
+        // Thor's decree passes through when the cap allows it.
+        assert_eq!(field_size(4, 10), 4);
+        // Thor is bounded to 2-10 regardless.
+        assert_eq!(field_size(25, 10), MAX_FIGHTERS);
+        assert_eq!(field_size(0, 10), MIN_FIGHTERS);
+        // The user's cap bites.
+        assert_eq!(field_size(8, 3), 3);
+        // Degenerate caps are clamped into the legal range.
+        assert_eq!(field_size(8, 0), MIN_FIGHTERS);
+        assert_eq!(field_size(8, 99), 8);
     }
 
     #[test]

@@ -2353,10 +2353,15 @@ pub struct RagnarokUi {
     pub esc_armed: bool,
     pub started_at: Instant,
     abort_tx: tokio::sync::watch::Sender<bool>,
+    proceed_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl RagnarokUi {
-    pub fn new(task: String, abort_tx: tokio::sync::watch::Sender<bool>) -> Self {
+    pub fn new(
+        task: String,
+        abort_tx: tokio::sync::watch::Sender<bool>,
+        proceed_tx: tokio::sync::watch::Sender<bool>,
+    ) -> Self {
         Self {
             task,
             phase: ragnarok::Phase::Mustering,
@@ -2374,12 +2379,23 @@ impl RagnarokUi {
             esc_armed: false,
             started_at: Instant::now(),
             abort_tx,
+            proceed_tx,
         }
     }
 
     /// Signal the battle task to stop. Idempotent.
     pub fn abort(&self) {
         let _ = self.abort_tx.send(true);
+    }
+
+    /// Unleash combat from the pre-combat approval gate. Idempotent.
+    pub fn unleash(&self) {
+        let _ = self.proceed_tx.send(true);
+    }
+
+    /// True while the battle waits at the pre-combat approval gate.
+    pub fn awaiting_approval(&self) -> bool {
+        self.phase == ragnarok::Phase::Approval && !self.battle_over()
     }
 
     /// The battle reached a terminal state (verdict, failure, or done).
@@ -4897,7 +4913,12 @@ mod tests {
     fn arena_state() -> AppState {
         let mut s = AppState::new();
         let (abort_tx, _abort_rx) = tokio::sync::watch::channel(false);
-        s.ragnarok = Some(RagnarokUi::new("build a thing".into(), abort_tx));
+        let (proceed_tx, _proceed_rx) = tokio::sync::watch::channel(false);
+        s.ragnarok = Some(RagnarokUi::new(
+            "build a thing".into(),
+            abort_tx,
+            proceed_tx,
+        ));
         s
     }
 
@@ -5042,6 +5063,27 @@ mod tests {
             .find(|l| l.contains("← your pick"))
             .expect("pick marker");
         assert!(pick_line.contains("GPT-5.5"), "line: {pick_line}");
+    }
+
+    #[test]
+    fn ragnarok_approval_gate_unleashes_via_watch() {
+        let mut s = AppState::new();
+        let (abort_tx, _abort_rx) = tokio::sync::watch::channel(false);
+        let (proceed_tx, proceed_rx) = tokio::sync::watch::channel(false);
+        s.ragnarok = Some(RagnarokUi::new("task".into(), abort_tx, proceed_tx));
+        s.apply_ragnarok_event(crate::ragnarok::RagnarokEvent::Phase(
+            crate::ragnarok::Phase::Approval,
+        ));
+        let arena = s.ragnarok.as_ref().expect("arena");
+        assert!(arena.awaiting_approval());
+        assert!(!*proceed_rx.borrow());
+        arena.unleash();
+        assert!(*proceed_rx.borrow());
+        // Once combat starts the gate is no longer pending.
+        s.apply_ragnarok_event(crate::ragnarok::RagnarokEvent::Phase(
+            crate::ragnarok::Phase::Combat,
+        ));
+        assert!(!s.ragnarok.as_ref().unwrap().awaiting_approval());
     }
 
     #[test]

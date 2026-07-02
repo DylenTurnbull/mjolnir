@@ -2038,6 +2038,7 @@ mod tests {
                 favorite_agents: Vec::new(),
                 custom_agents: Vec::new(),
                 scores: config::ScoresConfig::default(),
+                ragnarok: config::RagnarokConfig::default(),
             },
             None
         ));
@@ -2062,6 +2063,7 @@ mod tests {
                 favorite_agents: Vec::new(),
                 custom_agents: Vec::new(),
                 scores: config::ScoresConfig::default(),
+                ragnarok: config::RagnarokConfig::default(),
             },
             None
         ));
@@ -2093,6 +2095,7 @@ mod tests {
                 favorite_agents: Vec::new(),
                 custom_agents: Vec::new(),
                 scores: config::ScoresConfig::default(),
+                ragnarok: config::RagnarokConfig::default(),
             },
             None
         ));
@@ -2170,6 +2173,7 @@ mod tests {
                 description: "test".to_string(),
             }],
             scores: config::ScoresConfig::default(),
+            ragnarok: config::RagnarokConfig::default(),
         };
         let prefs = picker_preferences_from_config(&cfg);
         assert_eq!(prefs.custom_agents.len(), 1);
