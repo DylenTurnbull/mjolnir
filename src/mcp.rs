@@ -395,6 +395,7 @@ impl ConnState {
             // injects remote permission decisions of its own, and does not
             // surface Claude Code's local quota scrape.
             UiEvent::TerminalOutput(_)
+            | UiEvent::RagnarokAnimation(_)
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::ClaudeUsage(_) => {}
         }
@@ -829,6 +830,7 @@ impl McpServer {
             args: resolved.args,
             cwd,
             additional_directories,
+            mcp_servers: Vec::new(),
             resume_session: args.resume_session.clone(),
             env: resolved.env,
             agent_stderr: self.config.agent_stderr.clone(),

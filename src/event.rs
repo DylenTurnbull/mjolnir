@@ -22,6 +22,16 @@ pub struct PromptImage {
     pub height: u32,
 }
 
+/// A transient UI-only Ragnarok combat frame. These frames are rendered in
+/// place by the terminal UI and are intentionally kept out of the transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RagnarokAnimationFrame {
+    pub active: bool,
+    pub phase: String,
+    pub frame_index: usize,
+    pub lines: Vec<String>,
+}
+
 /// Events flowing from the ACP runtime into the UI task.
 #[derive(Debug)]
 pub enum UiEvent {
@@ -88,6 +98,9 @@ pub enum UiEvent {
     Warning(String),
     /// Informational runtime status. Shown in the status line and transcript.
     Info(String),
+    /// A Ragnarok animation frame rendered in place, not appended to the
+    /// transcript.
+    RagnarokAnimation(RagnarokAnimationFrame),
     /// Fatal error; the runtime is shutting down. UI should display the
     /// message and exit.
     Fatal(String),
@@ -162,6 +175,10 @@ pub enum UiCommand {
         text: String,
         images: Vec<PromptImage>,
     },
+    /// Start a Ragnarok tournament from the UI supervisor. This is not handled
+    /// by the active ACP runtime; `main` intercepts it and starts separate ACP
+    /// connections for Thor, competitors, and reviewers.
+    Ragnarok { prompt: String, fun: bool },
     /// Set a session configuration option to a new value.
     SetSessionConfigOption {
         target: SessionConfigTarget,

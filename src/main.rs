@@ -23,6 +23,7 @@ mod paths;
 mod picker;
 mod probe;
 mod qr;
+mod ragnarok;
 mod registry;
 mod remote;
 mod scores;
@@ -43,14 +44,17 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::app::UiExitReason;
 use crate::config::{
     Config, CustomAgent as ConfigCustomAgent, SelectedAgent, history_path, transcript_export_dir,
 };
-use crate::event::{LoadSessionResult, UiCommand};
+use crate::event::{LoadSessionResult, UiCommand, UiEvent};
 use crate::picker::{
     CustomAgent as PickerCustomAgent, PickerOutcome, PickerPreferences, PickerResult,
 };
@@ -971,6 +975,7 @@ async fn run_app(
             cfg.spinner,
             score_store.clone(),
             session_boundary,
+            cfg.clone(),
         )
         .await?;
         apply_session_result_to_config(&mut cfg, &session_result);
@@ -1501,6 +1506,7 @@ async fn run_session(
     mut spinner_style: spinner::SpinnerStyle,
     score_store: scores::ScoreStore,
     mut session_boundary: Option<String>,
+    app_config: Config,
 ) -> Result<RunSessionResult> {
     let mut terminal = SessionTerminal::fresh(mode)?;
 
@@ -1541,6 +1547,7 @@ async fn run_session(
         args: agent.args.clone(),
         cwd: cwd.clone(),
         additional_directories: runtime_options.additional_directories.clone(),
+        mcp_servers: Vec::new(),
         resume_session,
         env: agent.env.clone(),
         agent_stderr: runtime_options.agent_stderr.clone(),
@@ -1575,6 +1582,7 @@ async fn run_session(
         Some(ui_event_tx.clone()),
     );
 
+    let ragnarok_ui_tx = ui_event_tx.clone();
     let event_tracker = remote_tracker.clone();
     let event_proxy = tokio::spawn(async move {
         let mut runtime_event_rx = runtime_event_rx;
@@ -1596,8 +1604,64 @@ async fn run_session(
     });
 
     let cmd_tracker = remote_tracker.clone();
+    let ragnarok_active = Arc::new(AtomicBool::new(false));
+    let ragnarok_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    let ragnarok_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+    let ragnarok_cwd = cwd.clone();
+    let ragnarok_options = ragnarok::RagnarokOptions {
+        agent_stderr: runtime_options.agent_stderr.clone(),
+        fs_max_text_bytes: runtime_options.fs_max_text_bytes,
+    };
+    let ragnarok_task_for_proxy = ragnarok_task.clone();
+    let ragnarok_cancel_for_proxy = ragnarok_cancel.clone();
     let cmd_proxy = tokio::spawn(async move {
         while let Some(command) = ui_cmd_rx.recv().await {
+            if let UiCommand::Ragnarok { prompt, fun } = command {
+                if ragnarok_active.swap(true, Ordering::Relaxed) {
+                    let _ = ragnarok_ui_tx.send(UiEvent::Warning(
+                        "ragnarok is already running; wait for the current tournament to finish"
+                            .to_string(),
+                    ));
+                    continue;
+                }
+                let ui_tx = ragnarok_ui_tx.clone();
+                let active = ragnarok_active.clone();
+                let cancel_token = CancellationToken::new();
+                if let Ok(mut slot) = ragnarok_cancel_for_proxy.lock() {
+                    *slot = Some(cancel_token.clone());
+                }
+                let cfg = ragnarok::RunConfig {
+                    prompt,
+                    fun,
+                    cwd: ragnarok_cwd.clone(),
+                    app_config: app_config.clone(),
+                    options: ragnarok_options.clone(),
+                    cancel_token,
+                };
+                let cancel_slot = ragnarok_cancel_for_proxy.clone();
+                let handle = tokio::spawn(async move {
+                    ragnarok::run(cfg, ui_tx).await;
+                    active.store(false, Ordering::Relaxed);
+                    if let Ok(mut slot) = cancel_slot.lock() {
+                        *slot = None;
+                    }
+                });
+                if let Ok(mut slot) = ragnarok_task_for_proxy.lock() {
+                    *slot = Some(handle);
+                }
+                continue;
+            }
+            if matches!(command, UiCommand::CancelPrompt) && ragnarok_active.load(Ordering::Relaxed)
+            {
+                if let Ok(slot) = ragnarok_cancel_for_proxy.lock()
+                    && let Some(token) = slot.as_ref()
+                {
+                    token.cancel();
+                }
+                let _ = ragnarok_ui_tx
+                    .send(UiEvent::Info("ragnarok cancellation requested".to_string()));
+                continue;
+            }
             cmd_tracker.observe_command(&command);
             if runtime_cmd_tx.send(command).is_err() {
                 break;
@@ -1761,6 +1825,7 @@ async fn run_session(
 
     wait_for_task("remote-control event proxy", event_proxy).await;
     wait_for_task("remote-control command proxy", cmd_proxy).await;
+    wait_for_optional_task("ragnarok tournament", ragnarok_task).await;
     if let Some(task) = usage_task {
         wait_for_task("claude usage poller", task).await;
     }
@@ -1878,6 +1943,16 @@ async fn wait_for_task(label: &str, handle: tokio::task::JoinHandle<()>) {
             tracing::warn!("{label} did not exit within 2s; aborting");
             abort_handle.abort();
         }
+    }
+}
+
+async fn wait_for_optional_task(
+    label: &str,
+    handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+) {
+    let handle = handle.lock().ok().and_then(|mut guard| guard.take());
+    if let Some(handle) = handle {
+        wait_for_task(label, handle).await;
     }
 }
 

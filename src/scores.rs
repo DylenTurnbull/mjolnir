@@ -82,6 +82,14 @@ pub struct ModelScore {
     pub provisional: bool,
 }
 
+/// A model score plus the normalized resolver key that matched it. Callers that
+/// need distinct underlying models can dedupe on `match_key`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelScore {
+    pub score: ModelScore,
+    pub match_key: MatchKey,
+}
+
 /// Default on-disk cache location. The `-v2` suffix versions the source/schema
 /// (parquet leaderboard); bumping it abandons caches written by an older build
 /// so a format change can't be masked by a still-fresh stale cache.
@@ -402,6 +410,26 @@ impl ScoreCatalog {
             .into_iter()
             .find_map(|key| self.by_key.get(&key).copied())
     }
+
+    fn resolve(
+        &self,
+        agent_id: &str,
+        value: &str,
+        name: &str,
+        description: &str,
+    ) -> Option<ResolvedModelScore> {
+        model_resolve::agent_keys(agent_id, value, name, description, &self.overrides)
+            .into_iter()
+            .find_map(|key| {
+                self.by_key
+                    .get(&key)
+                    .copied()
+                    .map(|score| ResolvedModelScore {
+                        score,
+                        match_key: key,
+                    })
+            })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -450,6 +478,24 @@ impl ScoreStore {
         } else {
             format!("{} elo", score.elo)
         })
+    }
+
+    /// Resolve a selectable model to an Elo score and normalized identity key.
+    /// Returns `None` when scoring is disabled, no catalog is installed, or the
+    /// option has no exact leaderboard match.
+    pub fn model_score(
+        &self,
+        agent_id: &str,
+        value: &str,
+        name: &str,
+        description: &str,
+    ) -> Option<ResolvedModelScore> {
+        let guard = self.catalog.read().ok()?;
+        let catalog = guard.as_ref()?;
+        if !catalog.enabled {
+            return None;
+        }
+        catalog.resolve(agent_id, value, name, description)
     }
 }
 

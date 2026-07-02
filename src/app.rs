@@ -23,7 +23,8 @@ use crate::clipboard::ClipboardLease;
 
 use crate::event::{
     ElicitationOutcome, ElicitationPrompt, PermissionDecision, PermissionPrompt, PromptImage,
-    SessionConfigTarget, TerminalOutputSnapshot, UiEvent, content_block_text,
+    RagnarokAnimationFrame, SessionConfigTarget, TerminalOutputSnapshot, UiEvent,
+    content_block_text,
 };
 use crate::palette::TerminalTheme;
 use crate::spinner::SpinnerStyle;
@@ -39,6 +40,7 @@ const BUILTIN_LOAD_COMMAND: &str = "load";
 const BUILTIN_FORK_COMMAND: &str = "fork";
 const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
+const BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
 
 fn builtin_new_command() -> AvailableCommand {
@@ -54,6 +56,13 @@ fn builtin_clear_command() -> AvailableCommand {
 
 fn builtin_load_command() -> AvailableCommand {
     AvailableCommand::new(BUILTIN_LOAD_COMMAND, "load a previous session")
+}
+
+fn builtin_ragnarok_command() -> AvailableCommand {
+    AvailableCommand::new(
+        BUILTIN_RAGNAROK_COMMAND,
+        "run a Thor multi-agent implementation tournament",
+    )
 }
 
 fn builtin_fork_command() -> AvailableCommand {
@@ -82,12 +91,14 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
             && command.name != BUILTIN_FORK_COMMAND
             && command.name != BUILTIN_EXPORT_COMMAND
             && command.name != BUILTIN_MJCONFIG_COMMAND
+            && command.name != BUILTIN_RAGNAROK_COMMAND
     });
     if include_fork {
         commands.insert(0, builtin_fork_command());
     }
     commands.insert(0, builtin_mjconfig_command());
     commands.insert(0, builtin_export_command());
+    commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_load_command());
     commands.insert(0, builtin_clear_command());
     commands.insert(0, builtin_new_command());
@@ -588,6 +599,9 @@ pub struct AppState {
     pub runtime_closed: bool,
     /// Transient status line with severity.
     pub status_line: Option<StatusMessage>,
+    /// Current in-place Ragnarok arena frame. Animation updates never enter
+    /// the transcript.
+    pub ragnarok_animation: Option<RagnarokAnimationFrame>,
     /// True while the local microphone dictation helper is running.
     pub voice_input_active: bool,
     /// Prompt buffer range currently owned by live voice dictation.
@@ -868,6 +882,7 @@ impl AppState {
             exit_reason: None,
             runtime_closed: false,
             status_line: None,
+            ragnarok_animation: None,
             voice_input_active: false,
             voice_input_range: None,
             voice_input_level: None,
@@ -1879,6 +1894,9 @@ impl AppState {
             UiEvent::Info(msg) => {
                 self.record_status_message(StatusKind::Info, msg);
             }
+            UiEvent::RagnarokAnimation(frame) => {
+                self.ragnarok_animation = frame.active.then_some(frame);
+            }
             UiEvent::Fatal(msg) => {
                 self.set_connection_state(ConnectionState::Fatal);
                 self.record_status_message(StatusKind::Fatal, msg);
@@ -2285,6 +2303,33 @@ mod tests {
             Entry::AgentMessage(s) => assert_eq!(s, "hello world"),
             other => panic!("unexpected entry: {other:?}"),
         }
+    }
+
+    #[test]
+    fn ragnarok_animation_updates_ui_state_without_transcript_entries() {
+        let mut s = AppState::new();
+
+        s.apply_event(UiEvent::RagnarokAnimation(RagnarokAnimationFrame {
+            active: true,
+            phase: "routing".to_string(),
+            frame_index: 7,
+            lines: vec!["ᚱ [TH] ### [AG]".to_string()],
+        }));
+
+        assert!(s.transcript.is_empty());
+        let frame = s.ragnarok_animation.as_ref().expect("animation frame");
+        assert_eq!(frame.phase, "routing");
+        assert_eq!(frame.frame_index, 7);
+
+        s.apply_event(UiEvent::RagnarokAnimation(RagnarokAnimationFrame {
+            active: false,
+            phase: "routing".to_string(),
+            frame_index: 8,
+            lines: Vec::new(),
+        }));
+
+        assert!(s.ragnarok_animation.is_none());
+        assert!(s.transcript.is_empty());
     }
 
     #[test]
@@ -4024,7 +4069,10 @@ mod tests {
             .iter()
             .map(|&i| s.available_commands[i].name.as_str())
             .collect();
-        assert_eq!(names, vec!["new", "clear", "load", "export", "mjconfig"]);
+        assert_eq!(
+            names,
+            vec!["new", "clear", "load", "ragnarok", "export", "mjconfig"]
+        );
     }
 
     #[test]
@@ -4048,7 +4096,9 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "clear", "load", "export", "mjconfig", "fork"]
+            vec![
+                "new", "clear", "load", "ragnarok", "export", "mjconfig", "fork"
+            ]
         );
     }
 
@@ -4082,6 +4132,7 @@ mod tests {
                 "new",
                 "clear",
                 "load",
+                "ragnarok",
                 "export",
                 "mjconfig",
                 "fork",
@@ -4099,14 +4150,18 @@ mod tests {
         );
         assert_eq!(
             s.available_commands[3].description,
-            "export transcript to markdown"
+            "run a Thor multi-agent implementation tournament"
         );
         assert_eq!(
             s.available_commands[4].description,
-            "open the mj config menu (theme + spinner)"
+            "export transcript to markdown"
         );
         assert_eq!(
             s.available_commands[5].description,
+            "open the mj config menu (theme + spinner)"
+        );
+        assert_eq!(
+            s.available_commands[6].description,
             "fork the current session (unstable ACP extension)"
         );
     }
@@ -4128,7 +4183,15 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "clear", "load", "export", "mjconfig", "review_pr"]
+            vec![
+                "new",
+                "clear",
+                "load",
+                "ragnarok",
+                "export",
+                "mjconfig",
+                "review_pr"
+            ]
         );
     }
 

@@ -45,6 +45,13 @@ pub struct CreatedWorktree {
     pub was_created: bool,
 }
 
+/// Create a fresh linked worktree for background automation without prompting.
+/// The caller keeps the worktree and is responsible for surfacing its path.
+pub fn create_for_cwd_unprompted(cwd: &Path) -> Result<CreatedWorktree> {
+    let project_root = git_toplevel(cwd)?;
+    create_for_project_cwd(&project_root, cwd)
+}
+
 /// Resolve the current Git project, ensure the Mjolnir worktree directory is
 /// ignored when the user agrees, create a fresh linked worktree, and return the
 /// directory that should be used as the ACP session cwd.

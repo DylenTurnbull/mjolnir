@@ -541,6 +541,7 @@ impl TrackerState {
             // Elicitation modals are answered locally in the host TUI; the
             // remote viewer is a read-only mirror and has nothing to track.
             | UiEvent::ElicitationRequest(_)
+            | UiEvent::RagnarokAnimation(_)
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::Info(_)
             | UiEvent::SessionForkFailed { .. }
@@ -1368,6 +1369,7 @@ fn start_server_agent_session(
         args: agent.args,
         cwd,
         additional_directories,
+        mcp_servers: Vec::new(),
         resume_session: None,
         env: agent.env,
         agent_stderr: None,

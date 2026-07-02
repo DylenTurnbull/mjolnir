@@ -492,8 +492,9 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::SessionForkFailed { .. }
         | UiEvent::RemotePermissionDecision { .. }
         | UiEvent::Warning(_)
-        | UiEvent::Info(_)
         | UiEvent::Fatal(_) => RedrawCause::Interactive,
+        UiEvent::Info(_) => RedrawCause::Interactive,
+        UiEvent::RagnarokAnimation(_) => RedrawCause::Animation,
     }
 }
 
@@ -1132,6 +1133,7 @@ fn needs_live_redraw(state: &AppState) -> bool {
         || state.config_picker.is_some()
         // Keep redrawing so the menu's live spinner previews keep animating.
         || state.mjconfig_menu.is_some()
+        || state.ragnarok_animation.is_some()
         || should_show_spinner(state)
 }
 
@@ -1435,6 +1437,7 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
         // the input box keeps its full height while the queue is visible.
         usize::from(INLINE_CHAT_HEIGHT)
             + usize::from(queued_prompt_row_count(state))
+            + usize::from(ragnarok_arena_height(state))
             + usize::from(state.claude_usage.is_some())
     };
 
@@ -2950,6 +2953,34 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
+    if images.is_empty()
+        && let Some((fun, ragnarok_prompt)) = parse_ragnarok_invocation(&text)
+    {
+        state.input.clear();
+        clear_attachments(state);
+        state.input_cursor = 0;
+        state.scroll_input_to_bottom();
+        if ragnarok_prompt.is_empty() {
+            state.record_status_message(
+                StatusKind::Warning,
+                "usage: /ragnarok [--quiet] <implementation prompt>",
+            );
+            return;
+        }
+        state.record_status_message(
+            StatusKind::Info,
+            format!(
+                "ragnarok requested: {}",
+                queued_prompt_preview(&ragnarok_prompt)
+            ),
+        );
+        let _ = cmd_tx.send(UiCommand::Ragnarok {
+            prompt: ragnarok_prompt,
+            fun,
+        });
+        return;
+    }
+
     if images.is_empty() && text == "/fork" {
         state.input.clear();
         clear_attachments(state);
@@ -3025,6 +3056,22 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
 
     state.record_user_prompt(display_text);
     let _ = cmd_tx.send(UiCommand::SendPrompt { text, images });
+}
+
+fn parse_ragnarok_invocation(text: &str) -> Option<(bool, String)> {
+    let rest = text.strip_prefix("/ragnarok")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut rest = rest.trim_start();
+    let mut fun = true;
+    if let Some(after) = rest.strip_prefix("--quiet")
+        && (after.is_empty() || after.starts_with(char::is_whitespace))
+    {
+        fun = false;
+        rest = after.trim_start();
+    }
+    Some((fun, rest.trim().to_string()))
 }
 
 fn handle_mjconfig_menu_key(
@@ -3903,6 +3950,7 @@ const MIN_INPUT_HEIGHT: u16 = 5;
 /// Maximum input box height so the transcript stays usable even when
 /// the user pastes or drafts a long multi-line prompt.
 const MAX_INPUT_HEIGHT: u16 = 16;
+const RAGNAROK_ARENA_HEIGHT: u16 = 7;
 
 fn draw(
     f: &mut ratatui::Frame,
@@ -3925,11 +3973,13 @@ fn draw(
     let input_height = input_height.clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT);
 
     let queued_row = queued_prompt_row_count(state);
+    let arena_height = ragnarok_arena_height(state);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
+            Constraint::Length(arena_height),
             Constraint::Length(1),
             Constraint::Length(queued_row),
             Constraint::Length(input_height),
@@ -3939,18 +3989,19 @@ fn draw(
         .split(f.area());
 
     draw_transcript(f, chunks[0], state, transcript_scroll);
-    draw_header(f, chunks[1], state);
-    draw_queued_prompt_row(f, chunks[2], state);
-    draw_input(f, chunks[3], state, mode);
-    draw_usage_quota_row(f, chunks[4], state);
-    draw_config_shortcuts_row(f, chunks[5], state);
+    draw_ragnarok_arena(f, chunks[1], state);
+    draw_header(f, chunks[2], state);
+    draw_queued_prompt_row(f, chunks[3], state);
+    draw_input(f, chunks[4], state, mode);
+    draw_usage_quota_row(f, chunks[5], state);
+    draw_config_shortcuts_row(f, chunks[6], state);
 
     // Autocomplete sits above the input box (so it doesn't collide with
     // the cursor) and is rendered last among the input-area widgets so
     // it overlays the transcript pane. The permission modal trumps it
     // and renders on top.
     if state.autocomplete.visible {
-        draw_autocomplete_popover(f, chunks[1], state);
+        draw_autocomplete_popover(f, chunks[2], state);
     }
 
     if state.config_picker.is_some() {
@@ -4027,10 +4078,12 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
     let has_config_options = !state.selectable_config_options().is_empty();
     let has_usage_quota = state.claude_usage.is_some();
     let queued_row = queued_prompt_row_count(state);
+    let arena_height = ragnarok_arena_height(state);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(arena_height),
             Constraint::Length(queued_row),
             Constraint::Min(MIN_INPUT_HEIGHT),
             Constraint::Length(if has_usage_quota { 1 } else { 0 }),
@@ -4039,10 +4092,11 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
         .split(f.area());
 
     draw_header(f, chunks[0], state);
-    draw_queued_prompt_row(f, chunks[1], state);
-    draw_input(f, chunks[2], state, UiMode::InlineChat);
-    draw_usage_quota_row(f, chunks[3], state);
-    draw_config_shortcuts_row(f, chunks[4], state);
+    draw_ragnarok_arena(f, chunks[1], state);
+    draw_queued_prompt_row(f, chunks[2], state);
+    draw_input(f, chunks[3], state, UiMode::InlineChat);
+    draw_usage_quota_row(f, chunks[4], state);
+    draw_config_shortcuts_row(f, chunks[5], state);
 
     if state.autocomplete.visible
         && !state.has_pending_permission()
@@ -4264,6 +4318,72 @@ fn inline_config_view_line_count(state: &AppState, width: u16) -> usize {
     let option_rows = picker.filtered_indices.len().max(1);
     let legend_rows = usize::from(model_score_legend(state, option).is_some());
     1 + detail_rows + 1 + option_rows + legend_rows + 1
+}
+
+fn ragnarok_arena_height(state: &AppState) -> u16 {
+    state
+        .ragnarok_animation
+        .as_ref()
+        .map(|_| RAGNAROK_ARENA_HEIGHT)
+        .unwrap_or(0)
+}
+
+fn draw_ragnarok_arena(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let Some(frame) = state.ragnarok_animation.as_ref() else {
+        return;
+    };
+
+    let title = truncate_text_to_width(
+        format!(
+            " ᚱ ragnarok arena · {} · frame {} ᚦ ",
+            frame.phase, frame.frame_index
+        ),
+        area.width,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().fg(state.theme.secondary));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let lines = frame
+        .lines
+        .iter()
+        .take(inner.height as usize)
+        .enumerate()
+        .map(|(idx, line)| {
+            let style = if idx == frame.lines.len().saturating_sub(1) {
+                Style::default().fg(state.theme.muted)
+            } else if line.contains("###") || line.contains("BAM") || line.contains("CRASH") {
+                Style::default()
+                    .fg(state.theme.warning)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(state.theme.primary)
+            };
+            Line::from(Span::styled(
+                centered_arena_line(line, inner.width as usize),
+                style,
+            ))
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn centered_arena_line(text: &str, width: usize) -> String {
+    let clipped = truncate_text_to_width(text.to_string(), width.min(u16::MAX as usize) as u16);
+    let visible_width = clipped.width();
+    if visible_width >= width {
+        return clipped;
+    }
+    format!("{}{}", " ".repeat((width - visible_width) / 2), clipped)
 }
 
 fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
@@ -8908,6 +9028,58 @@ mod tests {
 
         assert!(state.mjconfig_menu.is_some(), "menu should be open");
         assert!(state.input.is_empty(), "input should be consumed");
+    }
+
+    #[test]
+    fn slash_ragnarok_sends_supervisor_command_without_streaming_active_session() {
+        let mut state = AppState::new();
+        state.session_id = Some("s-1".to_string());
+        state.set_connection_state(ConnectionState::Ready);
+        state.input = "/ragnarok implement the thing".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert_eq!(state.connection_state(), ConnectionState::Ready);
+        assert!(state.input.is_empty());
+        match cmd_rx.try_recv().expect("ragnarok command") {
+            UiCommand::Ragnarok { prompt, fun } => {
+                assert_eq!(prompt, "implement the thing");
+                assert!(fun);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_ragnarok_quiet_disables_fun_frames() {
+        let mut state = AppState::new();
+        state.input = "/ragnarok --quiet implement quietly".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        match cmd_rx.try_recv().expect("ragnarok command") {
+            UiCommand::Ragnarok { prompt, fun } => {
+                assert_eq!(prompt, "implement quietly");
+                assert!(!fun);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_ragnarok_without_prompt_warns() {
+        let mut state = AppState::new();
+        state.input = "/ragnarok".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert!(cmd_rx.try_recv().is_err());
+        let status = state.status_line.expect("status");
+        assert_eq!(status.kind, StatusKind::Warning);
+        assert!(status.text.contains("usage: /ragnarok"));
     }
 
     #[test]
