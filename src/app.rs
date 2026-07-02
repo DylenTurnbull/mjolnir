@@ -26,6 +26,7 @@ use crate::event::{
     SessionConfigTarget, TerminalOutputSnapshot, UiEvent, content_block_text,
 };
 use crate::palette::TerminalTheme;
+use crate::ragnarok;
 use crate::spinner::SpinnerStyle;
 use crate::theme::TerminalThemeKind;
 
@@ -39,6 +40,7 @@ const BUILTIN_LOAD_COMMAND: &str = "load";
 const BUILTIN_FORK_COMMAND: &str = "fork";
 const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
+const BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
 
 fn builtin_new_command() -> AvailableCommand {
@@ -74,6 +76,13 @@ fn builtin_mjconfig_command() -> AvailableCommand {
     )
 }
 
+fn builtin_ragnarok_command() -> AvailableCommand {
+    AvailableCommand::new(
+        BUILTIN_RAGNAROK_COMMAND,
+        "⚡ rival models battle over a task; Thor judges (usage: /ragnarok <task>)",
+    )
+}
+
 fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: bool) {
     commands.retain(|command| {
         command.name != BUILTIN_NEW_COMMAND
@@ -82,10 +91,12 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
             && command.name != BUILTIN_FORK_COMMAND
             && command.name != BUILTIN_EXPORT_COMMAND
             && command.name != BUILTIN_MJCONFIG_COMMAND
+            && command.name != BUILTIN_RAGNAROK_COMMAND
     });
     if include_fork {
         commands.insert(0, builtin_fork_command());
     }
+    commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_mjconfig_command());
     commands.insert(0, builtin_export_command());
     commands.insert(0, builtin_load_command());
@@ -496,6 +507,14 @@ pub struct AppState {
     pub spinner_style: SpinnerStyle,
     /// Open `/mjconfig` overlay, if any.
     pub mjconfig_menu: Option<MjConfigMenu>,
+    /// Active `/ragnarok` battle (arena overlay), if any.
+    pub ragnarok: Option<RagnarokUi>,
+    /// One-shot launch request set by `/ragnarok <task>`. The UI loop takes
+    /// it and spawns the battle task, because the loop owns the event channel.
+    ragnarok_launch: Option<String>,
+    /// The ACP session cwd; `/ragnarok` forges its worktrees off this
+    /// directory's git project.
+    pub session_cwd: PathBuf,
     pub agent_label: String,
     /// Registry `source_id` of the launched agent (e.g. `claude-acp`,
     /// `opencode`, `custom:foo`, `anvil`). Distinct from `agent_label`,
@@ -829,6 +848,9 @@ impl AppState {
             theme: theme_kind.palette(),
             spinner_style: SpinnerStyle::default(),
             mjconfig_menu: None,
+            ragnarok: None,
+            ragnarok_launch: None,
+            session_cwd: PathBuf::from("."),
             agent_label: String::new(),
             agent_source_id: String::new(),
             score_store: crate::scores::ScoreStore::default(),
@@ -2251,6 +2273,337 @@ fn status_transcript_text(kind: StatusKind, text: &str) -> String {
         StatusKind::Warning => format!("warning: {text}"),
         StatusKind::Fatal => format!("fatal: {text}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ragnarok arena state
+// ---------------------------------------------------------------------------
+
+/// Battle-feed lines retained for rendering.
+const RAGNAROK_FEED_CAP: usize = 250;
+/// Per-fighter transcript buffer cap (bytes); trimmed from the front.
+const RAGNAROK_TRANSCRIPT_CAP: usize = 96 * 1024;
+/// Cap on Thor's streamed text.
+const RAGNAROK_THOR_CAP: usize = 32 * 1024;
+
+/// Which pane the arena shows. `Tab` toggles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArenaPane {
+    Arena,
+    Transcript,
+}
+
+/// Per-fighter render state, folded from [`ragnarok::RagnarokEvent`]s.
+#[derive(Debug)]
+pub struct RagnarokFighterUi {
+    pub card: ragnarok::FighterCard,
+    pub state: ragnarok::FighterState,
+    /// Most recent action flourish: (kind, caption, when). Drives the pose
+    /// and caption in the arena; treated as faded after a few seconds.
+    pub action: Option<(ragnarok::ActionKind, String, Instant)>,
+    pub actions_seen: u64,
+    /// Combat-phase transcript (messages, thoughts, tool lines).
+    pub transcript: String,
+    /// What this fighter wrote while reviewing a rival.
+    pub review_transcript: String,
+    pub diffstat: Option<String>,
+    pub worktree_name: Option<String>,
+    pub worktree_path: Option<PathBuf>,
+    pub review_progress: Option<ragnarok::ReviewProgress>,
+}
+
+impl RagnarokFighterUi {
+    fn new(card: ragnarok::FighterCard) -> Self {
+        Self {
+            card,
+            state: ragnarok::FighterState::Summoned,
+            action: None,
+            actions_seen: 0,
+            transcript: String::new(),
+            review_transcript: String::new(),
+            diffstat: None,
+            worktree_name: None,
+            worktree_path: None,
+            review_progress: None,
+        }
+    }
+}
+
+/// All render state for one `/ragnarok` battle.
+#[derive(Debug)]
+pub struct RagnarokUi {
+    pub task: String,
+    pub phase: ragnarok::Phase,
+    pub fighters: Vec<RagnarokFighterUi>,
+    /// The scrolling battle feed: (fighter, themed line).
+    pub feed: VecDeque<(Option<ragnarok::FighterId>, String)>,
+    pub thor_text: String,
+    pub assignments: Vec<ragnarok::Assignment>,
+    pub verdict: Option<ragnarok::Verdict>,
+    pub failed: Option<String>,
+    pub done: bool,
+    pub pane: ArenaPane,
+    pub selected_fighter: usize,
+    /// In the transcript pane, show the fighter's review instead of their
+    /// combat transcript.
+    pub show_review_lane: bool,
+    /// The finalist chosen by the user at a split decision.
+    pub chosen_finalist: Option<ragnarok::FighterId>,
+    /// First Esc arms fleeing; the second Esc aborts the battle.
+    pub esc_armed: bool,
+    pub started_at: Instant,
+    abort_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl RagnarokUi {
+    pub fn new(task: String, abort_tx: tokio::sync::watch::Sender<bool>) -> Self {
+        Self {
+            task,
+            phase: ragnarok::Phase::Mustering,
+            fighters: Vec::new(),
+            feed: VecDeque::new(),
+            thor_text: String::new(),
+            assignments: Vec::new(),
+            verdict: None,
+            failed: None,
+            done: false,
+            pane: ArenaPane::Arena,
+            selected_fighter: 0,
+            show_review_lane: false,
+            chosen_finalist: None,
+            esc_armed: false,
+            started_at: Instant::now(),
+            abort_tx,
+        }
+    }
+
+    /// Signal the battle task to stop. Idempotent.
+    pub fn abort(&self) {
+        let _ = self.abort_tx.send(true);
+    }
+
+    /// The battle reached a terminal state (verdict, failure, or done).
+    pub fn battle_over(&self) -> bool {
+        self.done || self.failed.is_some() || self.verdict.is_some()
+    }
+
+    pub fn fighter(&self, id: ragnarok::FighterId) -> Option<&RagnarokFighterUi> {
+        self.fighters.iter().find(|f| f.card.id == id)
+    }
+
+    pub fn fighter_mut(&mut self, id: ragnarok::FighterId) -> Option<&mut RagnarokFighterUi> {
+        self.fighters.iter_mut().find(|f| f.card.id == id)
+    }
+
+    pub fn fighter_name(&self, id: ragnarok::FighterId) -> String {
+        self.fighter(id)
+            .map(|f| f.card.model_name.clone())
+            .unwrap_or_else(|| format!("champion {id}"))
+    }
+
+    fn push_feed(&mut self, fighter: Option<ragnarok::FighterId>, text: String) {
+        self.feed.push_back((fighter, text));
+        while self.feed.len() > RAGNAROK_FEED_CAP {
+            self.feed.pop_front();
+        }
+    }
+
+    pub fn cycle_fighter(&mut self, delta: isize) {
+        if self.fighters.is_empty() {
+            return;
+        }
+        let len = self.fighters.len() as isize;
+        let next = (self.selected_fighter as isize + delta).rem_euclid(len);
+        self.selected_fighter = next as usize;
+    }
+}
+
+/// Append while trimming the front (at a char boundary) once over `cap`.
+fn push_capped(buf: &mut String, chunk: &str, cap: usize) {
+    buf.push_str(chunk);
+    if buf.len() > cap {
+        let mut cut = buf.len() - cap * 3 / 4;
+        while cut < buf.len() && !buf.is_char_boundary(cut) {
+            cut += 1;
+        }
+        buf.replace_range(..cut, "…");
+    }
+}
+
+impl AppState {
+    /// `/ragnarok <task>`: stash a launch request for the UI loop (which owns
+    /// the battle event channel and the tokio spawn).
+    pub fn request_ragnarok(&mut self, task: String) {
+        self.ragnarok_launch = Some(task);
+    }
+
+    pub fn take_ragnarok_launch(&mut self) -> Option<String> {
+        self.ragnarok_launch.take()
+    }
+
+    /// Fold one battle event into the arena state.
+    pub fn apply_ragnarok_event(&mut self, ev: ragnarok::RagnarokEvent) {
+        use ragnarok::RagnarokEvent as E;
+        let Some(arena) = self.ragnarok.as_mut() else {
+            return;
+        };
+        match ev {
+            E::Phase(phase) => {
+                arena.phase = phase;
+                arena.esc_armed = false;
+                arena.push_feed(None, format!("━━ {} ━━", phase.banner()));
+            }
+            E::Log { fighter, text } => arena.push_feed(fighter, text),
+            E::ThorSpeaks(chunk) => push_capped(&mut arena.thor_text, &chunk, RAGNAROK_THOR_CAP),
+            E::Roster(cards) => {
+                arena.fighters = cards.into_iter().map(RagnarokFighterUi::new).collect();
+                arena.selected_fighter = 0;
+            }
+            E::FighterState { id, state } => {
+                let slain_line = if let ragnarok::FighterState::Slain(reason) = &state {
+                    Some(format!("☠ {} is slain: {reason}", arena.fighter_name(id)))
+                } else {
+                    None
+                };
+                if let Some(f) = arena.fighter_mut(id) {
+                    f.state = state;
+                }
+                if let Some(line) = slain_line {
+                    arena.push_feed(Some(id), line);
+                }
+            }
+            E::FighterWorktree { id, name, path } => {
+                let line = format!("🏕 {} pitches camp in {name}", arena.fighter_name(id));
+                if let Some(f) = arena.fighter_mut(id) {
+                    f.worktree_name = Some(name);
+                    f.worktree_path = Some(path);
+                }
+                arena.push_feed(Some(id), line);
+            }
+            E::FighterAction { id, action, detail } => {
+                if let Some(f) = arena.fighter_mut(id) {
+                    f.action = Some((action, detail, Instant::now()));
+                    f.actions_seen += 1;
+                }
+            }
+            E::FighterText { id, lane, chunk } => {
+                if let Some(f) = arena.fighter_mut(id) {
+                    let buf = if lane == ragnarok::TextLane::Review {
+                        &mut f.review_transcript
+                    } else {
+                        &mut f.transcript
+                    };
+                    push_capped(buf, &chunk, RAGNAROK_TRANSCRIPT_CAP);
+                }
+            }
+            E::FighterDiffStat { id, stat } => {
+                let tally = stat.lines().last().unwrap_or("").trim().to_string();
+                let line = format!("📜 the saga of {}: {tally}", arena.fighter_name(id));
+                if let Some(f) = arena.fighter_mut(id) {
+                    f.diffstat = Some(stat);
+                }
+                if !tally.is_empty() {
+                    arena.push_feed(Some(id), line);
+                }
+            }
+            E::Assignments(assignments) => arena.assignments = assignments,
+            E::ReviewState { reviewer, progress } => {
+                if let Some(f) = arena.fighter_mut(reviewer) {
+                    f.review_progress = Some(progress);
+                }
+            }
+            E::Verdict(verdict) => {
+                arena.verdict = Some(*verdict);
+                arena.phase = ragnarok::Phase::Verdict;
+            }
+            E::Failed(message) => {
+                arena.push_feed(None, format!("💀 RAGNAROK HAS FALLEN: {message}"));
+                arena.failed = Some(message);
+            }
+            E::Done => arena.done = true,
+        }
+    }
+
+    /// Close the arena: abort the battle if still raging and drop a summary
+    /// into the main transcript so the outcome survives in scrollback.
+    pub fn close_ragnarok(&mut self) {
+        let Some(arena) = self.ragnarok.take() else {
+            return;
+        };
+        arena.abort();
+        let summary = ragnarok_summary(&arena);
+        self.push_system_message(summary);
+    }
+}
+
+/// Human-readable battle summary for the main transcript.
+fn ragnarok_summary(arena: &RagnarokUi) -> String {
+    let mut out = format!("⚡ RAGNAROK — task: {}\n", arena.task);
+    if let Some(failed) = &arena.failed {
+        out.push_str(&format!("outcome: failed — {failed}\n"));
+    }
+    if let Some(verdict) = &arena.verdict {
+        match (verdict.clear_winner, verdict.finalists) {
+            (Some(id), _) => {
+                out.push_str(&format!(
+                    "👑 winner (Thor's recommendation): {}\n",
+                    arena
+                        .fighter(id)
+                        .map(|f| f.card.tag())
+                        .unwrap_or_else(|| format!("champion {id}"))
+                ));
+            }
+            (None, Some((a, b))) => {
+                out.push_str("⚖ split decision — finalists:\n");
+                for (n, id) in [a, b].into_iter().enumerate() {
+                    let marker = if arena.chosen_finalist == Some(id) {
+                        " ← your pick"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!(
+                        "  {}. {}{marker}\n",
+                        n + 1,
+                        arena
+                            .fighter(id)
+                            .map(|f| f.card.tag())
+                            .unwrap_or_else(|| format!("champion {id}"))
+                    ));
+                }
+            }
+            (None, None) => {}
+        }
+        if !verdict.review_verdicts.is_empty() {
+            out.push_str("review honesty/validity (Thor's scores):\n");
+            for rv in &verdict.review_verdicts {
+                out.push_str(&format!(
+                    "  {} reviewing {}: honesty {}/10, validity {}/10 — {}\n",
+                    arena.fighter_name(rv.reviewer),
+                    arena.fighter_name(rv.defender),
+                    rv.honesty,
+                    rv.validity,
+                    rv.notes
+                ));
+            }
+        }
+        out.push_str(&format!("Thor's reasoning: {}\n", verdict.reasoning));
+    }
+    let with_worktrees: Vec<&RagnarokFighterUi> = arena
+        .fighters
+        .iter()
+        .filter(|f| f.worktree_name.is_some())
+        .collect();
+    if !with_worktrees.is_empty() {
+        out.push_str("worktrees (inspect or adopt with `mj --worktree <name>`):\n");
+        for f in with_worktrees {
+            out.push_str(&format!(
+                "  {} → {}\n",
+                f.card.tag(),
+                f.worktree_name.as_deref().unwrap_or("?")
+            ));
+        }
+    }
+    out.trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -4024,7 +4377,10 @@ mod tests {
             .iter()
             .map(|&i| s.available_commands[i].name.as_str())
             .collect();
-        assert_eq!(names, vec!["new", "clear", "load", "export", "mjconfig"]);
+        assert_eq!(
+            names,
+            vec!["new", "clear", "load", "export", "mjconfig", "ragnarok"]
+        );
     }
 
     #[test]
@@ -4048,7 +4404,9 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "clear", "load", "export", "mjconfig", "fork"]
+            vec![
+                "new", "clear", "load", "export", "mjconfig", "ragnarok", "fork"
+            ]
         );
     }
 
@@ -4084,6 +4442,7 @@ mod tests {
                 "load",
                 "export",
                 "mjconfig",
+                "ragnarok",
                 "fork",
                 "review_pr"
             ]
@@ -4106,7 +4465,7 @@ mod tests {
             "open the mj config menu (theme + spinner)"
         );
         assert_eq!(
-            s.available_commands[5].description,
+            s.available_commands[6].description,
             "fork the current session (unstable ACP extension)"
         );
     }
@@ -4128,7 +4487,15 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "clear", "load", "export", "mjconfig", "review_pr"]
+            vec![
+                "new",
+                "clear",
+                "load",
+                "export",
+                "mjconfig",
+                "ragnarok",
+                "review_pr"
+            ]
         );
     }
 
@@ -4512,5 +4879,195 @@ mod tests {
         s.input.clear();
         assert!(s.prompt_history_previous());
         assert_eq!(s.input, "b");
+    }
+
+    // ---- Ragnarok arena state ----------------------------------------------
+
+    fn ragnarok_card(id: usize, name: &str) -> crate::ragnarok::FighterCard {
+        crate::ragnarok::FighterCard {
+            id,
+            agent_source_id: format!("agent-{id}"),
+            model_value: name.to_lowercase(),
+            model_name: name.to_string(),
+            elo: 1400 + id as u32,
+            provisional: false,
+        }
+    }
+
+    fn arena_state() -> AppState {
+        let mut s = AppState::new();
+        let (abort_tx, _abort_rx) = tokio::sync::watch::channel(false);
+        s.ragnarok = Some(RagnarokUi::new("build a thing".into(), abort_tx));
+        s
+    }
+
+    #[test]
+    fn ragnarok_launch_request_roundtrips() {
+        let mut s = AppState::new();
+        assert!(s.take_ragnarok_launch().is_none());
+        s.request_ragnarok("forge a hammer".into());
+        assert_eq!(s.take_ragnarok_launch().as_deref(), Some("forge a hammer"));
+        assert!(s.take_ragnarok_launch().is_none(), "request is one-shot");
+    }
+
+    #[test]
+    fn ragnarok_events_fold_into_arena_state() {
+        use crate::ragnarok::{ActionKind, FighterState, Phase, RagnarokEvent, TextLane, Verdict};
+        let mut s = arena_state();
+        s.apply_ragnarok_event(RagnarokEvent::Phase(Phase::Combat));
+        s.apply_ragnarok_event(RagnarokEvent::Roster(vec![
+            ragnarok_card(0, "Opus"),
+            ragnarok_card(1, "GPT-5.5"),
+        ]));
+        s.apply_ragnarok_event(RagnarokEvent::FighterState {
+            id: 1,
+            state: FighterState::Fighting,
+        });
+        s.apply_ragnarok_event(RagnarokEvent::FighterAction {
+            id: 1,
+            action: ActionKind::Forge,
+            detail: "src/main.rs".into(),
+        });
+        s.apply_ragnarok_event(RagnarokEvent::FighterText {
+            id: 1,
+            lane: TextLane::Message,
+            chunk: "I shall".into(),
+        });
+        s.apply_ragnarok_event(RagnarokEvent::FighterText {
+            id: 1,
+            lane: TextLane::Review,
+            chunk: "their code is bad".into(),
+        });
+        s.apply_ragnarok_event(RagnarokEvent::FighterWorktree {
+            id: 1,
+            name: "ragnarok-gpt".into(),
+            path: PathBuf::from("/tmp/ragnarok-gpt"),
+        });
+        s.apply_ragnarok_event(RagnarokEvent::FighterState {
+            id: 0,
+            state: FighterState::Slain("tripped on a rune".into()),
+        });
+
+        let arena = s.ragnarok.as_ref().expect("arena");
+        assert_eq!(arena.phase, Phase::Combat);
+        assert_eq!(arena.fighters.len(), 2);
+        let f1 = arena.fighter(1).expect("fighter 1");
+        assert_eq!(f1.state, FighterState::Fighting);
+        assert_eq!(f1.transcript, "I shall");
+        assert_eq!(f1.review_transcript, "their code is bad");
+        assert_eq!(f1.worktree_name.as_deref(), Some("ragnarok-gpt"));
+        assert_eq!(f1.actions_seen, 1);
+        // The slain fighter's reason lands in the feed.
+        assert!(
+            arena
+                .feed
+                .iter()
+                .any(|(id, text)| *id == Some(0) && text.contains("tripped on a rune"))
+        );
+
+        s.apply_ragnarok_event(RagnarokEvent::Verdict(Box::new(Verdict {
+            clear_winner: Some(1),
+            finalists: None,
+            ranking: vec![1, 0],
+            review_verdicts: Vec::new(),
+            reasoning: "the hammer spoke".into(),
+            thor_fallback: false,
+        })));
+        s.apply_ragnarok_event(RagnarokEvent::Done);
+        let arena = s.ragnarok.as_ref().expect("arena");
+        assert!(arena.battle_over());
+        assert_eq!(arena.verdict.as_ref().and_then(|v| v.clear_winner), Some(1));
+    }
+
+    #[test]
+    fn close_ragnarok_pushes_summary_with_winner_and_worktrees() {
+        use crate::ragnarok::{RagnarokEvent, Verdict};
+        let mut s = arena_state();
+        s.apply_ragnarok_event(RagnarokEvent::Roster(vec![
+            ragnarok_card(0, "Opus"),
+            ragnarok_card(1, "GPT-5.5"),
+        ]));
+        s.apply_ragnarok_event(RagnarokEvent::FighterWorktree {
+            id: 0,
+            name: "ragnarok-opus".into(),
+            path: PathBuf::from("/tmp/ragnarok-opus"),
+        });
+        s.apply_ragnarok_event(RagnarokEvent::Verdict(Box::new(Verdict {
+            clear_winner: Some(0),
+            finalists: None,
+            ranking: vec![0, 1],
+            review_verdicts: Vec::new(),
+            reasoning: "flawless".into(),
+            thor_fallback: false,
+        })));
+        s.close_ragnarok();
+        assert!(s.ragnarok.is_none());
+        let Some(Entry::System(summary)) = s.transcript.last() else {
+            panic!("expected a system summary entry");
+        };
+        assert!(summary.contains("winner"), "summary: {summary}");
+        assert!(summary.contains("Opus"), "summary: {summary}");
+        assert!(summary.contains("ragnarok-opus"), "summary: {summary}");
+        assert!(summary.contains("mj --worktree"), "summary: {summary}");
+        // Closing twice is harmless.
+        s.close_ragnarok();
+    }
+
+    #[test]
+    fn ragnarok_split_summary_marks_the_users_pick() {
+        use crate::ragnarok::{RagnarokEvent, Verdict};
+        let mut s = arena_state();
+        s.apply_ragnarok_event(RagnarokEvent::Roster(vec![
+            ragnarok_card(0, "Opus"),
+            ragnarok_card(1, "GPT-5.5"),
+        ]));
+        s.apply_ragnarok_event(RagnarokEvent::Verdict(Box::new(Verdict {
+            clear_winner: None,
+            finalists: Some((0, 1)),
+            ranking: vec![0, 1],
+            review_verdicts: Vec::new(),
+            reasoning: "dead heat".into(),
+            thor_fallback: false,
+        })));
+        if let Some(arena) = s.ragnarok.as_mut() {
+            arena.chosen_finalist = Some(1);
+        }
+        s.close_ragnarok();
+        let Some(Entry::System(summary)) = s.transcript.last() else {
+            panic!("expected a system summary entry");
+        };
+        assert!(summary.contains("split decision"), "summary: {summary}");
+        let pick_line = summary
+            .lines()
+            .find(|l| l.contains("← your pick"))
+            .expect("pick marker");
+        assert!(pick_line.contains("GPT-5.5"), "line: {pick_line}");
+    }
+
+    #[test]
+    fn push_capped_trims_front_at_char_boundary() {
+        let mut buf = String::new();
+        push_capped(&mut buf, "hello", 1000);
+        assert_eq!(buf, "hello");
+        let mut buf = "⚔".repeat(100);
+        push_capped(&mut buf, &"x".repeat(400), 300);
+        assert!(buf.len() <= 300 + 4, "len {}", buf.len());
+        assert!(buf.starts_with('…'));
+        assert!(buf.ends_with('x'));
+    }
+
+    #[test]
+    fn ragnarok_cycle_fighter_wraps() {
+        let mut s = arena_state();
+        s.apply_ragnarok_event(crate::ragnarok::RagnarokEvent::Roster(vec![
+            ragnarok_card(0, "A"),
+            ragnarok_card(1, "B"),
+            ragnarok_card(2, "C"),
+        ]));
+        let arena = s.ragnarok.as_mut().expect("arena");
+        arena.cycle_fighter(-1);
+        assert_eq!(arena.selected_fighter, 2);
+        arena.cycle_fighter(1);
+        assert_eq!(arena.selected_fighter, 0);
     }
 }

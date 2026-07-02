@@ -429,7 +429,9 @@ fn permission_decision(
     choose_allow_option(options)
 }
 
-fn choose_allow_option(
+/// First `AllowAlways` option, else first `AllowOnce`. Shared with Ragnarok's
+/// unattended fighters, which bypass permissions inside their own worktrees.
+pub(crate) fn choose_allow_option(
     options: &[agent_client_protocol::schema::v1::PermissionOption],
 ) -> Option<String> {
     options

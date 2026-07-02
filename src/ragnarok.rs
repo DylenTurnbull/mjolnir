@@ -1,0 +1,2410 @@
+//! ⚡ Ragnarok: model-vs-model combat for one implementation task.
+//!
+//! `/ragnarok <task>` summons THOR, a router agent running on the
+//! strongest Elo-rated model available. Thor sizes up the task and decrees
+//! how many champions battle (2–10). Each champion is a distinct model —
+//! ideally on a distinct ACP agent — chosen best-Elo-first from the agents
+//! that are already configured and ready to use (models without an LMArena
+//! Elo score are not eligible). Every champion implements the task in
+//! parallel inside its own git worktree with permissions bypassed, then each
+//! is assigned a rival's implementation to adversarially review (never their
+//! own). Thor judges the reviews for honesty and validity, ranks the
+//! implementations against the original task, and crowns a clear winner — or
+//! presents two finalists for the user to choose between.
+//!
+//! Architecture: [`run_battle`] is a background tokio task owning one ACP
+//! connection per champion/reviewer plus one for Thor (the same in-process
+//! `acp::run` runtime the TUI and `mj mcp` use). It streams [`RagnarokEvent`]s
+//! to the UI over an unbounded channel; the arena view in `ui.rs` renders the
+//! battle. Dropping the UI receiver or firing the abort watch ends the battle
+//! and tears down every agent subprocess.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use agent_client_protocol::schema::v1::{
+    SessionConfigOption, SessionUpdate, StopReason, ToolCallStatus, ToolKind,
+};
+use anyhow::{Context, Result, anyhow, bail};
+use futures::StreamExt;
+use serde::Deserialize;
+use tokio::sync::{mpsc, watch};
+
+use crate::acp;
+use crate::config::Config;
+use crate::event::{
+    ElicitationOutcome, PermissionDecision, SessionConfigTarget, UiCommand, UiEvent,
+    content_block_text,
+};
+use crate::headless::choose_allow_option;
+use crate::labels::stop_reason_label;
+use crate::scores::{ScoreCatalog, ScoreStore};
+use crate::{install, picker, probe, registry, scores, worktree};
+
+/// Thor may field at most this many champions.
+pub const MAX_FIGHTERS: usize = 10;
+/// ... and no fewer than this many.
+pub const MIN_FIGHTERS: usize = 2;
+
+/// Per-agent budget for the muster probe (spawn + `session/new` + model list).
+const MUSTER_TIMEOUT: Duration = Duration::from_secs(60);
+/// Budget for an agent to reach `SessionStarted` (covers cold npx/uvx runs).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(180);
+/// Budget for one champion to implement the task.
+const FIGHT_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+/// Budget for one adversarial review.
+const REVIEW_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// Budget for each of Thor's pronouncements (route / assign / judge).
+const THOR_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How long to wait for the session config options needed to arm a model.
+const CONFIG_OPTIONS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Cap on a captured `git diff` artifact.
+const DIFF_CAPTURE_LIMIT: usize = 256 * 1024;
+/// Diff budget inside a reviewer's prompt.
+const DIFF_FOR_REVIEW_LIMIT: usize = 24 * 1024;
+/// Per-champion diff budget inside Thor's judgment dossier.
+const DIFF_FOR_JUDGMENT_LIMIT: usize = 10 * 1024;
+/// Per-review budget inside Thor's judgment dossier.
+const REVIEW_FOR_JUDGMENT_LIMIT: usize = 8 * 1024;
+/// Per-champion closing-summary budget inside prompts.
+const SUMMARY_LIMIT: usize = 4 * 1024;
+/// Cap on accumulated agent text per turn (mirrors `mj mcp`).
+const FINAL_TEXT_LIMIT: usize = 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Events consumed by the arena UI
+// ---------------------------------------------------------------------------
+
+pub type FighterId = usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Mustering,
+    Routing,
+    Combat,
+    Review,
+    Judgment,
+    Verdict,
+}
+
+impl Phase {
+    pub fn banner(self) -> &'static str {
+        match self {
+            Phase::Mustering => "MUSTERING THE CHAMPIONS",
+            Phase::Routing => "THOR WEIGHS THE TASK",
+            Phase::Combat => "COMBAT",
+            Phase::Review => "ADVERSARIAL REVIEW",
+            Phase::Judgment => "THOR SITS IN JUDGMENT",
+            Phase::Verdict => "VERDICT",
+        }
+    }
+}
+
+/// One champion on the roster card shown in the arena.
+#[derive(Debug, Clone)]
+pub struct FighterCard {
+    pub id: FighterId,
+    pub agent_source_id: String,
+    pub model_value: String,
+    pub model_name: String,
+    pub elo: u32,
+    pub provisional: bool,
+}
+
+impl FighterCard {
+    /// `Opus [claude-acp] ⚡1456`
+    pub fn tag(&self) -> String {
+        let star = if self.provisional { "*" } else { "" };
+        format!(
+            "{} [{}] ⚡{}{}",
+            self.model_name, self.agent_source_id, self.elo, star
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FighterState {
+    Summoned,
+    Forging,
+    Connecting,
+    Fighting,
+    Capturing,
+    Standing,
+    Slain(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    Forge,  // edit / delete / move
+    Strike, // execute
+    Scry,   // read / search / fetch
+    Chant,  // agent message
+    Ponder, // agent thought
+    Wound,  // failed tool call
+    Guard,  // permission auto-answered
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextLane {
+    Message,
+    Thought,
+    Tool,
+    Review,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewProgress {
+    Connecting,
+    Reviewing,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Assignment {
+    pub reviewer: FighterId,
+    pub defender: FighterId,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewVerdict {
+    pub reviewer: FighterId,
+    pub defender: FighterId,
+    pub honesty: u8,
+    pub validity: u8,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Verdict {
+    pub clear_winner: Option<FighterId>,
+    pub finalists: Option<(FighterId, FighterId)>,
+    pub ranking: Vec<FighterId>,
+    pub review_verdicts: Vec<ReviewVerdict>,
+    pub reasoning: String,
+    /// True when Thor's judgment was unusable and Elo order decided instead.
+    pub thor_fallback: bool,
+}
+
+/// Events streamed from the battle task into the arena UI.
+#[derive(Debug)]
+pub enum RagnarokEvent {
+    Phase(Phase),
+    /// A themed line for the combat feed.
+    Log {
+        fighter: Option<FighterId>,
+        text: String,
+    },
+    /// Thor's streamed words (rationale, judgment prose).
+    ThorSpeaks(String),
+    /// The chosen roster, in fighter-id order.
+    Roster(Vec<FighterCard>),
+    FighterState {
+        id: FighterId,
+        state: FighterState,
+    },
+    /// The champion's private worktree was forged.
+    FighterWorktree {
+        id: FighterId,
+        name: String,
+        path: PathBuf,
+    },
+    FighterAction {
+        id: FighterId,
+        action: ActionKind,
+        detail: String,
+    },
+    /// Raw transcript chunk for the per-fighter transcript pane.
+    FighterText {
+        id: FighterId,
+        lane: TextLane,
+        chunk: String,
+    },
+    FighterDiffStat {
+        id: FighterId,
+        stat: String,
+    },
+    Assignments(Vec<Assignment>),
+    ReviewState {
+        reviewer: FighterId,
+        progress: ReviewProgress,
+    },
+    Verdict(Box<Verdict>),
+    Failed(String),
+    Done,
+}
+
+// ---------------------------------------------------------------------------
+// Battle configuration and entry point
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct BattleConfig {
+    /// The task prompt the user wants implemented.
+    pub task: String,
+    /// The current session cwd; worktrees are forged off its git project.
+    pub cwd: PathBuf,
+    /// Path to `config.toml` (agents roster source).
+    pub config_path: PathBuf,
+    /// The UI's score store; when it has no catalog Ragnarok loads its own.
+    pub score_store: ScoreStore,
+}
+
+/// Run one full battle. Never panics the UI: any error surfaces as
+/// [`RagnarokEvent::Failed`], and [`RagnarokEvent::Done`] is always the final
+/// event.
+pub async fn run_battle(
+    cfg: BattleConfig,
+    tx: mpsc::UnboundedSender<RagnarokEvent>,
+    abort: watch::Receiver<bool>,
+) {
+    if let Err(e) = battle(&cfg, &tx, abort).await {
+        let _ = tx.send(RagnarokEvent::Failed(format!("{e:#}")));
+    }
+    let _ = tx.send(RagnarokEvent::Done);
+}
+
+fn emit(tx: &mpsc::UnboundedSender<RagnarokEvent>, ev: RagnarokEvent) -> Result<()> {
+    tx.send(ev)
+        .map_err(|_| anyhow!("the arena was abandoned (ui closed)"))
+}
+
+fn feed(
+    tx: &mpsc::UnboundedSender<RagnarokEvent>,
+    fighter: Option<FighterId>,
+    text: impl Into<String>,
+) -> Result<()> {
+    emit(
+        tx,
+        RagnarokEvent::Log {
+            fighter,
+            text: text.into(),
+        },
+    )
+}
+
+/// Resolves when the battle should stop: the abort flag flipped, or the abort
+/// sender vanished (the UI is gone).
+async fn wait_abort(mut abort: watch::Receiver<bool>) {
+    loop {
+        if *abort.borrow() {
+            return;
+        }
+        if abort.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn battle(
+    cfg: &BattleConfig,
+    tx: &mpsc::UnboundedSender<RagnarokEvent>,
+    abort: watch::Receiver<bool>,
+) -> Result<()> {
+    // ---- Phase: muster -----------------------------------------------------
+    emit(tx, RagnarokEvent::Phase(Phase::Mustering))?;
+    feed(tx, None, "⚡ The Gjallarhorn sounds. Ragnarok begins.")?;
+
+    let store = ensure_scores(&cfg.score_store, &cfg.config_path).await;
+    let pool = tokio::select! {
+        pool = muster(cfg, &store, tx) => pool?,
+        _ = wait_abort(abort.clone()) => bail!("the battle was called off"),
+    };
+    if pool.len() < MIN_FIGHTERS {
+        bail!(
+            "only {} eligible champion(s) mustered — Ragnarok needs at least {MIN_FIGHTERS} \
+             distinct Elo-rated models on configured, ready-to-use ACP agents",
+            pool.len()
+        );
+    }
+    feed(
+        tx,
+        None,
+        format!(
+            "🛡 {} eligible champions answered the call (Elo-rated, battle-ready).",
+            pool.len()
+        ),
+    )?;
+
+    // ---- Phase: Thor routes ------------------------------------------------
+    emit(tx, RagnarokEvent::Phase(Phase::Routing))?;
+    let thor_pick = pool[0].clone(); // pool is sorted best-Elo-first
+    feed(
+        tx,
+        None,
+        format!(
+            "⚡ THOR descends, wearing the guise of {}.",
+            thor_pick.card.tag()
+        ),
+    )?;
+    let mut thor = Thor::summon(thor_pick, &cfg.cwd, abort.clone()).await?;
+    let route = thor.route(&cfg.task, tx).await?;
+    let want = route.competitors.clamp(MIN_FIGHTERS, MAX_FIGHTERS);
+    feed(
+        tx,
+        None,
+        format!(
+            "⚡ THOR decrees: this task is {} — {} champions shall battle. ({})",
+            route.complexity, want, route.rationale
+        ),
+    )?;
+
+    let mut chosen = select_fighters(&pool, want);
+    if chosen.len() < want {
+        feed(
+            tx,
+            None,
+            format!(
+                "🌫 Thor decreed {want}, but only {} distinct champions exist. So be it.",
+                chosen.len()
+            ),
+        )?;
+    }
+    if chosen.len() < MIN_FIGHTERS {
+        bail!("fewer than {MIN_FIGHTERS} distinct champions available");
+    }
+    for (id, fighter) in chosen.iter_mut().enumerate() {
+        fighter.card.id = id;
+    }
+    let cards: Vec<FighterCard> = chosen.iter().map(|c| c.card.clone()).collect();
+    emit(tx, RagnarokEvent::Roster(cards.clone()))?;
+    for card in &cards {
+        feed(
+            tx,
+            Some(card.id),
+            format!("⚔ {} enters the arena!", card.tag()),
+        )?;
+    }
+
+    // ---- Phase: combat (parallel implementations) ---------------------------
+    emit(tx, RagnarokEvent::Phase(Phase::Combat))?;
+    let forge_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    let mut joinset = tokio::task::JoinSet::new();
+    for fighter in chosen.clone() {
+        let task_text = cfg.task.clone();
+        let cwd = cfg.cwd.clone();
+        let forge_lock = forge_lock.clone();
+        let tx = tx.clone();
+        let abort = abort.clone();
+        joinset.spawn(async move { fight(fighter, task_text, cwd, forge_lock, tx, abort).await });
+    }
+    let mut reports: Vec<FighterReport> = Vec::new();
+    while let Some(joined) = joinset.join_next().await {
+        match joined {
+            Ok(report) => reports.push(report),
+            Err(e) => feed(tx, None, format!("☠ a champion's thread was severed: {e}"))?,
+        }
+    }
+    if *abort.borrow() {
+        bail!("the battle was called off");
+    }
+    reports.sort_by_key(|r| r.id);
+    let survivors: Vec<&FighterReport> = reports
+        .iter()
+        .filter(|r| r.slain_reason.is_none())
+        .collect();
+    if survivors.len() < MIN_FIGHTERS {
+        bail!(
+            "only {} champion(s) survived combat — not enough for adversarial review",
+            survivors.len()
+        );
+    }
+    feed(
+        tx,
+        None,
+        format!("🏰 Combat ends. {} champions still stand.", survivors.len()),
+    )?;
+
+    // ---- Phase: Thor assigns adversarial reviews ----------------------------
+    let survivor_ids: Vec<FighterId> = survivors.iter().map(|r| r.id).collect();
+    let assignments = thor
+        .assign(&survivor_ids, &cards, tx)
+        .await
+        .unwrap_or_else(|_| assignments_rotation(&survivor_ids));
+    emit(tx, RagnarokEvent::Phase(Phase::Review))?;
+    emit(tx, RagnarokEvent::Assignments(assignments.clone()))?;
+    for a in &assignments {
+        feed(
+            tx,
+            Some(a.reviewer),
+            format!(
+                "🗡 THOR commands: {} shall tear apart the work of {}!",
+                cards[a.reviewer].model_name, cards[a.defender].model_name
+            ),
+        )?;
+    }
+
+    // ---- Phase: adversarial reviews (parallel) -------------------------------
+    let by_id: HashMap<FighterId, &FighterReport> = reports.iter().map(|r| (r.id, r)).collect();
+    let mut review_set = tokio::task::JoinSet::new();
+    for a in assignments.clone() {
+        let reviewer = chosen.iter().find(|c| c.card.id == a.reviewer).cloned();
+        let Some(reviewer) = reviewer else { continue };
+        let Some(defender) = by_id.get(&a.defender) else {
+            continue;
+        };
+        let prompt = review_prompt(
+            &cfg.task,
+            &cards[a.reviewer],
+            &cards[a.defender],
+            defender.artifact.as_ref(),
+            &defender.final_text,
+        );
+        let defender_cwd = defender
+            .worktree
+            .as_ref()
+            .map(|w| w.session_cwd.clone())
+            .unwrap_or_else(|| cfg.cwd.clone());
+        let tx = tx.clone();
+        let abort = abort.clone();
+        review_set.spawn(async move { review(reviewer, a, prompt, defender_cwd, tx, abort).await });
+    }
+    let mut reviews: Vec<ReviewReport> = Vec::new();
+    while let Some(joined) = review_set.join_next().await {
+        match joined {
+            Ok(report) => reviews.push(report),
+            Err(e) => feed(tx, None, format!("☠ a reviewer's thread was severed: {e}"))?,
+        }
+    }
+    if *abort.borrow() {
+        bail!("the battle was called off");
+    }
+    reviews.sort_by_key(|r| r.assignment.defender);
+    feed(tx, None, "📜 All reviews are carved in stone.")?;
+
+    // ---- Phase: judgment -----------------------------------------------------
+    emit(tx, RagnarokEvent::Phase(Phase::Judgment))?;
+    let dossier = judgment_dossier(&cfg.task, &cards, &survivor_ids, &by_id, &reviews);
+    let verdict = thor.judge(&dossier, &survivor_ids, tx).await;
+    thor.dismiss().await;
+    let verdict = match verdict {
+        Ok(v) => v,
+        Err(e) => {
+            feed(
+                tx,
+                None,
+                format!("🌩 Thor's judgment was garbled ({e:#}); the runes fall back to Elo order."),
+            )?;
+            elo_fallback_verdict(&survivor_ids, &cards)
+        }
+    };
+
+    emit(tx, RagnarokEvent::Phase(Phase::Verdict))?;
+    match (&verdict.clear_winner, &verdict.finalists) {
+        (Some(id), _) => feed(
+            tx,
+            Some(*id),
+            format!(
+                "👑 THOR crowns {} the victor of Ragnarok!",
+                cards[*id].tag()
+            ),
+        )?,
+        (None, Some((a, b))) => feed(
+            tx,
+            None,
+            format!(
+                "⚖ No clear victor. THOR presents two finalists: {} and {}. The choice is yours.",
+                cards[*a].model_name, cards[*b].model_name
+            ),
+        )?,
+        (None, None) => {}
+    }
+    emit(tx, RagnarokEvent::Verdict(Box::new(verdict)))?;
+    Ok(())
+}
+
+/// Deterministic fallback when Thor cannot deliver a parseable judgment:
+/// no honest quality signal exists, so present the two strongest champions
+/// (by Elo) as finalists and let the user decide.
+fn elo_fallback_verdict(survivors: &[FighterId], cards: &[FighterCard]) -> Verdict {
+    let mut ranking: Vec<FighterId> = survivors.to_vec();
+    ranking.sort_by_key(|id| std::cmp::Reverse(cards[*id].elo));
+    let finalists = (ranking.len() >= 2).then(|| (ranking[0], ranking[1]));
+    Verdict {
+        clear_winner: None,
+        finalists,
+        ranking,
+        review_verdicts: Vec::new(),
+        reasoning: "Thor's judgment could not be parsed; finalists are presented in Elo order. \
+                    Read the adversarial reviews in the transcripts and choose."
+            .to_string(),
+        thor_fallback: true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Muster: which (agent, model) pairs may fight?
+// ---------------------------------------------------------------------------
+
+/// A battle-ready (agent, model) pair with an Elo rating.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub card: FighterCard,
+    pub launch: Launch,
+    pub match_key: String,
+}
+
+/// Clonable launch command (mirror of `picker::LaunchCommand`).
+#[derive(Debug, Clone)]
+pub struct Launch {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+}
+
+/// Use the session's score store when it has a catalog; otherwise load one
+/// (cache → network → bundled snapshot; never fails) so Ragnarok works even
+/// when the picker's score display is disabled.
+async fn ensure_scores(store: &ScoreStore, config_path: &Path) -> ScoreStore {
+    if store.has_catalog() {
+        return store.clone();
+    }
+    let cfg = Config::load(config_path).unwrap_or_default();
+    let file = scores::load_scores_file(
+        &scores::default_cache_path(),
+        scores::CACHE_TTL,
+        cfg.scores
+            .url
+            .as_deref()
+            .unwrap_or(scores::DEFAULT_SCORES_URL),
+    )
+    .await;
+    let fresh = ScoreStore::default();
+    fresh.install(ScoreCatalog::build(&file, cfg.scores.overrides, true));
+    fresh
+}
+
+/// Probe every configured agent (the picker's default view: default +
+/// favorites + curated + custom), read each one's real model list, and keep
+/// the Elo-rated models. Result is sorted best-Elo-first.
+async fn muster(
+    cfg: &BattleConfig,
+    store: &ScoreStore,
+    tx: &mpsc::UnboundedSender<RagnarokEvent>,
+) -> Result<Vec<Candidate>> {
+    let user_cfg = Config::load(&cfg.config_path).unwrap_or_default();
+    let reg = registry::load_with_cache(
+        &registry::default_cache_path(),
+        registry::CACHE_TTL,
+        registry::REGISTRY_URL,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("ragnarok: registry unavailable ({e:#}); using configured agents only");
+        registry::Registry::default()
+    });
+    let preferences = picker::PickerPreferences {
+        default_agent: user_cfg.agent.as_ref().map(|a| picker::PickerOutcome {
+            source_id: a.source_id.clone(),
+            program: a.program.clone(),
+            args: a.args.clone(),
+            env: a.env.clone(),
+        }),
+        favorite_source_ids: user_cfg.favorite_agents.clone(),
+        custom_agents: user_cfg
+            .custom_agents
+            .iter()
+            .map(|c| picker::CustomAgent {
+                name: c.name.clone(),
+                program: c.program.clone(),
+                args: c.args.clone(),
+                description: c.description.clone(),
+            })
+            .collect(),
+    };
+    let plan = picker::launch_plan(
+        &reg,
+        &registry::current_platform(),
+        &install::default_install_root(),
+        preferences,
+    );
+
+    let cwd = cfg.cwd.clone();
+    let mut probes = futures::stream::iter(plan.into_iter().map(|(source_id, command)| {
+        let cwd = cwd.clone();
+        async move {
+            match command {
+                None => (source_id, None, Err("not installed".to_string())),
+                Some(cmd) => {
+                    let launch = Launch {
+                        program: cmd.program.clone(),
+                        args: cmd.args.clone(),
+                        env: cmd.env.clone(),
+                    };
+                    let models =
+                        probe::session_models(cmd.program, cmd.args, cmd.env, cwd, MUSTER_TIMEOUT)
+                            .await;
+                    (source_id, Some(launch), models)
+                }
+            }
+        }
+    }))
+    .buffer_unordered(probe::PROBE_CONCURRENCY);
+
+    let mut pool: Vec<Candidate> = Vec::new();
+    while let Some((source_id, launch, outcome)) = probes.next().await {
+        match (launch, outcome) {
+            (Some(launch), Ok(models)) => {
+                let mut rated = 0usize;
+                for m in &models {
+                    let description = m.description.clone().unwrap_or_default();
+                    if let Some((key, score)) =
+                        store.model_score_with_key(&source_id, &m.value, &m.name, &description)
+                    {
+                        rated += 1;
+                        pool.push(Candidate {
+                            card: FighterCard {
+                                id: 0, // assigned at selection time
+                                agent_source_id: source_id.clone(),
+                                model_value: m.value.clone(),
+                                model_name: m.name.clone(),
+                                elo: score.elo,
+                                provisional: score.provisional,
+                            },
+                            launch: launch.clone(),
+                            match_key: key,
+                        });
+                    }
+                }
+                feed(
+                    tx,
+                    None,
+                    format!(
+                        "🏹 {source_id} answers the call: {} models, {} worthy of the arena.",
+                        models.len(),
+                        rated
+                    ),
+                )?;
+            }
+            (_, outcome) => {
+                let reason = match outcome {
+                    Err(r) => r,
+                    Ok(_) => "not installed".to_string(),
+                };
+                feed(
+                    tx,
+                    None,
+                    format!("🌫 {source_id} is questing elsewhere ({reason})."),
+                )?;
+            }
+        }
+    }
+
+    pool.sort_by(|a, b| {
+        b.card
+            .elo
+            .cmp(&a.card.elo)
+            .then_with(|| a.card.model_name.cmp(&b.card.model_name))
+            .then_with(|| a.card.agent_source_id.cmp(&b.card.agent_source_id))
+    });
+    Ok(pool)
+}
+
+/// Pick `want` champions from the Elo-sorted pool. Models must be genuinely
+/// distinct (dedup by leaderboard match key); agents should be distinct when
+/// possible (first pass takes each agent's best model, second pass fills the
+/// remainder best-Elo-first).
+pub fn select_fighters(pool: &[Candidate], want: usize) -> Vec<Candidate> {
+    let mut picked: Vec<Candidate> = Vec::new();
+    let mut used_keys: HashSet<&str> = HashSet::new();
+    let mut used_agents: HashSet<&str> = HashSet::new();
+
+    for c in pool {
+        if picked.len() >= want {
+            break;
+        }
+        if used_agents.contains(c.card.agent_source_id.as_str())
+            || used_keys.contains(c.match_key.as_str())
+        {
+            continue;
+        }
+        used_agents.insert(c.card.agent_source_id.as_str());
+        used_keys.insert(c.match_key.as_str());
+        picked.push(c.clone());
+    }
+    if picked.len() < want {
+        for c in pool {
+            if picked.len() >= want {
+                break;
+            }
+            if used_keys.contains(c.match_key.as_str()) {
+                continue;
+            }
+            used_keys.insert(c.match_key.as_str());
+            picked.push(c.clone());
+        }
+    }
+    picked
+}
+
+// ---------------------------------------------------------------------------
+// One ACP connection driven programmatically
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionPolicy {
+    /// Champions and reviewers: contained in a worktree, keep them moving.
+    AllowAll,
+    /// Thor: reasons over provided material only; never grant anything.
+    RejectAll,
+}
+
+/// What a turn streamed, reduced to what the arena cares about.
+enum TurnEvent {
+    Message(String),
+    Thought(String),
+    Tool {
+        title: String,
+        kind: Option<ToolKind>,
+        status: Option<ToolCallStatus>,
+        started: bool,
+    },
+    Note(String),
+}
+
+struct TurnOutcome {
+    text: String,
+    stop: StopReason,
+}
+
+/// A live agent subprocess + session, driven over the same channel pair the
+/// TUI uses.
+struct AgentHandle {
+    cmd_tx: mpsc::UnboundedSender<UiCommand>,
+    events: mpsc::UnboundedReceiver<UiEvent>,
+    runtime: tokio::task::JoinHandle<Result<()>>,
+    config_options: Vec<SessionConfigOption>,
+    config_targets: Vec<SessionConfigTarget>,
+    policy: PermissionPolicy,
+    abort: watch::Receiver<bool>,
+}
+
+impl AgentHandle {
+    async fn connect(
+        launch: &Launch,
+        cwd: &Path,
+        policy: PermissionPolicy,
+        abort: watch::Receiver<bool>,
+    ) -> Result<Self> {
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let runtime_cfg = acp::AcpRuntimeConfig {
+            command: launch.program.clone(),
+            args: launch.args.clone(),
+            cwd: cwd.to_path_buf(),
+            additional_directories: Vec::new(),
+            resume_session: None,
+            env: launch.env.clone(),
+            agent_stderr: None,
+            fs_max_text_bytes: acp::DEFAULT_FS_TEXT_BYTES,
+        };
+        let runtime = tokio::spawn(acp::run(runtime_cfg, event_tx, cmd_rx));
+        let mut handle = Self {
+            cmd_tx,
+            events,
+            runtime,
+            config_options: Vec::new(),
+            config_targets: Vec::new(),
+            policy,
+            abort,
+        };
+        handle.wait_session_started().await?;
+        Ok(handle)
+    }
+
+    async fn wait_session_started(&mut self) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+        loop {
+            let ev = tokio::select! {
+                ev = self.events.recv() => ev,
+                _ = wait_abort(self.abort.clone()) => bail!("battle aborted"),
+                _ = tokio::time::sleep_until(deadline) => bail!("timed out waiting for session"),
+            };
+            let Some(ev) = ev else {
+                bail!("agent runtime closed before a session started");
+            };
+            match ev {
+                UiEvent::SessionStarted { .. } => return Ok(()),
+                UiEvent::SessionConfigOptions { options, targets } => {
+                    self.store_config(options, targets);
+                }
+                UiEvent::PermissionRequest(p) => self.answer_permission(p),
+                UiEvent::ElicitationRequest(e) => {
+                    let _ = e.responder.send(ElicitationOutcome::Decline);
+                }
+                UiEvent::Fatal(m) => bail!("agent failed: {m}"),
+                UiEvent::PromptFailed { message } => bail!("agent failed: {message}"),
+                _ => {}
+            }
+        }
+    }
+
+    fn store_config(
+        &mut self,
+        options: Vec<SessionConfigOption>,
+        targets: Vec<SessionConfigTarget>,
+    ) {
+        if options.len() == targets.len() {
+            self.config_options = options;
+            self.config_targets = targets;
+        }
+    }
+
+    fn answer_permission(&self, prompt: crate::event::PermissionPrompt) {
+        let decision = match self.policy {
+            PermissionPolicy::AllowAll => choose_allow_option(&prompt.options)
+                .map(PermissionDecision::Selected)
+                .unwrap_or(PermissionDecision::Cancelled),
+            PermissionPolicy::RejectAll => PermissionDecision::Cancelled,
+        };
+        let _ = prompt.responder.send(decision);
+    }
+
+    /// Select `model_value` through the session's Model config option. The
+    /// runtime applies commands in order, so this lands before any prompt sent
+    /// afterwards. Errors when the agent never surfaces a model option that
+    /// carries the value (the roster was built from that same option list, so
+    /// this only fires on genuine agent misbehavior).
+    async fn arm_model(&mut self, model_value: &str) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + CONFIG_OPTIONS_TIMEOUT;
+        loop {
+            if let Some((target, value)) = self.find_model_choice(model_value) {
+                let _ = self
+                    .cmd_tx
+                    .send(UiCommand::SetSessionConfigOption { target, value });
+                return Ok(());
+            }
+            let ev = tokio::select! {
+                ev = self.events.recv() => ev,
+                _ = wait_abort(self.abort.clone()) => bail!("battle aborted"),
+                _ = tokio::time::sleep_until(deadline) => {
+                    bail!("agent never offered model '{model_value}' to select")
+                }
+            };
+            match ev {
+                Some(UiEvent::SessionConfigOptions { options, targets }) => {
+                    self.store_config(options, targets)
+                }
+                Some(UiEvent::PermissionRequest(p)) => self.answer_permission(p),
+                Some(UiEvent::ElicitationRequest(e)) => {
+                    let _ = e.responder.send(ElicitationOutcome::Decline);
+                }
+                Some(UiEvent::Fatal(m)) => bail!("agent failed: {m}"),
+                Some(_) => {}
+                None => bail!("agent runtime closed"),
+            }
+        }
+    }
+
+    fn find_model_choice(
+        &self,
+        model_value: &str,
+    ) -> Option<(
+        SessionConfigTarget,
+        agent_client_protocol::schema::v1::SessionConfigValueId,
+    )> {
+        for (option, target) in self.config_options.iter().zip(&self.config_targets) {
+            if !crate::app::is_model_config_option(option) {
+                continue;
+            }
+            let Some(choices) = crate::app::config_option_choices(option) else {
+                continue;
+            };
+            // Setting the current value again is harmless, so no special case
+            // for an already-armed model.
+            for choice in choices {
+                if choice.value.to_string() == model_value {
+                    return Some((target.clone(), choice.value));
+                }
+            }
+        }
+        None
+    }
+
+    /// Send one prompt and drive it to completion, streaming digested events
+    /// through `on_event`.
+    async fn prompt(
+        &mut self,
+        text: String,
+        budget: Duration,
+        mut on_event: impl FnMut(TurnEvent),
+    ) -> Result<TurnOutcome> {
+        let _ = self.cmd_tx.send(UiCommand::SendPrompt {
+            text,
+            images: Vec::new(),
+        });
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut acc = String::new();
+        let mut truncated = false;
+        let mut known_tools: HashMap<String, (String, Option<ToolKind>)> = HashMap::new();
+        loop {
+            let ev = tokio::select! {
+                ev = self.events.recv() => ev,
+                _ = wait_abort(self.abort.clone()) => {
+                    let _ = self.cmd_tx.send(UiCommand::CancelPrompt);
+                    bail!("battle aborted");
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let _ = self.cmd_tx.send(UiCommand::CancelPrompt);
+                    bail!("ran out of time");
+                }
+            };
+            let Some(ev) = ev else {
+                bail!("agent runtime closed mid-turn");
+            };
+            match ev {
+                UiEvent::SessionUpdate(update) => match update {
+                    SessionUpdate::AgentMessageChunk(chunk) => {
+                        let piece = content_block_text(&chunk.content);
+                        if acc.len() + piece.len() <= FINAL_TEXT_LIMIT {
+                            acc.push_str(&piece);
+                        } else {
+                            truncated = true;
+                        }
+                        on_event(TurnEvent::Message(piece));
+                    }
+                    SessionUpdate::AgentThoughtChunk(chunk) => {
+                        on_event(TurnEvent::Thought(content_block_text(&chunk.content)));
+                    }
+                    SessionUpdate::ToolCall(call) => {
+                        let id = call.tool_call_id.to_string();
+                        known_tools.insert(id, (call.title.clone(), Some(call.kind)));
+                        on_event(TurnEvent::Tool {
+                            title: call.title,
+                            kind: Some(call.kind),
+                            status: Some(call.status),
+                            started: true,
+                        });
+                    }
+                    SessionUpdate::ToolCallUpdate(update) => {
+                        let id = update.tool_call_id.to_string();
+                        let entry = known_tools.entry(id).or_default();
+                        if let Some(title) = &update.fields.title {
+                            entry.0 = title.clone();
+                        }
+                        if let Some(kind) = update.fields.kind {
+                            entry.1 = Some(kind);
+                        }
+                        on_event(TurnEvent::Tool {
+                            title: entry.0.clone(),
+                            kind: entry.1,
+                            status: update.fields.status,
+                            started: false,
+                        });
+                    }
+                    _ => {}
+                },
+                UiEvent::SessionConfigOptions { options, targets } => {
+                    self.store_config(options, targets)
+                }
+                UiEvent::PermissionRequest(p) => {
+                    on_event(TurnEvent::Note("permission auto-answered".to_string()));
+                    self.answer_permission(p);
+                }
+                UiEvent::ElicitationRequest(e) => {
+                    let _ = e.responder.send(ElicitationOutcome::Decline);
+                }
+                UiEvent::PromptDone { stop_reason, .. } => {
+                    if truncated {
+                        acc.push_str("\n…[output truncated]");
+                    }
+                    return Ok(TurnOutcome {
+                        text: acc,
+                        stop: stop_reason,
+                    });
+                }
+                UiEvent::PromptFailed { message } => bail!("prompt failed: {message}"),
+                UiEvent::Fatal(m) => bail!("agent failed: {m}"),
+                UiEvent::Warning(w) => on_event(TurnEvent::Note(w)),
+                _ => {}
+            }
+        }
+    }
+
+    /// Graceful teardown: ask the runtime to shut down and give it a moment;
+    /// dropping the handle afterwards closes the command channel, which ends
+    /// the runtime loop and kills the agent process tree in any case.
+    async fn dismiss(self) {
+        let _ = self.cmd_tx.send(UiCommand::Shutdown);
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.runtime).await;
+    }
+}
+
+fn turn_succeeded(stop: StopReason) -> bool {
+    matches!(
+        stop,
+        StopReason::EndTurn | StopReason::MaxTokens | StopReason::MaxTurnRequests
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Champions: fight + artifact capture
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct CapturedArtifact {
+    diffstat: String,
+    diff: String,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct FighterReport {
+    id: FighterId,
+    worktree: Option<worktree::CreatedWorktree>,
+    artifact: Option<CapturedArtifact>,
+    final_text: String,
+    slain_reason: Option<String>,
+}
+
+async fn fight(
+    fighter: Candidate,
+    task: String,
+    cwd: PathBuf,
+    forge_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    tx: mpsc::UnboundedSender<RagnarokEvent>,
+    abort: watch::Receiver<bool>,
+) -> FighterReport {
+    let id = fighter.card.id;
+    let mut report = FighterReport {
+        id,
+        worktree: None,
+        artifact: None,
+        final_text: String::new(),
+        slain_reason: None,
+    };
+    let set_state = |state: FighterState| {
+        let _ = tx.send(RagnarokEvent::FighterState { id, state });
+    };
+
+    set_state(FighterState::Forging);
+    let hint = format!(
+        "ragnarok-{}-{}",
+        fighter.card.model_name, fighter.card.agent_source_id
+    );
+    let forge_cwd = cwd.clone();
+    // `git worktree add` mutates shared repo metadata; forging one camp at a
+    // time keeps ten simultaneous champions from tripping over git's locks.
+    let created = {
+        let _guard = forge_lock.lock().await;
+        tokio::task::spawn_blocking(move || worktree::create_for_automation(&forge_cwd, &hint))
+            .await
+    };
+    let created = match created {
+        Ok(Ok(w)) => w,
+        Ok(Err(e)) => {
+            return slain(
+                report,
+                set_state,
+                format!("could not forge worktree: {e:#}"),
+            );
+        }
+        Err(e) => return slain(report, set_state, format!("worktree task failed: {e}")),
+    };
+    let worktree_name = created
+        .worktree_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| created.worktree_root.display().to_string());
+    let _ = tx.send(RagnarokEvent::FighterWorktree {
+        id,
+        name: worktree_name,
+        path: created.worktree_root.clone(),
+    });
+    let base_sha = match git_capture(&created.worktree_root, &["rev-parse", "HEAD"]).await {
+        Ok(sha) => sha.trim().to_string(),
+        Err(e) => return slain(report, set_state, format!("could not read base sha: {e:#}")),
+    };
+    report.worktree = Some(created.clone());
+
+    set_state(FighterState::Connecting);
+    let mut handle = match AgentHandle::connect(
+        &fighter.launch,
+        &created.session_cwd,
+        PermissionPolicy::AllowAll,
+        abort.clone(),
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => return slain(report, set_state, format!("never reached the arena: {e:#}")),
+    };
+    if let Err(e) = handle.arm_model(&fighter.card.model_value).await {
+        handle.dismiss().await;
+        return slain(
+            report,
+            set_state,
+            format!("could not arm their model: {e:#}"),
+        );
+    }
+
+    set_state(FighterState::Fighting);
+    let mut cry_roll = id.wrapping_mul(7);
+    let mut chunk_count = 0usize;
+    let fighter_name = fighter.card.model_name.clone();
+    let tx_events = tx.clone();
+    let outcome = handle
+        .prompt(fight_prompt(&task), FIGHT_TIMEOUT, |ev| {
+            forward_turn_event(
+                &tx_events,
+                id,
+                &fighter_name,
+                ev,
+                TextLane::Message,
+                &mut cry_roll,
+                &mut chunk_count,
+            );
+        })
+        .await;
+    handle.dismiss().await;
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => return slain(report, set_state, format!("fell in battle: {e:#}")),
+    };
+    if !turn_succeeded(outcome.stop) {
+        return slain(
+            report,
+            set_state,
+            format!("yielded ({})", stop_reason_label(outcome.stop)),
+        );
+    }
+    report.final_text = outcome.text;
+
+    set_state(FighterState::Capturing);
+    let root = created.worktree_root.clone();
+    let artifact = capture_artifact(&root, &base_sha).await;
+    match artifact {
+        Ok(a) => {
+            let _ = tx.send(RagnarokEvent::FighterDiffStat {
+                id,
+                stat: a.diffstat.clone(),
+            });
+            report.artifact = Some(a);
+        }
+        Err(e) => {
+            let _ = tx.send(RagnarokEvent::Log {
+                fighter: Some(id),
+                text: format!("⚠ artifact capture faltered: {e:#}"),
+            });
+        }
+    }
+    set_state(FighterState::Standing);
+    let _ = tx.send(RagnarokEvent::Log {
+        fighter: Some(id),
+        text: format!(
+            "🏁 {} plants their banner: the work is done!",
+            fighter.card.model_name
+        ),
+    });
+    report
+}
+
+fn slain(
+    mut report: FighterReport,
+    set_state: impl Fn(FighterState),
+    reason: String,
+) -> FighterReport {
+    set_state(FighterState::Slain(reason.clone()));
+    report.slain_reason = Some(reason);
+    report
+}
+
+/// Fold a digested turn event into arena events: transcript text, an action
+/// for the animation, and (sometimes) a silly battle cry for the feed.
+#[allow(clippy::too_many_arguments)]
+fn forward_turn_event(
+    tx: &mpsc::UnboundedSender<RagnarokEvent>,
+    id: FighterId,
+    fighter_name: &str,
+    ev: TurnEvent,
+    message_lane: TextLane,
+    cry_roll: &mut usize,
+    chunk_count: &mut usize,
+) {
+    match ev {
+        TurnEvent::Message(chunk) => {
+            *chunk_count += 1;
+            if *chunk_count == 1 || chunk_count.is_multiple_of(40) {
+                *cry_roll += 1;
+                let _ = tx.send(RagnarokEvent::FighterAction {
+                    id,
+                    action: ActionKind::Chant,
+                    detail: first_line(&chunk, 60),
+                });
+            }
+            let _ = tx.send(RagnarokEvent::FighterText {
+                id,
+                lane: message_lane,
+                chunk,
+            });
+        }
+        TurnEvent::Thought(chunk) => {
+            *cry_roll += 1;
+            if cry_roll.is_multiple_of(3) {
+                let _ = tx.send(RagnarokEvent::FighterAction {
+                    id,
+                    action: ActionKind::Ponder,
+                    detail: first_line(&chunk, 60),
+                });
+            }
+            let _ = tx.send(RagnarokEvent::FighterText {
+                id,
+                lane: TextLane::Thought,
+                chunk,
+            });
+        }
+        TurnEvent::Tool {
+            title,
+            kind,
+            status,
+            started,
+        } => {
+            let failed = status == Some(ToolCallStatus::Failed);
+            let action = if failed {
+                ActionKind::Wound
+            } else {
+                match kind {
+                    Some(ToolKind::Edit | ToolKind::Delete | ToolKind::Move) => ActionKind::Forge,
+                    Some(ToolKind::Execute) => ActionKind::Strike,
+                    Some(ToolKind::Read | ToolKind::Search | ToolKind::Fetch) => ActionKind::Scry,
+                    Some(ToolKind::Think) => ActionKind::Ponder,
+                    _ => ActionKind::Strike,
+                }
+            };
+            if started || failed {
+                *cry_roll += 1;
+                let _ = tx.send(RagnarokEvent::FighterAction {
+                    id,
+                    action,
+                    detail: first_line(&title, 60),
+                });
+                let _ = tx.send(RagnarokEvent::Log {
+                    fighter: Some(id),
+                    text: battle_cry(fighter_name, action, &first_line(&title, 48), *cry_roll),
+                });
+                let _ = tx.send(RagnarokEvent::FighterText {
+                    id,
+                    lane: TextLane::Tool,
+                    chunk: format!(
+                        "\n⚙ [{}] {}\n",
+                        tool_kind_word(kind),
+                        first_line(&title, 100)
+                    ),
+                });
+            }
+        }
+        TurnEvent::Note(note) => {
+            let _ = tx.send(RagnarokEvent::FighterAction {
+                id,
+                action: ActionKind::Guard,
+                detail: first_line(&note, 60),
+            });
+        }
+    }
+}
+
+fn tool_kind_word(kind: Option<ToolKind>) -> &'static str {
+    match kind {
+        Some(k) => crate::labels::tool_kind_label(k),
+        None => "tool",
+    }
+}
+
+fn fight_prompt(task: &str) -> String {
+    format!(
+        "⚔ RAGNAROK. You are one of several rival AI coding agents. Each rival is \
+         implementing the SAME task in parallel, each in an isolated git worktree. When \
+         combat ends, a rival will adversarially review your work, and Thor will judge \
+         whose implementation most faithfully and completely satisfies the task. Only \
+         one can win.\n\n\
+         Rules of combat:\n\
+         - Implement the task below in the current working directory (your private worktree).\n\
+         - Do NOT create git commits. Leave every change in the working tree.\n\
+         - Do NOT push, and do NOT touch anything outside this worktree.\n\
+         - Verify your work (build/tests) when the project allows it.\n\
+         - Finish with a concise summary of what you built and how you verified it. \
+           Overclaiming will be found out in review.\n\n\
+         THE TASK:\n{task}"
+    )
+}
+
+/// `git add -N` makes untracked files visible to `git diff`, then diff against
+/// the sha captured at worktree creation (immune to agents committing despite
+/// the rules).
+async fn capture_artifact(worktree_root: &Path, base_sha: &str) -> Result<CapturedArtifact> {
+    let _ = git_capture(worktree_root, &["add", "-A", "-N"]).await;
+    let diffstat = git_capture(worktree_root, &["diff", "--stat", base_sha]).await?;
+    let diff = git_capture(worktree_root, &["diff", base_sha]).await?;
+    let truncated = diff.len() > DIFF_CAPTURE_LIMIT;
+    let diff = if truncated {
+        truncate_middle(&diff, DIFF_CAPTURE_LIMIT)
+    } else {
+        diff
+    };
+    Ok(CapturedArtifact {
+        diffstat: diffstat.trim_end().to_string(),
+        diff,
+        truncated,
+    })
+}
+
+async fn git_capture(dir: &Path, args: &[&str]) -> Result<String> {
+    let dir = dir.to_path_buf();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let joined = args.join(" ");
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(&args)
+        .output()
+        .await
+        .with_context(|| format!("run git {joined} in {}", dir.display()))?;
+    if !output.status.success() {
+        bail!(
+            "git {joined} failed in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial reviews
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct ReviewReport {
+    assignment: Assignment,
+    text: String,
+    delivered: bool,
+}
+
+async fn review(
+    reviewer: Candidate,
+    assignment: Assignment,
+    prompt: String,
+    defender_cwd: PathBuf,
+    tx: mpsc::UnboundedSender<RagnarokEvent>,
+    abort: watch::Receiver<bool>,
+) -> ReviewReport {
+    let set_progress = |progress: ReviewProgress| {
+        let _ = tx.send(RagnarokEvent::ReviewState {
+            reviewer: assignment.reviewer,
+            progress,
+        });
+    };
+    set_progress(ReviewProgress::Connecting);
+    let mut handle = match AgentHandle::connect(
+        &reviewer.launch,
+        &defender_cwd,
+        PermissionPolicy::AllowAll,
+        abort.clone(),
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            set_progress(ReviewProgress::Failed);
+            return ReviewReport {
+                assignment,
+                text: format!("(review not delivered: {e:#})"),
+                delivered: false,
+            };
+        }
+    };
+    if let Err(e) = handle.arm_model(&reviewer.card.model_value).await {
+        handle.dismiss().await;
+        set_progress(ReviewProgress::Failed);
+        return ReviewReport {
+            assignment,
+            text: format!("(review not delivered: {e:#})"),
+            delivered: false,
+        };
+    }
+    set_progress(ReviewProgress::Reviewing);
+    let id = assignment.reviewer;
+    let name = reviewer.card.model_name.clone();
+    let mut cry_roll = id.wrapping_mul(13);
+    let mut chunk_count = 0usize;
+    let tx_events = tx.clone();
+    let outcome = handle
+        .prompt(prompt, REVIEW_TIMEOUT, |ev| {
+            forward_turn_event(
+                &tx_events,
+                id,
+                &name,
+                ev,
+                TextLane::Review,
+                &mut cry_roll,
+                &mut chunk_count,
+            );
+        })
+        .await;
+    handle.dismiss().await;
+    match outcome {
+        Ok(o) if turn_succeeded(o.stop) => {
+            set_progress(ReviewProgress::Done);
+            let _ = tx.send(RagnarokEvent::Log {
+                fighter: Some(id),
+                text: format!("🔍 {name} delivers a merciless review scroll."),
+            });
+            ReviewReport {
+                assignment,
+                text: o.text,
+                delivered: true,
+            }
+        }
+        Ok(o) => {
+            set_progress(ReviewProgress::Failed);
+            ReviewReport {
+                assignment,
+                text: format!("(review not delivered: {})", stop_reason_label(o.stop)),
+                delivered: false,
+            }
+        }
+        Err(e) => {
+            set_progress(ReviewProgress::Failed);
+            ReviewReport {
+                assignment,
+                text: format!("(review not delivered: {e:#})"),
+                delivered: false,
+            }
+        }
+    }
+}
+
+fn review_prompt(
+    task: &str,
+    reviewer: &FighterCard,
+    defender: &FighterCard,
+    artifact: Option<&CapturedArtifact>,
+    defender_summary: &str,
+) -> String {
+    let diff = artifact
+        .map(|a| truncate_middle(&a.diff, DIFF_FOR_REVIEW_LIMIT))
+        .unwrap_or_else(|| "(no diff was captured)".to_string());
+    let diffstat = artifact.map(|a| a.diffstat.clone()).unwrap_or_default();
+    format!(
+        "🛡 RAGNAROK ADVERSARIAL REVIEW. You are {reviewer_name}. Your rival \
+         {defender_name} implemented the task below; you are standing inside THEIR git \
+         worktree. Tear the implementation apart — but honestly. Thor will judge YOUR \
+         review for honesty and validity against the actual code, so fabricated flaws \
+         or lazy praise will cost you.\n\n\
+         Rules:\n\
+         - Inspect their real changes (diff included below; verify key claims against files).\n\
+         - Do NOT modify anything. Analysis only.\n\
+         - Judge fidelity to the task as written, correctness, completeness, and quality.\n\n\
+         Deliver exactly these sections:\n\
+         VERDICT: one line — SHIP IT | FLAWED | FATALLY FLAWED\n\
+         REQUIREMENT COVERAGE: score 0-10 and one sentence why\n\
+         FLAWS: numbered list with file:line evidence (or 'none found')\n\
+         STRENGTHS: short list\n\
+         LIES OR OVERCLAIMS: claims in their summary the code does not deliver (or 'none')\n\n\
+         THE TASK THEY WERE GIVEN:\n{task}\n\n\
+         THEIR DIFFSTAT:\n{diffstat}\n\n\
+         THEIR DIFF (may be truncated):\n{diff}\n\n\
+         THEIR CLOSING SUMMARY:\n{summary}",
+        reviewer_name = reviewer.tag(),
+        defender_name = defender.tag(),
+        task = task,
+        diffstat = diffstat,
+        diff = diff,
+        summary = truncate_middle(defender_summary, SUMMARY_LIMIT),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Thor: route → assign → judge (one persistent session)
+// ---------------------------------------------------------------------------
+
+struct Thor {
+    handle: AgentHandle,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteDecision {
+    pub complexity: String,
+    pub competitors: usize,
+    pub rationale: String,
+}
+
+impl Thor {
+    async fn summon(pick: Candidate, cwd: &Path, abort: watch::Receiver<bool>) -> Result<Self> {
+        let mut handle =
+            AgentHandle::connect(&pick.launch, cwd, PermissionPolicy::RejectAll, abort)
+                .await
+                .context("Thor could not descend (agent connect failed)")?;
+        handle
+            .arm_model(&pick.card.model_value)
+            .await
+            .context("Thor could not take form (model select failed)")?;
+        Ok(Self { handle })
+    }
+
+    /// One Thor turn: prompt, stream to the Thor panel, return the final text.
+    async fn speak(
+        &mut self,
+        prompt: String,
+        tx: &mpsc::UnboundedSender<RagnarokEvent>,
+    ) -> Result<String> {
+        let tx = tx.clone();
+        let outcome = self
+            .handle
+            .prompt(prompt, THOR_TIMEOUT, |ev| {
+                if let TurnEvent::Message(chunk) = ev {
+                    let _ = tx.send(RagnarokEvent::ThorSpeaks(chunk));
+                }
+            })
+            .await?;
+        if !turn_succeeded(outcome.stop) {
+            bail!("Thor fell silent ({})", stop_reason_label(outcome.stop));
+        }
+        Ok(outcome.text)
+    }
+
+    async fn route(
+        &mut self,
+        task: &str,
+        tx: &mpsc::UnboundedSender<RagnarokEvent>,
+    ) -> Result<RouteDecision> {
+        let prompt = route_prompt(task);
+        let first = self.speak(prompt, tx).await?;
+        if let Some(route) = parse_route(&first) {
+            return Ok(route);
+        }
+        feed(
+            tx,
+            None,
+            "🌩 Thor's first pronouncement was garbled; asking again.",
+        )?;
+        let retry = self
+            .speak(
+                "Your previous reply could not be parsed. Respond again with ONLY the JSON \
+                 object described before — no prose, no code fences."
+                    .to_string(),
+                tx,
+            )
+            .await?;
+        if let Some(route) = parse_route(&retry) {
+            return Ok(route);
+        }
+        let fallback = route_by_runes(task);
+        feed(
+            tx,
+            None,
+            format!(
+                "🌩 Thor's ravens garbled the message twice; the rune-count heuristic decrees \
+                 {} champions.",
+                fallback.competitors
+            ),
+        )?;
+        Ok(fallback)
+    }
+
+    async fn assign(
+        &mut self,
+        survivors: &[FighterId],
+        cards: &[FighterCard],
+        tx: &mpsc::UnboundedSender<RagnarokEvent>,
+    ) -> Result<Vec<Assignment>> {
+        let prompt = assign_prompt(survivors, cards);
+        for attempt in 0..2 {
+            let text = if attempt == 0 {
+                self.speak(prompt.clone(), tx).await?
+            } else {
+                self.speak(
+                    "Your previous reply could not be used. Respond with ONLY the JSON object \
+                     (every champion reviews exactly one rival, nobody reviews themselves, \
+                     every implementation reviewed exactly once)."
+                        .to_string(),
+                    tx,
+                )
+                .await?
+            };
+            if let Some(assignments) = parse_assignments(&text, survivors) {
+                return Ok(assignments);
+            }
+        }
+        feed(
+            tx,
+            None,
+            "🌩 Thor's pairings were invalid; the wheel of fate rotates the assignments instead.",
+        )?;
+        Ok(assignments_rotation(survivors))
+    }
+
+    async fn judge(
+        &mut self,
+        dossier: &str,
+        survivors: &[FighterId],
+        tx: &mpsc::UnboundedSender<RagnarokEvent>,
+    ) -> Result<Verdict> {
+        let prompt = judge_prompt(dossier);
+        for attempt in 0..2 {
+            let text = if attempt == 0 {
+                self.speak(prompt.clone(), tx).await?
+            } else {
+                self.speak(
+                    "Your previous reply could not be parsed. Respond with ONLY the JSON object \
+                     described before — no prose, no code fences."
+                        .to_string(),
+                    tx,
+                )
+                .await?
+            };
+            if let Some(verdict) = parse_judgment(&text, survivors) {
+                return Ok(verdict);
+            }
+        }
+        bail!("judgment unparseable after retry")
+    }
+
+    async fn dismiss(self) {
+        self.handle.dismiss().await;
+    }
+}
+
+fn route_prompt(task: &str) -> String {
+    format!(
+        "You are THOR, arbiter of RAGNAROK: a tournament where several rival AI coding \
+         agents each implement the same task in parallel and the best implementation \
+         wins. Assess the complexity of the task below and decree how many champions \
+         shall battle — an integer from {MIN_FIGHTERS} to {MAX_FIGHTERS}. Trivial tasks \
+         deserve few champions; epic, ambiguous, or high-stakes tasks deserve many.\n\n\
+         Do not use any tools. Respond with ONLY this JSON object — no prose, no code \
+         fences:\n\
+         {{\"complexity\":\"trivial|simple|moderate|complex|epic\",\
+         \"competitors\":<{MIN_FIGHTERS}-{MAX_FIGHTERS}>,\
+         \"rationale\":\"<one short sentence>\"}}\n\n\
+         THE TASK:\n{task}"
+    )
+}
+
+fn assign_prompt(survivors: &[FighterId], cards: &[FighterCard]) -> String {
+    let roster: Vec<String> = survivors
+        .iter()
+        .map(|id| format!("{{\"id\":{},\"name\":\"{}\"}}", id, cards[*id].model_name))
+        .collect();
+    format!(
+        "The champions below each produced an implementation. Assign each champion \
+         exactly one RIVAL's implementation to adversarially review. Every implementation \
+         must be reviewed exactly once, and no champion may review their own work.\n\n\
+         Champions: [{}]\n\n\
+         Do not use any tools. Respond with ONLY this JSON object:\n\
+         {{\"assignments\":[{{\"reviewer\":<id>,\"defender\":<id>}},…]}}",
+        roster.join(",")
+    )
+}
+
+fn judge_prompt(dossier: &str) -> String {
+    format!(
+        "All implementations and adversarial reviews are in. Judge RAGNAROK.\n\n\
+         Step 1 — judge the reviews: for each review, score its HONESTY (did the \
+         reviewer argue in good faith, neither inventing flaws nor flattering?) and \
+         VALIDITY (do its claims hold against the actual diff?) from 0-10.\n\
+         Step 2 — judge the implementations: rank every champion by how faithfully, \
+         completely, and correctly their implementation satisfies THE TASK as written. \
+         Weigh verified review findings; discount review claims you judged dishonest \
+         or invalid.\n\
+         Step 3 — verdict: if one champion is clearly best, declare them the winner. \
+         If the top two are genuinely close, name two finalists instead. Exactly one of \
+         \"clear_winner\" / \"finalists\" must be non-null.\n\n\
+         Do not use any tools. Respond with ONLY this JSON object — no prose, no code \
+         fences:\n\
+         {{\"review_verdicts\":[{{\"reviewer\":<id>,\"defender\":<id>,\"honesty\":<0-10>,\
+         \"validity\":<0-10>,\"notes\":\"<short>\"}}],\
+         \"ranking\":[<ids best to worst>],\
+         \"clear_winner\":<id or null>,\
+         \"finalists\":[<id>,<id>] or null,\
+         \"reasoning\":\"<a few sentences>\"}}\n\n\
+         {dossier}"
+    )
+}
+
+/// The complete, size-budgeted judgment dossier.
+fn judgment_dossier(
+    task: &str,
+    cards: &[FighterCard],
+    survivors: &[FighterId],
+    reports: &HashMap<FighterId, &FighterReport>,
+    reviews: &[ReviewReport],
+) -> String {
+    let mut out = format!("THE TASK:\n{task}\n");
+    for id in survivors {
+        let card = &cards[*id];
+        out.push_str(&format!("\n===== CHAMPION {id}: {} =====\n", card.tag()));
+        if let Some(report) = reports.get(id) {
+            match &report.artifact {
+                Some(a) => {
+                    out.push_str(&format!("DIFFSTAT:\n{}\n", a.diffstat));
+                    out.push_str(&format!(
+                        "DIFF{}:\n{}\n",
+                        if a.truncated { " (truncated)" } else { "" },
+                        truncate_middle(&a.diff, DIFF_FOR_JUDGMENT_LIMIT)
+                    ));
+                }
+                None => out.push_str("DIFF: (none captured)\n"),
+            }
+            out.push_str(&format!(
+                "THEIR CLOSING SUMMARY:\n{}\n",
+                truncate_middle(&report.final_text, SUMMARY_LIMIT)
+            ));
+        }
+        for review in reviews.iter().filter(|r| r.assignment.defender == *id) {
+            out.push_str(&format!(
+                "REVIEW OF CHAMPION {id} BY CHAMPION {} ({}){}:\n{}\n",
+                review.assignment.reviewer,
+                cards[review.assignment.reviewer].model_name,
+                if review.delivered {
+                    ""
+                } else {
+                    " — NOT DELIVERED"
+                },
+                truncate_middle(&review.text, REVIEW_FOR_JUDGMENT_LIMIT)
+            ));
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Thor output parsing (lenient, validated)
+// ---------------------------------------------------------------------------
+
+/// Find the first balanced `{…}` region that parses as JSON. Tolerates prose
+/// and code fences around the object.
+pub fn extract_json_object(text: &str) -> Option<serde_json::Value> {
+    let bytes = text.as_bytes();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' if start.is_some() => in_string = true,
+            b'{' => {
+                if start.is_none() {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' if start.is_some() => {
+                depth -= 1;
+                if depth == 0 {
+                    let candidate = &text[start.unwrap()..=i];
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+                        return Some(value);
+                    }
+                    start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRoute {
+    complexity: Option<String>,
+    competitors: Option<i64>,
+    rationale: Option<String>,
+}
+
+pub fn parse_route(text: &str) -> Option<RouteDecision> {
+    let value = extract_json_object(text)?;
+    let raw: RawRoute = serde_json::from_value(value).ok()?;
+    let competitors = raw.competitors?;
+    if !(1..=100).contains(&competitors) {
+        return None;
+    }
+    Some(RouteDecision {
+        complexity: raw.complexity.unwrap_or_else(|| "unknowable".to_string()),
+        competitors: (competitors as usize).clamp(MIN_FIGHTERS, MAX_FIGHTERS),
+        rationale: raw
+            .rationale
+            .unwrap_or_else(|| "Thor keeps his counsel.".to_string()),
+    })
+}
+
+/// Deterministic complexity heuristic when Thor's routing is unusable twice.
+pub fn route_by_runes(task: &str) -> RouteDecision {
+    let runes = task.chars().count();
+    let mut competitors = match runes {
+        0..=160 => 2,
+        161..=600 => 3,
+        601..=2000 => 4,
+        _ => 5,
+    };
+    let heavy_words = [
+        "refactor",
+        "migrate",
+        "rewrite",
+        "architecture",
+        "concurrent",
+        "parallel",
+        "protocol",
+        "database",
+        " ui",
+        "test",
+        "security",
+    ];
+    let lowered = task.to_lowercase();
+    if heavy_words.iter().filter(|w| lowered.contains(**w)).count() >= 2 {
+        competitors += 1;
+    }
+    let complexity = match competitors {
+        2 => "simple",
+        3 => "moderate",
+        4 => "complex",
+        _ => "epic",
+    };
+    RouteDecision {
+        complexity: complexity.to_string(),
+        competitors: competitors.clamp(MIN_FIGHTERS, MAX_FIGHTERS),
+        rationale: "rune-count heuristic (Thor's routing was unusable)".to_string(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAssignments {
+    assignments: Vec<RawAssignment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAssignment {
+    reviewer: i64,
+    defender: i64,
+}
+
+/// Accept Thor's pairings only when they form a perfect derangement over the
+/// survivors: everyone reviews exactly once, everyone is reviewed exactly
+/// once, nobody reviews themselves.
+pub fn parse_assignments(text: &str, survivors: &[FighterId]) -> Option<Vec<Assignment>> {
+    let value = extract_json_object(text)?;
+    let raw: RawAssignments = serde_json::from_value(value).ok()?;
+    let valid: HashSet<FighterId> = survivors.iter().copied().collect();
+    let mut reviewers = HashSet::new();
+    let mut defenders = HashSet::new();
+    let mut out = Vec::new();
+    for a in raw.assignments {
+        let reviewer = usize::try_from(a.reviewer).ok()?;
+        let defender = usize::try_from(a.defender).ok()?;
+        if reviewer == defender || !valid.contains(&reviewer) || !valid.contains(&defender) {
+            return None;
+        }
+        if !reviewers.insert(reviewer) || !defenders.insert(defender) {
+            return None;
+        }
+        out.push(Assignment { reviewer, defender });
+    }
+    (reviewers.len() == survivors.len() && defenders.len() == survivors.len()).then_some(out)
+}
+
+/// Everyone reviews the next survivor (wrapping): a valid derangement for any
+/// n ≥ 2.
+pub fn assignments_rotation(survivors: &[FighterId]) -> Vec<Assignment> {
+    let n = survivors.len();
+    (0..n)
+        .map(|i| Assignment {
+            reviewer: survivors[i],
+            defender: survivors[(i + 1) % n],
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct RawJudgment {
+    review_verdicts: Option<Vec<RawReviewVerdict>>,
+    ranking: Option<Vec<i64>>,
+    clear_winner: Option<i64>,
+    finalists: Option<Vec<i64>>,
+    reasoning: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawReviewVerdict {
+    reviewer: i64,
+    defender: i64,
+    honesty: Option<i64>,
+    validity: Option<i64>,
+    notes: Option<String>,
+}
+
+pub fn parse_judgment(text: &str, survivors: &[FighterId]) -> Option<Verdict> {
+    let value = extract_json_object(text)?;
+    let raw: RawJudgment = serde_json::from_value(value).ok()?;
+    let valid: HashSet<FighterId> = survivors.iter().copied().collect();
+    let to_id = |v: i64| -> Option<FighterId> {
+        let id = usize::try_from(v).ok()?;
+        valid.contains(&id).then_some(id)
+    };
+
+    let mut ranking: Vec<FighterId> = Vec::new();
+    for v in raw.ranking.unwrap_or_default() {
+        let id = to_id(v)?;
+        if !ranking.contains(&id) {
+            ranking.push(id);
+        }
+    }
+    for id in survivors {
+        if !ranking.contains(id) {
+            ranking.push(*id);
+        }
+    }
+
+    let clear_winner = match raw.clear_winner {
+        Some(v) => Some(to_id(v)?),
+        None => None,
+    };
+    let finalists = match raw.finalists {
+        Some(pair) if pair.len() == 2 => {
+            let a = to_id(pair[0])?;
+            let b = to_id(pair[1])?;
+            if a == b {
+                return None;
+            }
+            Some((a, b))
+        }
+        Some(_) => return None,
+        None => None,
+    };
+    // Exactly one of winner/finalists; fall back to the ranking when Thor
+    // supplied neither, and prefer the winner when he supplied both.
+    let (clear_winner, finalists) = match (clear_winner, finalists) {
+        (Some(w), _) => (Some(w), None),
+        (None, Some(pair)) => (None, Some(pair)),
+        (None, None) => match ranking.len() {
+            0 => return None,
+            1 => (Some(ranking[0]), None),
+            _ => (None, Some((ranking[0], ranking[1]))),
+        },
+    };
+
+    let review_verdicts = raw
+        .review_verdicts
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|rv| {
+            Some(ReviewVerdict {
+                reviewer: to_id(rv.reviewer)?,
+                defender: to_id(rv.defender)?,
+                honesty: rv.honesty.unwrap_or(0).clamp(0, 10) as u8,
+                validity: rv.validity.unwrap_or(0).clamp(0, 10) as u8,
+                notes: rv.notes.unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    Some(Verdict {
+        clear_winner,
+        finalists,
+        ranking,
+        review_verdicts,
+        reasoning: raw
+            .reasoning
+            .unwrap_or_else(|| "Thor offers no reasoning.".to_string()),
+        thor_fallback: false,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Text utilities + battle cries
+// ---------------------------------------------------------------------------
+
+/// Keep the head and tail of oversized text, excising the middle.
+pub fn truncate_middle(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let head_budget = max * 7 / 10;
+    let tail_budget = max.saturating_sub(head_budget);
+    let head_end = floor_char_boundary(text, head_budget);
+    let tail_start = ceil_char_boundary(text, text.len().saturating_sub(tail_budget));
+    let excised = tail_start.saturating_sub(head_end);
+    format!(
+        "{}\n…[{excised} bytes excised]…\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    )
+}
+
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// First line of `text`, hard-capped at `max` chars with an ellipsis.
+pub fn first_line(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= max {
+        line.to_string()
+    } else {
+        let cut: String = line.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
+/// An extremely silly, deterministic battle cry for the combat feed.
+pub fn battle_cry(fighter: &str, action: ActionKind, detail: &str, roll: usize) -> String {
+    let pool: &[&str] = match action {
+        ActionKind::Forge => &[
+            "🔨 {f} hammers white-hot code upon the anvil: {d}",
+            "🔥 {f} quenches a fresh blade in coolant: {d}",
+            "⚒ {f} reforges the very bones of the repo: {d}",
+            "🧲 {f} bends molten syntax to their will: {d}",
+        ],
+        ActionKind::Strike => &[
+            "⚡ {f} hurls a thunderbolt of shell: {d}",
+            "🌪 {f} unleashes a whirlwind subprocess: {d}",
+            "💥 {f} smites the terminal with {d}",
+            "🐍 {f} releases a screaming daemon: {d}",
+        ],
+        ActionKind::Scry => &[
+            "🔮 {f} peers into the swirling runes: {d}",
+            "🦉 {f} dispatches ravens to spy upon {d}",
+            "📜 {f} unrolls a dusty scroll: {d}",
+            "👁 {f} gazes unblinking at {d}",
+        ],
+        ActionKind::Chant => &[
+            "🎵 {f} chants an epic saga: “{d}”",
+            "📯 {f} bellows across the arena: “{d}”",
+            "🗣 {f} monologues heroically: “{d}”",
+        ],
+        ActionKind::Ponder => &[
+            "🤔 {f} strokes a magnificent imaginary beard: {d}",
+            "🧠 {f} enters the mind palace: {d}",
+            "💭 {f} consults their inner völva: {d}",
+        ],
+        ActionKind::Wound => &[
+            "🩸 {f} takes a nasty error to the knee: {d}",
+            "☄ {f} is scorched by a failing rune: {d}",
+            "😱 {f} staggers — the tool has betrayed them! {d}",
+        ],
+        ActionKind::Guard => &[
+            "🛡 {f} flashes the seal of permission: {d}",
+            "🗝 {f} is waved through the gates: {d}",
+        ],
+    };
+    let template = pool[roll % pool.len()];
+    template.replace("{f}", fighter).replace("{d}", detail)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(agent: &str, model: &str, elo: u32, key: &str) -> Candidate {
+        Candidate {
+            card: FighterCard {
+                id: 0,
+                agent_source_id: agent.to_string(),
+                model_value: model.to_string(),
+                model_name: model.to_string(),
+                elo,
+                provisional: false,
+            },
+            launch: Launch {
+                program: PathBuf::from("true"),
+                args: vec![],
+                env: HashMap::new(),
+            },
+            match_key: key.to_string(),
+        }
+    }
+
+    fn sorted(mut pool: Vec<Candidate>) -> Vec<Candidate> {
+        pool.sort_by_key(|c| std::cmp::Reverse(c.card.elo));
+        pool
+    }
+
+    #[test]
+    fn select_prefers_distinct_agents_first() {
+        let pool = sorted(vec![
+            candidate("claude-acp", "opus", 1456, "anthropic/opus48"),
+            candidate("claude-acp", "sonnet", 1457, "anthropic/sonnet46"),
+            candidate("codex-acp", "gpt-5.5", 1463, "openai/gpt55"),
+            candidate("anvil", "glm-5", 1446, "zhipuai/glm5"),
+        ]);
+        let picked = select_fighters(&pool, 3);
+        let agents: Vec<&str> = picked
+            .iter()
+            .map(|c| c.card.agent_source_id.as_str())
+            .collect();
+        assert_eq!(picked.len(), 3);
+        // One model per agent while agents remain unused.
+        assert!(agents.contains(&"codex-acp"));
+        assert!(agents.contains(&"claude-acp"));
+        assert!(agents.contains(&"anvil"));
+        // The claude pick is its best model (sonnet at 1457 beats opus 1456).
+        let claude = picked
+            .iter()
+            .find(|c| c.card.agent_source_id == "claude-acp")
+            .unwrap();
+        assert_eq!(claude.card.model_name, "sonnet");
+    }
+
+    #[test]
+    fn select_fills_from_same_agent_when_needed() {
+        let pool = sorted(vec![
+            candidate("claude-acp", "opus", 1456, "anthropic/opus48"),
+            candidate("claude-acp", "sonnet", 1457, "anthropic/sonnet46"),
+            candidate("codex-acp", "gpt-5.5", 1463, "openai/gpt55"),
+        ]);
+        let picked = select_fighters(&pool, 3);
+        assert_eq!(picked.len(), 3);
+        // Distinct models even when agents repeat.
+        let keys: HashSet<&str> = picked.iter().map(|c| c.match_key.as_str()).collect();
+        assert_eq!(keys.len(), 3);
+    }
+
+    #[test]
+    fn select_never_duplicates_the_same_underlying_model() {
+        // opus via two different agents shares a match key: only one may fight.
+        let pool = sorted(vec![
+            candidate("claude-acp", "opus", 1456, "anthropic/opus48"),
+            candidate(
+                "anvil",
+                "bedrock::us.anthropic.claude-opus-4-8",
+                1456,
+                "anthropic/opus48",
+            ),
+            candidate("codex-acp", "gpt-5.5", 1463, "openai/gpt55"),
+        ]);
+        let picked = select_fighters(&pool, 3);
+        assert_eq!(picked.len(), 2, "duplicate model must be excluded");
+    }
+
+    #[test]
+    fn rotation_is_a_derangement_for_all_sizes() {
+        for n in 2..=10 {
+            let ids: Vec<FighterId> = (0..n).collect();
+            let assignments = assignments_rotation(&ids);
+            assert_eq!(assignments.len(), n);
+            let reviewers: HashSet<_> = assignments.iter().map(|a| a.reviewer).collect();
+            let defenders: HashSet<_> = assignments.iter().map(|a| a.defender).collect();
+            assert_eq!(reviewers.len(), n);
+            assert_eq!(defenders.len(), n);
+            assert!(assignments.iter().all(|a| a.reviewer != a.defender));
+        }
+    }
+
+    #[test]
+    fn extract_json_handles_fences_prose_and_nested_braces() {
+        let text = "Very well!\n```json\n{\"a\":{\"b\":\"}{\"},\"n\":2}\n```\ndone";
+        let v = extract_json_object(text).expect("json");
+        assert_eq!(v["n"], 2);
+        assert_eq!(v["a"]["b"], "}{");
+    }
+
+    #[test]
+    fn extract_json_skips_unparseable_candidates() {
+        let text = "{not json} but later {\"ok\":true}";
+        let v = extract_json_object(text).expect("json");
+        assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn parse_route_clamps_and_validates() {
+        let route =
+            parse_route("{\"complexity\":\"epic\",\"competitors\":25,\"rationale\":\"big\"}")
+                .expect("route");
+        assert_eq!(route.competitors, MAX_FIGHTERS);
+        let route = parse_route("{\"competitors\":2}").expect("route");
+        assert_eq!(route.competitors, 2);
+        assert!(parse_route("{\"competitors\":0}").is_none());
+        assert!(parse_route("no json here").is_none());
+    }
+
+    #[test]
+    fn route_by_runes_stays_in_bounds() {
+        for task in [
+            "fix typo",
+            &"x".repeat(5000),
+            "refactor the ui and migrate tests",
+        ] {
+            let route = route_by_runes(task);
+            assert!((MIN_FIGHTERS..=MAX_FIGHTERS).contains(&route.competitors));
+        }
+    }
+
+    #[test]
+    fn parse_assignments_accepts_only_perfect_derangements() {
+        let survivors = vec![0, 1, 2];
+        let good = "{\"assignments\":[{\"reviewer\":0,\"defender\":2},{\"reviewer\":2,\"defender\":1},{\"reviewer\":1,\"defender\":0}]}";
+        let parsed = parse_assignments(good, &survivors).expect("valid");
+        assert_eq!(parsed.len(), 3);
+
+        // Self-review rejected.
+        let selfish = "{\"assignments\":[{\"reviewer\":0,\"defender\":0},{\"reviewer\":1,\"defender\":2},{\"reviewer\":2,\"defender\":1}]}";
+        assert!(parse_assignments(selfish, &survivors).is_none());
+        // Missing coverage rejected.
+        let partial = "{\"assignments\":[{\"reviewer\":0,\"defender\":1}]}";
+        assert!(parse_assignments(partial, &survivors).is_none());
+        // Unknown ids rejected.
+        let unknown = "{\"assignments\":[{\"reviewer\":0,\"defender\":7},{\"reviewer\":7,\"defender\":1},{\"reviewer\":1,\"defender\":0}]}";
+        assert!(parse_assignments(unknown, &survivors).is_none());
+    }
+
+    #[test]
+    fn parse_judgment_normalizes_winner_vs_finalists() {
+        let survivors = vec![0, 1, 2];
+        let win =
+            "{\"ranking\":[1,0,2],\"clear_winner\":1,\"finalists\":null,\"reasoning\":\"strong\"}";
+        let v = parse_judgment(win, &survivors).expect("verdict");
+        assert_eq!(v.clear_winner, Some(1));
+        assert!(v.finalists.is_none());
+        assert_eq!(v.ranking, vec![1, 0, 2]);
+
+        let split =
+            "{\"ranking\":[2,0],\"clear_winner\":null,\"finalists\":[2,0],\"reasoning\":\"close\"}";
+        let v = parse_judgment(split, &survivors).expect("verdict");
+        assert_eq!(v.finalists, Some((2, 0)));
+        // Missing survivors are appended to the ranking.
+        assert_eq!(v.ranking, vec![2, 0, 1]);
+
+        // Neither winner nor finalists: derive finalists from ranking.
+        let neither = "{\"ranking\":[0,2,1],\"reasoning\":\"meh\"}";
+        let v = parse_judgment(neither, &survivors).expect("verdict");
+        assert_eq!(v.finalists, Some((0, 2)));
+        assert!(v.clear_winner.is_none());
+
+        // Bogus ids fail the parse entirely.
+        assert!(parse_judgment("{\"clear_winner\":9}", &survivors).is_none());
+    }
+
+    #[test]
+    fn parse_judgment_collects_review_verdicts() {
+        let survivors = vec![0, 1];
+        let text = "{\"review_verdicts\":[{\"reviewer\":0,\"defender\":1,\"honesty\":9,\"validity\":22,\"notes\":\"fair\"}],\"clear_winner\":0,\"reasoning\":\"ok\"}";
+        let v = parse_judgment(text, &survivors).expect("verdict");
+        assert_eq!(v.review_verdicts.len(), 1);
+        assert_eq!(v.review_verdicts[0].honesty, 9);
+        assert_eq!(v.review_verdicts[0].validity, 10, "clamped to 10");
+    }
+
+    #[test]
+    fn elo_fallback_presents_two_strongest_finalists() {
+        let cards = vec![
+            FighterCard {
+                id: 0,
+                agent_source_id: "a".into(),
+                model_value: "m0".into(),
+                model_name: "m0".into(),
+                elo: 1400,
+                provisional: false,
+            },
+            FighterCard {
+                id: 1,
+                agent_source_id: "b".into(),
+                model_value: "m1".into(),
+                model_name: "m1".into(),
+                elo: 1460,
+                provisional: false,
+            },
+            FighterCard {
+                id: 2,
+                agent_source_id: "c".into(),
+                model_value: "m2".into(),
+                model_name: "m2".into(),
+                elo: 1430,
+                provisional: false,
+            },
+        ];
+        let v = elo_fallback_verdict(&[0, 1, 2], &cards);
+        assert!(v.thor_fallback);
+        assert_eq!(v.finalists, Some((1, 2)));
+        assert_eq!(v.ranking, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn truncate_middle_keeps_head_and_tail() {
+        let text = format!("{}MIDDLE{}", "H".repeat(100), "T".repeat(100));
+        let out = truncate_middle(&text, 60);
+        assert!(out.starts_with("HHHH"));
+        assert!(out.ends_with("TTTT"));
+        assert!(out.contains("excised"));
+        assert!(truncate_middle("short", 60) == "short");
+    }
+
+    #[test]
+    fn truncate_middle_respects_char_boundaries() {
+        let text = "⚔".repeat(100);
+        let out = truncate_middle(&text, 50);
+        assert!(out.contains("excised"));
+        // Must not panic and must remain valid UTF-8 (guaranteed by String).
+        assert!(out.chars().count() > 0);
+    }
+
+    #[test]
+    fn first_line_truncates_politely() {
+        assert_eq!(first_line("hello\nworld", 60), "hello");
+        assert_eq!(first_line("", 60), "");
+        let long = "x".repeat(100);
+        assert_eq!(first_line(&long, 10).chars().count(), 10);
+    }
+
+    #[test]
+    fn battle_cries_are_deterministic_and_themed() {
+        let a = battle_cry("Opus", ActionKind::Forge, "src/main.rs", 3);
+        let b = battle_cry("Opus", ActionKind::Forge, "src/main.rs", 3);
+        assert_eq!(a, b);
+        assert!(a.contains("Opus"));
+        assert!(a.contains("src/main.rs"));
+        // All action kinds produce something for many rolls.
+        for kind in [
+            ActionKind::Forge,
+            ActionKind::Strike,
+            ActionKind::Scry,
+            ActionKind::Chant,
+            ActionKind::Ponder,
+            ActionKind::Wound,
+            ActionKind::Guard,
+        ] {
+            for roll in 0..8 {
+                assert!(!battle_cry("X", kind, "y", roll).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn fighter_tag_includes_elo_and_agent() {
+        let card = FighterCard {
+            id: 0,
+            agent_source_id: "claude-acp".into(),
+            model_value: "opus".into(),
+            model_name: "Opus".into(),
+            elo: 1456,
+            provisional: true,
+        };
+        assert_eq!(card.tag(), "Opus [claude-acp] ⚡1456*");
+    }
+}

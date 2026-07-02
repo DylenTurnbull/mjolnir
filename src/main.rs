@@ -23,6 +23,7 @@ mod paths;
 mod picker;
 mod probe;
 mod qr;
+mod ragnarok;
 mod registry;
 mod remote;
 mod scores;
@@ -1625,6 +1626,7 @@ async fn run_session(
                 spinner_style,
                 score_store: score_store.clone(),
                 session_boundary: session_boundary.take(),
+                session_cwd: cwd.clone(),
             },
         )
         .await;

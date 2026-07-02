@@ -398,9 +398,24 @@ impl ScoreCatalog {
         name: &str,
         description: &str,
     ) -> Option<ModelScore> {
+        self.lookup_with_key(agent_id, value, name, description)
+            .map(|(_, score)| score)
+    }
+
+    /// Like [`Self::lookup`], but also returns the normalized match key that
+    /// resolved. Two options resolving to the same key are the same underlying
+    /// model, regardless of which agent exposes them — Ragnarok uses this to
+    /// keep its roster of champions genuinely distinct.
+    fn lookup_with_key(
+        &self,
+        agent_id: &str,
+        value: &str,
+        name: &str,
+        description: &str,
+    ) -> Option<(MatchKey, ModelScore)> {
         model_resolve::agent_keys(agent_id, value, name, description, &self.overrides)
             .into_iter()
-            .find_map(|key| self.by_key.get(&key).copied())
+            .find_map(|key| self.by_key.get(&key).copied().map(|score| (key, score)))
     }
 }
 
@@ -425,6 +440,34 @@ impl ScoreStore {
             .ok()
             .and_then(|guard| guard.as_ref().map(|c| c.enabled))
             .unwrap_or(false)
+    }
+
+    /// True when any catalog has been installed, regardless of the picker
+    /// display toggle. Ragnarok loads its own catalog when this is false.
+    pub fn has_catalog(&self) -> bool {
+        self.catalog
+            .read()
+            .ok()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Numeric Elo lookup for one agent model option, plus the normalized
+    /// match key it resolved through. Unlike [`Self::score_suffix`] this
+    /// ignores the display toggle: an installed catalog always answers.
+    /// `None` means the model is not on the leaderboard — for Ragnarok that
+    /// makes it ineligible.
+    pub fn model_score_with_key(
+        &self,
+        agent_id: &str,
+        value: &str,
+        name: &str,
+        description: &str,
+    ) -> Option<(MatchKey, ModelScore)> {
+        let guard = self.catalog.read().ok()?;
+        guard
+            .as_ref()?
+            .lookup_with_key(agent_id, value, name, description)
     }
 
     /// Render suffix for a model row in the picker: the Elo, or a provisional

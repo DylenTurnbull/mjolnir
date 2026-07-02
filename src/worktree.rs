@@ -90,6 +90,95 @@ fn create_for_project_cwd(project_root: &Path, cwd: &Path) -> Result<CreatedWork
     })
 }
 
+/// Create a linked worktree for an automated flow (Ragnarok fighters).
+/// Never prompts and never touches `.gitignore`; the caller owns any user
+/// messaging. `name_hint` seeds the directory name and is sanitized and
+/// uniquified, so callers can pass model names verbatim.
+pub fn create_for_automation(cwd: &Path, name_hint: &str) -> Result<CreatedWorktree> {
+    let project_root = git_toplevel(cwd)?;
+    let relative_cwd = relative_cwd(&project_root, cwd)?;
+    let worktrees_dir = worktrees_dir(&project_root);
+    std::fs::create_dir_all(&worktrees_dir)
+        .with_context(|| format!("create {}", worktrees_dir.display()))?;
+
+    let worktree_root = hinted_worktree_path(&worktrees_dir, name_hint)?;
+    run_git(
+        &project_root,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("--detach"),
+            worktree_root.as_os_str(),
+            OsStr::new("HEAD"),
+        ],
+    )
+    .with_context(|| format!("create git worktree {}", worktree_root.display()))?;
+
+    let session_cwd = worktree_root.join(relative_cwd);
+    std::fs::create_dir_all(&session_cwd)
+        .with_context(|| format!("create session cwd {}", session_cwd.display()))?;
+
+    Ok(CreatedWorktree {
+        project_root,
+        worktree_root,
+        session_cwd,
+        was_created: true,
+    })
+}
+
+/// Reduce an arbitrary label (model/agent names may carry `::`, spaces, or
+/// unicode) to a safe, compact worktree directory name.
+fn sanitize_worktree_name(hint: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = true; // trim leading dashes
+    for c in hint.chars() {
+        let mapped = if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
+            c.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if mapped == '-' {
+            if last_dash {
+                continue;
+            }
+            last_dash = true;
+        } else {
+            last_dash = false;
+        }
+        out.push(mapped);
+        if out.len() >= 48 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "fighter".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Like [`unique_worktree_path`], but seeded from a caller-supplied hint
+/// instead of a random adjective-noun pair.
+fn hinted_worktree_path(worktrees_dir: &Path, name_hint: &str) -> Result<PathBuf> {
+    let base = sanitize_worktree_name(name_hint);
+    for attempt in 0..100_u32 {
+        let name = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{attempt}")
+        };
+        let path = worktrees_dir.join(&name);
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(anyhow!(
+        "could not find an unused worktree name for '{base}' under {}",
+        worktrees_dir.display()
+    ))
+}
+
 /// Open an existing worktree by name (short name under
 /// `.mjolnir/worktrees/`) or by path (absolute or relative to `cwd`).
 /// The target directory must already exist and be a registered Git
@@ -594,6 +683,54 @@ mod tests {
             created.worktree_root.join("scratch/empty")
         );
         assert!(created.session_cwd.is_dir());
+    }
+
+    #[test]
+    fn sanitize_worktree_name_cleans_labels() {
+        assert_eq!(
+            sanitize_worktree_name("ragnarok-GPT-5 Codex-codex-acp"),
+            "ragnarok-gpt-5-codex-codex-acp"
+        );
+        assert_eq!(
+            sanitize_worktree_name("bedrock::us.anthropic.claude-opus-4-8"),
+            "bedrock-us.anthropic.claude-opus-4-8"
+        );
+        assert_eq!(sanitize_worktree_name("///"), "fighter");
+        assert!(sanitize_worktree_name(&"x".repeat(200)).len() <= 48);
+    }
+
+    #[test]
+    fn hinted_path_uniquifies_on_collision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = hinted_worktree_path(dir.path(), "ragnarok-opus").expect("path");
+        assert_eq!(first.file_name().unwrap(), "ragnarok-opus");
+        std::fs::create_dir_all(&first).expect("mkdir");
+        let second = hinted_worktree_path(dir.path(), "ragnarok-opus").expect("path 2");
+        assert_eq!(second.file_name().unwrap(), "ragnarok-opus-1");
+    }
+
+    #[test]
+    fn create_for_automation_creates_detached_worktree_without_prompting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("file.txt"), "hello").expect("write file");
+        run_git(dir.path(), [OsStr::new("add"), OsStr::new(".")]).expect("git add");
+        commit_all(dir.path());
+
+        let created =
+            create_for_automation(dir.path(), "ragnarok-Opus-claude-acp").expect("create");
+        assert!(created.was_created);
+        assert!(created.session_cwd.join("file.txt").exists());
+        assert!(
+            created
+                .worktree_root
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ragnarok-opus-claude-acp")
+        );
+        // No prompting means the parent checkout's .gitignore is untouched.
+        assert!(!dir.path().join(".gitignore").exists());
     }
 
     #[test]

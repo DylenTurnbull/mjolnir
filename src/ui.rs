@@ -40,10 +40,11 @@ use tokio::time::MissedTickBehavior;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    AppState, ConfigValueChoice, ConnectionState, ElicitationView, Entry, MjConfigSection,
-    PastedAttachment, PastedImageAttachment, PendingElicitation, PendingPermission,
-    QUEUED_PROMPT_PREVIEW_WIDTH, QueuedPrompt, StatusKind, StatusMessage, ToolCallOutput,
-    UiExitReason, classify_elicitation, config_option_choices, config_option_current_value_label,
+    AppState, ArenaPane, ConfigValueChoice, ConnectionState, ElicitationView, Entry,
+    MjConfigSection, PastedAttachment, PastedImageAttachment, PendingElicitation,
+    PendingPermission, QUEUED_PROMPT_PREVIEW_WIDTH, QueuedPrompt, RagnarokFighterUi, RagnarokUi,
+    StatusKind, StatusMessage, ToolCallOutput, UiExitReason, classify_elicitation,
+    config_option_choices, config_option_current_value_label,
 };
 use crate::clipboard::{
     ClipboardImage, copy_to_clipboard, load_image_path_as_png, read_clipboard_image_as_png,
@@ -52,6 +53,7 @@ use crate::config;
 use crate::event::{PermissionDecision, PermissionPrompt, PromptImage, UiCommand, UiEvent};
 use crate::notifications::TerminalNotificationBackend;
 use crate::palette::TerminalTheme;
+use crate::ragnarok;
 use crate::speech::{dictation_error_message, run_dictation};
 use crate::spinner::SpinnerStyle;
 use crate::term::TrackedBackend;
@@ -293,6 +295,8 @@ pub struct UiRunOptions<'a> {
     pub spinner_style: SpinnerStyle,
     pub score_store: crate::scores::ScoreStore,
     pub session_boundary: Option<String>,
+    /// The ACP session cwd; `/ragnarok` battles are rooted here.
+    pub session_cwd: PathBuf,
 }
 
 pub struct UiRunResult {
@@ -314,6 +318,7 @@ struct UiInitialState {
     theme_kind: TerminalThemeKind,
     spinner_style: SpinnerStyle,
     session_boundary: Option<String>,
+    session_cwd: PathBuf,
 }
 
 /// Internal result of [`ui_loop`]. `run` unpacks it into the public
@@ -366,6 +371,7 @@ pub async fn run(
             theme_kind: options.theme_kind,
             spinner_style: options.spinner_style,
             session_boundary: options.session_boundary,
+            session_cwd: options.session_cwd,
         },
         options.mode,
     )
@@ -538,6 +544,7 @@ async fn ui_loop(
         state.agent_source_id = source_id;
     }
     state.score_store = initial.score_store;
+    state.session_cwd = initial.session_cwd;
     state.transcript_export_dir = initial.transcript_export_dir;
     state.set_theme(initial.theme_kind);
     state.set_spinner_style(initial.spinner_style);
@@ -552,6 +559,9 @@ async fn ui_loop(
     let mut crossterm_events = EventStream::new();
     let (dictation_tx, mut dictation_rx) = mpsc::unbounded_channel::<DictationEvent>();
     let mut dictation_cancel_tx: Option<std_mpsc::Sender<()>> = None;
+    // Ragnarok battles report through their own channel (the sender stays
+    // alive here for the whole loop, so `recv` pends rather than closing).
+    let (ragnarok_tx, mut ragnarok_rx) = mpsc::unbounded_channel::<ragnarok::RagnarokEvent>();
     let mut inline_height = INLINE_CHAT_HEIGHT;
     // Wake-up timers so queued input can render at the interactive cadence
     // while spinner-only animation advances at a calmer progress cadence.
@@ -604,6 +614,10 @@ async fn ui_loop(
                             &dictation_tx,
                             &mut dictation_cancel_tx,
                         )?;
+                        if let Some(task) = state.take_ragnarok_launch() {
+                            start_ragnarok(&mut state, task, ragnarok_tx.clone());
+                            force_soft_inline_repair = mode == UiMode::InlineChat;
+                        }
                     }
                     Some(Err(e)) => {
                         state.record_status_message(
@@ -635,6 +649,19 @@ async fn ui_loop(
                         pending_redraw.mark_interactive();
                     }
                     None => {}
+                }
+            }
+            maybe_rag = ragnarok_rx.recv() => {
+                if let Some(ev) = maybe_rag {
+                    let cause = match &ev {
+                        ragnarok::RagnarokEvent::FighterText { .. }
+                        | ragnarok::RagnarokEvent::FighterAction { .. }
+                        | ragnarok::RagnarokEvent::ThorSpeaks(_)
+                        | ragnarok::RagnarokEvent::Log { .. } => RedrawCause::Stream,
+                        _ => RedrawCause::Interactive,
+                    };
+                    state.apply_ragnarok_event(ev);
+                    pending_redraw.mark(cause);
                 }
             }
             // Use the unconditional form (no `Some(ev) = ...`) so the
@@ -739,6 +766,7 @@ async fn ui_loop(
         // mid-read. Entries that go stable meanwhile are flushed on close.
         if mode == UiMode::InlineChat
             && !state.transcript_viewer
+            && state.ragnarok.is_none()
             && !inline_resize_reflow.is_pending()
         {
             flush_transcript_to_scrollback(terminal, &mut transcript_sink, &state)?;
@@ -1106,6 +1134,11 @@ fn repair_inline_viewport(
 }
 
 fn timer_driven_live_redraw(mode: UiMode, state: &AppState) -> bool {
+    // The arena animates (poses, banners, elapsed time) as long as it is on
+    // screen, in both UI modes.
+    if state.ragnarok.is_some() {
+        return true;
+    }
     if mode == UiMode::InlineChat && state.is_busy() {
         return should_show_spinner(state);
     }
@@ -1400,6 +1433,15 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
             .saturating_sub(1)
             .max(INLINE_CHAT_HEIGHT);
     }
+    // The Ragnarok arena also takes the whole terminal; battles deserve a
+    // stage. Pending permission/elicitation prompts still win (above rule
+    // does not apply — they render inside the arena-sized viewport fine).
+    if state.ragnarok.is_some() {
+        return terminal_size
+            .height
+            .saturating_sub(1)
+            .max(INLINE_CHAT_HEIGHT);
+    }
     let max_height = terminal_size
         .height
         .saturating_sub(1)
@@ -1470,6 +1512,7 @@ fn handle_crossterm(
                 || state.has_pending_elicitation()
                 || state.config_picker.is_some()
                 || state.mjconfig_menu.is_some()
+                || state.ragnarok.is_some()
             {
                 return TerminalRequest::None;
             }
@@ -1599,6 +1642,12 @@ fn handle_crossterm(
     // and wins if both are somehow pending (its check runs first above).
     if state.has_pending_elicitation() {
         return handle_elicitation_key(state, key.code, mode);
+    }
+
+    // The Ragnarok arena owns the keyboard while a battle is on screen. It
+    // yields only to the safety-critical modals above.
+    if state.ragnarok.is_some() {
+        return handle_ragnarok_key(state, key.modifiers, key.code, mode);
     }
 
     if state.config_picker.is_some() {
@@ -2981,6 +3030,30 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
     }
 
     if images.is_empty()
+        && let Some(rest) = text.strip_prefix("/ragnarok")
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        let task = rest.trim().to_string();
+        state.input.clear();
+        clear_attachments(state);
+        state.input_cursor = 0;
+        state.scroll_input_to_bottom();
+        if state.ragnarok.is_some() {
+            state.record_status_message(
+                StatusKind::Warning,
+                "a Ragnarok is already raging (press Esc twice in the arena to flee)",
+            );
+        } else if task.is_empty() {
+            state
+                .record_status_message(StatusKind::Warning, "usage: /ragnarok <task to implement>");
+        } else {
+            state.push_system_message(format!("⚡ Ragnarok summoned — task: {task}"));
+            state.request_ragnarok(task);
+        }
+        return;
+    }
+
+    if images.is_empty()
         && let Some(rest) = text.strip_prefix("/mj:")
     {
         let other = rest.trim();
@@ -3915,6 +3988,31 @@ fn draw(
         return;
     }
 
+    // The Ragnarok arena replaces the whole chat surface while a battle is on
+    // screen. The safety-critical permission/elicitation modals still render
+    // on top of it.
+    if state.ragnarok.is_some() {
+        draw_ragnarok(f, f.area(), state);
+        if let Some(pending) = state.pending_permission() {
+            draw_permission_modal(
+                f,
+                f.area(),
+                pending,
+                state.pending_permission_count(),
+                state.theme,
+            );
+        } else if let Some(pending) = state.pending_elicitation() {
+            draw_elicitation_modal(
+                f,
+                f.area(),
+                pending,
+                state.pending_elicitation_count(),
+                state.theme,
+            );
+        }
+        return;
+    }
+
     let has_config_options = !state.selectable_config_options().is_empty();
     let has_usage_quota = state.claude_usage.is_some();
 
@@ -4006,6 +4104,11 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
             state.pending_elicitation_count(),
             state.theme,
         );
+        return;
+    }
+
+    if state.ragnarok.is_some() {
+        draw_ragnarok(f, f.area(), state);
         return;
     }
 
@@ -7322,6 +7425,945 @@ fn model_choice_score(
         &choice.name,
         choice.description.as_deref().unwrap_or_default(),
     )
+}
+
+// ===========================================================================
+// Ragnarok arena: launch, keys, and the gloriously silly battle scenes
+// ===========================================================================
+
+/// How long an action flourish keeps driving a fighter's pose.
+const RAGNAROK_ACTION_TTL: Duration = Duration::from_secs(4);
+/// Animation frame cadence (shares the spinner heartbeat).
+const RAGNAROK_FRAME_MS: u128 = 250;
+
+/// Arena-local convenience over [`truncate_text_to_width`], which takes an
+/// owned `String` and a `u16` width.
+fn fit_width(text: impl Into<String>, width: usize) -> String {
+    truncate_text_to_width(text.into(), width.min(u16::MAX as usize) as u16)
+}
+
+/// Spawn the battle task for a validated `/ragnarok` request.
+fn start_ragnarok(
+    state: &mut AppState,
+    task: String,
+    tx: mpsc::UnboundedSender<ragnarok::RagnarokEvent>,
+) {
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let cfg = ragnarok::BattleConfig {
+        task: task.clone(),
+        cwd: state.session_cwd.clone(),
+        config_path: state
+            .config_path
+            .clone()
+            .unwrap_or_else(config::default_config_path),
+        score_store: state.score_store.clone(),
+    };
+    state.ragnarok = Some(RagnarokUi::new(task, abort_tx));
+    tokio::spawn(ragnarok::run_battle(cfg, tx, abort_rx));
+}
+
+fn handle_ragnarok_key(
+    state: &mut AppState,
+    modifiers: KeyModifiers,
+    code: KeyCode,
+    mode: UiMode,
+) -> TerminalRequest {
+    let Some(arena) = state.ragnarok.as_mut() else {
+        return TerminalRequest::None;
+    };
+    let over = arena.battle_over();
+
+    // Ctrl-C always flees, raging battle or not.
+    if modifiers == KeyModifiers::CONTROL && matches!(code, KeyCode::Char('c')) {
+        state.close_ragnarok();
+        return inline_repair_request(mode);
+    }
+
+    let disarm = !matches!(code, KeyCode::Esc);
+    match code {
+        KeyCode::Esc => {
+            if over {
+                state.close_ragnarok();
+                return inline_repair_request(mode);
+            }
+            if arena.esc_armed {
+                arena.abort();
+                arena.esc_armed = false;
+            } else {
+                arena.esc_armed = true;
+            }
+        }
+        KeyCode::Tab => {
+            arena.pane = match arena.pane {
+                ArenaPane::Arena => ArenaPane::Transcript,
+                ArenaPane::Transcript => ArenaPane::Arena,
+            };
+            return inline_repair_request(mode);
+        }
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('[') => arena.cycle_fighter(-1),
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(']') => arena.cycle_fighter(1),
+        KeyCode::Char('r') => arena.show_review_lane = !arena.show_review_lane,
+        KeyCode::Char(c @ '1'..='9') => {
+            let picked = (c as u8 - b'1') as usize;
+            if over {
+                if let Some(verdict) = &arena.verdict
+                    && let Some((a, b)) = verdict.finalists
+                {
+                    match picked {
+                        0 => arena.chosen_finalist = Some(a),
+                        1 => arena.chosen_finalist = Some(b),
+                        _ => {}
+                    }
+                }
+            } else if picked < arena.fighters.len() {
+                arena.selected_fighter = picked;
+            }
+        }
+        KeyCode::Enter | KeyCode::Char('q') if over => {
+            state.close_ragnarok();
+            return inline_repair_request(mode);
+        }
+        _ => {}
+    }
+    if disarm && let Some(arena) = state.ragnarok.as_mut() {
+        arena.esc_armed = false;
+    }
+    TerminalRequest::None
+}
+
+/// Wall-clock animation frame, shared by every arena element.
+fn arena_frame() -> usize {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| (elapsed.as_millis() / RAGNAROK_FRAME_MS) as usize)
+        .unwrap_or(0)
+}
+
+fn battle_clock(arena: &RagnarokUi) -> String {
+    let secs = arena.started_at.elapsed().as_secs();
+    if secs >= 3600 {
+        format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    } else {
+        format!("{:02}:{:02}", secs / 60, secs % 60)
+    }
+}
+
+/// A stable, distinct-ish color per fighter.
+fn fighter_color(theme: TerminalTheme, id: ragnarok::FighterId) -> Color {
+    let cycle = [
+        theme.primary,
+        theme.secondary,
+        theme.success,
+        theme.warning,
+        theme.tool,
+        theme.accent,
+        theme.user,
+        theme.terminal,
+        theme.error,
+        theme.quote,
+    ];
+    cycle[id % cycle.len()]
+}
+
+fn draw_ragnarok(f: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
+    let Some(arena) = state.ragnarok.as_ref() else {
+        return;
+    };
+    let theme = state.theme;
+    f.render_widget(Clear, area);
+    if area.width < 10 || area.height < 4 {
+        let line = Line::from(Span::styled(
+            "⚡ RAGNAROK rages (terminal too small for the arena)",
+            Style::default().fg(theme.warning),
+        ));
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    match arena.pane {
+        ArenaPane::Arena => draw_ragnarok_arena_pane(f, area, arena, theme),
+        ArenaPane::Transcript => draw_ragnarok_transcript_pane(f, area, arena, theme),
+    }
+}
+
+fn ragnarok_banner_line(arena: &RagnarokUi, theme: TerminalTheme, width: u16) -> Line<'static> {
+    let frame = arena_frame();
+    let bolts = ["⚡", "🔥", "⚡", "☄"];
+    let bolt = bolts[frame % bolts.len()];
+    let phase = if arena.failed.is_some() {
+        "THE BATTLE IS LOST".to_string()
+    } else {
+        arena.phase.banner().to_string()
+    };
+    let text = format!(
+        "{bolt} RAGNAROK ━ {} ━ {} {bolt}",
+        phase,
+        battle_clock(arena)
+    );
+    let text = fit_width(&text, width as usize);
+    Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(if arena.failed.is_some() {
+                theme.error
+            } else {
+                theme.warning
+            })
+            .add_modifier(Modifier::BOLD),
+    ))
+    .centered()
+}
+
+fn ragnarok_footer_line(arena: &RagnarokUi, theme: TerminalTheme, width: u16) -> Line<'static> {
+    let over = arena.battle_over();
+    let hints = if arena.esc_armed {
+        "⚠ Esc again to FLEE RAGNAROK (any other key stays) ⚠".to_string()
+    } else if over {
+        match arena.verdict.as_ref().and_then(|v| v.finalists) {
+            Some(_) => "1/2 choose finalist · Enter accept & close · Tab transcripts · ←/→ fighter"
+                .to_string(),
+            None => "Enter/q close · Tab transcripts · ←/→ fighter · r review lane".to_string(),
+        }
+    } else {
+        match arena.pane {
+            ArenaPane::Arena => {
+                "Tab transcripts · ←/→ fighter · 1-9 select · Esc Esc flee".to_string()
+            }
+            ArenaPane::Transcript => {
+                "Tab arena · ←/→ fighter · r review lane · Esc Esc flee".to_string()
+            }
+        }
+    };
+    let style = if arena.esc_armed {
+        Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    Line::from(Span::styled(fit_width(&hints, width as usize), style)).centered()
+}
+
+fn draw_ragnarok_arena_pane(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    arena: &RagnarokUi,
+    theme: TerminalTheme,
+) {
+    // Banner / task / stage / feed / footer.
+    let feed_height = (area.height / 4).clamp(3, 9);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(4),
+            Constraint::Length(feed_height),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    f.render_widget(
+        Paragraph::new(ragnarok_banner_line(arena, theme, chunks[0].width)),
+        chunks[0],
+    );
+    let task_line = Line::from(vec![
+        Span::styled("quest: ", Style::default().fg(theme.muted)),
+        Span::styled(
+            fit_width(
+                arena.task.replace('\n', " "),
+                chunks[1].width.saturating_sub(7) as usize,
+            ),
+            Style::default().fg(theme.text),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(task_line), chunks[1]);
+
+    match arena.phase {
+        ragnarok::Phase::Verdict => draw_ragnarok_verdict(f, chunks[2], arena, theme),
+        ragnarok::Phase::Judgment => draw_ragnarok_judgment(f, chunks[2], arena, theme),
+        ragnarok::Phase::Mustering | ragnarok::Phase::Routing if arena.fighters.is_empty() => {
+            draw_ragnarok_summoning(f, chunks[2], arena, theme)
+        }
+        _ => draw_ragnarok_fighters(f, chunks[2], arena, theme),
+    }
+
+    draw_ragnarok_feed(f, chunks[3], arena, theme);
+    f.render_widget(
+        Paragraph::new(ragnarok_footer_line(arena, theme, chunks[4].width)),
+        chunks[4],
+    );
+}
+
+/// Pre-roster splash: Thor descends, ravens fly, runes glow.
+fn draw_ragnarok_summoning(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    arena: &RagnarokUi,
+    theme: TerminalTheme,
+) {
+    let frame = arena_frame();
+    let raven = ["    >o)   ", "   (o<    ", "    >o)   ", "     (o<  "][frame % 4];
+    let bolt = ["      ⌁⌁", "     ⌁⌁ ", "    ⌁⌁  ", "     ⌁⌁ "][frame % 4];
+    let art = [
+        String::new(),
+        format!(
+            "        {raven}        {}",
+            raven.chars().rev().collect::<String>()
+        ),
+        "          ___________".to_string(),
+        "         |  MJÖLNIR  |".to_string(),
+        format!("         |___________|{bolt}"),
+        "              | |".to_string(),
+        "              | |".to_string(),
+        "             (___)".to_string(),
+        String::new(),
+        match arena.phase {
+            ragnarok::Phase::Mustering => "« ravens scour the nine realms for champions »",
+            _ => "« Thor weighs the quest upon his scales »",
+        }
+        .to_string(),
+    ];
+    let lines: Vec<Line> = art
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, Style::default().fg(theme.accent))).centered())
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// The main combat grid: one animated card per champion.
+fn draw_ragnarok_fighters(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    arena: &RagnarokUi,
+    theme: TerminalTheme,
+) {
+    if arena.fighters.is_empty() {
+        return;
+    }
+    let n = arena.fighters.len() as u16;
+    const CARD_MIN_WIDTH: u16 = 24;
+    const CARD_HEIGHT: u16 = 8;
+    let cols = (area.width / CARD_MIN_WIDTH).clamp(1, n);
+    let rows = n.div_ceil(cols);
+
+    // Not enough vertical room for cards: compact one-line-per-fighter view.
+    if area.height < rows * CARD_HEIGHT {
+        let lines: Vec<Line> = arena
+            .fighters
+            .iter()
+            .enumerate()
+            .take(area.height as usize)
+            .map(|(i, fighter)| compact_fighter_line(arena, fighter, i, theme, area.width))
+            .collect();
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let row_rects = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            std::iter::repeat_n(Constraint::Length(CARD_HEIGHT), rows as usize)
+                .chain(std::iter::once(Constraint::Min(0)))
+                .collect::<Vec<_>>(),
+        )
+        .split(area);
+    for row in 0..rows {
+        let start = (row * cols) as usize;
+        let in_row = arena
+            .fighters
+            .len()
+            .saturating_sub(start)
+            .min(cols as usize);
+        if in_row == 0 {
+            break;
+        }
+        let col_rects = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(vec![Constraint::Ratio(1, in_row as u32); in_row])
+            .split(row_rects[row as usize]);
+        for col in 0..in_row {
+            let idx = start + col;
+            draw_fighter_card(f, col_rects[col], arena, &arena.fighters[idx], idx, theme);
+        }
+    }
+}
+
+fn compact_fighter_line(
+    arena: &RagnarokUi,
+    fighter: &RagnarokFighterUi,
+    index: usize,
+    theme: TerminalTheme,
+    width: u16,
+) -> Line<'static> {
+    let selected = index == arena.selected_fighter;
+    let marker = if selected { "▶" } else { " " };
+    let (state_word, state_color) = fighter_state_label(&fighter.state, theme);
+    let action = fighter
+        .action
+        .as_ref()
+        .filter(|(_, _, at)| at.elapsed() < RAGNAROK_ACTION_TTL)
+        .map(|(kind, detail, _)| format!(" {} {detail}", action_glyph(*kind)))
+        .unwrap_or_default();
+    let text = format!(
+        "{marker}{} {} — {state_word}{action}",
+        pose_for(fighter)[1].trim(),
+        fighter.card.tag(),
+    );
+    Line::from(Span::styled(
+        fit_width(&text, width as usize),
+        Style::default().fg(state_color),
+    ))
+}
+
+fn fighter_state_label(state: &ragnarok::FighterState, theme: TerminalTheme) -> (String, Color) {
+    match state {
+        ragnarok::FighterState::Summoned => ("SUMMONED".to_string(), theme.muted),
+        ragnarok::FighterState::Forging => ("FORGING CAMP".to_string(), theme.accent),
+        ragnarok::FighterState::Connecting => ("APPROACHING".to_string(), theme.accent),
+        ragnarok::FighterState::Fighting => ("FIGHTING".to_string(), theme.warning),
+        ragnarok::FighterState::Capturing => ("TALLYING".to_string(), theme.secondary),
+        ragnarok::FighterState::Standing => ("STANDING".to_string(), theme.success),
+        ragnarok::FighterState::Slain(_) => ("SLAIN".to_string(), theme.error),
+    }
+}
+
+fn action_glyph(kind: ragnarok::ActionKind) -> &'static str {
+    match kind {
+        ragnarok::ActionKind::Forge => "🔨",
+        ragnarok::ActionKind::Strike => "⚡",
+        ragnarok::ActionKind::Scry => "🔮",
+        ragnarok::ActionKind::Chant => "🎵",
+        ragnarok::ActionKind::Ponder => "💭",
+        ragnarok::ActionKind::Wound => "🩸",
+        ragnarok::ActionKind::Guard => "🛡",
+    }
+}
+
+/// The 3-line ASCII pose for a fighter, chosen by state + recent action and
+/// animated by the shared wall-clock frame.
+fn pose_for(fighter: &RagnarokFighterUi) -> [&'static str; 3] {
+    type Pose = [&'static str; 3];
+    const IDLE: [Pose; 2] = [[" o ", "/|\\", "/ \\"], [" o ", "\\|/", "/ \\"]];
+    const MARCH: [Pose; 2] = [[" o ", "/|\\", "/< "], [" o ", "/|\\", " >\\"]];
+    const FORGE: [Pose; 4] = [
+        [" o_T", "/| ", "/ \\"],
+        [" oT ", "/|\\", "/ \\"],
+        ["_o  ", "T|\\", "/ \\"],
+        [" o__", "/|T", "/ \\"],
+    ];
+    const STRIKE: [Pose; 4] = [
+        ["\\o~z", " |  ", "/ \\"],
+        [" o~z", "/|  ", "/ \\"],
+        [" o  ", "/|~z", "/ \\"],
+        ["\\o/ ", " |z ", "/ \\"],
+    ];
+    const SCRY: [Pose; 2] = [[" o ", "/|(@)", "/ \\"], [" o ", "/|(o)", "/ \\"]];
+    const CHANT: [Pose; 2] = [["\\o/", " | d", "/ \\"], [" o/", "/| b", "/ \\"]];
+    const PONDER: [Pose; 2] = [[".oO", " |\\", "/ \\"], ["oO°", " |\\", "/ \\"]];
+    const WOUND: [Pose; 2] = [[" o ", "x|/", "/ \\"], ["\\o ", "x| ", "_/\\"]];
+    const VICTOR: [Pose; 2] = [["\\o/", " | ", "/ \\"], [" o ", "\\|/", "/ \\"]];
+    const SLAIN: [Pose; 1] = [["   ", "x_x", "_/\\"]];
+
+    let frame = arena_frame();
+    let pick = |poses: &'static [Pose]| poses[frame % poses.len()];
+    match &fighter.state {
+        ragnarok::FighterState::Slain(_) => pick(&SLAIN),
+        ragnarok::FighterState::Standing => pick(&VICTOR),
+        ragnarok::FighterState::Summoned
+        | ragnarok::FighterState::Forging
+        | ragnarok::FighterState::Connecting => pick(&MARCH),
+        _ => {
+            let live_action = fighter
+                .action
+                .as_ref()
+                .filter(|(_, _, at)| at.elapsed() < RAGNAROK_ACTION_TTL)
+                .map(|(kind, _, _)| *kind);
+            match live_action {
+                Some(ragnarok::ActionKind::Forge) => pick(&FORGE),
+                Some(ragnarok::ActionKind::Strike) => pick(&STRIKE),
+                Some(ragnarok::ActionKind::Scry) => pick(&SCRY),
+                Some(ragnarok::ActionKind::Chant) => pick(&CHANT),
+                Some(ragnarok::ActionKind::Ponder) => pick(&PONDER),
+                Some(ragnarok::ActionKind::Wound) => pick(&WOUND),
+                Some(ragnarok::ActionKind::Guard) => pick(&IDLE),
+                None => pick(&IDLE),
+            }
+        }
+    }
+}
+
+/// Animated "vigor" bar: marching while fighting, full when standing,
+/// skulls when slain.
+fn vigor_bar(fighter: &RagnarokFighterUi, width: usize) -> String {
+    let width = width.max(4);
+    match &fighter.state {
+        ragnarok::FighterState::Slain(_) => "☠ ".repeat(width / 2),
+        ragnarok::FighterState::Standing => "▓".repeat(width),
+        ragnarok::FighterState::Fighting | ragnarok::FighterState::Capturing => {
+            let frame = arena_frame().wrapping_add(fighter.card.id * 3);
+            (0..width)
+                .map(|i| {
+                    if (i + frame).is_multiple_of(4) {
+                        '░'
+                    } else {
+                        '▓'
+                    }
+                })
+                .collect()
+        }
+        _ => "░".repeat(width),
+    }
+}
+
+fn draw_fighter_card(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    arena: &RagnarokUi,
+    fighter: &RagnarokFighterUi,
+    index: usize,
+    theme: TerminalTheme,
+) {
+    if area.width < 6 || area.height < 3 {
+        return;
+    }
+    let selected = index == arena.selected_fighter;
+    let color = fighter_color(theme, fighter.card.id);
+    let (state_word, state_color) = fighter_state_label(&fighter.state, theme);
+    let border_style = if selected {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    let title = format!(
+        " {}{} ",
+        if selected { "▶ " } else { "" },
+        fighter.card.model_name
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(Span::styled(
+            fit_width(&title, area.width.saturating_sub(2) as usize),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let inner_width = inner.width as usize;
+    let star = if fighter.card.provisional { "*" } else { "" };
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        fit_width(
+            format!(
+                "{} ⚡{}{star}",
+                fighter.card.agent_source_id, fighter.card.elo
+            ),
+            inner_width,
+        ),
+        Style::default().fg(theme.muted),
+    )));
+
+    let pose = pose_for(fighter);
+    let glyph = fighter
+        .action
+        .as_ref()
+        .filter(|(_, _, at)| at.elapsed() < RAGNAROK_ACTION_TTL)
+        .map(|(kind, _, _)| action_glyph(*kind))
+        .unwrap_or(" ");
+    let pad = inner_width.saturating_sub(6) / 2;
+    for (i, row) in pose.iter().enumerate() {
+        let decorated = if i == 1 {
+            format!("{}{row} {glyph}", " ".repeat(pad))
+        } else {
+            format!("{}{row}", " ".repeat(pad))
+        };
+        lines.push(Line::from(Span::styled(
+            fit_width(&decorated, inner_width),
+            Style::default().fg(color),
+        )));
+    }
+
+    let bar_width = inner_width.saturating_sub(state_word.len() + 2).max(4);
+    lines.push(Line::from(vec![
+        Span::styled(
+            vigor_bar(fighter, bar_width),
+            Style::default().fg(state_color),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            state_word,
+            Style::default()
+                .fg(state_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let caption = match &fighter.state {
+        ragnarok::FighterState::Slain(reason) => format!("☠ {reason}"),
+        _ => fighter
+            .action
+            .as_ref()
+            .filter(|(_, _, at)| at.elapsed() < RAGNAROK_ACTION_TTL)
+            .map(|(kind, detail, _)| format!("{} {detail}", action_glyph(*kind)))
+            .or_else(|| {
+                fighter.review_progress.map(|p| {
+                    match p {
+                        ragnarok::ReviewProgress::Connecting => "🗡 sharpening the quill…",
+                        ragnarok::ReviewProgress::Reviewing => "🗡 dissecting a rival…",
+                        ragnarok::ReviewProgress::Done => "🗡 review delivered",
+                        ragnarok::ReviewProgress::Failed => "🗡 review lost",
+                    }
+                    .to_string()
+                })
+            })
+            .unwrap_or_default(),
+    };
+    lines.push(Line::from(Span::styled(
+        fit_width(&caption, inner_width),
+        Style::default().fg(theme.subtle),
+    )));
+
+    lines.truncate(inner.height as usize);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The scrolling battle feed, colored per fighter.
+fn draw_ragnarok_feed(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    arena: &RagnarokUi,
+    theme: TerminalTheme,
+) {
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(theme.muted))
+        .title(Span::styled(
+            " ⚔ battle feed ",
+            Style::default().fg(theme.muted),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+    let take = inner.height as usize;
+    let lines: Vec<Line> = arena
+        .feed
+        .iter()
+        .rev()
+        .take(take)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|(fighter, text)| {
+            let color = match fighter {
+                Some(id) => fighter_color(theme, *id),
+                None => theme.text,
+            };
+            Line::from(Span::styled(
+                fit_width(text, inner.width as usize),
+                Style::default().fg(color),
+            ))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Judgment scene: Mjölnir hovers while Thor's verdict streams in.
+fn draw_ragnarok_judgment(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    arena: &RagnarokUi,
+    theme: TerminalTheme,
+) {
+    let frame = arena_frame();
+    let aura = ["✦", "✧", "✶", "✧"][frame % 4];
+    let art = [
+        format!("{aura}  ______  {aura}"),
+        " [______]___".to_string(),
+        "    ||      ".to_string(),
+        format!("    ||   « THOR SITS IN JUDGMENT {aura} »"),
+    ];
+    let mut lines: Vec<Line> = art
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, Style::default().fg(theme.warning))).centered())
+        .collect();
+    lines.push(Line::default());
+    let remaining = (area.height as usize).saturating_sub(lines.len());
+    if remaining > 0 {
+        let width = area.width.saturating_sub(2) as usize;
+        for l in wrap_tail_lines(&arena.thor_text, width.max(8), remaining) {
+            lines.push(Line::from(Span::styled(
+                l,
+                Style::default().fg(theme.thought),
+            )));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Verdict scene: crown the winner, or stage the finalists for the user.
+fn draw_ragnarok_verdict(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    arena: &RagnarokUi,
+    theme: TerminalTheme,
+) {
+    let Some(verdict) = arena.verdict.as_ref() else {
+        return;
+    };
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    match (verdict.clear_winner, verdict.finalists) {
+        (Some(id), _) => {
+            let tag = arena
+                .fighter(id)
+                .map(|f| f.card.tag())
+                .unwrap_or_else(|| format!("champion {id}"));
+            let crown = ["👑", "✨👑✨", "👑"][arena_frame() % 3];
+            lines.push(
+                Line::from(Span::styled(
+                    format!("{crown} VICTOR: {tag} {crown}"),
+                    Style::default()
+                        .fg(theme.success)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .centered(),
+            );
+            if let Some(name) = arena.fighter(id).and_then(|f| f.worktree_name.clone()) {
+                lines.push(
+                    Line::from(Span::styled(
+                        format!("Thor recommends this work — adopt it: mj --worktree {name}"),
+                        Style::default().fg(theme.accent),
+                    ))
+                    .centered(),
+                );
+            }
+        }
+        (None, Some((a, b))) => {
+            lines.push(
+                Line::from(Span::styled(
+                    "⚖ SPLIT DECISION — choose your champion ⚖",
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .centered(),
+            );
+            for (n, id) in [a, b].into_iter().enumerate() {
+                let chosen = arena.chosen_finalist == Some(id);
+                let tag = arena
+                    .fighter(id)
+                    .map(|f| f.card.tag())
+                    .unwrap_or_else(|| format!("champion {id}"));
+                let wt = arena
+                    .fighter(id)
+                    .and_then(|f| f.worktree_name.clone())
+                    .unwrap_or_default();
+                let marker = if chosen { " ← your pick" } else { "" };
+                lines.push(Line::from(Span::styled(
+                    fit_width(
+                        format!("  [{}] {tag} — worktree {wt}{marker}", n + 1),
+                        width,
+                    ),
+                    if chosen {
+                        Style::default()
+                            .fg(theme.success)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(fighter_color(theme, id))
+                    },
+                )));
+            }
+        }
+        (None, None) => {}
+    }
+
+    if verdict.thor_fallback {
+        lines.push(Line::from(Span::styled(
+            fit_width(
+                "(Thor's judgment was garbled; finalists stand in Elo order)",
+                width,
+            ),
+            Style::default().fg(theme.muted),
+        )));
+    }
+
+    if !verdict.ranking.is_empty() {
+        let names: Vec<String> = verdict
+            .ranking
+            .iter()
+            .map(|id| arena.fighter_name(*id))
+            .collect();
+        lines.push(Line::from(Span::styled(
+            fit_width(format!("ranking: {}", names.join(" > ")), width),
+            Style::default().fg(theme.subtle),
+        )));
+    }
+    for rv in &verdict.review_verdicts {
+        lines.push(Line::from(Span::styled(
+            fit_width(
+                format!(
+                    "🔍 {} on {} — honesty {}/10, validity {}/10: {}",
+                    arena.fighter_name(rv.reviewer),
+                    arena.fighter_name(rv.defender),
+                    rv.honesty,
+                    rv.validity,
+                    rv.notes
+                ),
+                width,
+            ),
+            Style::default().fg(theme.thought),
+        )));
+    }
+
+    lines.push(Line::default());
+    let used = lines.len();
+    let remaining = (area.height as usize).saturating_sub(used);
+    if remaining > 0 {
+        for l in wrap_tail_lines(&verdict.reasoning, width.max(8), remaining) {
+            lines.push(Line::from(Span::styled(l, Style::default().fg(theme.text))));
+        }
+    }
+    lines.truncate(area.height as usize);
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Transcript pane: live per-fighter output (combat work or their review).
+fn draw_ragnarok_transcript_pane(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    arena: &RagnarokUi,
+    theme: TerminalTheme,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    f.render_widget(
+        Paragraph::new(ragnarok_banner_line(arena, theme, chunks[0].width)),
+        chunks[0],
+    );
+
+    if arena.fighters.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no champions yet — the muster is still on",
+                Style::default().fg(theme.muted),
+            ))),
+            chunks[2],
+        );
+        f.render_widget(
+            Paragraph::new(ragnarok_footer_line(arena, theme, chunks[3].width)),
+            chunks[3],
+        );
+        return;
+    }
+
+    let idx = arena.selected_fighter.min(arena.fighters.len() - 1);
+    let fighter = &arena.fighters[idx];
+    let lane = if arena.show_review_lane {
+        "review"
+    } else {
+        "combat"
+    };
+    let header = format!(
+        "◀ {} ▶  ({}/{})  lane: {lane} (r toggles)",
+        fighter.card.tag(),
+        idx + 1,
+        arena.fighters.len()
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            fit_width(&header, chunks[1].width as usize),
+            Style::default()
+                .fg(fighter_color(theme, fighter.card.id))
+                .add_modifier(Modifier::BOLD),
+        ))),
+        chunks[1],
+    );
+
+    let body = if arena.show_review_lane {
+        &fighter.review_transcript
+    } else {
+        &fighter.transcript
+    };
+    let width = chunks[2].width.saturating_sub(1) as usize;
+    let lines: Vec<Line> = if body.is_empty() {
+        vec![Line::from(Span::styled(
+            match (arena.show_review_lane, &fighter.state) {
+                (true, _) => "…no review words yet (their quill is dry)",
+                (false, ragnarok::FighterState::Summoned) => "…awaiting the horn",
+                _ => "…silence on the battlefield",
+            },
+            Style::default().fg(theme.muted),
+        ))]
+    } else {
+        wrap_tail_lines(body, width.max(8), chunks[2].height as usize)
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, Style::default().fg(theme.text))))
+            .collect()
+    };
+    f.render_widget(Paragraph::new(lines), chunks[2]);
+    f.render_widget(
+        Paragraph::new(ragnarok_footer_line(arena, theme, chunks[3].width)),
+        chunks[3],
+    );
+}
+
+/// Wrap `text` to `width` display columns and keep only the last `max_lines`
+/// lines. Works on a bounded tail slice so huge buffers stay cheap.
+fn wrap_tail_lines(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    // Only the tail can be visible; keep a generous margin for wrapping.
+    let budget = width.saturating_mul(max_lines).saturating_mul(4).max(256);
+    let mut start = text.len().saturating_sub(budget);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &text[start..];
+
+    let mut lines: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    let push_line = |lines: &mut std::collections::VecDeque<String>, line: String| {
+        lines.push_back(line);
+        while lines.len() > max_lines {
+            lines.pop_front();
+        }
+    };
+    for ch in tail.chars() {
+        if ch == '\n' {
+            push_line(&mut lines, std::mem::take(&mut current));
+            current_width = 0;
+            continue;
+        }
+        if ch == '\r' {
+            continue;
+        }
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + w > width && !current.is_empty() {
+            push_line(&mut lines, std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += w;
+    }
+    if !current.is_empty() {
+        push_line(&mut lines, current);
+    }
+    lines.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -12169,6 +13211,204 @@ mod tests {
         let status = state.status_line.expect("status");
         assert_eq!(status.kind, StatusKind::Warning);
         assert_eq!(status.text, "waiting for session...");
+    }
+
+    #[test]
+    fn ragnarok_command_without_task_warns_usage() {
+        let mut state = AppState::new();
+        state.input = "/ragnarok".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+        submit_prompt(&mut state, &cmd_tx);
+        assert!(cmd_rx.try_recv().is_err(), "nothing goes to the agent");
+        assert!(state.take_ragnarok_launch().is_none());
+        let status = state.status_line.clone().expect("status");
+        assert_eq!(status.kind, StatusKind::Warning);
+        assert!(status.text.contains("usage: /ragnarok"));
+    }
+
+    #[test]
+    fn ragnarok_command_requests_launch_without_touching_the_agent() {
+        let mut state = AppState::new();
+        // No session, runtime not even connected: /ragnarok must still work —
+        // battles run on their own ACP connections.
+        state.input = "/ragnarok forge me a hammer".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+        submit_prompt(&mut state, &cmd_tx);
+        assert!(cmd_rx.try_recv().is_err(), "nothing goes to the agent");
+        assert_eq!(
+            state.take_ragnarok_launch().as_deref(),
+            Some("forge me a hammer")
+        );
+        assert!(state.input.is_empty());
+        assert!(matches!(
+            state.transcript.last(),
+            Some(Entry::System(text)) if text.contains("Ragnarok summoned")
+        ));
+    }
+
+    #[test]
+    fn ragnarok_command_warns_when_battle_already_raging() {
+        let mut state = AppState::new();
+        let (abort_tx, _abort_rx) = tokio::sync::watch::channel(false);
+        state.ragnarok = Some(RagnarokUi::new("first".into(), abort_tx));
+        state.input = "/ragnarok second task".to_string();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+        submit_prompt(&mut state, &cmd_tx);
+        assert!(state.take_ragnarok_launch().is_none());
+        let status = state.status_line.clone().expect("status");
+        assert_eq!(status.kind, StatusKind::Warning);
+        assert!(status.text.contains("already raging"));
+    }
+
+    #[test]
+    fn ragnarok_prefix_must_be_word_aligned() {
+        let mut state = AppState::new();
+        state.session_id = Some("s-1".to_string());
+        state.input = "/ragnarokish".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+        submit_prompt(&mut state, &cmd_tx);
+        // Not our command: falls through to a normal prompt send.
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(UiCommand::SendPrompt { text, .. }) if text == "/ragnarokish"
+        ));
+        assert!(state.take_ragnarok_launch().is_none());
+    }
+
+    #[test]
+    fn ragnarok_keys_drive_the_arena() {
+        let mut state = AppState::new();
+        let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+        state.ragnarok = Some(RagnarokUi::new("task".into(), abort_tx));
+        state.apply_ragnarok_event(ragnarok::RagnarokEvent::Roster(vec![
+            crate::ragnarok::FighterCard {
+                id: 0,
+                agent_source_id: "a".into(),
+                model_value: "m0".into(),
+                model_name: "M0".into(),
+                elo: 1400,
+                provisional: false,
+            },
+            crate::ragnarok::FighterCard {
+                id: 1,
+                agent_source_id: "b".into(),
+                model_value: "m1".into(),
+                model_name: "M1".into(),
+                elo: 1500,
+                provisional: false,
+            },
+        ]));
+
+        // Tab toggles panes.
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Tab,
+            UiMode::InlineChat,
+        );
+        assert_eq!(state.ragnarok.as_ref().unwrap().pane, ArenaPane::Transcript);
+        // Arrows cycle fighters.
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Right,
+            UiMode::InlineChat,
+        );
+        assert_eq!(state.ragnarok.as_ref().unwrap().selected_fighter, 1);
+
+        // Esc arms, second Esc fires the abort watch.
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Esc,
+            UiMode::InlineChat,
+        );
+        assert!(state.ragnarok.as_ref().unwrap().esc_armed);
+        assert!(!*abort_rx.borrow());
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Esc,
+            UiMode::InlineChat,
+        );
+        assert!(*abort_rx.borrow(), "second Esc flees the battle");
+        // The arena stays up until the battle task reports Failed/Done.
+        assert!(state.ragnarok.is_some());
+    }
+
+    #[test]
+    fn ragnarok_finalist_pick_and_close_after_verdict() {
+        let mut state = AppState::new();
+        let (abort_tx, _abort_rx) = tokio::sync::watch::channel(false);
+        state.ragnarok = Some(RagnarokUi::new("task".into(), abort_tx));
+        state.apply_ragnarok_event(ragnarok::RagnarokEvent::Roster(vec![
+            crate::ragnarok::FighterCard {
+                id: 0,
+                agent_source_id: "a".into(),
+                model_value: "m0".into(),
+                model_name: "M0".into(),
+                elo: 1400,
+                provisional: false,
+            },
+            crate::ragnarok::FighterCard {
+                id: 1,
+                agent_source_id: "b".into(),
+                model_value: "m1".into(),
+                model_name: "M1".into(),
+                elo: 1500,
+                provisional: false,
+            },
+        ]));
+        state.apply_ragnarok_event(ragnarok::RagnarokEvent::Verdict(Box::new(
+            crate::ragnarok::Verdict {
+                clear_winner: None,
+                finalists: Some((0, 1)),
+                ranking: vec![0, 1],
+                review_verdicts: Vec::new(),
+                reasoning: "close".into(),
+                thor_fallback: false,
+            },
+        )));
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Char('2'),
+            UiMode::InlineChat,
+        );
+        assert_eq!(state.ragnarok.as_ref().unwrap().chosen_finalist, Some(1));
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Enter,
+            UiMode::InlineChat,
+        );
+        assert!(state.ragnarok.is_none(), "Enter closes after the verdict");
+        assert!(matches!(
+            state.transcript.last(),
+            Some(Entry::System(text)) if text.contains("your pick")
+        ));
+    }
+
+    #[test]
+    fn wrap_tail_lines_wraps_and_keeps_only_the_tail() {
+        let text = "alpha\nbeta gamma delta\nepsilon";
+        let lines = wrap_tail_lines(text, 6, 10);
+        assert_eq!(
+            lines,
+            vec!["alpha", "beta g", "amma d", "elta", "epsilo", "n"]
+        );
+        // Only the last N lines are kept.
+        let lines = wrap_tail_lines(text, 6, 2);
+        assert_eq!(lines, vec!["epsilo", "n"]);
+        // Wide glyphs never split mid-cell.
+        let wide = "⚔⚔⚔⚔";
+        let lines = wrap_tail_lines(wide, 3, 10);
+        assert!(
+            lines
+                .iter()
+                .all(|l| UnicodeWidthStr::width(l.as_str()) <= 3)
+        );
+        assert!(wrap_tail_lines("", 10, 5).is_empty());
     }
 
     #[test]
