@@ -67,6 +67,18 @@ const CONFIG_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// rejected with "config update already in flight" (250ms apart).
 const PROMPT_RESEND_LIMIT: usize = 20;
 
+/// Straggler judgment never begins before this much combat time has passed…
+const STRAGGLER_MIN_ELAPSED: Duration = Duration::from_secs(4 * 60);
+/// …or before a fighter has burned this multiple of the median finisher's
+/// time (only fighters who finished cleanly count toward the median).
+const STRAGGLER_MULT: u32 = 3;
+/// How often the combat watchdog looks for stragglers.
+const STRAGGLER_CHECK_EVERY: Duration = Duration::from_secs(20);
+/// Budget for Thor's mid-combat mercy ruling.
+const MERCY_TURN_TIMEOUT: Duration = Duration::from_secs(180);
+/// Recent tool actions remembered per fighter for loop detection.
+const RECENT_ACTIONS_CAP: usize = 30;
+
 /// Cap on a captured `git diff` artifact.
 const DIFF_CAPTURE_LIMIT: usize = 256 * 1024;
 /// Diff budget inside a reviewer's prompt.
@@ -452,23 +464,89 @@ async fn battle(
         "⚡ UNLEASHED! The horns of war thunder across the nine realms!",
     )?;
 
-    // ---- Phase: combat (parallel implementations) ---------------------------
+    // ---- Phase: combat (parallel implementations, watched by Thor) ----------
     emit(tx, RagnarokEvent::Phase(Phase::Combat))?;
     let forge_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    let (ping_tx, mut ping_rx) = mpsc::unbounded_channel::<WatchdogPing>();
+    let mut kills: HashMap<FighterId, KillSwitch> = HashMap::new();
     let mut joinset = tokio::task::JoinSet::new();
     for fighter in chosen.clone() {
-        let task_text = cfg.task.clone();
-        let cwd = cfg.cwd.clone();
-        let forge_lock = forge_lock.clone();
-        let tx = tx.clone();
-        let abort = abort.clone();
-        joinset.spawn(async move { fight(fighter, task_text, cwd, forge_lock, tx, abort).await });
+        let (kill_tx, kill_rx) = watch::channel(false);
+        let kill_reason = std::sync::Arc::new(std::sync::Mutex::new(None));
+        kills.insert(
+            fighter.card.id,
+            KillSwitch {
+                trigger: kill_tx,
+                reason: kill_reason.clone(),
+            },
+        );
+        let orders = FightOrders {
+            task: cfg.task.clone(),
+            cwd: cfg.cwd.clone(),
+            forge_lock: forge_lock.clone(),
+            kill: kill_rx,
+            kill_reason,
+            ping: ping_tx.clone(),
+            tx: tx.clone(),
+            abort: abort.clone(),
+        };
+        joinset.spawn(async move { fight(fighter, orders).await });
     }
+
+    // Supervise the melee: collect finishers, feed the watchdog with action
+    // pings, and let Thor pass mid-battle judgment on stragglers so one
+    // champion stuck in a loop cannot hold the whole tournament hostage.
+    let spawned = chosen.len();
+    let mut seen = 0usize;
     let mut reports: Vec<FighterReport> = Vec::new();
-    while let Some(joined) = joinset.join_next().await {
-        match joined {
-            Ok(report) => reports.push(report),
-            Err(e) => feed(tx, None, format!("☠ a champion's thread was severed: {e}"))?,
+    let mut watchdog = StragglerWatch::new(spawned);
+    let mut pending: HashSet<FighterId> = cards.iter().map(|c| c.id).collect();
+    let combat_started = tokio::time::Instant::now();
+    let mut ticker = tokio::time::interval(STRAGGLER_CHECK_EVERY);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut abort_fanned = false;
+    while seen < spawned {
+        tokio::select! {
+            joined = joinset.join_next() => {
+                match joined {
+                    Some(Ok(report)) => {
+                        seen += 1;
+                        pending.remove(&report.id);
+                        if report.slain_reason.is_none() {
+                            watchdog.note_finished(combat_started.elapsed());
+                        }
+                        reports.push(report);
+                    }
+                    Some(Err(e)) => {
+                        seen += 1;
+                        feed(tx, None, format!("☠ a champion's thread was severed: {e}"))?;
+                    }
+                    None => break,
+                }
+            }
+            maybe_ping = ping_rx.recv() => {
+                if let Some(ping) = maybe_ping {
+                    watchdog.note_action(ping.id, ping.title);
+                }
+            }
+            _ = ticker.tick() => {
+                judge_stragglers(
+                    &mut watchdog,
+                    &mut thor,
+                    &cards,
+                    &pending,
+                    &kills,
+                    combat_started,
+                    tx,
+                )
+                .await?;
+            }
+            _ = wait_abort(abort.clone()), if !abort_fanned => {
+                abort_fanned = true;
+                for switch in kills.values() {
+                    switch.fire("the battle was called off");
+                }
+            }
         }
     }
     if *abort.borrow() {
@@ -1192,6 +1270,246 @@ fn choose_reject_option(
 }
 
 // ---------------------------------------------------------------------------
+// The straggler watchdog: Thor's mid-battle mercy
+// ---------------------------------------------------------------------------
+
+/// A lightweight action report from a fighter to the combat watchdog.
+struct WatchdogPing {
+    id: FighterId,
+    title: String,
+}
+
+/// One fighter's mid-battle kill switch: the reason is set before the
+/// trigger fires so the fighter can die with an honest epitaph.
+struct KillSwitch {
+    trigger: watch::Sender<bool>,
+    reason: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl KillSwitch {
+    fn fire(&self, reason: &str) {
+        if let Ok(mut slot) = self.reason.lock() {
+            slot.get_or_insert_with(|| reason.to_string());
+        }
+        let _ = self.trigger.send(true);
+    }
+}
+
+/// Combat bookkeeping for straggler judgment.
+struct StragglerWatch {
+    total: usize,
+    finished: Vec<Duration>,
+    recent: HashMap<FighterId, std::collections::VecDeque<String>>,
+    next_review: HashMap<FighterId, tokio::time::Instant>,
+    condemned: HashSet<FighterId>,
+}
+
+impl StragglerWatch {
+    fn new(total: usize) -> Self {
+        Self {
+            total,
+            finished: Vec::new(),
+            recent: HashMap::new(),
+            next_review: HashMap::new(),
+            condemned: HashSet::new(),
+        }
+    }
+
+    fn note_action(&mut self, id: FighterId, title: String) {
+        let recent = self.recent.entry(id).or_default();
+        recent.push_back(title);
+        while recent.len() > RECENT_ACTIONS_CAP {
+            recent.pop_front();
+        }
+    }
+
+    fn note_finished(&mut self, took: Duration) {
+        self.finished.push(took);
+    }
+
+    fn quorum_reached(&self) -> bool {
+        self.finished.len() * 2 >= self.total
+    }
+
+    fn recent_actions(&self, id: FighterId) -> Vec<String> {
+        self.recent
+            .get(&id)
+            .map(|d| d.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Once a quorum has finished, examine every fighter that is dramatically
+/// over the median finishing time; Thor rules mercy or death for each.
+async fn judge_stragglers(
+    watchdog: &mut StragglerWatch,
+    thor: &mut Thor,
+    cards: &[FighterCard],
+    pending: &HashSet<FighterId>,
+    kills: &HashMap<FighterId, KillSwitch>,
+    combat_started: tokio::time::Instant,
+    tx: &mpsc::UnboundedSender<RagnarokEvent>,
+) -> Result<()> {
+    if !watchdog.quorum_reached() {
+        return Ok(());
+    }
+    let Some(median) = median_duration(&watchdog.finished) else {
+        return Ok(());
+    };
+    let elapsed = combat_started.elapsed();
+    if !should_judge_straggler(elapsed, median) {
+        return Ok(());
+    }
+    let now = tokio::time::Instant::now();
+    let mut ids: Vec<FighterId> = pending.iter().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        if watchdog.condemned.contains(&id) {
+            continue;
+        }
+        if watchdog
+            .next_review
+            .get(&id)
+            .is_some_and(|&review_at| now < review_at)
+        {
+            continue;
+        }
+        let Some(card) = cards.get(id) else { continue };
+        let ratio = elapsed.as_secs_f64() / median.as_secs_f64().max(1.0);
+        let recent = watchdog.recent_actions(id);
+        let tally = action_tally(&recent);
+        feed(
+            tx,
+            Some(id),
+            format!(
+                "👁 THOR turns his gaze upon {} ({ratio:.1}x the median finisher)…",
+                card.model_name
+            ),
+        )?;
+        let (cut, reason) = thor
+            .mercy(&card.tag(), elapsed, median, &tally, &recent, tx)
+            .await;
+        if cut {
+            watchdog.condemned.insert(id);
+            if let Some(switch) = kills.get(&id) {
+                switch.fire(&format!("cut down by Thor — {reason}"));
+            }
+            feed(
+                tx,
+                Some(id),
+                format!(
+                    "⚡ THOR'S PATIENCE ENDS: {} is cut down! ({reason})",
+                    card.model_name
+                ),
+            )?;
+        } else {
+            let reprieve = median.max(Duration::from_secs(180));
+            watchdog.next_review.insert(id, now + reprieve);
+            feed(
+                tx,
+                Some(id),
+                format!("⚖ THOR grants {} a reprieve — {reason}", card.model_name),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// True when a still-running fighter has earned Thor's scrutiny.
+pub fn should_judge_straggler(elapsed: Duration, median: Duration) -> bool {
+    elapsed >= STRAGGLER_MIN_ELAPSED && elapsed >= median.saturating_mul(STRAGGLER_MULT)
+}
+
+/// Median of a set of durations. `None` when empty.
+pub fn median_duration(samples: &[Duration]) -> Option<Duration> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) / 2
+    })
+}
+
+/// The deterministic loop detector: a fighter is stuck when one action
+/// dominates ≥60% of their recent actions (with enough actions to matter).
+pub fn looks_stuck(recent: &[String]) -> bool {
+    if recent.len() < 10 {
+        return false;
+    }
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for action in recent {
+        *counts.entry(action.as_str()).or_default() += 1;
+    }
+    let top = counts.values().copied().max().unwrap_or(0);
+    top * 10 >= recent.len() * 6
+}
+
+/// Summarize recent actions for Thor: `edit src/foo.rs ×17 · cargo test ×2`.
+pub fn action_tally(recent: &[String]) -> String {
+    if recent.is_empty() {
+        return "(no recorded actions)".to_string();
+    }
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for action in recent {
+        match counts.iter_mut().find(|(title, _)| *title == action) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((action.as_str(), 1)),
+        }
+    }
+    counts.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    let shown: Vec<String> = counts
+        .iter()
+        .take(4)
+        .map(|(title, n)| format!("{title} ×{n}"))
+        .collect();
+    format!("{} (of the last {})", shown.join(" · "), recent.len())
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMercy {
+    verdict: Option<String>,
+    reason: Option<String>,
+}
+
+/// Parse Thor's mercy ruling: `(cut_down, reason)`.
+pub fn parse_mercy(text: &str) -> Option<(bool, String)> {
+    let value = extract_json_object(text)?;
+    let raw: RawMercy = serde_json::from_value(value).ok()?;
+    let cut = match raw.verdict?.as_str() {
+        "cut_down" => true,
+        "mercy" => false,
+        _ => return None,
+    };
+    Some((
+        cut,
+        raw.reason
+            .unwrap_or_else(|| "Thor keeps his counsel.".to_string()),
+    ))
+}
+
+fn mercy_prompt(tag: &str, elapsed: Duration, median: Duration, tally: &str) -> String {
+    let ratio = elapsed.as_secs_f64() / median.as_secs_f64().max(1.0);
+    format!(
+        "MID-BATTLE JUDGMENT. Champion {tag} has fought for {:.1} minutes; the median \
+         finisher needed {:.1} minutes ({ratio:.1}x). Their most recent actions:\n{tally}\n\n\
+         A champion stuck repeating the same futile blow (for example, editing one file \
+         over and over without progress) must be CUT DOWN so the tournament can proceed. \
+         A champion visibly making steady progress on genuinely larger work deserves \
+         MERCY.\n\n\
+         Do not use any tools. Respond with ONLY this JSON object — no prose, no code \
+         fences:\n\
+         {{\"verdict\":\"cut_down\"|\"mercy\",\"reason\":\"<one short sentence>\"}}",
+        elapsed.as_secs_f64() / 60.0,
+        median.as_secs_f64() / 60.0,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Champions: fight + artifact capture
 // ---------------------------------------------------------------------------
 
@@ -1211,14 +1529,31 @@ struct FighterReport {
     slain_reason: Option<String>,
 }
 
-async fn fight(
-    fighter: Candidate,
+/// Everything one champion needs to fight: the task, the battleground, the
+/// shared forge lock, their personal kill switch, the watchdog ping line,
+/// and the arena event channel.
+struct FightOrders {
     task: String,
     cwd: PathBuf,
     forge_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    kill: watch::Receiver<bool>,
+    kill_reason: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    ping: mpsc::UnboundedSender<WatchdogPing>,
     tx: mpsc::UnboundedSender<RagnarokEvent>,
     abort: watch::Receiver<bool>,
-) -> FighterReport {
+}
+
+async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
+    let FightOrders {
+        task,
+        cwd,
+        forge_lock,
+        kill,
+        kill_reason,
+        ping,
+        tx,
+        abort,
+    } = orders;
     let id = fighter.card.id;
     let mut report = FighterReport {
         id,
@@ -1229,6 +1564,24 @@ async fn fight(
     };
     let set_state = |state: FighterState| {
         let _ = tx.send(RagnarokEvent::FighterState { id, state });
+    };
+    // Merge the global abort and this fighter's personal kill switch into
+    // the one stop channel the agent driver understands.
+    let (merged_tx, merged) = watch::channel(false);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = wait_abort(abort) => {}
+            _ = wait_abort(kill) => {}
+        }
+        let _ = merged_tx.send(true);
+    });
+    // When the kill switch fired, its reason outranks the generic error.
+    let kill_note = |fallback: String| -> String {
+        kill_reason
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .unwrap_or(fallback)
     };
 
     set_state(FighterState::Forging);
@@ -1273,16 +1626,22 @@ async fn fight(
 
     set_state(FighterState::Connecting);
     let mut handle =
-        match AgentHandle::connect(&fighter.launch, &created.session_cwd, abort.clone()).await {
+        match AgentHandle::connect(&fighter.launch, &created.session_cwd, merged.clone()).await {
             Ok(h) => h,
-            Err(e) => return slain(report, set_state, format!("never reached the arena: {e:#}")),
+            Err(e) => {
+                return slain(
+                    report,
+                    set_state,
+                    kill_note(format!("never reached the arena: {e:#}")),
+                );
+            }
         };
     if let Err(e) = handle.arm_model(&fighter.card.model_value).await {
         handle.dismiss().await;
         return slain(
             report,
             set_state,
-            format!("could not arm their model: {e:#}"),
+            kill_note(format!("could not arm their model: {e:#}")),
         );
     }
 
@@ -1293,6 +1652,17 @@ async fn fight(
     let tx_events = tx.clone();
     let outcome = handle
         .prompt(fight_prompt(&task), FIGHT_TIMEOUT, |ev| {
+            if let TurnEvent::Tool {
+                title,
+                started: true,
+                ..
+            } = &ev
+            {
+                let _ = ping.send(WatchdogPing {
+                    id,
+                    title: title.clone(),
+                });
+            }
             forward_turn_event(
                 &tx_events,
                 id,
@@ -1307,13 +1677,19 @@ async fn fight(
     handle.dismiss().await;
     let outcome = match outcome {
         Ok(o) => o,
-        Err(e) => return slain(report, set_state, format!("fell in battle: {e:#}")),
+        Err(e) => {
+            return slain(
+                report,
+                set_state,
+                kill_note(format!("fell in battle: {e:#}")),
+            );
+        }
     };
     if !turn_succeeded(outcome.stop) {
         return slain(
             report,
             set_state,
-            format!("yielded ({})", stop_reason_label(outcome.stop)),
+            kill_note(format!("yielded ({})", stop_reason_label(outcome.stop))),
         );
     }
     report.final_text = outcome.text;
@@ -1699,10 +2075,19 @@ impl Thor {
         prompt: String,
         tx: &mpsc::UnboundedSender<RagnarokEvent>,
     ) -> Result<String> {
+        self.speak_budget(prompt, THOR_TIMEOUT, tx).await
+    }
+
+    async fn speak_budget(
+        &mut self,
+        prompt: String,
+        budget: Duration,
+        tx: &mpsc::UnboundedSender<RagnarokEvent>,
+    ) -> Result<String> {
         let tx = tx.clone();
         let outcome = self
             .handle
-            .prompt(prompt, THOR_TIMEOUT, |ev| {
+            .prompt(prompt, budget, |ev| {
                 if let TurnEvent::Message(chunk) = ev {
                     let _ = tx.send(RagnarokEvent::ThorSpeaks(chunk));
                 }
@@ -1712,6 +2097,57 @@ impl Thor {
             bail!("Thor fell silent ({})", stop_reason_label(outcome.stop));
         }
         Ok(outcome.text)
+    }
+
+    /// Mid-combat straggler ruling: `(cut_down, reason)`. Never fails the
+    /// battle — when Thor's ruling is garbled or he cannot be reached, the
+    /// deterministic loop detector rules in his stead, and says so.
+    async fn mercy(
+        &mut self,
+        fighter_tag: &str,
+        elapsed: Duration,
+        median: Duration,
+        tally: &str,
+        recent: &[String],
+        tx: &mpsc::UnboundedSender<RagnarokEvent>,
+    ) -> (bool, String) {
+        let prompt = mercy_prompt(fighter_tag, elapsed, median, tally);
+        for attempt in 0..2 {
+            let text = if attempt == 0 {
+                self.speak_budget(prompt.clone(), MERCY_TURN_TIMEOUT, tx)
+                    .await
+            } else {
+                self.speak_budget(
+                    "Your previous reply could not be parsed. Respond again with ONLY the \
+                     JSON object described before — no prose, no code fences."
+                        .to_string(),
+                    MERCY_TURN_TIMEOUT,
+                    tx,
+                )
+                .await
+            };
+            match text {
+                Ok(text) => {
+                    if let Some(ruling) = parse_mercy(&text) {
+                        return ruling;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if looks_stuck(recent) {
+            (
+                true,
+                "Thor's ruling was garbled; the loop-detector decreed death (the same blow \
+                 repeated over and over)"
+                    .to_string(),
+            )
+        } else {
+            (
+                false,
+                "Thor's ruling was garbled; mercy by default".to_string(),
+            )
+        }
     }
 
     async fn route(
@@ -2515,6 +2951,124 @@ mod tests {
         assert!(v.thor_fallback);
         assert_eq!(v.finalists, Some((1, 2)));
         assert_eq!(v.ranking, vec![1, 2, 0]);
+    }
+
+    // ---- Straggler watchdog -----------------------------------------------
+
+    #[test]
+    fn straggler_judgment_needs_both_time_gates() {
+        let median = Duration::from_secs(120);
+        // Over the multiplier but under the absolute floor: no judgment.
+        assert!(!should_judge_straggler(Duration::from_secs(200), median));
+        // Past the floor but under the multiplier: no judgment.
+        assert!(!should_judge_straggler(
+            Duration::from_secs(300),
+            Duration::from_secs(150)
+        ));
+        // Past both: judged.
+        assert!(should_judge_straggler(Duration::from_secs(400), median));
+    }
+
+    #[test]
+    fn median_duration_handles_odd_even_and_empty() {
+        assert_eq!(median_duration(&[]), None);
+        assert_eq!(
+            median_duration(&[Duration::from_secs(5)]),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            median_duration(&[
+                Duration::from_secs(9),
+                Duration::from_secs(1),
+                Duration::from_secs(4)
+            ]),
+            Some(Duration::from_secs(4))
+        );
+        assert_eq!(
+            median_duration(&[Duration::from_secs(2), Duration::from_secs(4)]),
+            Some(Duration::from_secs(3))
+        );
+    }
+
+    #[test]
+    fn loop_detector_fires_on_dominant_repeats_only() {
+        let stuck: Vec<String> = (0..12)
+            .map(|i| {
+                if i % 5 == 4 {
+                    "run tests".to_string()
+                } else {
+                    "edit src/foo.rs".to_string()
+                }
+            })
+            .collect();
+        assert!(looks_stuck(&stuck));
+
+        let varied: Vec<String> = (0..12).map(|i| format!("edit file-{i}.rs")).collect();
+        assert!(!looks_stuck(&varied));
+
+        let short = vec!["edit src/foo.rs".to_string(); 5];
+        assert!(!looks_stuck(&short), "too few actions to condemn");
+    }
+
+    #[test]
+    fn action_tally_ranks_repeats() {
+        let recent = vec![
+            "edit src/foo.rs".to_string(),
+            "edit src/foo.rs".to_string(),
+            "run tests".to_string(),
+            "edit src/foo.rs".to_string(),
+        ];
+        let tally = action_tally(&recent);
+        assert!(tally.starts_with("edit src/foo.rs ×3"), "tally: {tally}");
+        assert!(tally.contains("run tests ×1"));
+        assert!(tally.contains("of the last 4"));
+        assert_eq!(action_tally(&[]), "(no recorded actions)");
+    }
+
+    #[test]
+    fn parse_mercy_accepts_only_known_verdicts() {
+        assert_eq!(
+            parse_mercy("{\"verdict\":\"cut_down\",\"reason\":\"stuck\"}"),
+            Some((true, "stuck".to_string()))
+        );
+        assert_eq!(
+            parse_mercy("verily {\"verdict\":\"mercy\"} so be it"),
+            Some((false, "Thor keeps his counsel.".to_string()))
+        );
+        assert!(parse_mercy("{\"verdict\":\"maybe\"}").is_none());
+        assert!(parse_mercy("no json").is_none());
+    }
+
+    #[test]
+    fn kill_switch_sets_reason_once_and_fires() {
+        let (trigger, rx) = watch::channel(false);
+        let switch = KillSwitch {
+            trigger,
+            reason: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        };
+        switch.fire("cut down by Thor — looping");
+        switch.fire("second reason must not overwrite");
+        assert!(*rx.borrow());
+        assert_eq!(
+            switch.reason.lock().unwrap().as_deref(),
+            Some("cut down by Thor — looping")
+        );
+    }
+
+    #[test]
+    fn straggler_watch_tracks_quorum_and_recent_actions() {
+        let mut watch = StragglerWatch::new(4);
+        assert!(!watch.quorum_reached());
+        watch.note_finished(Duration::from_secs(60));
+        assert!(!watch.quorum_reached());
+        watch.note_finished(Duration::from_secs(90));
+        assert!(watch.quorum_reached(), "2 of 4 is a quorum");
+
+        for i in 0..(RECENT_ACTIONS_CAP + 10) {
+            watch.note_action(1, format!("edit {i}"));
+        }
+        assert_eq!(watch.recent_actions(1).len(), RECENT_ACTIONS_CAP);
+        assert!(watch.recent_actions(2).is_empty());
     }
 
     #[test]
