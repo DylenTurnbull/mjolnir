@@ -23,6 +23,7 @@ mod paths;
 mod picker;
 mod probe;
 mod qr;
+mod ragnarok;
 mod registry;
 mod remote;
 mod scores;
@@ -871,6 +872,7 @@ struct RunSessionResult {
     session_title: Option<String>,
     theme_kind: theme::TerminalThemeKind,
     spinner_style: spinner::SpinnerStyle,
+    ragnarok_prompt: Option<String>,
 }
 
 impl From<ui::UiRunResult> for RunSessionResult {
@@ -881,6 +883,7 @@ impl From<ui::UiRunResult> for RunSessionResult {
             session_title: result.session_title,
             theme_kind: result.theme_kind,
             spinner_style: result.spinner_style,
+            ragnarok_prompt: result.ragnarok_prompt,
         }
     }
 }
@@ -982,6 +985,23 @@ async fn run_app(
                 continue;
             }
             UiExitReason::ClearSession => {
+                initial_agent = Some(agent);
+                continue;
+            }
+            UiExitReason::Ragnarok => {
+                if let Some(quest) = session_result.ragnarok_prompt.clone()
+                    && let Err(e) = run_ragnarok(
+                        cwd.clone(),
+                        quest,
+                        &cfg,
+                        score_store.clone(),
+                        runtime_options.agent_stderr.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!("ragnarok tournament failed: {e:#}");
+                }
+                // Return to a fresh session with the same agent afterwards.
                 initial_agent = Some(agent);
                 continue;
             }
@@ -1245,6 +1265,39 @@ async fn run_session_picker_once(
         session::run_session_picker(&mut terminal, sessions, delete_supported, notice, theme).await;
     if let Err(e) = ui::restore_fullscreen_terminal(&mut terminal) {
         tracing::warn!("restore terminal (session picker) failed: {e}");
+    }
+    settle_after_fullscreen_picker_restore().await;
+    outcome
+}
+
+/// Run a `/ragnarok` tournament: take over the terminal with the fullscreen
+/// combat view, drive the competing agents, and restore the terminal after.
+/// Mirrors [`run_session_picker_once`]'s setup/teardown so the inline chat can
+/// resume cleanly afterwards.
+async fn run_ragnarok(
+    cwd: PathBuf,
+    prompt: String,
+    cfg: &Config,
+    score_store: scores::ScoreStore,
+    agent_stderr: Option<&Path>,
+) -> Result<()> {
+    let registry = load_agent_registry().await;
+    let rag_cfg = ragnarok::RagnarokConfig {
+        prompt,
+        cwd,
+        theme: cfg.theme.palette(),
+        score_store,
+        registry,
+        install_root: install::default_install_root(),
+        platform: registry::current_platform(),
+        preferences: picker_preferences_from_config(cfg),
+        agent_stderr: agent_stderr.map(Path::to_path_buf),
+    };
+
+    let mut terminal = ui::setup_fullscreen_terminal().context("setup terminal")?;
+    let outcome = ragnarok::run(&mut terminal, rag_cfg).await;
+    if let Err(e) = ui::restore_fullscreen_terminal(&mut terminal) {
+        tracing::warn!("restore terminal (ragnarok) failed: {e}");
     }
     settle_after_fullscreen_picker_restore().await;
     outcome
@@ -1682,6 +1735,7 @@ async fn run_session(
                 session_title: current_session_title,
                 theme_kind,
                 spinner_style,
+                ragnarok_prompt: None,
             });
         };
 
@@ -1715,6 +1769,7 @@ async fn run_session(
                     session_title: target_title,
                     theme_kind,
                     spinner_style,
+                    ragnarok_prompt: None,
                 });
             }
         }
@@ -2146,6 +2201,7 @@ mod tests {
             session_title: Some("Current".to_string()),
             theme_kind: theme::TerminalThemeKind::AnsiLight,
             spinner_style: spinner::SpinnerStyle::Bars,
+            ragnarok_prompt: None,
         };
 
         apply_session_result_to_config(&mut cfg, &result);

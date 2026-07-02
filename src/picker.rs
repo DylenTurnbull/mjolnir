@@ -704,6 +704,7 @@ pub fn spawn_startup_probes(
 }
 
 /// Resolved launch command for one agent (for `mj dump-models`).
+#[derive(Debug, Clone)]
 pub struct LaunchCommand {
     pub program: PathBuf,
     pub args: Vec<String>,

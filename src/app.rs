@@ -39,6 +39,7 @@ const BUILTIN_LOAD_COMMAND: &str = "load";
 const BUILTIN_FORK_COMMAND: &str = "fork";
 const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
+const BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
 
 fn builtin_new_command() -> AvailableCommand {
@@ -74,6 +75,13 @@ fn builtin_mjconfig_command() -> AvailableCommand {
     )
 }
 
+fn builtin_ragnarok_command() -> AvailableCommand {
+    AvailableCommand::new(
+        BUILTIN_RAGNAROK_COMMAND,
+        "⚡ pit rival agents against each other on a task and crown a winner",
+    )
+}
+
 fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: bool) {
     commands.retain(|command| {
         command.name != BUILTIN_NEW_COMMAND
@@ -82,10 +90,12 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
             && command.name != BUILTIN_FORK_COMMAND
             && command.name != BUILTIN_EXPORT_COMMAND
             && command.name != BUILTIN_MJCONFIG_COMMAND
+            && command.name != BUILTIN_RAGNAROK_COMMAND
     });
     if include_fork {
         commands.insert(0, builtin_fork_command());
     }
+    commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_mjconfig_command());
     commands.insert(0, builtin_export_command());
     commands.insert(0, builtin_load_command());
@@ -102,6 +112,10 @@ pub enum UiExitReason {
     ClearSession,
     LoadSession,
     SwitchSession,
+    /// Leave the chat to run a `/ragnarok` tournament. The prompt itself is
+    /// carried out-of-band (see `AppState::ragnarok_prompt`) so this enum can
+    /// stay `Copy`.
+    Ragnarok,
 }
 
 /// One entry in the scrolling transcript.
@@ -584,6 +598,9 @@ pub struct AppState {
     /// flushed, so this reader is how users re-read earlier output in full.
     pub transcript_viewer: bool,
     pub exit_reason: Option<UiExitReason>,
+    /// Prompt captured from `/ragnarok <prompt>`, handed to `main` when the UI
+    /// loop exits with [`UiExitReason::Ragnarok`].
+    pub ragnarok_prompt: Option<String>,
     /// True once the runtime has stopped accepting commands.
     pub runtime_closed: bool,
     /// Transient status line with severity.
@@ -866,6 +883,7 @@ impl AppState {
             expand_tool_outputs: false,
             transcript_viewer: false,
             exit_reason: None,
+            ragnarok_prompt: None,
             runtime_closed: false,
             status_line: None,
             voice_input_active: false,
@@ -4024,7 +4042,10 @@ mod tests {
             .iter()
             .map(|&i| s.available_commands[i].name.as_str())
             .collect();
-        assert_eq!(names, vec!["new", "clear", "load", "export", "mjconfig"]);
+        assert_eq!(
+            names,
+            vec!["new", "clear", "load", "export", "mjconfig", "ragnarok"]
+        );
     }
 
     #[test]
@@ -4048,7 +4069,9 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "clear", "load", "export", "mjconfig", "fork"]
+            vec![
+                "new", "clear", "load", "export", "mjconfig", "ragnarok", "fork"
+            ]
         );
     }
 
@@ -4084,6 +4107,7 @@ mod tests {
                 "load",
                 "export",
                 "mjconfig",
+                "ragnarok",
                 "fork",
                 "review_pr"
             ]
@@ -4107,6 +4131,10 @@ mod tests {
         );
         assert_eq!(
             s.available_commands[5].description,
+            "⚡ pit rival agents against each other on a task and crown a winner"
+        );
+        assert_eq!(
+            s.available_commands[6].description,
             "fork the current session (unstable ACP extension)"
         );
     }
@@ -4128,7 +4156,15 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "clear", "load", "export", "mjconfig", "review_pr"]
+            vec![
+                "new",
+                "clear",
+                "load",
+                "export",
+                "mjconfig",
+                "ragnarok",
+                "review_pr"
+            ]
         );
     }
 

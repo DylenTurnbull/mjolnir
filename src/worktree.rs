@@ -90,6 +90,142 @@ fn create_for_project_cwd(project_root: &Path, cwd: &Path) -> Result<CreatedWork
     })
 }
 
+/// Create a fresh linked worktree with no interactive prompting, for
+/// programmatic/batch use (e.g. running several agents against the same
+/// project in parallel).
+///
+/// The new worktree is placed under the **main** repository's
+/// `.mjolnir/worktrees/` (so several can be siblings even when `cwd` is itself
+/// a linked worktree — nesting would block the outer worktree's later removal),
+/// but it is branched from the **current** worktree's `HEAD` so agents build on
+/// whatever the user is actually working on. Worktrees are left on disk for the
+/// caller to inspect or clean up with `git worktree remove`.
+///
+/// NOTE: not safe to call concurrently for the same repo — the generated names
+/// are only collision-checked against what already exists on disk. Serialize
+/// creation, then run the agents in parallel.
+pub fn create_detached(cwd: &Path) -> Result<CreatedWorktree> {
+    let session_root = git_toplevel(cwd)?;
+    // Fall back to the current worktree if the main root cannot be resolved.
+    let main_root = main_worktree_root(cwd).unwrap_or_else(|_| session_root.clone());
+    let relative_cwd = relative_cwd(&session_root, cwd)?;
+
+    let worktrees_dir = worktrees_dir(&main_root);
+    std::fs::create_dir_all(&worktrees_dir)
+        .with_context(|| format!("create {}", worktrees_dir.display()))?;
+    let worktree_root = unique_worktree_path(&worktrees_dir)?;
+
+    // Run from the current worktree so `HEAD` resolves to what the user is on,
+    // while the new worktree lives under the main repo.
+    run_git(
+        &session_root,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("--detach"),
+            worktree_root.as_os_str(),
+            OsStr::new("HEAD"),
+        ],
+    )
+    .with_context(|| format!("create git worktree {}", worktree_root.display()))?;
+
+    let session_cwd = worktree_root.join(&relative_cwd);
+    std::fs::create_dir_all(&session_cwd)
+        .with_context(|| format!("create session cwd {}", session_cwd.display()))?;
+
+    Ok(CreatedWorktree {
+        project_root: main_root,
+        worktree_root,
+        session_cwd,
+        was_created: true,
+    })
+}
+
+/// The working-tree path of the repository's **main** worktree, resolved from
+/// any linked worktree. The first `worktree` entry of `git worktree list` is
+/// always the main one.
+fn main_worktree_root(cwd: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .with_context(|| format!("run git worktree list in {}", cwd.display()))?;
+    if !output.status.success() {
+        bail!(
+            "git worktree list failed in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8(output.stdout).context("git worktree list output not UTF-8")?;
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            let path = path.trim();
+            if !path.is_empty() {
+                return Ok(PathBuf::from(path));
+            }
+        }
+    }
+    bail!(
+        "git worktree list returned no main worktree for {}",
+        cwd.display()
+    )
+}
+
+/// A summary of what an agent changed inside a worktree, relative to the
+/// commit it was branched from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorktreeDiff {
+    /// Unified diff patch text (tracked edits, new files, deletions).
+    pub patch: String,
+    /// Number of files touched.
+    pub files_changed: usize,
+}
+
+impl WorktreeDiff {
+    /// True when the worktree is untouched (the agent produced nothing).
+    pub fn is_empty(&self) -> bool {
+        self.files_changed == 0 && self.patch.trim().is_empty()
+    }
+}
+
+/// Capture the full diff of a worktree relative to its base commit, including
+/// untracked (new) files. Stages everything first (`git add -A`) so new files
+/// appear in the patch — harmless on a throwaway worktree — then reads the
+/// staged diff.
+pub fn diff(worktree_root: &Path) -> Result<WorktreeDiff> {
+    // Stage all changes so `git diff --cached` includes new/deleted files.
+    run_git(worktree_root, [OsStr::new("add"), OsStr::new("-A")])
+        .with_context(|| format!("git add -A in {}", worktree_root.display()))?;
+    let patch = git_stdout(worktree_root, &["diff", "--cached", "--no-color"])?;
+    let names = git_stdout(worktree_root, &["diff", "--cached", "--name-only"])?;
+    let files_changed = names.lines().filter(|line| !line.trim().is_empty()).count();
+    Ok(WorktreeDiff {
+        patch,
+        files_changed,
+    })
+}
+
+/// Run a git subcommand in `dir` and return its stdout as a `String`.
+fn git_stdout(dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("run git {args:?} in {}", dir.display()))?;
+    if !output.status.success() {
+        bail!(
+            "git {:?} failed in {}: {}",
+            args,
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout).with_context(|| format!("git {args:?} output was not UTF-8"))
+}
+
 /// Open an existing worktree by name (short name under
 /// `.mjolnir/worktrees/`) or by path (absolute or relative to `cwd`).
 /// The target directory must already exist and be a registered Git
@@ -470,6 +606,62 @@ mod tests {
     }
 
     #[test]
+    fn create_detached_from_linked_worktree_is_sibling_under_main() {
+        // Reproduces the `/ragnarok` case: the user runs from inside a linked
+        // worktree, and competitor worktrees must be siblings under the MAIN
+        // repo (not nested inside the outer worktree), branched from the outer
+        // worktree's HEAD.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main_root = std::fs::canonicalize(dir.path()).expect("canon");
+        init_git_repo(&main_root);
+        std::fs::write(main_root.join("f.txt"), "v1\n").expect("write");
+        run_git(&main_root, [OsStr::new("add"), OsStr::new(".")]).expect("add");
+        commit_all(&main_root);
+
+        // Outer worktree "quick-orchid" under the main repo, advanced one commit.
+        let outer = create_for_project_cwd(&main_root, &main_root).expect("outer worktree");
+        std::fs::write(outer.session_cwd.join("f.txt"), "v2\n").expect("edit");
+        run_git(&outer.worktree_root, [OsStr::new("add"), OsStr::new(".")]).expect("add");
+        commit_all(&outer.worktree_root);
+        let outer_head = git_stdout(&outer.worktree_root, &["rev-parse", "HEAD"])
+            .expect("outer head")
+            .trim()
+            .to_string();
+
+        // Create a detached worktree from INSIDE the outer worktree.
+        let created = create_detached(&outer.session_cwd).expect("create detached");
+
+        // It lives under the MAIN repo's .mjolnir/worktrees, not nested inside
+        // the outer worktree.
+        assert_eq!(
+            std::fs::canonicalize(&created.project_root).expect("canon"),
+            main_root
+        );
+        assert!(
+            created
+                .worktree_root
+                .starts_with(main_root.join(".mjolnir/worktrees")),
+            "should be under main: {}",
+            created.worktree_root.display()
+        );
+        assert!(
+            !created.worktree_root.starts_with(&outer.worktree_root),
+            "must not nest inside the outer worktree: {}",
+            created.worktree_root.display()
+        );
+        // And it is branched from the outer worktree's HEAD (v2), not main (v1).
+        let created_head = git_stdout(&created.worktree_root, &["rev-parse", "HEAD"])
+            .expect("created head")
+            .trim()
+            .to_string();
+        assert_eq!(created_head, outer_head);
+        assert_eq!(
+            std::fs::read_to_string(created.worktree_root.join("f.txt")).unwrap(),
+            "v2\n"
+        );
+    }
+
+    #[test]
     fn gitignore_detection_recognizes_parent_and_worktree_entries() {
         assert!(gitignore_text_contains_worktree_entry(
             ".mjolnir/worktrees/\n"
@@ -720,6 +912,39 @@ mod tests {
         );
         let output = String::from_utf8(output).expect("utf8");
         assert!(output.contains("Keeping worktree"));
+    }
+
+    #[test]
+    fn create_detached_and_diff_captures_agent_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("tracked.txt"), "before\n").expect("write file");
+        run_git(dir.path(), [OsStr::new("add"), OsStr::new(".")]).expect("git add");
+        commit_all(dir.path());
+
+        let created = create_detached(dir.path()).expect("create detached worktree");
+        assert!(created.was_created);
+        assert!(created.worktree_root.is_dir());
+
+        // A fresh worktree has no changes yet.
+        let clean = diff(&created.worktree_root).expect("diff clean");
+        assert!(
+            clean.is_empty(),
+            "fresh worktree should be clean: {clean:?}"
+        );
+
+        // Simulate an agent editing a tracked file and adding a new one.
+        std::fs::write(created.session_cwd.join("tracked.txt"), "after\n").expect("edit");
+        std::fs::write(created.session_cwd.join("new.rs"), "fn main() {}\n").expect("new file");
+
+        let changed = diff(&created.worktree_root).expect("diff changed");
+        assert_eq!(changed.files_changed, 2, "patch: {}", changed.patch);
+        assert!(changed.patch.contains("tracked.txt"));
+        assert!(changed.patch.contains("new.rs"));
+        assert!(changed.patch.contains("fn main"));
+
+        remove_worktree(&created.project_root, &created.worktree_root).expect("remove worktree");
+        assert!(!created.worktree_root.is_dir(), "worktree should be gone");
     }
 
     fn init_git_repo(path: &Path) {

@@ -451,6 +451,27 @@ impl ScoreStore {
             format!("{} elo", score.elo)
         })
     }
+
+    /// Raw numeric Elo for a model, or `None` when scoring is disabled / not
+    /// installed, or the model is not on the leaderboard. Mirrors
+    /// [`Self::score_suffix`] but returns the number itself so callers can
+    /// rank `(agent, model)` pairs and drop the unrated ones.
+    pub fn score_numeric(
+        &self,
+        agent_id: &str,
+        value: &str,
+        name: &str,
+        description: &str,
+    ) -> Option<u32> {
+        let guard = self.catalog.read().ok()?;
+        let catalog = guard.as_ref()?;
+        if !catalog.enabled {
+            return None;
+        }
+        catalog
+            .lookup(agent_id, value, name, description)
+            .map(|score| score.elo)
+    }
 }
 
 #[cfg(test)]
@@ -578,6 +599,20 @@ mod tests {
     fn unmatched_model_has_no_score() {
         let cat = catalog_from_snapshot(true);
         assert!(cat.lookup("devin", "devin-1", "Devin 1", "").is_none());
+    }
+
+    #[test]
+    fn score_numeric_returns_raw_elo_and_respects_enabled() {
+        let store = ScoreStore::default();
+        store.install(catalog_from_snapshot(true));
+        let id = "bedrock::us.anthropic.claude-opus-4-8";
+        assert_eq!(store.score_numeric("anvil", id, id, ""), Some(1456));
+        // Unmatched models rank as None so the router can drop them.
+        assert_eq!(store.score_numeric("devin", "devin-1", "Devin 1", ""), None);
+        // A disabled catalog never yields a number.
+        let disabled = ScoreStore::default();
+        disabled.install(catalog_from_snapshot(false));
+        assert_eq!(disabled.score_numeric("anvil", id, id, ""), None);
     }
 
     #[test]

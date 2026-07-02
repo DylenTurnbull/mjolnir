@@ -301,6 +301,8 @@ pub struct UiRunResult {
     pub session_title: Option<String>,
     pub theme_kind: TerminalThemeKind,
     pub spinner_style: SpinnerStyle,
+    /// Set when `reason` is [`UiExitReason::Ragnarok`]: the quest to run.
+    pub ragnarok_prompt: Option<String>,
 }
 
 struct UiInitialState {
@@ -325,6 +327,7 @@ struct UiLoopOutcome {
     theme_kind: TerminalThemeKind,
     spinner_style: SpinnerStyle,
     history: Vec<String>,
+    ragnarok_prompt: Option<String>,
 }
 
 pub async fn run(
@@ -348,6 +351,7 @@ pub async fn run(
         theme_kind,
         spinner_style,
         history,
+        ragnarok_prompt,
     } = ui_loop(
         terminal,
         cmd_tx,
@@ -381,6 +385,7 @@ pub async fn run(
         session_title,
         theme_kind,
         spinner_style,
+        ragnarok_prompt,
     })
 }
 
@@ -766,6 +771,7 @@ async fn ui_loop(
                 theme_kind: state.theme_kind,
                 spinner_style: state.spinner_style,
                 history: state.prompt_history(),
+                ragnarok_prompt: state.ragnarok_prompt.take(),
             });
         }
 
@@ -847,6 +853,7 @@ async fn ui_loop(
         theme_kind: state.theme_kind,
         spinner_style: state.spinner_style,
         history: state.prompt_history(),
+        ragnarok_prompt: None,
     })
 }
 
@@ -2977,6 +2984,27 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
             state.record_status_message(StatusKind::Info, "forking session...");
             let _ = cmd_tx.send(UiCommand::ForkSession);
         }
+        return;
+    }
+
+    if images.is_empty()
+        && let Some(rest) = text.strip_prefix("/ragnarok")
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        let quest = rest.trim().to_string();
+        state.input.clear();
+        clear_attachments(state);
+        state.input_cursor = 0;
+        state.scroll_input_to_bottom();
+        if quest.is_empty() {
+            state.record_status_message(
+                StatusKind::Warning,
+                "usage: /ragnarok <what to build> — rival agents compete to implement it",
+            );
+            return;
+        }
+        state.ragnarok_prompt = Some(quest);
+        state.exit_reason = Some(UiExitReason::Ragnarok);
         return;
     }
 
@@ -8868,6 +8896,35 @@ mod tests {
         assert_eq!(state.exit_reason, Some(UiExitReason::NewSession));
         // Must not forward the command to the agent.
         assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn slash_ragnarok_captures_quest_and_triggers_exit_reason() {
+        let mut state = AppState::new();
+        state.session_id = Some("s-1".to_string());
+        state.input = "/ragnarok build a snake game".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert_eq!(state.exit_reason, Some(UiExitReason::Ragnarok));
+        assert_eq!(state.ragnarok_prompt.as_deref(), Some("build a snake game"));
+        // Client-side: nothing is sent to the agent.
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn slash_ragnarok_without_quest_warns_and_does_not_exit() {
+        let mut state = AppState::new();
+        state.session_id = Some("s-1".to_string());
+        state.input = "/ragnarok   ".to_string();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert_eq!(state.exit_reason, None);
+        assert!(state.ragnarok_prompt.is_none());
+        assert!(state.status_line.is_some(), "should warn about usage");
     }
 
     #[test]
