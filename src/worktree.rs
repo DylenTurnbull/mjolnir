@@ -126,6 +126,12 @@ pub fn create_for_automation(cwd: &Path, name_hint: &str) -> Result<CreatedWorkt
     })
 }
 
+/// Remove a linked worktree created by an automated flow (Thor's camp).
+/// Same cleanup as the interactive exit prompt, without the prompt.
+pub fn remove_automation_worktree(project_root: &Path, worktree_root: &Path) -> Result<()> {
+    remove_worktree(project_root, worktree_root)
+}
+
 /// Reduce an arbitrary label (model/agent names may carry `::`, spaces, or
 /// unicode) to a safe, compact worktree directory name.
 fn sanitize_worktree_name(hint: &str) -> String {

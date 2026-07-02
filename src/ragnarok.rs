@@ -375,7 +375,14 @@ async fn battle(
             thor_pick.card.tag()
         ),
     )?;
-    let mut thor = Thor::summon(thor_pick, &cfg.cwd, abort.clone()).await?;
+    let thor_camp = {
+        let cwd = cfg.cwd.clone();
+        tokio::task::spawn_blocking(move || worktree::create_for_automation(&cwd, "ragnarok-thor"))
+            .await
+            .context("thor camp task failed")?
+            .context("could not forge Thor's camp")?
+    };
+    let mut thor = Thor::summon(thor_pick, thor_camp, abort.clone()).await?;
     let route = thor.route(&cfg.task, tx).await?;
     let cap = user_cfg.ragnarok.max_competitors;
     let want = field_size(route.competitors, cap);
@@ -814,13 +821,12 @@ pub fn select_fighters(pool: &[Candidate], want: usize) -> Vec<Candidate> {
 // One ACP connection driven programmatically
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PermissionPolicy {
-    /// Champions and reviewers: contained in a worktree, keep them moving.
-    AllowAll,
-    /// Thor: reasons over provided material only; never grant anything.
-    RejectAll,
-}
+// Every battle connection — Thor, champions, reviewers — runs inside its own
+// disposable git worktree, so permissions are auto-granted rather than
+// prompted: there is no user at the modal, and answering a permission with
+// `Cancelled` makes agents cancel the whole turn (Thor learned this the hard
+// way). When an agent offers no allow option, the first reject option is
+// chosen — an explicit denial keeps the turn alive where a cancel kills it.
 
 /// What a turn streamed, reduced to what the arena cares about.
 enum TurnEvent {
@@ -849,17 +855,11 @@ struct AgentHandle {
     runtime: tokio::task::JoinHandle<Result<()>>,
     config_options: Vec<SessionConfigOption>,
     config_targets: Vec<SessionConfigTarget>,
-    policy: PermissionPolicy,
     abort: watch::Receiver<bool>,
 }
 
 impl AgentHandle {
-    async fn connect(
-        launch: &Launch,
-        cwd: &Path,
-        policy: PermissionPolicy,
-        abort: watch::Receiver<bool>,
-    ) -> Result<Self> {
+    async fn connect(launch: &Launch, cwd: &Path, abort: watch::Receiver<bool>) -> Result<Self> {
         let (event_tx, events) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let runtime_cfg = acp::AcpRuntimeConfig {
@@ -879,7 +879,6 @@ impl AgentHandle {
             runtime,
             config_options: Vec::new(),
             config_targets: Vec::new(),
-            policy,
             abort,
         };
         handle.wait_session_started().await?;
@@ -925,12 +924,10 @@ impl AgentHandle {
     }
 
     fn answer_permission(&self, prompt: crate::event::PermissionPrompt) {
-        let decision = match self.policy {
-            PermissionPolicy::AllowAll => choose_allow_option(&prompt.options)
-                .map(PermissionDecision::Selected)
-                .unwrap_or(PermissionDecision::Cancelled),
-            PermissionPolicy::RejectAll => PermissionDecision::Cancelled,
-        };
+        let decision = choose_allow_option(&prompt.options)
+            .or_else(|| choose_reject_option(&prompt.options))
+            .map(PermissionDecision::Selected)
+            .unwrap_or(PermissionDecision::Cancelled);
         let _ = prompt.responder.send(decision);
     }
 
@@ -1176,6 +1173,24 @@ fn turn_succeeded(stop: StopReason) -> bool {
     )
 }
 
+/// First `RejectOnce` option, else first `RejectAlways`. Used only when an
+/// agent offers no allow option at all: an explicit rejection lets the turn
+/// continue, whereas cancelling the request cancels the whole turn.
+fn choose_reject_option(
+    options: &[agent_client_protocol::schema::v1::PermissionOption],
+) -> Option<String> {
+    use agent_client_protocol::schema::v1::PermissionOptionKind;
+    options
+        .iter()
+        .find(|option| option.kind == PermissionOptionKind::RejectOnce)
+        .or_else(|| {
+            options
+                .iter()
+                .find(|option| option.kind == PermissionOptionKind::RejectAlways)
+        })
+        .map(|option| option.option_id.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Champions: fight + artifact capture
 // ---------------------------------------------------------------------------
@@ -1257,17 +1272,11 @@ async fn fight(
     report.worktree = Some(created.clone());
 
     set_state(FighterState::Connecting);
-    let mut handle = match AgentHandle::connect(
-        &fighter.launch,
-        &created.session_cwd,
-        PermissionPolicy::AllowAll,
-        abort.clone(),
-    )
-    .await
-    {
-        Ok(h) => h,
-        Err(e) => return slain(report, set_state, format!("never reached the arena: {e:#}")),
-    };
+    let mut handle =
+        match AgentHandle::connect(&fighter.launch, &created.session_cwd, abort.clone()).await {
+            Ok(h) => h,
+            Err(e) => return slain(report, set_state, format!("never reached the arena: {e:#}")),
+        };
     if let Err(e) = handle.arm_model(&fighter.card.model_value).await {
         handle.dismiss().await;
         return slain(
@@ -1534,24 +1543,18 @@ async fn review(
         });
     };
     set_progress(ReviewProgress::Connecting);
-    let mut handle = match AgentHandle::connect(
-        &reviewer.launch,
-        &defender_cwd,
-        PermissionPolicy::AllowAll,
-        abort.clone(),
-    )
-    .await
-    {
-        Ok(h) => h,
-        Err(e) => {
-            set_progress(ReviewProgress::Failed);
-            return ReviewReport {
-                assignment,
-                text: format!("(review not delivered: {e:#})"),
-                delivered: false,
-            };
-        }
-    };
+    let mut handle =
+        match AgentHandle::connect(&reviewer.launch, &defender_cwd, abort.clone()).await {
+            Ok(h) => h,
+            Err(e) => {
+                set_progress(ReviewProgress::Failed);
+                return ReviewReport {
+                    assignment,
+                    text: format!("(review not delivered: {e:#})"),
+                    delivered: false,
+                };
+            }
+        };
     if let Err(e) = handle.arm_model(&reviewer.card.model_value).await {
         handle.dismiss().await;
         set_progress(ReviewProgress::Failed);
@@ -1659,6 +1662,12 @@ fn review_prompt(
 
 struct Thor {
     handle: AgentHandle,
+    /// Thor's own disposable worktree. Like the champions he judges, Thor
+    /// runs with auto-granted permissions inside a throwaway copy — a
+    /// rejected/cancelled permission makes agents cancel the whole turn,
+    /// which is how the first live Thor died. Removed at dismissal; battles
+    /// that error out mid-flight leave it behind like any fighter camp.
+    camp: worktree::CreatedWorktree,
 }
 
 #[derive(Debug, Clone)]
@@ -1669,16 +1678,19 @@ pub struct RouteDecision {
 }
 
 impl Thor {
-    async fn summon(pick: Candidate, cwd: &Path, abort: watch::Receiver<bool>) -> Result<Self> {
-        let mut handle =
-            AgentHandle::connect(&pick.launch, cwd, PermissionPolicy::RejectAll, abort)
-                .await
-                .context("Thor could not descend (agent connect failed)")?;
+    async fn summon(
+        pick: Candidate,
+        camp: worktree::CreatedWorktree,
+        abort: watch::Receiver<bool>,
+    ) -> Result<Self> {
+        let mut handle = AgentHandle::connect(&pick.launch, &camp.session_cwd, abort)
+            .await
+            .context("Thor could not descend (agent connect failed)")?;
         handle
             .arm_model(&pick.card.model_value)
             .await
             .context("Thor could not take form (model select failed)")?;
-        Ok(Self { handle })
+        Ok(Self { handle, camp })
     }
 
     /// One Thor turn: prompt, stream to the Thor panel, return the final text.
@@ -1801,6 +1813,15 @@ impl Thor {
 
     async fn dismiss(self) {
         self.handle.dismiss().await;
+        let camp = self.camp;
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) =
+                worktree::remove_automation_worktree(&camp.project_root, &camp.worktree_root)
+            {
+                tracing::warn!("remove thor camp {:?}: {e:#}", camp.worktree_root);
+            }
+        })
+        .await;
     }
 }
 
@@ -2571,7 +2592,6 @@ mod tests {
             runtime: tokio::spawn(async { Ok(()) }),
             config_options: Vec::new(),
             config_targets: Vec::new(),
-            policy: PermissionPolicy::RejectAll,
             abort,
         };
         TestRig {
@@ -2693,6 +2713,52 @@ mod tests {
             }
         }
         assert_eq!(sends, 2, "the rejected prompt must be re-sent once");
+    }
+
+    #[tokio::test]
+    async fn permissions_prefer_allow_then_reject_never_cancel_when_avoidable() {
+        use agent_client_protocol::schema::v1::{
+            PermissionOption, PermissionOptionKind, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let rig = test_rig();
+
+        // Allow option present: allow wins.
+        let (ptx, prx) = tokio::sync::oneshot::channel();
+        rig.handle
+            .answer_permission(crate::event::PermissionPrompt {
+                tool_call: ToolCallUpdate::new("t1", ToolCallUpdateFields::default()),
+                options: vec![
+                    PermissionOption::new("deny", "Deny", PermissionOptionKind::RejectOnce),
+                    PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
+                ],
+                responder: ptx,
+            });
+        assert!(matches!(prx.await, Ok(PermissionDecision::Selected(id)) if id == "allow"));
+
+        // No allow options: an explicit rejection keeps the turn alive where
+        // a cancel would cancel the whole turn (the live Thor failure).
+        let (ptx, prx) = tokio::sync::oneshot::channel();
+        rig.handle
+            .answer_permission(crate::event::PermissionPrompt {
+                tool_call: ToolCallUpdate::new("t2", ToolCallUpdateFields::default()),
+                options: vec![PermissionOption::new(
+                    "deny",
+                    "Deny",
+                    PermissionOptionKind::RejectOnce,
+                )],
+                responder: ptx,
+            });
+        assert!(matches!(prx.await, Ok(PermissionDecision::Selected(id)) if id == "deny"));
+
+        // No options at all: cancel is the only move left.
+        let (ptx, prx) = tokio::sync::oneshot::channel();
+        rig.handle
+            .answer_permission(crate::event::PermissionPrompt {
+                tool_call: ToolCallUpdate::new("t3", ToolCallUpdateFields::default()),
+                options: Vec::new(),
+                responder: ptx,
+            });
+        assert!(matches!(prx.await, Ok(PermissionDecision::Cancelled)));
     }
 
     #[tokio::test]
