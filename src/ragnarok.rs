@@ -59,6 +59,13 @@ const REVIEW_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const THOR_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How long to wait for the session config options needed to arm a model.
 const CONFIG_OPTIONS_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long to wait for the runtime to confirm a model selection. The
+/// runtime rejects prompts while a config update is in flight, so arming
+/// must not return before the confirmation lands.
+const CONFIG_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Defense in depth: how many times one turn re-sends a prompt the runtime
+/// rejected with "config update already in flight" (250ms apart).
+const PROMPT_RESEND_LIMIT: usize = 20;
 
 /// Cap on a captured `git diff` artifact.
 const DIFF_CAPTURE_LIMIT: usize = 256 * 1024;
@@ -828,6 +835,7 @@ enum TurnEvent {
     Note(String),
 }
 
+#[derive(Debug)]
 struct TurnOutcome {
     text: String,
     stop: StopReason,
@@ -926,19 +934,24 @@ impl AgentHandle {
         let _ = prompt.responder.send(decision);
     }
 
-    /// Select `model_value` through the session's Model config option. The
-    /// runtime applies commands in order, so this lands before any prompt sent
-    /// afterwards. Errors when the agent never surfaces a model option that
-    /// carries the value (the roster was built from that same option list, so
-    /// this only fires on genuine agent misbehavior).
+    /// Select `model_value` through the session's Model config option and
+    /// wait for the runtime to confirm the update. The runtime rejects
+    /// prompts while a config update is in flight ("config update already in
+    /// flight"), so returning before the confirmation would poison the very
+    /// next turn. Confirmation is a refreshed `SessionConfigOptions` whose
+    /// model option carries the requested value; failure surfaces as a
+    /// "session config update failed" warning. Already-current models skip
+    /// the round trip entirely.
     async fn arm_model(&mut self, model_value: &str) -> Result<()> {
+        if self.model_is_current(model_value) {
+            return Ok(());
+        }
+
+        // Wait for the option table if it hasn't arrived yet, then send.
         let deadline = tokio::time::Instant::now() + CONFIG_OPTIONS_TIMEOUT;
-        loop {
-            if let Some((target, value)) = self.find_model_choice(model_value) {
-                let _ = self
-                    .cmd_tx
-                    .send(UiCommand::SetSessionConfigOption { target, value });
-                return Ok(());
+        let (target, value) = loop {
+            if let Some(found) = self.find_model_choice(model_value) {
+                break found;
             }
             let ev = tokio::select! {
                 ev = self.events.recv() => ev,
@@ -959,7 +972,50 @@ impl AgentHandle {
                 Some(_) => {}
                 None => bail!("agent runtime closed"),
             }
+        };
+        let _ = self
+            .cmd_tx
+            .send(UiCommand::SetSessionConfigOption { target, value });
+
+        // Await the confirmation before releasing the caller to prompt.
+        let deadline = tokio::time::Instant::now() + CONFIG_UPDATE_TIMEOUT;
+        loop {
+            let ev = tokio::select! {
+                ev = self.events.recv() => ev,
+                _ = wait_abort(self.abort.clone()) => bail!("battle aborted"),
+                _ = tokio::time::sleep_until(deadline) => {
+                    bail!("model select for '{model_value}' was not confirmed in time")
+                }
+            };
+            match ev {
+                Some(UiEvent::SessionConfigOptions { options, targets }) => {
+                    self.store_config(options, targets);
+                    if self.model_is_current(model_value) {
+                        return Ok(());
+                    }
+                }
+                Some(UiEvent::Warning(w)) if w.contains("session config update failed") => {
+                    bail!("agent refused model '{model_value}': {w}")
+                }
+                Some(UiEvent::PermissionRequest(p)) => self.answer_permission(p),
+                Some(UiEvent::ElicitationRequest(e)) => {
+                    let _ = e.responder.send(ElicitationOutcome::Decline);
+                }
+                Some(UiEvent::Fatal(m)) => bail!("agent failed: {m}"),
+                Some(_) => {}
+                None => bail!("agent runtime closed"),
+            }
         }
+    }
+
+    /// True when a Model-category option's current value already equals
+    /// `model_value`.
+    fn model_is_current(&self, model_value: &str) -> bool {
+        self.config_options.iter().any(|option| {
+            crate::app::is_model_config_option(option)
+                && crate::app::config_option_current_value_id(option)
+                    .is_some_and(|current| current.to_string() == model_value)
+        })
     }
 
     fn find_model_choice(
@@ -988,13 +1044,17 @@ impl AgentHandle {
     }
 
     /// Send one prompt and drive it to completion, streaming digested events
-    /// through `on_event`.
+    /// through `on_event`. A rejection caused by a still-in-flight config
+    /// update ([`Self::arm_model`] should prevent it, but belt and braces)
+    /// re-sends the prompt a bounded number of times instead of failing.
     async fn prompt(
         &mut self,
         text: String,
         budget: Duration,
         mut on_event: impl FnMut(TurnEvent),
     ) -> Result<TurnOutcome> {
+        let resend_text = text.clone();
+        let mut resends = 0usize;
         let _ = self.cmd_tx.send(UiCommand::SendPrompt {
             text,
             images: Vec::new(),
@@ -1079,7 +1139,20 @@ impl AgentHandle {
                         stop: stop_reason,
                     });
                 }
-                UiEvent::PromptFailed { message } => bail!("prompt failed: {message}"),
+                UiEvent::PromptFailed { message } => {
+                    if message.contains("config update already in flight")
+                        && resends < PROMPT_RESEND_LIMIT
+                    {
+                        resends += 1;
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        let _ = self.cmd_tx.send(UiCommand::SendPrompt {
+                            text: resend_text.clone(),
+                            images: Vec::new(),
+                        });
+                        continue;
+                    }
+                    bail!("prompt failed: {message}")
+                }
                 UiEvent::Fatal(m) => bail!("agent failed: {m}"),
                 UiEvent::Warning(w) => on_event(TurnEvent::Note(w)),
                 _ => {}
@@ -2471,6 +2544,171 @@ mod tests {
                 assert!(!battle_cry("X", kind, "y", roll).is_empty());
             }
         }
+    }
+
+    // ---- AgentHandle: model arming + prompt turn contract -----------------
+
+    use agent_client_protocol::schema::v1::{
+        SessionConfigOptionCategory, SessionConfigSelectOption,
+    };
+
+    /// A handle wired to test-owned channels, plus the guards that keep it
+    /// alive (dropping the abort sender reads as "UI gone" = abort).
+    struct TestRig {
+        handle: AgentHandle,
+        event_tx: mpsc::UnboundedSender<UiEvent>,
+        cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
+        _abort_tx: watch::Sender<bool>,
+    }
+
+    fn test_rig() -> TestRig {
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (abort_tx, abort) = watch::channel(false);
+        let handle = AgentHandle {
+            cmd_tx,
+            events,
+            runtime: tokio::spawn(async { Ok(()) }),
+            config_options: Vec::new(),
+            config_targets: Vec::new(),
+            policy: PermissionPolicy::RejectAll,
+            abort,
+        };
+        TestRig {
+            handle,
+            event_tx,
+            cmd_rx,
+            _abort_tx: abort_tx,
+        }
+    }
+
+    fn model_options(current: &str) -> (Vec<SessionConfigOption>, Vec<SessionConfigTarget>) {
+        let option = SessionConfigOption::select(
+            "model",
+            "Model",
+            current.to_string(),
+            vec![
+                SessionConfigSelectOption::new("opus", "Opus"),
+                SessionConfigSelectOption::new("sonnet", "Sonnet"),
+            ],
+        )
+        .category(Some(SessionConfigOptionCategory::Model));
+        let target = SessionConfigTarget::ConfigOption {
+            config_id: option.id.clone(),
+        };
+        (vec![option], vec![target])
+    }
+
+    #[tokio::test]
+    async fn arm_model_skips_round_trip_when_already_current() {
+        let mut rig = test_rig();
+        let (options, targets) = model_options("opus");
+        rig.handle.store_config(options, targets);
+        rig.handle.arm_model("opus").await.expect("already armed");
+        assert!(
+            rig.cmd_rx.try_recv().is_err(),
+            "no command should be sent for an already-current model"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_model_waits_for_the_runtime_confirmation() {
+        let mut rig = test_rig();
+        let (options, targets) = model_options("sonnet");
+        rig.handle.store_config(options, targets);
+
+        // Buffer an interim (unchanged) table and then the real confirmation.
+        let (stale_options, stale_targets) = model_options("sonnet");
+        rig.event_tx
+            .send(UiEvent::SessionConfigOptions {
+                options: stale_options,
+                targets: stale_targets,
+            })
+            .unwrap();
+        let (confirmed_options, confirmed_targets) = model_options("opus");
+        rig.event_tx
+            .send(UiEvent::SessionConfigOptions {
+                options: confirmed_options,
+                targets: confirmed_targets,
+            })
+            .unwrap();
+
+        rig.handle.arm_model("opus").await.expect("armed");
+        assert!(
+            matches!(
+                rig.cmd_rx.try_recv(),
+                Ok(UiCommand::SetSessionConfigOption { value, .. }) if value.to_string() == "opus"
+            ),
+            "the set command must have been sent"
+        );
+        assert!(rig.handle.model_is_current("opus"));
+    }
+
+    #[tokio::test]
+    async fn arm_model_surfaces_config_update_failure() {
+        let mut rig = test_rig();
+        let (options, targets) = model_options("sonnet");
+        rig.handle.store_config(options, targets);
+        rig.event_tx
+            .send(UiEvent::Warning(
+                "session config update failed: no such model".to_string(),
+            ))
+            .unwrap();
+        let err = rig
+            .handle
+            .arm_model("opus")
+            .await
+            .expect_err("failure must surface");
+        assert!(format!("{err:#}").contains("refused"), "err: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn prompt_resends_after_config_in_flight_rejection() {
+        // The exact live failure: the first prompt lands while the runtime
+        // still has a config update in flight and gets rejected.
+        let mut rig = test_rig();
+        rig.event_tx
+            .send(UiEvent::PromptFailed {
+                message: "prompt failed: config update already in flight".to_string(),
+            })
+            .unwrap();
+        rig.event_tx
+            .send(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+            .unwrap();
+
+        let outcome = rig
+            .handle
+            .prompt("go".to_string(), Duration::from_secs(5), |_| {})
+            .await
+            .expect("prompt survives the rejection");
+        assert_eq!(outcome.stop, StopReason::EndTurn);
+
+        let mut sends = 0;
+        while let Ok(cmd) = rig.cmd_rx.try_recv() {
+            if matches!(cmd, UiCommand::SendPrompt { .. }) {
+                sends += 1;
+            }
+        }
+        assert_eq!(sends, 2, "the rejected prompt must be re-sent once");
+    }
+
+    #[tokio::test]
+    async fn prompt_still_fails_on_other_rejections() {
+        let mut rig = test_rig();
+        rig.event_tx
+            .send(UiEvent::PromptFailed {
+                message: "agent exploded".to_string(),
+            })
+            .unwrap();
+        let err = rig
+            .handle
+            .prompt("go".to_string(), Duration::from_secs(5), |_| {})
+            .await
+            .expect_err("unrelated failures still fail");
+        assert!(format!("{err:#}").contains("agent exploded"));
     }
 
     #[test]
