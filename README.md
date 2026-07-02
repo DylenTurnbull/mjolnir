@@ -72,7 +72,10 @@ configured default agent are stored in `~/.config/mj/config.toml`.
 Use `/new` inside the TUI when you want to end the current chat and choose a
 harness again. The agent picker stays open for that explicit new-session flow
 until you select an agent or cancel it. Use `/load` to open the session picker
-for the current agent.
+for the current agent. Use `/ragnarok <task>` when you want Thor to stage a
+multi-agent/model battle: it asks the active agent to pick competitors, compare
+their versions, critique them, and present the winning result while the prompt
+shows a tiny ASCII combat animation.
 
 ## Why Multiple Harnesses
 
@@ -186,6 +189,7 @@ Keyboard basics:
 
 - `Enter`: send the current prompt, or accept the selected slash command.
 - `Tab`: accept the selected slash command.
+- `/ragnarok <task>`: ask Thor to run a silly multi-agent combat review and pick the winner.
 - `Up` / `Down`: move within slash-command autocomplete or permission prompts.
 - `PageUp` / `PageDown`: scroll the transcript.
 - `F10`: show or hide the help overlay.

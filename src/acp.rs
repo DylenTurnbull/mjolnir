@@ -2,32 +2,35 @@
 //! stdio, and bridges UI commands/events through two mpsc channels.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthenticateRequest, CancelNotification, ClientCapabilities,
-    CloseSessionRequest, ContentBlock, CreateElicitationRequest, CreateElicitationResponse,
-    CreateTerminalRequest, CreateTerminalResponse, ElicitationAcceptAction, ElicitationAction,
-    ElicitationCapabilities, ElicitationFormCapabilities, ElicitationUrlCapabilities, ErrorCode,
-    FileSystemCapabilities, ForkSessionRequest, ImageContent, Implementation, InitializeRequest,
-    KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, NewSessionRequest,
-    PermissionOption, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
-    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
-    SessionInfoUpdate, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, TerminalExitStatus, TerminalId,
-    TerminalOutputRequest, TerminalOutputResponse, TextContent, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
-    WriteTextFileRequest, WriteTextFileResponse,
+    CloseSessionRequest, ContentBlock, ContentChunk, CreateElicitationRequest,
+    CreateElicitationResponse, CreateTerminalRequest, CreateTerminalResponse,
+    ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities,
+    ElicitationFormCapabilities, ElicitationUrlCapabilities, ErrorCode, FileSystemCapabilities,
+    ForkSessionRequest, ImageContent, Implementation, InitializeRequest, KillTerminalRequest,
+    KillTerminalResponse, LoadSessionRequest, MessageId, NewSessionRequest, PermissionOption,
+    PermissionOptionKind, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionInfoUpdate,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionModeRequest, StopReason, TerminalExitStatus, TerminalId, TerminalOutputRequest,
+    TerminalOutputResponse, TextContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind, Usage, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::Result;
+use futures::stream::{FuturesUnordered, StreamExt};
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
@@ -39,9 +42,10 @@ use crate::event::{
     ElicitationOutcome, ElicitationPrompt, LoadSessionResult, PermissionDecision, PermissionPrompt,
     PromptImage, SessionConfigTarget, TerminalOutputSnapshot, UiCommand, UiEvent,
 };
-use crate::install;
 use crate::paths::{WorkspaceRoots, normalize_spawn_program, path_is_under_any_root};
+use crate::{config, install};
 
+#[derive(Debug, Clone)]
 pub struct AcpRuntimeConfig {
     pub command: PathBuf,
     pub args: Vec<String>,
@@ -69,6 +73,7 @@ struct RuntimeSessionState {
     active_roots: Arc<Mutex<Vec<PathBuf>>>,
     cancelled_permission_sessions: Arc<Mutex<HashSet<SessionId>>>,
     permission_cancel_generation: watch::Sender<u64>,
+    prompt_capture: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -87,6 +92,7 @@ impl RuntimeSessionState {
             active_roots: Arc::new(Mutex::new(Vec::new())),
             cancelled_permission_sessions: Arc::new(Mutex::new(HashSet::new())),
             permission_cancel_generation,
+            prompt_capture: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -199,6 +205,24 @@ impl RuntimeSessionState {
                 return;
             }
         }
+    }
+
+    async fn begin_prompt_capture(&self) {
+        *self.prompt_capture.lock().await = Some(String::new());
+    }
+
+    async fn append_prompt_capture_from_update(&self, update: &SessionUpdate) {
+        let SessionUpdate::AgentMessageChunk(chunk) = update else {
+            return;
+        };
+        let mut capture = self.prompt_capture.lock().await;
+        if let Some(text) = capture.as_mut() {
+            text.push_str(&crate::event::content_block_text(&chunk.content));
+        }
+    }
+
+    async fn take_prompt_capture(&self) -> Option<String> {
+        self.prompt_capture.lock().await.take()
     }
 }
 
@@ -586,6 +610,7 @@ pub async fn run(
             ui_rx,
             fatal_emitted.clone(),
             cfg.fs_max_text_bytes,
+            Some(cfg.clone()),
         );
         tokio::pin!(drive);
         tokio::select! {
@@ -1100,6 +1125,7 @@ where
         ui_rx,
         fatal_emitted,
         DEFAULT_FS_TEXT_BYTES,
+        None,
     )
     .await
 }
@@ -1126,6 +1152,7 @@ where
         ui_rx,
         fatal_emitted,
         DEFAULT_FS_TEXT_BYTES,
+        None,
     )
     .await
 }
@@ -1140,6 +1167,7 @@ async fn drive_client_with_fs_limit<T>(
     mut ui_rx: mpsc::UnboundedReceiver<UiCommand>,
     fatal_emitted: Arc<AtomicBool>,
     fs_max_text_bytes: u64,
+    runtime_config: Option<AcpRuntimeConfig>,
 ) -> Result<()>
 where
     T: ConnectTo<Client>,
@@ -1178,6 +1206,9 @@ where
                     .is_active_session(&notification.session_id)
                     .await
                 {
+                    notif_session_state
+                        .append_prompt_capture_from_update(&notification.update)
+                        .await;
                     let _ = notif_ui_tx.send(UiEvent::SessionUpdate(notification.update));
                 }
                 Ok(())
@@ -1320,6 +1351,7 @@ where
                 fatal_emitted,
                 session_state,
                 drive_terminals,
+                runtime_config,
             )
             .await
             {
@@ -1350,6 +1382,7 @@ async fn drive_session(
     fatal_emitted: Arc<AtomicBool>,
     session_state: RuntimeSessionState,
     terminals: Arc<ManagedTerminals>,
+    runtime_config: Option<AcpRuntimeConfig>,
 ) -> Result<()> {
     // Advertise the client capabilities backed by handlers registered in
     // `drive_client` above.
@@ -1519,6 +1552,30 @@ async fn drive_session(
                     &session_id,
                     text,
                     images,
+                    ui_tx,
+                    ui_rx,
+                    &session_state,
+                )
+                .await?
+                {
+                    break;
+                }
+            }
+            UiCommand::RunRagnarok { task, display_text } => {
+                let Some(runtime_config) = runtime_config.clone() else {
+                    let _ = ui_tx.send(UiEvent::PromptFailed {
+                        message: "Ragnarok requires a spawnable ACP runtime configuration"
+                            .to_string(),
+                    });
+                    continue;
+                };
+                session_state.clear_permissions_cancelled(&session_id).await;
+                if !drive_ragnarok_turn(
+                    &conn,
+                    &session_id,
+                    runtime_config,
+                    task,
+                    display_text,
                     ui_tx,
                     ui_rx,
                     &session_state,
@@ -1807,7 +1864,7 @@ async fn drive_fork_session(
                     Some(UiCommand::Shutdown) | None => {
                         return Ok(false);
                     }
-                    Some(UiCommand::SendPrompt { .. }) => {
+                    Some(UiCommand::SendPrompt { .. } | UiCommand::RunRagnarok { .. }) => {
                         let _ = ui_tx.send(UiEvent::PromptFailed {
                             message: "prompt failed: session fork already in flight".to_string(),
                         });
@@ -3071,10 +3128,146 @@ fn set_current_config_value(
     }
 }
 
+#[derive(Debug, Clone, Default)]
 struct SessionConfigCache {
     options: Vec<SessionConfigOption>,
     targets: Vec<SessionConfigTarget>,
 }
+
+#[derive(Debug, Clone)]
+struct RagnarokChampion {
+    id: String,
+    name: String,
+    role: String,
+    instructions: String,
+    runtime_config: Option<AcpRuntimeConfig>,
+}
+
+#[derive(Debug)]
+struct RagnarokChampionResult {
+    champion: RagnarokChampion,
+    agent_label: String,
+    model_label: Option<String>,
+    connection_id: String,
+    workspace_path: PathBuf,
+    success: bool,
+    final_text: String,
+    error: Option<String>,
+    transcript: Vec<RagnarokProgressItem>,
+    diff: String,
+    usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone)]
+struct RagnarokProgressItem {
+    turn: &'static str,
+    item: String,
+}
+
+#[derive(Clone)]
+struct RagnarokConnection {
+    id: String,
+    cwd: PathBuf,
+    cmd_tx: mpsc::UnboundedSender<UiCommand>,
+    state: Arc<Mutex<RagnarokConnectionState>>,
+    runtime_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+#[derive(Debug)]
+struct RagnarokConnectionState {
+    connection_status: ConnStatusLite,
+    status_message: Option<String>,
+    agent_name: Option<String>,
+    agent_version: Option<String>,
+    session_id: Option<String>,
+    config: SessionConfigCache,
+    turn: RagnarokTurnState,
+    permission_mode: RagnarokPermissionMode,
+    progress: Vec<RagnarokProgressItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnStatusLite {
+    Connecting,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug)]
+struct RagnarokTurnState {
+    status: RagnarokTurnStatus,
+    final_text: String,
+    stop_reason: Option<StopReason>,
+    usage: Option<Usage>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RagnarokTurnStatus {
+    Idle,
+    Running,
+    Done,
+    Failed,
+}
+
+impl RagnarokTurnStatus {
+    fn is_active(self) -> bool {
+        matches!(self, Self::Running)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RagnarokPermissionMode {
+    /// Planning and critique turns are read-only by policy.
+    ReadOnly,
+    /// Solve turns may edit/write/move/delete and run verification inside their
+    /// isolated worktree. This is intentionally more permissive than critique
+    /// mode so champions can actually build and test their versions.
+    ChampionSandbox,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RagnarokTurnKind {
+    Champion,
+    Critique,
+}
+
+const RAGNAROK_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+const RAGNAROK_TURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const RAGNAROK_CONFIG_TIMEOUT: Duration = Duration::from_secs(20);
+const RAGNAROK_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const RAGNAROK_FINAL_TEXT_LIMIT: usize = 64 * 1024;
+const RAGNAROK_DIFF_TEXT_LIMIT: usize = 96 * 1024;
+const RAGNAROK_PROGRESS_ITEM_LIMIT: usize = 2 * 1024;
+const RAGNAROK_CONFIG_CHOICE_LIMIT: usize = 4 * 1024;
+
+struct DefaultRagnarokChampion {
+    id: &'static str,
+    name: &'static str,
+    role: &'static str,
+    instructions: &'static str,
+}
+
+const DEFAULT_RAGNAROK_CHAMPIONS: &[DefaultRagnarokChampion] = &[
+    DefaultRagnarokChampion {
+        id: "heimdall",
+        name: "Heimdall",
+        role: "sentinel reviewer",
+        instructions: "Optimize for correctness, invariants, regression safety, and edge cases. Be skeptical of shallow patches.",
+    },
+    DefaultRagnarokChampion {
+        id: "loki",
+        name: "Loki",
+        role: "adversarial simplifier",
+        instructions: "Find the clever minimal design, remove accidental complexity, and look for surprising failure modes.",
+    },
+    DefaultRagnarokChampion {
+        id: "freya",
+        name: "Freya",
+        role: "UX and integration champion",
+        instructions: "Optimize for user experience, integration with existing code, helpful tests, and maintainability.",
+    },
+];
 
 async fn drive_config_update(
     conn: &ConnectionTo<Agent>,
@@ -3125,7 +3318,7 @@ async fn drive_config_update(
                     Some(UiCommand::Shutdown) | None => {
                         return Ok(false);
                     }
-                    Some(UiCommand::SendPrompt { .. }) => {
+                    Some(UiCommand::SendPrompt { .. } | UiCommand::RunRagnarok { .. }) => {
                         let _ = ui_tx.send(UiEvent::PromptFailed {
                             message: "prompt failed: config update already in flight".to_string(),
                         });
@@ -3181,6 +3374,1162 @@ fn legacy_model_config_update_error() -> agent_client_protocol::Error {
     }))
 }
 
+fn ragnarok_thor_plan_prompt(task: &str, champions: &[RagnarokChampion]) -> String {
+    format!(
+        "Thor, invoke Ragnarok for this task.\n\n\
+         Task:\n{task}\n\n\
+         Configured candidate champions:\n{}\n\n\
+         First, do not solve yet. Evaluate complexity, risk, affected areas, likely test strategy, and which candidate champion agents/models should compete. Return a compact battle plan with explicit judging criteria. End with an exact machine-readable line `SELECTED_CHAMPIONS: id1,id2,...` using only champion ids from the candidate list. Pick all useful champions for hard tasks; pick fewer only when the task is clearly simple.",
+        champion_roster_for_prompt(champions)
+    )
+}
+
+fn ragnarok_champion_prompt(task: &str, champion: &RagnarokChampion, plan: &str) -> String {
+    format!(
+        "You are {name}, {role}, competing in Thor's Ragnarok.\n\n\
+         Task:\n{task}\n\n\
+         Thor's battle plan and judging criteria:\n{plan}\n\n\
+         Champion mandate:\n{instructions}\n\n\
+         Produce your best independent solution in this isolated worktree. Make needed code changes directly when the task asks for implementation. Include focused tests or verification steps. End with a concise summary of what you changed, why it is strong, and any remaining risk.",
+        name = champion.name,
+        role = champion.role,
+        instructions = champion.instructions,
+    )
+}
+
+fn ragnarok_critique_prompt(
+    task: &str,
+    champion: &RagnarokChampion,
+    plan: &str,
+    rivals: &str,
+) -> String {
+    format!(
+        "You are {name}, {role}, now in Ragnarok critique combat.\n\n\
+         Original task:\n{task}\n\n\
+         Thor's judging criteria:\n{plan}\n\n\
+         Rival submissions to critique:\n{rivals}\n\n\
+         Critique the rival versions and your own likely blind spots. Identify concrete bugs, missing tests, design flaws, overfit assumptions, and merge risks. Do not make more code changes in this turn; deliver battle notes Thor can use for final judgment.",
+        name = champion.name,
+        role = champion.role,
+    )
+}
+
+fn truncate_for_ragnarok_prompt(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n… [truncated {} bytes]", &text[..end], text.len() - end)
+}
+
+fn ragnarok_judgment_prompt(
+    task: &str,
+    display_text: &str,
+    plan: &str,
+    champion_results: &[RagnarokChampionResult],
+) -> String {
+    let mut report = String::new();
+    for result in champion_results {
+        let _ = writeln!(
+            report,
+            "\n## Champion: {} ({})\nstatus: {}\nagent: {}\nmodel/config: {}\nconnection: {}\nworkspace: {}",
+            result.champion.name,
+            result.champion.role,
+            if result.success {
+                "completed"
+            } else {
+                "failed"
+            },
+            result.agent_label,
+            result.model_label.as_deref().unwrap_or("not advertised"),
+            result.connection_id,
+            result.workspace_path.display()
+        );
+        if let Some(error) = &result.error {
+            let _ = writeln!(report, "error: {error}");
+        }
+        if let Some(usage) = &result.usage {
+            let _ = writeln!(
+                report,
+                "usage: total={} input={} output={}",
+                usage.total_tokens, usage.input_tokens, usage.output_tokens
+            );
+        }
+        if !result.final_text.trim().is_empty() {
+            let _ = writeln!(
+                report,
+                "\n### Final answer\n{}",
+                truncate_for_ragnarok_prompt(result.final_text.trim(), RAGNAROK_FINAL_TEXT_LIMIT)
+            );
+        }
+        if !result.diff.trim().is_empty() {
+            let _ = writeln!(
+                report,
+                "\n### Workspace diff\n```diff\n{}\n```",
+                truncate_for_ragnarok_prompt(result.diff.trim(), RAGNAROK_DIFF_TEXT_LIMIT)
+            );
+        }
+        if !result.transcript.is_empty() {
+            let _ = writeln!(report, "\n### Progress highlights");
+            for item in result.transcript.iter().take(80) {
+                let _ = writeln!(
+                    report,
+                    "- [{}] {}",
+                    item.turn,
+                    truncate_for_ragnarok_prompt(&item.item, RAGNAROK_PROGRESS_ITEM_LIMIT)
+                );
+            }
+        }
+    }
+
+    format!(
+        "Thor, conclude Ragnarok for this user command: {display_text}\n\n\
+         Original task:\n{task}\n\n\
+         Your initial battle plan:\n{plan}\n\n\
+         Champion submissions, critique transcripts, and workspace diffs:\n{report}\n\n\
+         Choose the winning version. The champion diffs above were generated from isolated worktrees. Port/apply the winning implementation to the current session workspace as needed, reconcile any critique findings, and do not merely summarize if code changes are required. Then present the final result to the user: what actually won, why it won, what changed, verification performed or still needed, and remaining uncertainty. Be decisive; do not hand-wave the competition."
+    )
+}
+
+fn ragnarok_stage_message(message: impl Into<String>) -> UiEvent {
+    UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+        ContentChunk::new(ContentBlock::Text(TextContent::new(message.into())))
+            .message_id(MessageId::new("mj-ragnarok")),
+    ))
+}
+
+fn ragnarok_tool_update(
+    id: impl Into<String>,
+    title: impl Into<String>,
+    status: ToolCallStatus,
+) -> UiEvent {
+    UiEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        id.into(),
+        ToolCallUpdateFields::new()
+            .kind(ToolKind::Think)
+            .status(status)
+            .title(title.into()),
+    )))
+}
+
+fn emit_ragnarok_stage(ui_tx: &mpsc::UnboundedSender<UiEvent>, message: impl Into<String>) {
+    let _ = ui_tx.send(ragnarok_stage_message(message));
+}
+
+fn emit_ragnarok_tool(
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    id: impl Into<String>,
+    title: impl Into<String>,
+    status: ToolCallStatus,
+) {
+    let _ = ui_tx.send(ragnarok_tool_update(id, title, status));
+}
+
+fn ragnarok_connection_config(
+    base: &AcpRuntimeConfig,
+    champion: &RagnarokChampion,
+) -> AcpRuntimeConfig {
+    let mut cfg = champion
+        .runtime_config
+        .clone()
+        .unwrap_or_else(|| base.clone());
+    cfg.resume_session = None;
+    cfg.cwd = ragnarok_champion_workspace(&base.cwd, &champion.id);
+    cfg.additional_directories = Vec::new();
+    cfg.agent_stderr = base.agent_stderr.clone();
+    cfg.fs_max_text_bytes = base.fs_max_text_bytes;
+    cfg
+}
+
+fn sanitize_ragnarok_id(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '-' | '_') && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-');
+    if out.is_empty() {
+        "champion".to_string()
+    } else {
+        out.to_string()
+    }
+}
+
+fn default_ragnarok_champions(base_config: &AcpRuntimeConfig) -> Vec<RagnarokChampion> {
+    let mut champions: Vec<RagnarokChampion> = DEFAULT_RAGNAROK_CHAMPIONS
+        .iter()
+        .map(|c| RagnarokChampion {
+            id: c.id.to_string(),
+            name: c.name.to_string(),
+            role: c.role.to_string(),
+            instructions: c.instructions.to_string(),
+            runtime_config: Some(base_config.clone()),
+        })
+        .collect();
+
+    if let Ok(cfg) = config::Config::load(&config::default_config_path()) {
+        for custom in cfg.custom_agents {
+            let name = custom.name.clone();
+            champions.push(RagnarokChampion {
+                id: format!("custom-{}", sanitize_ragnarok_id(&name)),
+                name: name.clone(),
+                role: "configured custom agent".to_string(),
+                instructions: if custom.description.trim().is_empty() {
+                    "Compete using this configured custom ACP agent's strengths.".to_string()
+                } else {
+                    custom.description.clone()
+                },
+                runtime_config: Some(AcpRuntimeConfig {
+                    command: custom.program,
+                    args: custom.args,
+                    cwd: base_config.cwd.clone(),
+                    additional_directories: Vec::new(),
+                    resume_session: None,
+                    env: HashMap::new(),
+                    agent_stderr: base_config.agent_stderr.clone(),
+                    fs_max_text_bytes: base_config.fs_max_text_bytes,
+                }),
+            });
+        }
+    }
+    champions
+}
+
+fn ragnarok_champion_workspace(base_cwd: &Path, champion_id: &str) -> PathBuf {
+    base_cwd
+        .join(".mjolnir")
+        .join("worktrees")
+        .join("ragnarok")
+        .join(sanitize_ragnarok_id(champion_id))
+}
+
+async fn prepare_ragnarok_workspace(
+    base_cwd: &Path,
+    champion: &RagnarokChampion,
+) -> Result<PathBuf> {
+    let path = ragnarok_champion_workspace(base_cwd, &champion.id);
+    reset_ragnarok_workspace(base_cwd, &path).await?;
+    Ok(path)
+}
+
+async fn reset_ragnarok_workspace(base_cwd: &Path, path: &Path) -> Result<()> {
+    if path.exists() {
+        let _ = Command::new("git")
+            .arg("worktree")
+            .arg("remove")
+            .arg("--force")
+            .arg(path)
+            .current_dir(base_cwd)
+            .status()
+            .await;
+        if path.exists() {
+            tokio::fs::remove_dir_all(path).await?;
+        }
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid Ragnarok workspace path"))?;
+    tokio::fs::create_dir_all(parent).await?;
+
+    if tokio::fs::metadata(base_cwd.join(".git")).await.is_ok() {
+        let status = Command::new("git")
+            .arg("worktree")
+            .arg("add")
+            .arg("--detach")
+            .arg(path)
+            .arg("HEAD")
+            .current_dir(base_cwd)
+            .status()
+            .await?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    // Fallback for non-Git dirs or environments where the parent repo's
+    // worktree metadata is unavailable. Copy the current checkout so each
+    // champion still gets an isolated filesystem and Thor can judge a diff.
+    copy_dir_for_ragnarok(base_cwd, path).await
+}
+
+async fn copy_dir_for_ragnarok(src: &Path, dst: &Path) -> Result<()> {
+    let src = src.to_path_buf();
+    let dst = dst.to_path_buf();
+    tokio::task::spawn_blocking(move || copy_dir_for_ragnarok_sync(&src, &dst)).await??;
+    Ok(())
+}
+
+fn copy_dir_for_ragnarok_sync(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_lossy = name.to_string_lossy();
+        if name_lossy == ".git" || name_lossy == "target" {
+            continue;
+        }
+        if name_lossy == ".mjolnir" {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(&name);
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_for_ragnarok_sync(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = dst_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&src_path, &dst_path)?;
+        } else if file_type.is_symlink() {
+            // Avoid following symlinks out of the workspace. Champions can still
+            // reason from the copied regular files.
+            continue;
+        }
+    }
+    Ok(())
+}
+
+async fn ragnarok_workspace_diff(path: &Path) -> String {
+    match Command::new("git")
+        .arg("diff")
+        .arg("--")
+        .current_dir(path)
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            format!("git diff failed: {stderr}")
+        }
+        Err(e) => format!("git diff failed: {e}"),
+    }
+}
+
+fn selected_ragnarok_champions(
+    plan: &str,
+    candidates: &[RagnarokChampion],
+) -> Vec<RagnarokChampion> {
+    let selected_line = plan
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("SELECTED_CHAMPIONS:"));
+    let Some(selected_line) = selected_line else {
+        return candidates.to_vec();
+    };
+    let wanted: HashSet<String> = selected_line
+        .split(',')
+        .map(|id| sanitize_ragnarok_id(id.trim()))
+        .filter(|id| !id.is_empty())
+        .collect();
+    let selected: Vec<_> = candidates
+        .iter()
+        .filter(|champion| wanted.contains(&sanitize_ragnarok_id(&champion.id)))
+        .cloned()
+        .collect();
+    if selected.is_empty() {
+        candidates.to_vec()
+    } else {
+        selected
+    }
+}
+
+fn ragnarok_model_label(config: &SessionConfigCache) -> Option<String> {
+    config.options.iter().find_map(|option| {
+        let name = option.name.to_ascii_lowercase();
+        let id = option.id.to_string().to_ascii_lowercase();
+        if !name.contains("model") && !id.contains("model") {
+            return None;
+        }
+        match &option.kind {
+            SessionConfigKind::Select(select) => Some(select.current_value.to_string()),
+            _ => None,
+        }
+    })
+}
+
+fn summarize_config_options(config: &SessionConfigCache) -> String {
+    let mut out = String::new();
+    for (idx, option) in config.options.iter().enumerate() {
+        if idx >= 12 {
+            out.push_str("… additional config options omitted\n");
+            break;
+        }
+        if let SessionConfigKind::Select(select) = &option.kind {
+            let current = select.current_value.to_string();
+            let mut choices = Vec::new();
+            match &select.options {
+                agent_client_protocol::schema::v1::SessionConfigSelectOptions::Ungrouped(
+                    options,
+                ) => {
+                    for opt in options {
+                        choices.push(format!("{} ({})", opt.name, opt.value));
+                    }
+                }
+                agent_client_protocol::schema::v1::SessionConfigSelectOptions::Grouped(groups) => {
+                    for group in groups {
+                        for opt in &group.options {
+                            choices.push(format!("{} / {} ({})", group.name, opt.name, opt.value));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let _ = writeln!(
+                out,
+                "{}. {} [{}] current={} choices={}",
+                idx + 1,
+                option.name,
+                option.id,
+                current,
+                truncate_for_ragnarok_prompt(&choices.join(", "), RAGNAROK_CONFIG_CHOICE_LIMIT)
+            );
+        }
+    }
+    if out.is_empty() {
+        "No selectable session config options advertised.".to_string()
+    } else {
+        out
+    }
+}
+
+fn summarize_champion_roster(champions: &[RagnarokChampion]) -> String {
+    champions
+        .iter()
+        .map(|c| format!("- {} ({})", c.name, c.role))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn champion_roster_for_prompt(champions: &[RagnarokChampion]) -> String {
+    champions
+        .iter()
+        .map(|c| {
+            format!(
+                "- id={} name={} role={} instructions={} agent={}",
+                c.id,
+                c.name,
+                c.role,
+                c.instructions,
+                c.runtime_config
+                    .as_ref()
+                    .map(|cfg| format!("{} {}", cfg.command.display(), cfg.args.join(" ")))
+                    .unwrap_or_else(|| "current default agent".to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn ragnarok_permission_decision(
+    mode: RagnarokPermissionMode,
+    kind: Option<ToolKind>,
+    options: &[PermissionOption],
+) -> PermissionDecision {
+    let allow = match mode {
+        RagnarokPermissionMode::ReadOnly => matches!(
+            kind,
+            Some(ToolKind::Read | ToolKind::Search | ToolKind::Think)
+        ),
+        RagnarokPermissionMode::ChampionSandbox => matches!(
+            kind,
+            Some(
+                ToolKind::Read
+                    | ToolKind::Search
+                    | ToolKind::Think
+                    | ToolKind::Edit
+                    | ToolKind::Delete
+                    | ToolKind::Move
+                    | ToolKind::Execute
+            )
+        ),
+    };
+    if allow
+        && let Some(option) = options
+            .iter()
+            .find(|option| option.kind == PermissionOptionKind::AllowAlways)
+            .or_else(|| {
+                options
+                    .iter()
+                    .find(|option| option.kind == PermissionOptionKind::AllowOnce)
+            })
+    {
+        PermissionDecision::Selected(option.option_id.to_string())
+    } else {
+        PermissionDecision::Cancelled
+    }
+}
+
+async fn teardown_ragnarok_connection(conn: &RagnarokConnection) {
+    let _ = conn.cmd_tx.send(UiCommand::Shutdown);
+    let handle = conn.runtime_task.lock().await.take();
+    if let Some(handle) = handle {
+        let aborter = handle.abort_handle();
+        if tokio::time::timeout(RAGNAROK_TEARDOWN_TIMEOUT, handle)
+            .await
+            .is_err()
+        {
+            aborter.abort();
+        }
+    }
+}
+
+fn new_ragnarok_state(permission_mode: RagnarokPermissionMode) -> RagnarokConnectionState {
+    RagnarokConnectionState {
+        connection_status: ConnStatusLite::Connecting,
+        status_message: None,
+        agent_name: None,
+        agent_version: None,
+        session_id: None,
+        config: SessionConfigCache::default(),
+        turn: RagnarokTurnState {
+            status: RagnarokTurnStatus::Idle,
+            final_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            error: None,
+        },
+        permission_mode,
+        progress: Vec::new(),
+    }
+}
+
+fn spawn_ragnarok_connection(cfg: AcpRuntimeConfig, id: impl Into<String>) -> RagnarokConnection {
+    let id = id.into();
+    let cwd = cfg.cwd.clone();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let state = Arc::new(Mutex::new(new_ragnarok_state(
+        RagnarokPermissionMode::ChampionSandbox,
+    )));
+    let pump_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            fold_ragnarok_event(&pump_state, event).await;
+        }
+        let mut st = pump_state.lock().await;
+        if st.connection_status == ConnStatusLite::Connecting {
+            st.connection_status = ConnStatusLite::Failed;
+            st.status_message
+                .get_or_insert_with(|| "agent exited before session started".to_string());
+        }
+        if st.turn.status.is_active() {
+            st.turn.status = RagnarokTurnStatus::Failed;
+            st.turn
+                .error
+                .get_or_insert_with(|| "agent connection closed".to_string());
+        }
+    });
+
+    let runtime_task = tokio::spawn(async move {
+        let _ = run(cfg, event_tx, cmd_rx).await;
+    });
+
+    RagnarokConnection {
+        id,
+        cwd,
+        cmd_tx,
+        state,
+        runtime_task: Arc::new(Mutex::new(Some(runtime_task))),
+    }
+}
+
+async fn fold_ragnarok_event(state: &Arc<Mutex<RagnarokConnectionState>>, event: UiEvent) {
+    match event {
+        UiEvent::Connected {
+            agent_name,
+            agent_version,
+            ..
+        } => {
+            let mut st = state.lock().await;
+            st.agent_name = agent_name;
+            st.agent_version = agent_version;
+        }
+        UiEvent::SessionStarted { session_id, .. } => {
+            let mut st = state.lock().await;
+            st.session_id = Some(session_id);
+            if st.connection_status == ConnStatusLite::Connecting {
+                st.connection_status = ConnStatusLite::Ready;
+            }
+        }
+        UiEvent::SessionConfigOptions { options, targets } => {
+            let mut st = state.lock().await;
+            st.config = SessionConfigCache { options, targets };
+        }
+        UiEvent::SessionUpdate(update) => {
+            let mut st = state.lock().await;
+            fold_ragnarok_update(&mut st, update);
+        }
+        UiEvent::PermissionRequest(prompt) => {
+            let (decision, title) = {
+                let st = state.lock().await;
+                let title = prompt.tool_call.fields.title.clone().unwrap_or_default();
+                (
+                    ragnarok_permission_decision(
+                        st.permission_mode,
+                        prompt.tool_call.fields.kind,
+                        &prompt.options,
+                    ),
+                    title,
+                )
+            };
+            let decision_text = match &decision {
+                PermissionDecision::Selected(id) => {
+                    format!("auto-allowed permission {id}: {title}")
+                }
+                PermissionDecision::Cancelled => format!("auto-cancelled permission: {title}"),
+            };
+            let _ = prompt.responder.send(decision);
+            let mut st = state.lock().await;
+            st.progress.push(RagnarokProgressItem {
+                turn: "permission",
+                item: decision_text,
+            });
+        }
+        UiEvent::CancelPendingPermissions => {
+            let mut st = state.lock().await;
+            st.progress.push(RagnarokProgressItem {
+                turn: "permission",
+                item: "pending permissions cancelled".to_string(),
+            });
+        }
+        UiEvent::PromptDone { stop_reason, usage } => {
+            let mut st = state.lock().await;
+            st.turn.status = RagnarokTurnStatus::Done;
+            st.turn.stop_reason = Some(stop_reason);
+            st.turn.usage = usage;
+        }
+        UiEvent::PromptFailed { message } | UiEvent::SessionForkFailed { message } => {
+            let mut st = state.lock().await;
+            st.turn.status = RagnarokTurnStatus::Failed;
+            st.turn.error = Some(message);
+        }
+        UiEvent::Fatal(message) => {
+            let mut st = state.lock().await;
+            st.connection_status = ConnStatusLite::Failed;
+            st.status_message = Some(message.clone());
+            st.turn.status = RagnarokTurnStatus::Failed;
+            st.turn.error = Some(message);
+        }
+        UiEvent::Warning(message) | UiEvent::Info(message) => {
+            let mut st = state.lock().await;
+            st.progress.push(RagnarokProgressItem {
+                turn: "status",
+                item: message,
+            });
+        }
+        UiEvent::ElicitationRequest(prompt) => {
+            let _ = prompt.responder.send(ElicitationOutcome::Decline);
+        }
+        UiEvent::TerminalOutput(_)
+        | UiEvent::RemotePermissionDecision { .. }
+        | UiEvent::ClaudeUsage(_) => {}
+    }
+}
+
+fn fold_ragnarok_update(st: &mut RagnarokConnectionState, update: SessionUpdate) {
+    match update {
+        SessionUpdate::AgentMessageChunk(chunk) => {
+            let text = crate::event::content_block_text(&chunk.content);
+            st.turn.final_text.push_str(&text);
+            st.progress.push(RagnarokProgressItem {
+                turn: "message",
+                item: text,
+            });
+        }
+        SessionUpdate::AgentThoughtChunk(chunk) => {
+            let text = crate::event::content_block_text(&chunk.content);
+            st.progress.push(RagnarokProgressItem {
+                turn: "thought",
+                item: text,
+            });
+        }
+        SessionUpdate::ToolCall(tool_call) => {
+            st.progress.push(RagnarokProgressItem {
+                turn: "tool",
+                item: format!("{}: {}", tool_call.tool_call_id, tool_call.title),
+            });
+        }
+        SessionUpdate::ToolCallUpdate(update) => {
+            let mut text = update.tool_call_id.to_string();
+            if let Some(title) = update.fields.title {
+                text.push_str(": ");
+                text.push_str(&title);
+            }
+            if let Some(status) = update.fields.status {
+                let _ = write!(text, " [{status:?}]");
+            }
+            st.progress.push(RagnarokProgressItem {
+                turn: "tool_update",
+                item: text,
+            });
+        }
+        _ => {}
+    }
+}
+
+async fn wait_for_ragnarok_connection_ready(conn: &RagnarokConnection) -> Result<()> {
+    let connected = wait_until(RAGNAROK_CONNECT_TIMEOUT, || {
+        let state = conn.state.clone();
+        async move { state.lock().await.connection_status != ConnStatusLite::Connecting }
+    })
+    .await;
+    if connected {
+        let _ = wait_until(RAGNAROK_CONFIG_TIMEOUT, || {
+            let state = conn.state.clone();
+            async move { !state.lock().await.config.options.is_empty() }
+        })
+        .await;
+    }
+    let st = conn.state.lock().await;
+    if connected && st.connection_status == ConnStatusLite::Ready {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "{} failed to connect: {}",
+            conn.id,
+            st.status_message
+                .clone()
+                .unwrap_or_else(|| "timed out waiting for session".to_string())
+        ))
+    }
+}
+
+async fn wait_until<F, Fut>(timeout: Duration, mut predicate: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    tokio::time::timeout(timeout, async {
+        loop {
+            if predicate().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+async fn run_ragnarok_prompt(
+    conn: &RagnarokConnection,
+    champion: RagnarokChampion,
+    prompt: String,
+    kind: RagnarokTurnKind,
+) -> RagnarokChampionResult {
+    {
+        let mut st = conn.state.lock().await;
+        st.turn = RagnarokTurnState {
+            status: RagnarokTurnStatus::Running,
+            final_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            error: None,
+        };
+        st.permission_mode = match kind {
+            RagnarokTurnKind::Critique => RagnarokPermissionMode::ReadOnly,
+            RagnarokTurnKind::Champion => RagnarokPermissionMode::ChampionSandbox,
+        };
+    }
+    if conn
+        .cmd_tx
+        .send(UiCommand::SendPrompt {
+            text: prompt,
+            images: Vec::new(),
+        })
+        .is_err()
+    {
+        return RagnarokChampionResult {
+            champion,
+            agent_label: "closed".to_string(),
+            model_label: None,
+            connection_id: conn.id.clone(),
+            workspace_path: conn.cwd.clone(),
+            success: false,
+            final_text: String::new(),
+            error: Some("connection closed".to_string()),
+            transcript: Vec::new(),
+            diff: String::new(),
+            usage: None,
+        };
+    }
+
+    let finished = wait_until(RAGNAROK_TURN_TIMEOUT, || {
+        let state = conn.state.clone();
+        async move {
+            let st = state.lock().await;
+            !st.turn.status.is_active()
+        }
+    })
+    .await;
+    let st = conn.state.lock().await;
+    let agent_label = match (&st.agent_name, &st.agent_version) {
+        (Some(name), Some(version)) => format!("{name} {version}"),
+        (Some(name), None) => name.clone(),
+        (None, Some(version)) => format!("unknown {version}"),
+        (None, None) => "unknown".to_string(),
+    };
+    let model_label = ragnarok_model_label(&st.config);
+    RagnarokChampionResult {
+        champion,
+        agent_label,
+        model_label,
+        connection_id: conn.id.clone(),
+        workspace_path: conn.cwd.clone(),
+        success: finished && st.turn.status == RagnarokTurnStatus::Done,
+        final_text: st.turn.final_text.clone(),
+        error: if finished {
+            st.turn.error.clone()
+        } else {
+            Some("timed out waiting for Ragnarok turn".to_string())
+        },
+        transcript: st.progress.clone(),
+        diff: ragnarok_workspace_diff(&conn.cwd).await,
+        usage: st.turn.usage.clone(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_ragnarok_turn(
+    conn: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    base_config: AcpRuntimeConfig,
+    task: String,
+    display_text: String,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
+    session_state: &RuntimeSessionState,
+) -> Result<bool> {
+    let started = Instant::now();
+    emit_ragnarok_stage(ui_tx, "⚡ Ragnarok begins. Thor is reading the runes...\n");
+    emit_ragnarok_tool(
+        ui_tx,
+        "mj-ragnarok-plan",
+        "Thor plans the battlefield",
+        ToolCallStatus::InProgress,
+    );
+
+    let candidate_champions = default_ragnarok_champions(&base_config);
+    let plan_prompt = ragnarok_thor_plan_prompt(&task, &candidate_champions);
+    session_state.begin_prompt_capture().await;
+    let plan_outcome = drive_prompt_turn_inner(
+        conn,
+        session_id,
+        plan_prompt,
+        Vec::new(),
+        ui_tx,
+        ui_rx,
+        session_state,
+        false,
+    )
+    .await?;
+    let plan = session_state
+        .take_prompt_capture()
+        .await
+        .unwrap_or_default();
+    if !plan_outcome.keep_running {
+        return Ok(false);
+    }
+    if matches!(plan_outcome.stop_reason, Some(StopReason::Cancelled)) {
+        let _ = ui_tx.send(UiEvent::PromptDone {
+            stop_reason: StopReason::Cancelled,
+            usage: plan_outcome.usage,
+        });
+        return Ok(true);
+    }
+    if let Some(error) = plan_outcome.error {
+        let _ = ui_tx.send(UiEvent::PromptFailed { message: error });
+        return Ok(true);
+    }
+    emit_ragnarok_tool(
+        ui_tx,
+        "mj-ragnarok-plan",
+        "Thor planned the battlefield",
+        ToolCallStatus::Completed,
+    );
+    let plan = if plan.trim().is_empty() {
+        "Thor completed the planning turn, but it produced no text. Judge by the original task and champion results.".to_string()
+    } else {
+        plan
+    };
+    let selected_champions = selected_ragnarok_champions(&plan, &candidate_champions);
+    emit_ragnarok_stage(
+        ui_tx,
+        format!(
+            "\n⚔ Champions enter the arena:\n{}\n\n",
+            summarize_champion_roster(&selected_champions)
+        ),
+    );
+
+    let mut champion_connections = Vec::new();
+    for champion in &selected_champions {
+        if let Err(e) = prepare_ragnarok_workspace(&base_config.cwd, champion).await {
+            emit_ragnarok_stage(
+                ui_tx,
+                format!("{} could not enter the arena: {e:#}\n", champion.name),
+            );
+            continue;
+        }
+        let cfg = ragnarok_connection_config(&base_config, champion);
+        let rconn = spawn_ragnarok_connection(cfg, champion.id.clone());
+        match wait_for_ragnarok_connection_ready(&rconn).await {
+            Ok(()) => {
+                let config_summary = {
+                    let st = rconn.state.lock().await;
+                    summarize_config_options(&st.config)
+                };
+                emit_ragnarok_stage(
+                    ui_tx,
+                    format!(
+                        "⚒ {} connected as {}. Config options:\n{}\n",
+                        champion.name, champion.role, config_summary
+                    ),
+                );
+                champion_connections.push((champion.clone(), rconn));
+            }
+            Err(e) => {
+                emit_ragnarok_stage(
+                    ui_tx,
+                    format!("{} failed to connect: {e:#}\n", champion.name),
+                );
+                teardown_ragnarok_connection(&rconn).await;
+            }
+        }
+    }
+
+    if champion_connections.is_empty() {
+        let _ = ui_tx.send(UiEvent::PromptFailed {
+            message: "Ragnarok failed: no champion agents could connect".to_string(),
+        });
+        return Ok(true);
+    }
+
+    emit_ragnarok_tool(
+        ui_tx,
+        "mj-ragnarok-champions",
+        "Champion agents forge competing versions",
+        ToolCallStatus::InProgress,
+    );
+    let mut handles = FuturesUnordered::new();
+    for (champion, rconn) in &champion_connections {
+        let prompt = ragnarok_champion_prompt(&task, champion, &plan);
+        let rconn = rconn.clone();
+        let champion = champion.clone();
+        handles.push(tokio::spawn(async move {
+            run_ragnarok_prompt(&rconn, champion, prompt, RagnarokTurnKind::Champion).await
+        }));
+    }
+
+    let mut results = Vec::new();
+    loop {
+        tokio::select! {
+            Some(joined) = handles.next() => {
+                match joined {
+                    Ok(result) => {
+                        emit_ragnarok_stage(
+                            ui_tx,
+                            format!(
+                                "{} {} the forge.\n",
+                                result.champion.name,
+                                if result.success { "survived" } else { "fell in" }
+                            ),
+                        );
+                        results.push(result);
+                    }
+                    Err(e) => emit_ragnarok_stage(ui_tx, format!("A champion task panicked: {e}\n")),
+                }
+            }
+            maybe_cmd = ui_rx.recv(), if !handles.is_empty() => {
+                match maybe_cmd {
+                    Some(UiCommand::CancelPrompt) => {
+                        for (_, rconn) in &champion_connections {
+                            let _ = rconn.cmd_tx.send(UiCommand::CancelPrompt);
+                        }
+                        session_state.mark_permissions_cancelled(session_id).await;
+                        let _ = ui_tx.send(UiEvent::CancelPendingPermissions);
+                    }
+                    Some(UiCommand::Shutdown) | None => {
+                        for (_, rconn) in &champion_connections {
+                            teardown_ragnarok_connection(rconn).await;
+                        }
+                        return Ok(false);
+                    }
+                    Some(UiCommand::SendPrompt { .. } | UiCommand::RunRagnarok { .. }) => {
+                        let _ = ui_tx.send(UiEvent::Warning("prompt already in flight".to_string()));
+                    }
+                    Some(UiCommand::SetSessionConfigOption { .. }) => {
+                        let _ = ui_tx.send(UiEvent::Warning("config updates are only supported while idle".to_string()));
+                    }
+                    Some(UiCommand::ForkSession) => {
+                        let _ = ui_tx.send(UiEvent::Warning("session fork is only supported while idle".to_string()));
+                    }
+                    Some(UiCommand::LoadSession { responder, .. }) => {
+                        let _ = responder.send(LoadSessionResult::Fallback { message: "prompt already in flight".to_string() });
+                    }
+                }
+            }
+            else => break,
+        }
+    }
+    emit_ragnarok_tool(
+        ui_tx,
+        "mj-ragnarok-champions",
+        "Champion agents forged competing versions",
+        ToolCallStatus::Completed,
+    );
+
+    let mut rival_summaries = String::new();
+    for result in &results {
+        let _ = writeln!(
+            rival_summaries,
+            "\n## {}\nstatus: {}\n{}",
+            result.champion.name,
+            if result.success {
+                "completed"
+            } else {
+                "failed"
+            },
+            result.final_text.trim()
+        );
+        if let Some(error) = &result.error {
+            let _ = writeln!(rival_summaries, "error: {error}");
+        }
+    }
+
+    emit_ragnarok_tool(
+        ui_tx,
+        "mj-ragnarok-critique",
+        "Champions critique each other",
+        ToolCallStatus::InProgress,
+    );
+    let mut critique_handles = FuturesUnordered::new();
+    for (champion, rconn) in &champion_connections {
+        let prompt = ragnarok_critique_prompt(&task, champion, &plan, &rival_summaries);
+        let rconn = rconn.clone();
+        let champion = champion.clone();
+        critique_handles.push(tokio::spawn(async move {
+            run_ragnarok_prompt(&rconn, champion, prompt, RagnarokTurnKind::Critique).await
+        }));
+    }
+    loop {
+        tokio::select! {
+            Some(joined) = critique_handles.next() => {
+                if let Ok(critique) = joined {
+                    emit_ragnarok_stage(
+                        ui_tx,
+                        format!("{}'s critique lands.\n", critique.champion.name),
+                    );
+                    results.push(critique);
+                }
+            }
+            maybe_cmd = ui_rx.recv(), if !critique_handles.is_empty() => {
+                match maybe_cmd {
+                    Some(UiCommand::CancelPrompt) => {
+                        for (_, rconn) in &champion_connections {
+                            let _ = rconn.cmd_tx.send(UiCommand::CancelPrompt);
+                        }
+                        session_state.mark_permissions_cancelled(session_id).await;
+                        let _ = ui_tx.send(UiEvent::CancelPendingPermissions);
+                    }
+                    Some(UiCommand::Shutdown) | None => {
+                        for (_, rconn) in &champion_connections {
+                            teardown_ragnarok_connection(rconn).await;
+                        }
+                        return Ok(false);
+                    }
+                    Some(UiCommand::SendPrompt { .. } | UiCommand::RunRagnarok { .. }) => {
+                        let _ = ui_tx.send(UiEvent::Warning("prompt already in flight".to_string()));
+                    }
+                    Some(UiCommand::SetSessionConfigOption { .. }) => {
+                        let _ = ui_tx.send(UiEvent::Warning("config updates are only supported while idle".to_string()));
+                    }
+                    Some(UiCommand::ForkSession) => {
+                        let _ = ui_tx.send(UiEvent::Warning("session fork is only supported while idle".to_string()));
+                    }
+                    Some(UiCommand::LoadSession { responder, .. }) => {
+                        let _ = responder.send(LoadSessionResult::Fallback { message: "prompt already in flight".to_string() });
+                    }
+                }
+            }
+            else => break,
+        }
+    }
+    emit_ragnarok_tool(
+        ui_tx,
+        "mj-ragnarok-critique",
+        "Champions completed critique combat",
+        ToolCallStatus::Completed,
+    );
+
+    for (_, rconn) in &champion_connections {
+        teardown_ragnarok_connection(rconn).await;
+    }
+
+    emit_ragnarok_tool(
+        ui_tx,
+        "mj-ragnarok-judgment",
+        "Thor judges and applies the winning version",
+        ToolCallStatus::InProgress,
+    );
+    let judgment_prompt = ragnarok_judgment_prompt(&task, &display_text, &plan, &results);
+    session_state.begin_prompt_capture().await;
+    let judgment_outcome = drive_prompt_turn_inner(
+        conn,
+        session_id,
+        judgment_prompt,
+        Vec::new(),
+        ui_tx,
+        ui_rx,
+        session_state,
+        false,
+    )
+    .await?;
+    let _judgment_text = session_state.take_prompt_capture().await;
+    if !judgment_outcome.keep_running {
+        return Ok(false);
+    }
+    emit_ragnarok_tool(
+        ui_tx,
+        "mj-ragnarok-judgment",
+        "Thor judged Ragnarok",
+        ToolCallStatus::Completed,
+    );
+    emit_ragnarok_stage(
+        ui_tx,
+        format!(
+            "\n🏆 Ragnarok ended after {:.1}s.\n",
+            started.elapsed().as_secs_f32()
+        ),
+    );
+    if let Some(error) = judgment_outcome.error {
+        let _ = ui_tx.send(UiEvent::PromptFailed { message: error });
+    } else {
+        let _ = ui_tx.send(UiEvent::PromptDone {
+            stop_reason: judgment_outcome.stop_reason.unwrap_or(StopReason::EndTurn),
+            usage: judgment_outcome.usage,
+        });
+    }
+    Ok(true)
+}
+
+#[derive(Debug)]
+struct PromptTurnOutcome {
+    keep_running: bool,
+    stop_reason: Option<StopReason>,
+    usage: Option<Usage>,
+    error: Option<String>,
+}
+
 async fn drive_prompt_turn(
     conn: &ConnectionTo<Agent>,
     session_id: &SessionId,
@@ -3190,6 +4539,31 @@ async fn drive_prompt_turn(
     ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
     session_state: &RuntimeSessionState,
 ) -> Result<bool> {
+    let outcome = drive_prompt_turn_inner(
+        conn,
+        session_id,
+        text,
+        images,
+        ui_tx,
+        ui_rx,
+        session_state,
+        true,
+    )
+    .await?;
+    Ok(outcome.keep_running)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_prompt_turn_inner(
+    conn: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    text: String,
+    images: Vec<PromptImage>,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
+    session_state: &RuntimeSessionState,
+    emit_completion: bool,
+) -> Result<PromptTurnOutcome> {
     let req = PromptRequest::new(session_id.clone(), prompt_content_blocks(text, images));
     let prompt = conn.send_request(req).block_task();
     tokio::pin!(prompt);
@@ -3198,20 +4572,38 @@ async fn drive_prompt_turn(
     loop {
         tokio::select! {
             prompt_result = &mut prompt => {
-                match prompt_result {
+                return Ok(match prompt_result {
                     Ok(resp) => {
-                        let _ = ui_tx.send(UiEvent::PromptDone {
-                            stop_reason: resp.stop_reason,
-                            usage: resp.usage,
-                        });
+                        let stop_reason = resp.stop_reason;
+                        let usage = resp.usage;
+                        if emit_completion {
+                            let _ = ui_tx.send(UiEvent::PromptDone {
+                                stop_reason,
+                                usage: usage.clone(),
+                            });
+                        }
+                        PromptTurnOutcome {
+                            keep_running: true,
+                            stop_reason: Some(stop_reason),
+                            usage,
+                            error: None,
+                        }
                     }
                     Err(e) => {
-                        let _ = ui_tx.send(UiEvent::PromptFailed {
-                            message: format!("prompt failed: {e}"),
-                        });
+                        let message = format!("prompt failed: {e}");
+                        if emit_completion {
+                            let _ = ui_tx.send(UiEvent::PromptFailed {
+                                message: message.clone(),
+                            });
+                        }
+                        PromptTurnOutcome {
+                            keep_running: true,
+                            stop_reason: None,
+                            usage: None,
+                            error: Some(message),
+                        }
                     }
-                }
-                return Ok(true);
+                });
             }
             maybe_cmd = ui_rx.recv() => {
                 match maybe_cmd {
@@ -3226,9 +4618,14 @@ async fn drive_prompt_turn(
                         }
                     }
                     Some(UiCommand::Shutdown) | None => {
-                        return Ok(false);
+                        return Ok(PromptTurnOutcome {
+                            keep_running: false,
+                            stop_reason: None,
+                            usage: None,
+                            error: None,
+                        });
                     }
-                    Some(UiCommand::SendPrompt { .. }) => {
+                    Some(UiCommand::SendPrompt { .. } | UiCommand::RunRagnarok { .. }) => {
                         let _ = ui_tx.send(UiEvent::Warning(
                             "prompt already in flight".to_string(),
                         ));

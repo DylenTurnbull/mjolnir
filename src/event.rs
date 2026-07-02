@@ -162,6 +162,10 @@ pub enum UiCommand {
         text: String,
         images: Vec<PromptImage>,
     },
+    /// Run a full Ragnarok orchestration: Thor plans the battle, separate
+    /// champion ACP agents compete in isolated worktrees, champions critique
+    /// one another, and Thor judges/applies the winner in the current session.
+    RunRagnarok { task: String, display_text: String },
     /// Set a session configuration option to a new value.
     SetSessionConfigOption {
         target: SessionConfigTarget,

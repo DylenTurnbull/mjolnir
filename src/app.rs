@@ -10,11 +10,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
-    AvailableCommand, Diff, ElicitationContentValue, ElicitationMode, ElicitationPropertySchema,
-    EnumOption, Plan, PlanEntry, SessionConfigKind, SessionConfigOption,
+    AvailableCommand, AvailableCommandInput, Diff, ElicitationContentValue, ElicitationMode,
+    ElicitationPropertySchema, EnumOption, Plan, PlanEntry, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOptions,
     SessionConfigValueId, SessionUpdate, StopReason, TerminalExitStatus, ToolCall, ToolCallContent,
-    ToolCallStatus, ToolCallUpdate, ToolKind, Usage, UsageUpdate,
+    ToolCallStatus, ToolCallUpdate, ToolKind, UnstructuredCommandInput, Usage, UsageUpdate,
 };
 use chrono::{DateTime, FixedOffset, Local, TimeZone};
 
@@ -39,6 +39,8 @@ const BUILTIN_LOAD_COMMAND: &str = "load";
 const BUILTIN_FORK_COMMAND: &str = "fork";
 const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
+const BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
+const RAGNAROK_COMMAND_HINT: &str = "task to forge in glorious combat";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
 
 fn builtin_new_command() -> AvailableCommand {
@@ -74,6 +76,16 @@ fn builtin_mjconfig_command() -> AvailableCommand {
     )
 }
 
+fn builtin_ragnarok_command() -> AvailableCommand {
+    AvailableCommand::new(
+        BUILTIN_RAGNAROK_COMMAND,
+        "Thor runs a multi-agent code battle and selects the winner",
+    )
+    .input(AvailableCommandInput::Unstructured(
+        UnstructuredCommandInput::new(RAGNAROK_COMMAND_HINT),
+    ))
+}
+
 fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: bool) {
     commands.retain(|command| {
         command.name != BUILTIN_NEW_COMMAND
@@ -82,10 +94,12 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
             && command.name != BUILTIN_FORK_COMMAND
             && command.name != BUILTIN_EXPORT_COMMAND
             && command.name != BUILTIN_MJCONFIG_COMMAND
+            && command.name != BUILTIN_RAGNAROK_COMMAND
     });
     if include_fork {
         commands.insert(0, builtin_fork_command());
     }
+    commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_mjconfig_command());
     commands.insert(0, builtin_export_command());
     commands.insert(0, builtin_load_command());
@@ -629,6 +643,8 @@ pub struct AppState {
     /// flight. They stay out of the transcript until the runtime actually
     /// sends them, then drain oldest-first.
     queued_prompts: VecDeque<QueuedPrompt>,
+    /// Whether the active prompt was launched by `/ragnarok`.
+    pub ragnarok_active: bool,
 }
 
 /// A prompt staged behind the currently streaming turn. The runtime takes
@@ -643,6 +659,8 @@ pub struct QueuedPrompt {
     /// Transcript-ready display text (matches what `submit_prompt` would
     /// have produced if the prompt had fired immediately).
     pub display_text: String,
+    /// Whether this prompt should use Ragnarok's combat animation while active.
+    pub ragnarok: bool,
 }
 
 #[derive(Debug)]
@@ -886,6 +904,7 @@ impl AppState {
             config_path: None,
             clipboard_lease: None,
             queued_prompts: VecDeque::new(),
+            ragnarok_active: false,
         }
     }
 
@@ -1248,6 +1267,7 @@ impl AppState {
         self.config_picker = None;
         self.autocomplete = Autocomplete::default();
         self.clear_queued_prompts();
+        self.ragnarok_active = false;
         // Preserve Fatal: a fatal event always supersedes a clean close,
         // since the channel-drop that triggers this method follows the
         // Fatal event by design.
@@ -1487,6 +1507,16 @@ impl AppState {
     /// Push a user prompt into the transcript immediately, before the
     /// command reaches the runtime. Keeps the UI responsive.
     pub fn record_user_prompt(&mut self, text: String) {
+        self.record_user_prompt_with_ragnarok(text, false);
+    }
+
+    /// Push a Ragnarok prompt into the transcript and enable its combat ornament.
+    pub fn record_ragnarok_prompt(&mut self, text: String) {
+        self.record_user_prompt_with_ragnarok(text, true);
+    }
+
+    fn record_user_prompt_with_ragnarok(&mut self, text: String, ragnarok: bool) {
+        self.ragnarok_active = ragnarok;
         self.transcript.push(Entry::UserPrompt(text.clone()));
         // Record in prompt history for Up/Down navigation, deduplicating
         // consecutive identical prompts.
@@ -1901,6 +1931,7 @@ impl AppState {
         ) {
             self.set_connection_state(ConnectionState::Ready);
         }
+        self.ragnarok_active = false;
     }
 
     fn fail_unfinished_tool_calls(&mut self) {
@@ -2975,6 +3006,7 @@ mod tests {
             text: "queued body".to_string(),
             images: Vec::new(),
             display_text: "queued body".to_string(),
+            ragnarok: false,
         });
 
         s.apply_event(UiEvent::PromptFailed {
@@ -3068,6 +3100,7 @@ mod tests {
                 text: "queued".to_string(),
                 images: Vec::new(),
                 display_text: "queued".to_string(),
+                ragnarok: false,
             });
             s.status_line = Some(StatusMessage::info("queued 1: queued"));
 
@@ -4024,7 +4057,10 @@ mod tests {
             .iter()
             .map(|&i| s.available_commands[i].name.as_str())
             .collect();
-        assert_eq!(names, vec!["new", "clear", "load", "export", "mjconfig"]);
+        assert_eq!(
+            names,
+            vec!["new", "clear", "load", "export", "mjconfig", "ragnarok"]
+        );
     }
 
     #[test]
@@ -4048,7 +4084,9 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "clear", "load", "export", "mjconfig", "fork"]
+            vec![
+                "new", "clear", "load", "export", "mjconfig", "ragnarok", "fork"
+            ]
         );
     }
 
@@ -4084,6 +4122,7 @@ mod tests {
                 "load",
                 "export",
                 "mjconfig",
+                "ragnarok",
                 "fork",
                 "review_pr"
             ]
@@ -4107,8 +4146,28 @@ mod tests {
         );
         assert_eq!(
             s.available_commands[5].description,
+            "Thor runs a multi-agent code battle and selects the winner"
+        );
+        assert_eq!(
+            s.available_commands[6].description,
             "fork the current session (unstable ACP extension)"
         );
+    }
+
+    #[test]
+    fn builtin_ragnarok_advertises_task_hint() {
+        let s = AppState::new();
+        let command = s
+            .available_commands
+            .iter()
+            .find(|command| command.name == "ragnarok")
+            .expect("ragnarok command");
+        match command.input.as_ref().expect("ragnarok input") {
+            AvailableCommandInput::Unstructured(input) => {
+                assert_eq!(input.hint, "task to forge in glorious combat");
+            }
+            other => panic!("unexpected Ragnarok input: {other:?}"),
+        }
     }
 
     #[test]
@@ -4128,7 +4187,15 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "clear", "load", "export", "mjconfig", "review_pr"]
+            vec![
+                "new",
+                "clear",
+                "load",
+                "export",
+                "mjconfig",
+                "ragnarok",
+                "review_pr"
+            ]
         );
     }
 

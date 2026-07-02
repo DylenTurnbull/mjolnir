@@ -1114,6 +1114,11 @@ impl McpServer {
                     "a prompt turn is already in progress; poll_progress or cancel_prompt first",
                 ));
             }
+            if args.text.trim_start().starts_with("/ragnarok") {
+                return Err(err(
+                    "Ragnarok is a TUI slash command; use the MCP tools directly to connect multiple agents, submit prompts, poll_progress, critique, and get_result",
+                ));
+            }
             // Replace per-turn state wholesale so nothing leaks from the prior turn.
             let next_id = st.turn.id + 1;
             st.turn = TurnState::new(next_id);

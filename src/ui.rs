@@ -11,6 +11,7 @@ use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -105,6 +106,20 @@ enum TerminalRequest {
 fn terminal_request_forces_inline_repair(request: TerminalRequest) -> bool {
     matches!(request, TerminalRequest::ForceInlineRepair)
 }
+
+const RAGNAROK_COMMAND: &str = "/ragnarok";
+static RAGNAROK_FRAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    vec![
+        "⚒  th  vs  cp".to_string(),
+        "⚒ th=>  cp ".to_string(),
+        "⚡TH=>  cp ".to_string(),
+        "⚔ TH <=>CP".to_string(),
+        " cp  <=TH⚡".to_string(),
+        " cp  vs TH⚒".to_string(),
+        "judging... ".to_string(),
+        "🏆 THOR    ".to_string(),
+    ]
+});
 
 #[derive(Debug)]
 enum DictationEvent {
@@ -1121,6 +1136,13 @@ fn should_show_spinner(state: &AppState) -> bool {
             | ConnectionState::Streaming
             | ConnectionState::Cancelling
             | ConnectionState::Forking
+    )
+}
+
+fn should_show_ragnarok_animation(state: &AppState) -> bool {
+    matches!(
+        state.connection_state(),
+        ConnectionState::Streaming | ConnectionState::Cancelling
     )
 }
 
@@ -2850,6 +2872,24 @@ fn should_open_help(modifiers: KeyModifiers, code: KeyCode) -> bool {
     modifiers.is_empty() && matches!(code, KeyCode::F(10))
 }
 
+fn ragnarok_display_text(task: &str) -> String {
+    let task = task.trim();
+    format!("/ragnarok {task}")
+}
+
+fn ragnarok_intro_status(display_text: &str) -> String {
+    let preview = queued_prompt_preview(display_text);
+    format!("Ragnarok begins: Thor is picking champions for {preview}")
+}
+
+fn split_ragnarok_command(text: &str) -> Option<&str> {
+    if text == RAGNAROK_COMMAND {
+        Some("")
+    } else {
+        text.strip_prefix("/ragnarok ")
+    }
+}
+
 fn input_text_with_attachments(input: &str, attachments: &[PastedAttachment]) -> String {
     let input_len = input_char_count(input);
     let mut ordered: Vec<&PastedAttachment> = attachments.iter().collect();
@@ -2893,6 +2933,11 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
     if text.is_empty() && images.is_empty() {
         return;
     }
+    let ragnarok_task = if images.is_empty() {
+        split_ragnarok_command(&text).map(str::to_string)
+    } else {
+        None
+    };
 
     // Client-side commands are handled here without forwarding anything
     // to the agent.
@@ -2980,6 +3025,17 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
+    if let Some(task) = ragnarok_task.as_deref()
+        && task.trim().is_empty()
+    {
+        state.input.clear();
+        clear_attachments(state);
+        state.input_cursor = 0;
+        state.scroll_input_to_bottom();
+        state.record_status_message(StatusKind::Warning, "usage: /ragnarok <task>");
+        return;
+    }
+
     if images.is_empty()
         && let Some(rest) = text.strip_prefix("/mj:")
     {
@@ -3003,7 +3059,14 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    let display_text = prompt_display_text(&text, images.len());
+    let (task, text, display_text, ragnarok) = if let Some(task) = ragnarok_task.as_deref() {
+        let task = task.trim().to_string();
+        let display_text = ragnarok_display_text(&task);
+        (Some(task.clone()), task, display_text, true)
+    } else {
+        let display_text = prompt_display_text(&text, images.len());
+        (None, text, display_text, false)
+    };
     state.input.clear();
     clear_attachments(state);
     state.input_cursor = 0;
@@ -3017,14 +3080,22 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
             text,
             images,
             display_text,
+            ragnarok,
         });
         let queued = state.queued_prompt_count();
         state.status_line = Some(StatusMessage::info(format!("queued {queued}: {preview}")));
         return;
     }
 
-    state.record_user_prompt(display_text);
-    let _ = cmd_tx.send(UiCommand::SendPrompt { text, images });
+    if ragnarok {
+        state.record_status_message(StatusKind::Info, ragnarok_intro_status(&display_text));
+        state.record_ragnarok_prompt(display_text.clone());
+        let task = task.expect("ragnarok task set when ragnarok=true");
+        let _ = cmd_tx.send(UiCommand::RunRagnarok { task, display_text });
+    } else {
+        state.record_user_prompt(display_text);
+        let _ = cmd_tx.send(UiCommand::SendPrompt { text, images });
+    }
 }
 
 fn handle_mjconfig_menu_key(
@@ -3440,11 +3511,26 @@ fn drain_queued_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCo
     let Some(queued) = state.take_queued_prompt() else {
         return;
     };
-    state.record_user_prompt(queued.display_text);
-    let _ = cmd_tx.send(UiCommand::SendPrompt {
-        text: queued.text,
-        images: queued.images,
-    });
+    if queued.ragnarok {
+        state.record_status_message(
+            StatusKind::Info,
+            ragnarok_intro_status(&queued.display_text),
+        );
+        state.record_ragnarok_prompt(queued.display_text.clone());
+    } else {
+        state.record_user_prompt(queued.display_text.clone());
+    }
+    if queued.ragnarok {
+        let _ = cmd_tx.send(UiCommand::RunRagnarok {
+            task: queued.text,
+            display_text: queued.display_text,
+        });
+    } else {
+        let _ = cmd_tx.send(UiCommand::SendPrompt {
+            text: queued.text,
+            images: queued.images,
+        });
+    }
 }
 
 /// Truncate the display text to a short single-line preview for the
@@ -5815,15 +5901,30 @@ fn voice_level_meter(level: Option<f32>) -> String {
 }
 
 fn prompt_activity_ornament(state: &AppState) -> &'static str {
-    if should_show_spinner(state) {
+    if state.ragnarok_active && should_show_ragnarok_animation(state) {
+        ragnarok_current_frame()
+    } else if should_show_spinner(state) {
         state.spinner_style.current_frame()
     } else {
         state.spinner_style.idle_frame()
     }
 }
 
+fn ragnarok_current_frame() -> &'static str {
+    let frames = RAGNAROK_FRAMES.as_slice();
+    let idx = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| (elapsed.as_millis() / crate::spinner::SPINNER_FRAME_INTERVAL_MS) as usize)
+        .unwrap_or(0)
+        % frames.len();
+    frames[idx].as_str()
+}
+
 fn prompt_title_label(state: &AppState) -> String {
     let ornament = prompt_activity_ornament(state);
+    if state.ragnarok_active && should_show_ragnarok_animation(state) {
+        return format!("{ornament} Ragnarok");
+    }
     if let Some(elapsed) = turn_elapsed_value_label(state) {
         format!("{ornament} {elapsed}")
     } else {
@@ -6847,6 +6948,13 @@ fn help_modal_lines(
         ]);
     }
     lines.extend([
+        help_section_line("Ragnarok", theme),
+        help_command_line(
+            "/ragnarok <task>",
+            "Thor picks competitor agents/models, runs critique combat, and presents the winner",
+            theme,
+        ),
+        help_blank_line(),
         help_section_line("Overlays", theme),
         help_binding_line(
             "F10 / Tab",
@@ -6863,7 +6971,7 @@ fn help_modal_lines(
         help_blank_line(),
         help_command_line(
             "Built-in commands:",
-            "/clear keeps agent; /new opens agent picker; /load opens session picker",
+            "/clear keeps agent; /new opens agent picker; /load opens session picker; /ragnarok <task> starts combat mode",
             theme,
         ),
     ]);
@@ -7184,6 +7292,9 @@ fn draw_autocomplete_popover(f: &mut ratatui::Frame, input_area: Rect, state: &A
                 line.push_str("  -- ");
                 line.push_str(description);
             }
+            if cmd.name == "ragnarok" {
+                line.push_str("  ⚔");
+            }
             truncate_line(line, inner.width, absolute == selected, state.theme)
         })
         .collect();
@@ -7243,6 +7354,9 @@ fn draw_inline_autocomplete_popover(f: &mut ratatui::Frame, area: Rect, state: &
             if !description.is_empty() {
                 line.push_str("  -- ");
                 line.push_str(description);
+            }
+            if cmd.name == "ragnarok" {
+                line.push_str("  ⚔");
             }
             truncate_line(line, inner.width, marker == ">", state.theme)
         })
@@ -7469,6 +7583,9 @@ mod tests {
             .iter()
             .flat_map(|style| style.frames())
             .any(|frame| text.contains(frame.as_str()))
+            || RAGNAROK_FRAMES
+                .iter()
+                .any(|frame| text.contains(frame.as_str()))
     }
 
     #[test]
@@ -9089,6 +9206,69 @@ mod tests {
     }
 
     #[test]
+    fn slash_ragnarok_wraps_task_for_agent_and_animates_combat() {
+        let mut state = AppState::new();
+        state.session_id = Some("s-1".to_string());
+        state.set_connection_state(ConnectionState::Ready);
+        state.input = "/ragnarok refactor the parser".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        match cmd_rx.try_recv() {
+            Ok(UiCommand::RunRagnarok { task, display_text }) => {
+                assert_eq!(task, "refactor the parser");
+                assert_eq!(display_text, "/ragnarok refactor the parser");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(state.ragnarok_active, "Ragnarok animation should be active");
+        assert!(
+            state
+                .status_line
+                .as_ref()
+                .expect("status")
+                .text
+                .contains("Ragnarok begins")
+        );
+        assert!(
+            matches!(state.transcript.last(), Some(Entry::UserPrompt(text)) if text == "/ragnarok refactor the parser")
+        );
+        assert!(
+            RAGNAROK_FRAMES
+                .iter()
+                .any(|frame| frame == prompt_activity_ornament(&state))
+        );
+
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        assert!(
+            !state.ragnarok_active,
+            "combat animation stops when turn ends"
+        );
+    }
+
+    #[test]
+    fn slash_ragnarok_requires_task() {
+        let mut state = AppState::new();
+        state.session_id = Some("s-1".to_string());
+        state.set_connection_state(ConnectionState::Ready);
+        state.input = "/ragnarok".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(!state.ragnarok_active);
+        let status = state.status_line.expect("status");
+        assert_eq!(status.kind, StatusKind::Warning);
+        assert_eq!(status.text, "usage: /ragnarok <task>");
+        assert!(state.input.is_empty());
+    }
+
+    #[test]
     fn slash_fork_sends_fork_session_command() {
         let mut state = AppState::new();
         state.session_id = Some("s-1".to_string());
@@ -9106,6 +9286,40 @@ mod tests {
         let status = state.status_line.expect("status");
         assert_eq!(status.kind, StatusKind::Info);
         assert_eq!(status.text, "forking session...");
+    }
+
+    #[test]
+    fn ragnarok_prompt_queued_during_streaming_drains_with_combat_animation() {
+        let mut state = ready_state_with_session();
+        state.record_user_prompt("first".to_string());
+        state.input = "/ragnarok improve tests".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert!(cmd_rx.try_recv().is_err());
+        let queued = state.queued_prompts().next().expect("queued ragnarok");
+        assert!(queued.ragnarok);
+        assert_eq!(queued.text, "improve tests");
+        assert_eq!(queued.display_text, "/ragnarok improve tests");
+
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        drain_queued_prompt(&mut state, &cmd_tx);
+
+        match cmd_rx.try_recv() {
+            Ok(UiCommand::RunRagnarok { task, display_text }) => {
+                assert_eq!(task, "improve tests");
+                assert_eq!(display_text, "/ragnarok improve tests");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(state.ragnarok_active);
+        assert!(
+            matches!(state.transcript.last(), Some(Entry::UserPrompt(text)) if text == "/ragnarok improve tests")
+        );
     }
 
     #[test]
@@ -10067,6 +10281,12 @@ mod tests {
         );
         assert!(rendered.contains("Ctrl-C quit"), "rendered:\n{rendered}");
         assert!(rendered.contains("F10 help"), "rendered:\n{rendered}");
+        assert!(
+            help_modal_lines(UiMode::InlineChat, false, state.theme)
+                .iter()
+                .any(|line| line_text(line).contains("/ragnarok <task>")),
+            "help should mention Ragnarok command"
+        );
         assert!(!rendered.contains("F12"), "rendered:\n{rendered}");
         assert!(!rendered.contains("prompt"), "rendered:\n{rendered}");
         assert!(!rendered.contains("ready"), "rendered:\n{rendered}");
@@ -10178,6 +10398,7 @@ mod tests {
             text: "next".to_string(),
             images: Vec::new(),
             display_text: "next".to_string(),
+            ragnarok: false,
         });
         let queued = busy_prompt_title(&state).expect("queued title");
         assert!(queued.contains("1 queued"), "{queued}");
@@ -12540,6 +12761,7 @@ mod tests {
             text: "queued body".to_string(),
             images: Vec::new(),
             display_text: "queued body".to_string(),
+            ragnarok: false,
         });
 
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -12572,6 +12794,7 @@ mod tests {
             text: "keep me".to_string(),
             images: Vec::new(),
             display_text: "keep me".to_string(),
+            ragnarok: false,
         });
 
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -12601,6 +12824,7 @@ mod tests {
             text: "keep me".to_string(),
             images: Vec::new(),
             display_text: "keep me".to_string(),
+            ragnarok: false,
         });
 
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -12697,6 +12921,7 @@ mod tests {
             text: "stale".to_string(),
             images: Vec::new(),
             display_text: "stale".to_string(),
+            ragnarok: false,
         });
 
         state.mark_runtime_closed();

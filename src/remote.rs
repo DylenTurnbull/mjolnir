@@ -466,13 +466,16 @@ impl TrackerState {
     }
 
     fn observe_command(&mut self, command: &UiCommand) {
-        if let UiCommand::SendPrompt { text, .. } = command {
-            self.total_messages = self.total_messages.saturating_add(1);
-            self.agent_message_open = false;
-            self.prompt_in_flight = true;
-            self.push_transcript_entry("user", text.clone());
-            self.touch();
-        }
+        let text = match command {
+            UiCommand::SendPrompt { text, .. } => text.clone(),
+            UiCommand::RunRagnarok { display_text, .. } => display_text.clone(),
+            _ => return,
+        };
+        self.total_messages = self.total_messages.saturating_add(1);
+        self.agent_message_open = false;
+        self.prompt_in_flight = true;
+        self.push_transcript_entry("user", text);
+        self.touch();
     }
 
     fn reset_for_session_change(&mut self, new_session_id: &str, now: &str) {
