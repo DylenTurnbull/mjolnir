@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     McpServer, McpServerStdio, PermissionOption, PermissionOptionKind, SessionConfigOption,
@@ -39,6 +39,9 @@ use crate::worktree::{self, CreatedWorktree};
 
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 const THOR_TIMEOUT: Duration = Duration::from_secs(8 * 60);
+const THOR_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
+const THOR_IDLE_NOTICE_INTERVAL: Duration = Duration::from_secs(15);
+const MAX_THOR_ROUTING_ATTEMPTS: usize = 6;
 const IMPLEMENTATION_TIMEOUT: Duration = Duration::from_secs(90 * 60);
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const JUDGE_TIMEOUT: Duration = Duration::from_secs(12 * 60);
@@ -289,19 +292,18 @@ async fn run_inner(cfg: RunConfig, ui_tx: mpsc::UnboundedSender<UiEvent>) -> Res
         );
     }
 
-    let thor = candidates
+    let primary_thor = candidates
         .first()
-        .cloned()
         .context("candidate list unexpectedly empty")?;
     emit_info(
         &ui_tx,
         format!(
-            "ragnarok: Thor is {} / {} ({} Elo)",
-            thor.launch.source_id, thor.model.name, thor.model.score.elo
+            "ragnarok: primary Thor candidate is {} / {} ({} Elo)",
+            primary_thor.launch.source_id, primary_thor.model.name, primary_thor.model.score.elo
         ),
     );
 
-    let routing = route_competitors(&cfg, &thor, &candidates, &ui_tx).await?;
+    let (thor, routing) = route_with_thor_fallback(&cfg, &candidates, &ui_tx).await?;
     check_cancelled(&cfg)?;
     let competitors = create_competitors(&cfg.cwd, routing, &ui_tx)?;
     if competitors.len() < 2 {
@@ -580,6 +582,84 @@ pub(crate) fn ranked_unique_candidate_list(mut candidates: Vec<Candidate>) -> Ve
     ranked
 }
 
+async fn route_with_thor_fallback(
+    cfg: &RunConfig,
+    candidates: &[Candidate],
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+) -> Result<(Candidate, Vec<Candidate>)> {
+    let thor_order = thor_candidate_order(candidates);
+    let attempts = thor_order.len().min(MAX_THOR_ROUTING_ATTEMPTS);
+    let mut failures = Vec::new();
+    for (index, thor) in thor_order.into_iter().take(attempts).enumerate() {
+        check_cancelled(cfg)?;
+        if index == 0 {
+            emit_info(
+                ui_tx,
+                format!(
+                    "ragnarok: Thor routing using {} / {} ({} Elo)",
+                    thor.launch.source_id, thor.model.name, thor.model.score.elo
+                ),
+            );
+        } else {
+            emit_warning(
+                ui_tx,
+                format!(
+                    "ragnarok: Thor routing retry {} using {} / {} ({} Elo)",
+                    index + 1,
+                    thor.launch.source_id,
+                    thor.model.name,
+                    thor.model.score.elo
+                ),
+            );
+        }
+        match route_competitors(cfg, &thor, candidates, ui_tx).await {
+            Ok(routing) => return Ok((thor, routing)),
+            Err(error) => {
+                let message = format!(
+                    "{} / {} failed: {error:#}",
+                    thor.launch.source_id, thor.model.name
+                );
+                emit_warning(ui_tx, format!("ragnarok: Thor routing {message}"));
+                failures.push(message);
+            }
+        }
+    }
+
+    bail!(
+        "Thor routing failed across {} candidate(s): {}",
+        failures.len(),
+        failures.join("; ")
+    )
+}
+
+fn thor_candidate_order(candidates: &[Candidate]) -> Vec<Candidate> {
+    let mut ordered = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut seen_sources = HashSet::new();
+
+    if let Some(primary) = candidates.first() {
+        seen_ids.insert(primary.candidate_id.clone());
+        seen_sources.insert(primary.launch.source_id.clone());
+        ordered.push(primary.clone());
+    }
+
+    for candidate in candidates {
+        if seen_sources.insert(candidate.launch.source_id.clone())
+            && seen_ids.insert(candidate.candidate_id.clone())
+        {
+            ordered.push(candidate.clone());
+        }
+    }
+
+    for candidate in candidates {
+        if seen_ids.insert(candidate.candidate_id.clone()) {
+            ordered.push(candidate.clone());
+        }
+    }
+
+    ordered
+}
+
 async fn route_competitors(
     cfg: &RunConfig,
     thor: &Candidate,
@@ -855,6 +935,8 @@ async fn run_implementations(
                 ui_tx.clone(),
                 label,
                 IMPLEMENTATION_TIMEOUT,
+                None,
+                None,
             )
             .await;
             let (result, status) = match turn {
@@ -1046,6 +1128,8 @@ async fn run_reviews(
                 ui_tx,
                 label,
                 REVIEW_TIMEOUT,
+                None,
+                None,
             )
             .await
             .map_err(|error| format!("{error:#}"));
@@ -1298,9 +1382,10 @@ async fn ask_thor_json<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
+    let progress = RagnarokProgressState::new(1, format!("Thor {phase}: preparing ACP turn"));
     let active = cfg
         .fun
-        .then(|| spawn_animator(ui_tx.clone(), format!("Thor {phase}")));
+        .then(|| spawn_progress_animator(ui_tx.clone(), format!("Thor {phase}"), progress.clone()));
     let result: Result<T> = async {
         let first = run_agent_turn(
             &thor.launch,
@@ -1314,15 +1399,21 @@ where
             ui_tx.clone(),
             format!("Thor {phase}"),
             timeout,
+            Some(THOR_IDLE_TIMEOUT),
+            Some(progress.clone()),
         )
         .await?;
         match parse_json_object::<T>(&first.final_text) {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                progress.finish_one(format!("Thor {phase}: valid JSON received"));
+                Ok(value)
+            }
             Err(first_error) => {
                 emit_warning(
                     ui_tx,
                     format!("ragnarok: Thor returned invalid JSON for {phase}; retrying once"),
                 );
+                progress.set_detail(format!("Thor {phase}: invalid JSON; retrying"));
                 let retry_prompt = format!(
                     "Your previous {phase} answer was not valid JSON ({first_error}).\n\
                      Return ONLY the requested JSON object. No markdown, no prose.\n\n\
@@ -1340,10 +1431,14 @@ where
                     ui_tx.clone(),
                     format!("Thor {phase} retry"),
                     timeout,
+                    Some(THOR_IDLE_TIMEOUT),
+                    Some(progress.clone()),
                 )
                 .await?;
-                parse_json_object::<T>(&second.final_text)
-                    .with_context(|| format!("Thor did not return valid JSON for {phase}"))
+                let parsed = parse_json_object::<T>(&second.final_text)
+                    .with_context(|| format!("Thor did not return valid JSON for {phase}"))?;
+                progress.finish_one(format!("Thor {phase}: valid retry JSON received"));
+                Ok(parsed)
             }
         }
     }
@@ -1365,6 +1460,8 @@ async fn run_agent_turn(
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     label: String,
     timeout: Duration,
+    idle_timeout: Option<Duration>,
+    progress: Option<RagnarokProgressState>,
 ) -> Result<AgentTurnResult> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -1389,6 +1486,10 @@ async fn run_agent_turn(
     let mut stop_reason = None;
     let timeout = tokio::time::sleep(timeout);
     tokio::pin!(timeout);
+    let mut idle_tick = tokio::time::interval(Duration::from_secs(5));
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_activity = Instant::now();
+    let mut next_idle_notice = THOR_IDLE_NOTICE_INTERVAL;
 
     emit_info(
         &ui_tx,
@@ -1399,6 +1500,9 @@ async fn run_agent_turn(
             cwd.display()
         ),
     );
+    if let Some(progress) = &progress {
+        progress.set_detail(format!("{label}: connecting ACP"));
+    }
 
     let result = loop {
         tokio::select! {
@@ -1408,16 +1512,58 @@ async fn run_agent_turn(
             () = cancel_token.cancelled() => {
                 break Err(anyhow!("{label} cancelled"));
             }
+            _ = idle_tick.tick(), if sent_prompt && (idle_timeout.is_some() || progress.is_some()) => {
+                let idle_for = last_activity.elapsed();
+                let idle_for_text = format_elapsed(idle_for);
+                let watchdog_text = idle_timeout
+                    .map(format_elapsed)
+                    .map(|limit| format!(" / watchdog {limit}"))
+                    .unwrap_or_default();
+                if let Some(progress) = &progress {
+                    progress.set_detail(format!(
+                        "{label}: waiting for ACP activity; idle {idle_for_text}{watchdog_text}"
+                    ));
+                }
+                if let Some(limit) = idle_timeout
+                    && idle_for >= limit
+                {
+                    break Err(anyhow!(
+                        "{label} idle for {idle_for_text} after prompt launch; no ACP output, tool call, permission, or completion"
+                    ));
+                }
+                if idle_for >= next_idle_notice {
+                    emit_info(
+                        &ui_tx,
+                        format!(
+                            "ragnarok: {label} still waiting for ACP activity (idle {idle_for_text}{watchdog_text})"
+                        ),
+                    );
+                    next_idle_notice += THOR_IDLE_NOTICE_INTERVAL;
+                }
+            }
             maybe_event = event_rx.recv() => {
                 let Some(event) = maybe_event else {
                     break Err(anyhow!("{label} ACP runtime closed before prompt completed"));
                 };
+                if sent_prompt {
+                    last_activity = Instant::now();
+                    next_idle_notice = THOR_IDLE_NOTICE_INTERVAL;
+                    if let Some(progress) = &progress {
+                        progress.set_detail(format!("{label}: ACP event received"));
+                    }
+                }
                 match event {
                     UiEvent::Connected { .. } => {
+                        if let Some(progress) = &progress {
+                            progress.set_detail(format!("{label}: ACP connected"));
+                        }
                         emit_info(&ui_tx, format!("ragnarok: {label} ACP connected"));
                     }
                     UiEvent::SessionStarted { .. } => {
                         session_started = true;
+                        if let Some(progress) = &progress {
+                            progress.set_detail(format!("{label}: session started"));
+                        }
                         emit_info(&ui_tx, format!("ragnarok: {label} session started"));
                     }
                     UiEvent::SessionConfigOptions { options, targets } => {
@@ -1433,6 +1579,11 @@ async fn run_agent_turn(
                                     &ui_tx,
                                     format!("ragnarok: {label} model {status}: {value}"),
                                 );
+                                if let Some(progress) = &progress {
+                                    progress.set_detail(format!(
+                                        "{label}: model {status}: {value}"
+                                    ));
+                                }
                             }
                             Ok(ModelConfigProgress::UpdateSent { from, to }) => {
                                 sent_model_update = true;
@@ -1441,6 +1592,11 @@ async fn run_agent_turn(
                                     &ui_tx,
                                     format!("ragnarok: {label} switching model {from} -> {to}"),
                                 );
+                                if let Some(progress) = &progress {
+                                    progress.set_detail(format!(
+                                        "{label}: switching model {from} -> {to}"
+                                    ));
+                                }
                             }
                             Err(error) => break Err(error),
                         }
@@ -1491,6 +1647,12 @@ async fn run_agent_turn(
                     }
                     UiEvent::PromptDone { stop_reason: reason, .. } => {
                         stop_reason = Some(reason);
+                        if let Some(progress) = &progress {
+                            progress.set_detail(format!(
+                                "{label}: prompt finished with {}",
+                                stop_reason_label(reason)
+                            ));
+                        }
                         emit_info(
                             &ui_tx,
                             format!(
@@ -1526,6 +1688,13 @@ async fn run_agent_turn(
                         })
                         .with_context(|| format!("send {label} prompt"))?;
                     sent_prompt = true;
+                    last_activity = Instant::now();
+                    next_idle_notice = THOR_IDLE_NOTICE_INTERVAL;
+                    if let Some(progress) = &progress {
+                        progress.set_detail(format!(
+                            "{label}: prompt launched; waiting for ACP output"
+                        ));
+                    }
                     emit_info(
                         &ui_tx,
                         format!("ragnarok: {label} prompt launched; awaiting response"),
@@ -1946,13 +2115,6 @@ fn stop_reason_status(reason: Option<StopReason>) -> String {
         .to_string()
 }
 
-fn spawn_animator(
-    ui_tx: mpsc::UnboundedSender<UiEvent>,
-    phase: String,
-) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
-    spawn_animator_inner(ui_tx, phase, None)
-}
-
 fn spawn_progress_animator(
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     phase: String,
@@ -2246,6 +2408,28 @@ mod tests {
             sources,
             vec!["anvil", "codex-acp", "claude-acp", "anvil", "anvil"]
         );
+    }
+
+    #[test]
+    fn thor_candidate_order_tries_other_sources_before_same_source_depth() {
+        let mut candidates = vec![
+            candidate("anvil", "anvil-1", 1500, "anvil-1"),
+            candidate("anvil", "anvil-2", 1499, "anvil-2"),
+            candidate("codex-acp", "codex-1", 1450, "codex-1"),
+            candidate("claude-acp", "claude-1", 1440, "claude-1"),
+            candidate("anvil", "anvil-3", 1430, "anvil-3"),
+        ];
+        for (index, candidate) in candidates.iter_mut().enumerate() {
+            candidate.candidate_id = format!("M{}", index + 1);
+        }
+
+        let order = thor_candidate_order(&candidates);
+        let ids = order
+            .iter()
+            .map(|candidate| candidate.candidate_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["M1", "M3", "M4", "M2", "M5"]);
     }
 
     #[test]
