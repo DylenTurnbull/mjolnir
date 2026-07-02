@@ -6,8 +6,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
@@ -183,6 +183,54 @@ struct ThorPermissionChoice {
     rationale: String,
 }
 
+#[derive(Clone)]
+struct RagnarokProgressState {
+    completed: Arc<AtomicUsize>,
+    total: usize,
+    detail: Arc<Mutex<String>>,
+}
+
+#[derive(Clone)]
+struct RagnarokProgressSnapshot {
+    completed: usize,
+    total: usize,
+    detail: String,
+}
+
+impl RagnarokProgressState {
+    fn new(total: usize, detail: impl Into<String>) -> Self {
+        Self {
+            completed: Arc::new(AtomicUsize::new(0)),
+            total,
+            detail: Arc::new(Mutex::new(detail.into())),
+        }
+    }
+
+    fn finish_one(&self, detail: impl Into<String>) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        self.set_detail(detail);
+    }
+
+    fn set_detail(&self, detail: impl Into<String>) {
+        if let Ok(mut value) = self.detail.lock() {
+            *value = detail.into();
+        }
+    }
+
+    fn snapshot(&self) -> RagnarokProgressSnapshot {
+        let detail = self
+            .detail
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| "progress detail unavailable".to_string());
+        RagnarokProgressSnapshot {
+            completed: self.completed.load(Ordering::Relaxed).min(self.total),
+            total: self.total,
+            detail,
+        }
+    }
+}
+
 pub async fn run(cfg: RunConfig, ui_tx: mpsc::UnboundedSender<UiEvent>) {
     if let Err(error) = run_inner(cfg, ui_tx.clone()).await {
         emit_warning(&ui_tx, format!("ragnarok failed: {error:#}"));
@@ -212,8 +260,27 @@ async fn run_inner(cfg: RunConfig, ui_tx: mpsc::UnboundedSender<UiEvent>) -> Res
         ),
     );
 
-    let mut candidates =
-        discover_candidates(launches, &cfg.cwd, &score_store, &cfg.cancel_token, &ui_tx).await;
+    let discovery_progress = RagnarokProgressState::new(
+        launches.len(),
+        format!("probing {} ACP agent(s)", launches.len()),
+    );
+    let discovery_active = cfg.fun.then(|| {
+        spawn_progress_animator(
+            ui_tx.clone(),
+            "model discovery".to_string(),
+            discovery_progress.clone(),
+        )
+    });
+    let mut candidates = discover_candidates(
+        launches,
+        &cfg.cwd,
+        &score_store,
+        &cfg.cancel_token,
+        &ui_tx,
+        Some(discovery_progress),
+    )
+    .await;
+    stop_animator(discovery_active).await;
     candidates = ranked_unique_candidate_list(candidates);
     if candidates.len() < 2 {
         bail!(
@@ -416,6 +483,7 @@ async fn discover_candidates(
     score_store: &scores::ScoreStore,
     cancel_token: &CancellationToken,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    progress: Option<RagnarokProgressState>,
 ) -> Vec<Candidate> {
     let mut tasks = FuturesUnordered::new();
     for launch in launches {
@@ -471,11 +539,19 @@ async fn discover_candidates(
                     ui_tx,
                     format!("ragnarok: {source_id} ready with {eligible} Elo-scored model(s)"),
                 );
+                if let Some(progress) = &progress {
+                    progress.finish_one(format!("{source_id}: {eligible} eligible Elo model(s)"));
+                }
             }
-            Err(error) => emit_warning(
-                ui_tx,
-                format!("ragnarok: skipping {source_id}; not ready: {error}"),
-            ),
+            Err(error) => {
+                emit_warning(
+                    ui_tx,
+                    format!("ragnarok: skipping {source_id}; not ready: {error}"),
+                );
+                if let Some(progress) = &progress {
+                    progress.finish_one(format!("{source_id}: skipped ({error})"));
+                }
+            }
         }
     }
     candidates
@@ -743,9 +819,17 @@ async fn run_implementations(
     competitors: Vec<Competitor>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> Vec<ImplementationResult> {
-    let active = cfg
-        .fun
-        .then(|| spawn_animator(ui_tx.clone(), "implementation melee".to_string()));
+    let progress = RagnarokProgressState::new(
+        competitors.len(),
+        format!("{} competitor worktree(s) fighting", competitors.len()),
+    );
+    let active = cfg.fun.then(|| {
+        spawn_progress_animator(
+            ui_tx.clone(),
+            "implementation melee".to_string(),
+            progress.clone(),
+        )
+    });
     let mut tasks = FuturesUnordered::new();
     for competitor in competitors {
         let prompt = implementation_prompt(&cfg.prompt, &competitor);
@@ -798,6 +882,10 @@ async fn run_implementations(
 
     let mut out = Vec::new();
     while let Some(result) = tasks.next().await {
+        progress.finish_one(format!(
+            "{} implementation finished ({})",
+            result.competitor.id, result.status
+        ));
         emit_info(
             ui_tx,
             format!(
@@ -912,9 +1000,17 @@ async fn run_reviews(
     assignments: Vec<ReviewAssignment>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> Vec<ReviewResult> {
-    let active = cfg
-        .fun
-        .then(|| spawn_animator(ui_tx.clone(), "adversarial review brawl".to_string()));
+    let progress = RagnarokProgressState::new(
+        assignments.len(),
+        format!("{} adversarial review(s) assigned", assignments.len()),
+    );
+    let active = cfg.fun.then(|| {
+        spawn_progress_animator(
+            ui_tx.clone(),
+            "adversarial review brawl".to_string(),
+            progress.clone(),
+        )
+    });
     let by_id: HashMap<&str, &ImplementationResult> = implementations
         .iter()
         .map(|implementation| (implementation.competitor.id.as_str(), implementation))
@@ -963,6 +1059,10 @@ async fn run_reviews(
             Ok(result) => stop_reason_status(result.stop_reason),
             Err(error) => format!("failed: {error}"),
         };
+        progress.finish_one(format!(
+            "{} -> {} finished ({suffix})",
+            review.assignment.reviewer_id, review.assignment.target_id
+        ));
         emit_info(
             ui_tx,
             format!(
@@ -1850,12 +1950,30 @@ fn spawn_animator(
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     phase: String,
 ) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+    spawn_animator_inner(ui_tx, phase, None)
+}
+
+fn spawn_progress_animator(
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
+    phase: String,
+    progress: RagnarokProgressState,
+) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+    spawn_animator_inner(ui_tx, phase, Some(progress))
+}
+
+fn spawn_animator_inner(
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
+    phase: String,
+    progress: Option<RagnarokProgressState>,
+) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
     let active = Arc::new(AtomicBool::new(true));
     let thread_active = active.clone();
     let handle = tokio::spawn(async move {
         let mut idx = 0usize;
+        let started = std::time::Instant::now();
         while thread_active.load(Ordering::Relaxed) {
-            let lines = ragnarok_combat_frame(idx, &phase);
+            let snapshot = progress.as_ref().map(RagnarokProgressState::snapshot);
+            let lines = ragnarok_combat_frame(idx, &phase, started.elapsed(), snapshot.as_ref());
             let _ = ui_tx.send(UiEvent::RagnarokAnimation(RagnarokAnimationFrame {
                 active: true,
                 phase: phase.clone(),
@@ -1875,9 +1993,16 @@ fn spawn_animator(
     (active, handle)
 }
 
-fn ragnarok_combat_frame(frame: usize, phase: &str) -> Vec<String> {
+fn ragnarok_combat_frame(
+    frame: usize,
+    phase: &str,
+    elapsed: Duration,
+    progress: Option<&RagnarokProgressSnapshot>,
+) -> Vec<String> {
+    let (ladder, status) = ragnarok_phase_hud(phase, elapsed);
+    let progress = ragnarok_progress_line(progress);
     let caption = format!("ᚱᚢᚾᛖ phase: {phase}  ᚦᛟᚱ");
-    match frame % 10 {
+    let mut lines = match frame % 10 {
         0 => vec![
             "        [TH]                         [AG]        ".to_string(),
             "       /|##|\\        ....           /|??|\\       ".to_string(),
@@ -1948,7 +2073,74 @@ fn ragnarok_combat_frame(frame: usize, phase: &str) -> Vec<String> {
             "  =====/====\\=====================/======\\=====  ".to_string(),
             caption,
         ],
+    };
+    lines.insert(0, progress);
+    lines.insert(0, status);
+    lines.insert(0, ladder);
+    lines
+}
+
+fn ragnarok_phase_hud(phase: &str, elapsed: Duration) -> (String, String) {
+    let lower = phase.to_ascii_lowercase();
+    let elapsed = format_elapsed(elapsed);
+    if lower.contains("routing") {
+        (
+            "discover ✓  |  route ⚔  |  implement ·  |  review ·  |  judge ·".to_string(),
+            format!("stage 2/5 ROUTING  · Thor selecting competitors · elapsed {elapsed}"),
+        )
+    } else if lower.contains("permission") {
+        (
+            "discover ✓  |  route ✓  |  implement ⚔  |  review ·  |  judge ·".to_string(),
+            format!("gate THOR PERMISSION  · deciding ACP approval · elapsed {elapsed}"),
+        )
+    } else if lower.contains("implementation") {
+        (
+            "discover ✓  |  route ✓  |  implement ⚔  |  review ·  |  judge ·".to_string(),
+            format!(
+                "stage 3/5 IMPLEMENT  · competitors fight in parallel worktrees · elapsed {elapsed}"
+            ),
+        )
+    } else if lower.contains("review") {
+        (
+            "discover ✓  |  route ✓  |  implement ✓  |  review ⚔  |  judge ·".to_string(),
+            format!("stage 4/5 REVIEW  · adversarial reviewers inspect rivals · elapsed {elapsed}"),
+        )
+    } else if lower.contains("judgment") || lower.contains("judge") {
+        (
+            "discover ✓  |  route ✓  |  implement ✓  |  review ✓  |  judge ⚔".to_string(),
+            format!(
+                "stage 5/5 JUDGE  · Thor auditing reviews and choosing winner · elapsed {elapsed}"
+            ),
+        )
+    } else {
+        (
+            "discover ⚔  |  route ·  |  implement ·  |  review ·  |  judge ·".to_string(),
+            format!("stage 1/5 DISCOVER  · probing ACP agents and Elo models · elapsed {elapsed}"),
+        )
     }
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+fn ragnarok_progress_line(progress: Option<&RagnarokProgressSnapshot>) -> String {
+    let Some(progress) = progress else {
+        return "progress [--------------------] live ACP turn active".to_string();
+    };
+    let total = progress.total.max(1);
+    let completed = progress.completed.min(total);
+    let filled = completed * 20 / total;
+    let empty = 20usize.saturating_sub(filled);
+    format!(
+        "progress [{}{}] {}/{} · {}",
+        "#".repeat(filled),
+        "-".repeat(empty),
+        completed,
+        progress.total,
+        progress.detail
+    )
 }
 
 async fn stop_animator(active: Option<(Arc<AtomicBool>, tokio::task::JoinHandle<()>)>) {
@@ -2054,6 +2246,36 @@ mod tests {
             sources,
             vec!["anvil", "codex-acp", "claude-acp", "anvil", "anvil"]
         );
+    }
+
+    #[test]
+    fn ragnarok_combat_frame_reports_phase_timer_and_progress() {
+        let progress = RagnarokProgressSnapshot {
+            completed: 2,
+            total: 5,
+            detail: "C2 implementation finished".to_string(),
+        };
+
+        let lines = ragnarok_combat_frame(
+            4,
+            "implementation melee",
+            Duration::from_secs(65),
+            Some(&progress),
+        );
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("stage 3/5 IMPLEMENT"))
+        );
+        assert!(lines.iter().any(|line| line.contains("elapsed 01:05")));
+        assert!(lines.iter().any(|line| line.contains("2/5")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("C2 implementation finished"))
+        );
+        assert!(lines.iter().any(|line| line.contains("BAM")));
     }
 
     #[test]

@@ -3950,7 +3950,7 @@ const MIN_INPUT_HEIGHT: u16 = 5;
 /// Maximum input box height so the transcript stays usable even when
 /// the user pastes or drafts a long multi-line prompt.
 const MAX_INPUT_HEIGHT: u16 = 16;
-const RAGNAROK_ARENA_HEIGHT: u16 = 7;
+const RAGNAROK_ARENA_HEIGHT: u16 = 10;
 
 fn draw(
     f: &mut ratatui::Frame,
@@ -4361,6 +4361,11 @@ fn draw_ragnarok_arena(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         .map(|(idx, line)| {
             let style = if idx == frame.lines.len().saturating_sub(1) {
                 Style::default().fg(state.theme.muted)
+            } else if line.contains("stage")
+                || line.contains("discover")
+                || line.contains("progress")
+            {
+                Style::default().fg(state.theme.secondary)
             } else if line.contains("###") || line.contains("BAM") || line.contains("CRASH") {
                 Style::default()
                     .fg(state.theme.warning)
