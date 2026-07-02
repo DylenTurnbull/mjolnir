@@ -26,6 +26,9 @@ use crate::event::{
     SessionConfigTarget, TerminalOutputSnapshot, UiEvent, content_block_text,
 };
 use crate::palette::TerminalTheme;
+use crate::ragnarok::{
+    self, CombatantStatus, RagnarokCommand, RagnarokEvent, RagnarokPhase, RagnarokState,
+};
 use crate::spinner::SpinnerStyle;
 use crate::theme::TerminalThemeKind;
 
@@ -39,6 +42,7 @@ const BUILTIN_LOAD_COMMAND: &str = "load";
 const BUILTIN_FORK_COMMAND: &str = "fork";
 const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
+const BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
 
 fn builtin_new_command() -> AvailableCommand {
@@ -74,6 +78,13 @@ fn builtin_mjconfig_command() -> AvailableCommand {
     )
 }
 
+fn builtin_ragnarok_command() -> AvailableCommand {
+    AvailableCommand::new(
+        BUILTIN_RAGNAROK_COMMAND,
+        "spin up a multi-agent tournament to implement a task",
+    )
+}
+
 fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: bool) {
     commands.retain(|command| {
         command.name != BUILTIN_NEW_COMMAND
@@ -82,10 +93,12 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
             && command.name != BUILTIN_FORK_COMMAND
             && command.name != BUILTIN_EXPORT_COMMAND
             && command.name != BUILTIN_MJCONFIG_COMMAND
+            && command.name != BUILTIN_RAGNAROK_COMMAND
     });
     if include_fork {
         commands.insert(0, builtin_fork_command());
     }
+    commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_mjconfig_command());
     commands.insert(0, builtin_export_command());
     commands.insert(0, builtin_load_command());
@@ -496,6 +509,20 @@ pub struct AppState {
     pub spinner_style: SpinnerStyle,
     /// Open `/mjconfig` overlay, if any.
     pub mjconfig_menu: Option<MjConfigMenu>,
+    /// Open `/ragnarok` tournament overlay, if any. `None` means no
+    /// tournament is running or being reviewed.
+    pub ragnarok: Option<RagnarokState>,
+    /// Clone of this session's own `UiEvent` sender, handed to `ui_loop` at
+    /// startup. `/ragnarok` needs this to spawn a bridging task that folds
+    /// a tournament's `RagnarokEvent`s into `UiEvent::Ragnarok` on the same
+    /// stream `ui_loop` already selects on — `submit_prompt` has no other
+    /// way to reach the sending half (`ui_loop`/`handle_crossterm`/
+    /// `submit_prompt` only ever see the receiving half).
+    pub ragnarok_event_tx: Option<tokio::sync::mpsc::UnboundedSender<UiEvent>>,
+    /// Project root for this session (a real filesystem path, unlike
+    /// `project_label`'s display string). `/ragnarok` needs this to create
+    /// competitor worktrees under `.mjolnir/worktrees/`.
+    pub cwd: PathBuf,
     pub agent_label: String,
     /// Registry `source_id` of the launched agent (e.g. `claude-acp`,
     /// `opencode`, `custom:foo`, `anvil`). Distinct from `agent_label`,
@@ -820,6 +847,67 @@ pub struct Autocomplete {
     pub matches: Vec<usize>,
 }
 
+/// `mm:ss`/`ss` duration label for status messages. Mirrors `ui.rs`'s own
+/// (private, unreachable from here) `format_duration` — small enough not to
+/// bother widening that one's visibility for a single extra caller.
+fn format_duration_compact(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let minutes = secs / 60;
+    let seconds = secs % 60;
+    if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Fold Thor's final verdict into the overlay: a clear winner concludes the
+/// tournament outright; a tie (or a malformed verdict that fell back to
+/// one) hands the pick to the user rather than guessing on their behalf.
+fn apply_judging_outcome(rag: &mut RagnarokState, verdict: ragnarok::event::JudgingOutcome) {
+    use ragnarok::event::JudgingOutcome;
+    match verdict {
+        JudgingOutcome::ClearWinner {
+            winner_slot,
+            judgment,
+        } => {
+            for c in &mut rag.combatants {
+                c.status = CombatantStatus::Judged {
+                    won: c.slot == winner_slot,
+                };
+            }
+            rag.verdict_summary = Some(judgment.reasoning);
+            rag.winner = Some(winner_slot);
+            rag.phase = RagnarokPhase::Concluded;
+        }
+        JudgingOutcome::TiedBestTwo {
+            finalist_slots: [a, b],
+            judgment,
+        } => {
+            let reasoning = judgment
+                .map(|j| j.reasoning)
+                .unwrap_or_else(|| "thor couldn't separate these two.".to_string());
+            rag.finalists = Some((a, b, reasoning));
+            rag.phase = RagnarokPhase::AwaitingUserPick;
+            rag.decision_cursor = 0;
+        }
+        JudgingOutcome::FellBack {
+            reason,
+            finalist_slots: [a, b],
+        } => {
+            rag.finalists = Some((
+                a,
+                b,
+                format!(
+                    "thor's verdict couldn't be used ({reason}); showing the top two by Elo instead."
+                ),
+            ));
+            rag.phase = RagnarokPhase::AwaitingUserPick;
+            rag.decision_cursor = 0;
+        }
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         let now = Instant::now();
@@ -829,6 +917,9 @@ impl AppState {
             theme: theme_kind.palette(),
             spinner_style: SpinnerStyle::default(),
             mjconfig_menu: None,
+            ragnarok: None,
+            ragnarok_event_tx: None,
+            cwd: PathBuf::new(),
             agent_label: String::new(),
             agent_source_id: String::new(),
             score_store: crate::scores::ScoreStore::default(),
@@ -918,6 +1009,133 @@ impl AppState {
             orig_theme: self.theme_kind,
             orig_spinner: self.spinner_style,
         });
+    }
+
+    /// Open the `/ragnarok` overlay and record how to reach the just-spawned
+    /// orchestration task. Call sites are expected to have already checked
+    /// `self.ragnarok.is_none()` (only one tournament at a time).
+    pub fn start_ragnarok(
+        &mut self,
+        task: String,
+        cmd_tx: tokio::sync::mpsc::UnboundedSender<RagnarokCommand>,
+    ) {
+        self.ragnarok = Some(RagnarokState::new(task, cmd_tx));
+    }
+
+    /// Fold one `RagnarokEvent` into the overlay state. Every arm guards on
+    /// `self.ragnarok` still being `Some`: an event arriving after the user
+    /// already dismissed the overlay is dropped, not resurrected.
+    pub fn apply_ragnarok_event(&mut self, event: RagnarokEvent) {
+        let Some(rag) = self.ragnarok.as_mut() else {
+            return;
+        };
+        match event {
+            RagnarokEvent::EligibilityScanned { eligible_count } => {
+                self.record_status_message(
+                    StatusKind::Info,
+                    format!(
+                        "thor is choosing from {eligible_count} eligible (agent, model) pair(s)..."
+                    ),
+                );
+            }
+            RagnarokEvent::Aborted { reason } => {
+                rag.verdict_summary = Some(reason);
+                rag.phase = RagnarokPhase::Cancelled;
+            }
+            RagnarokEvent::CompetitorStarted {
+                slot,
+                agent_label,
+                model_name,
+                elo,
+            } => {
+                rag.phase = RagnarokPhase::Implementing;
+                rag.combatants.push(ragnarok::Combatant {
+                    slot,
+                    agent_label,
+                    model_label: model_name,
+                    elo,
+                    status: CombatantStatus::Spawning,
+                    started_at: Instant::now(),
+                    activity: None,
+                });
+            }
+            RagnarokEvent::CompetitorModelChosen {
+                slot,
+                model_name,
+                elo,
+            } => {
+                if let Some(c) = rag.combatant_mut(&slot) {
+                    c.model_label = model_name;
+                    c.elo = elo;
+                    // Model selection is the last setup step before Thor
+                    // submits the task (see the prompt's step 3c/3d) -- the
+                    // closest reliable signal telemetry gives us for "this
+                    // competitor is now actually implementing."
+                    c.status = CombatantStatus::Implementing;
+                }
+            }
+            RagnarokEvent::CompetitorActivity { slot, summary } => {
+                if let Some(c) = rag.combatant_mut(&slot) {
+                    c.activity = Some(summary);
+                }
+            }
+            RagnarokEvent::PermissionDecision {
+                slot,
+                approved,
+                summary,
+            } => {
+                self.record_status_message(
+                    StatusKind::Info,
+                    format!(
+                        "thor {} {slot}'s request: {summary}",
+                        if approved { "approved" } else { "denied" }
+                    ),
+                );
+            }
+            RagnarokEvent::CompetitorFinished {
+                slot,
+                outcome,
+                duration,
+            } => {
+                // Send the status message first: `rag`/the combatant
+                // borrow below must not overlap a `&mut self` call.
+                match &outcome {
+                    ragnarok::event::TurnOutcome::Completed => {
+                        self.record_status_message(
+                            StatusKind::Info,
+                            format!(
+                                "{slot} finished implementing in {}",
+                                format_duration_compact(duration)
+                            ),
+                        );
+                    }
+                    ragnarok::event::TurnOutcome::Failed { message } => {
+                        self.record_status_message(
+                            StatusKind::Warning,
+                            format!("{slot} failed: {message}"),
+                        );
+                    }
+                }
+                let Some(rag) = self.ragnarok.as_mut() else {
+                    return;
+                };
+                if let Some(c) = rag.combatant_mut(&slot) {
+                    c.status = match outcome {
+                        ragnarok::event::TurnOutcome::Completed => CombatantStatus::Waiting,
+                        ragnarok::event::TurnOutcome::Failed { message } => {
+                            CombatantStatus::Failed { message }
+                        }
+                    };
+                }
+            }
+            RagnarokEvent::ReviewPhaseStarted => {
+                rag.phase = RagnarokPhase::Reviewing;
+            }
+            RagnarokEvent::TournamentDone { verdict } => {
+                rag.phase = RagnarokPhase::Judging;
+                apply_judging_outcome(rag, verdict);
+            }
+        }
     }
 
     pub fn mjconfig_menu_toggle_section(&mut self) {
@@ -1847,6 +2065,9 @@ impl AppState {
             }
             UiEvent::ClaudeUsage(report) => {
                 self.claude_usage = Some(report);
+            }
+            UiEvent::Ragnarok(ev) => {
+                self.apply_ragnarok_event(ev);
             }
             UiEvent::PromptFailed { message } => {
                 self.finish_prompt_turn(true);
@@ -4024,7 +4245,10 @@ mod tests {
             .iter()
             .map(|&i| s.available_commands[i].name.as_str())
             .collect();
-        assert_eq!(names, vec!["new", "clear", "load", "export", "mjconfig"]);
+        assert_eq!(
+            names,
+            vec!["new", "clear", "load", "export", "mjconfig", "ragnarok"]
+        );
     }
 
     #[test]
@@ -4048,7 +4272,9 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "clear", "load", "export", "mjconfig", "fork"]
+            vec![
+                "new", "clear", "load", "export", "mjconfig", "ragnarok", "fork"
+            ]
         );
     }
 
@@ -4084,6 +4310,7 @@ mod tests {
                 "load",
                 "export",
                 "mjconfig",
+                "ragnarok",
                 "fork",
                 "review_pr"
             ]
@@ -4107,6 +4334,10 @@ mod tests {
         );
         assert_eq!(
             s.available_commands[5].description,
+            "spin up a multi-agent tournament to implement a task"
+        );
+        assert_eq!(
+            s.available_commands[6].description,
             "fork the current session (unstable ACP extension)"
         );
     }
@@ -4128,7 +4359,15 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "clear", "load", "export", "mjconfig", "review_pr"]
+            vec![
+                "new",
+                "clear",
+                "load",
+                "export",
+                "mjconfig",
+                "ragnarok",
+                "review_pr"
+            ]
         );
     }
 

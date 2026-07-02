@@ -14,7 +14,7 @@ use agent_client_protocol::schema::v1::{
     CreateTerminalRequest, CreateTerminalResponse, ElicitationAcceptAction, ElicitationAction,
     ElicitationCapabilities, ElicitationFormCapabilities, ElicitationUrlCapabilities, ErrorCode,
     FileSystemCapabilities, ForkSessionRequest, ImageContent, Implementation, InitializeRequest,
-    KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, NewSessionRequest,
+    KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, McpServer, NewSessionRequest,
     PermissionOption, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
@@ -61,6 +61,11 @@ pub struct AcpRuntimeConfig {
     /// Maximum text bytes returned by ACP filesystem reads or accepted by
     /// ACP filesystem writes.
     pub fs_max_text_bytes: u64,
+    /// MCP servers to advertise to the agent for this session (stdio
+    /// transport is spec-mandatory, so any ACP agent must support this).
+    /// Empty for ordinary sessions; Ragnarok's Thor connection is the one
+    /// caller that populates this, wiring in `mj mcp` as a tool source.
+    pub mcp_servers: Vec<McpServer>,
 }
 
 #[derive(Clone)]
@@ -414,8 +419,14 @@ fn require_additional_directories(
     }
 }
 
-fn new_session_request(cwd: PathBuf, additional_directories: &[PathBuf]) -> NewSessionRequest {
-    NewSessionRequest::new(cwd).additional_directories(additional_directories.to_vec())
+fn new_session_request(
+    cwd: PathBuf,
+    additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
+) -> NewSessionRequest {
+    NewSessionRequest::new(cwd)
+        .additional_directories(additional_directories.to_vec())
+        .mcp_servers(mcp_servers.to_vec())
 }
 
 fn resume_session_request(
@@ -586,6 +597,7 @@ pub async fn run(
             ui_rx,
             fatal_emitted.clone(),
             cfg.fs_max_text_bytes,
+            cfg.mcp_servers.clone(),
         );
         tokio::pin!(drive);
         tokio::select! {
@@ -1100,6 +1112,7 @@ where
         ui_rx,
         fatal_emitted,
         DEFAULT_FS_TEXT_BYTES,
+        Vec::new(),
     )
     .await
 }
@@ -1126,6 +1139,7 @@ where
         ui_rx,
         fatal_emitted,
         DEFAULT_FS_TEXT_BYTES,
+        Vec::new(),
     )
     .await
 }
@@ -1140,6 +1154,7 @@ async fn drive_client_with_fs_limit<T>(
     mut ui_rx: mpsc::UnboundedReceiver<UiCommand>,
     fatal_emitted: Arc<AtomicBool>,
     fs_max_text_bytes: u64,
+    mcp_servers: Vec<McpServer>,
 ) -> Result<()>
 where
     T: ConnectTo<Client>,
@@ -1315,6 +1330,7 @@ where
                 cwd,
                 additional_directories,
                 resume_session,
+                mcp_servers,
                 &ui_tx,
                 &mut ui_rx,
                 fatal_emitted,
@@ -1345,6 +1361,7 @@ async fn drive_session(
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
     resume_session: Option<String>,
+    mcp_servers: Vec<McpServer>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
     fatal_emitted: Arc<AtomicBool>,
@@ -1434,7 +1451,11 @@ async fn drive_session(
             (session_id, initial_config, true)
         }
         None => match conn
-            .send_request(new_session_request(cwd.clone(), &additional_directories))
+            .send_request(new_session_request(
+                cwd.clone(),
+                &additional_directories,
+                &mcp_servers,
+            ))
             .block_task()
             .await
         {
@@ -1461,7 +1482,11 @@ async fn drive_session(
                         return Err(anyhow::anyhow!(text));
                     }
                     match conn
-                        .send_request(new_session_request(cwd.clone(), &additional_directories))
+                        .send_request(new_session_request(
+                            cwd.clone(),
+                            &additional_directories,
+                            &mcp_servers,
+                        ))
                         .block_task()
                         .await
                     {
@@ -6090,6 +6115,7 @@ mod tests {
             env: HashMap::new(),
             agent_stderr: None,
             fs_max_text_bytes: DEFAULT_FS_TEXT_BYTES,
+            mcp_servers: Vec::new(),
         };
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
@@ -6142,6 +6168,7 @@ mod tests {
             env: HashMap::new(),
             agent_stderr: Some(bad_stderr),
             fs_max_text_bytes: DEFAULT_FS_TEXT_BYTES,
+            mcp_servers: Vec::new(),
         };
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
@@ -6273,6 +6300,7 @@ mod tests {
             env: HashMap::new(),
             agent_stderr: None,
             fs_max_text_bytes: DEFAULT_FS_TEXT_BYTES,
+            mcp_servers: Vec::new(),
         };
         assert_run_reports_agent_exited(cfg).await;
     }
@@ -6294,6 +6322,7 @@ mod tests {
             env: HashMap::new(),
             agent_stderr: None,
             fs_max_text_bytes: DEFAULT_FS_TEXT_BYTES,
+            mcp_servers: Vec::new(),
         };
         assert_run_reports_agent_exited(cfg).await;
     }

@@ -70,6 +70,12 @@ pub enum UiEvent {
     /// Latest Claude Code `/usage` quota scrape. This is UI-only side-channel
     /// data; it never goes through ACP.
     ClaudeUsage(crate::claude_usage::ClaudeUsageReport),
+    /// Progress from an in-flight `/ragnarok` tournament, forwarded from a
+    /// dedicated bridging task (mirroring the `ClaudeUsage` poller shape)
+    /// rather than flowing through this session's own ACP connection —
+    /// Ragnarok's competitors/reviewer/Thor connections are entirely
+    /// separate from the one this event pair otherwise carries.
+    Ragnarok(crate::ragnarok::event::RagnarokEvent),
     /// The prompt request failed before returning a stop reason. UI can
     /// re-enable the input prompt and surface the error.
     PromptFailed { message: String },

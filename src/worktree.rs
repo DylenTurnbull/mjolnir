@@ -90,6 +90,35 @@ fn create_for_project_cwd(project_root: &Path, cwd: &Path) -> Result<CreatedWork
     })
 }
 
+/// Create a linked worktree on a new branch named `branch_name`, rooted at
+/// `.mjolnir/worktrees/<branch_name>` (slashes in `branch_name` become
+/// nested directories, mirroring the branch's own structure). Unlike
+/// `create_for_cwd_prompting`, this is non-interactive, always creates a
+/// real branch rather than a detached HEAD, and takes a caller-chosen name
+/// rather than a random adjective-noun pair — for batch/programmatic
+/// callers (Ragnarok's `create_worktree` MCP tool) that need a stable,
+/// predictable path and a branch the winner can be pushed from directly.
+/// Returns the absolute path of the created worktree.
+pub fn create_on_new_branch(project_root: &Path, branch_name: &str) -> Result<PathBuf> {
+    let worktree_root = worktrees_dir(project_root).join(branch_name);
+    if let Some(parent) = worktree_root.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    run_git(
+        project_root,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("-b"),
+            OsStr::new(branch_name),
+            worktree_root.as_os_str(),
+            OsStr::new("HEAD"),
+        ],
+    )
+    .with_context(|| format!("create git worktree on branch {branch_name}"))?;
+    Ok(worktree_root)
+}
+
 /// Open an existing worktree by name (short name under
 /// `.mjolnir/worktrees/`) or by path (absolute or relative to `cwd`).
 /// The target directory must already exist and be a registered Git
@@ -268,7 +297,7 @@ fn prompt_to_ignore_worktrees(
     Ok(())
 }
 
-fn git_toplevel(cwd: &Path) -> Result<PathBuf> {
+pub(crate) fn git_toplevel(cwd: &Path) -> Result<PathBuf> {
     let output = Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -720,6 +749,54 @@ mod tests {
         );
         let output = String::from_utf8(output).expect("utf8");
         assert!(output.contains("Keeping worktree"));
+    }
+
+    #[test]
+    fn create_on_new_branch_creates_worktree_on_named_branch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("file.txt"), "hello").expect("write file");
+        run_git(dir.path(), [OsStr::new("add"), OsStr::new(".")]).expect("git add");
+        commit_all(dir.path());
+
+        let worktree_root =
+            create_on_new_branch(dir.path(), "ragnarok/run1/c1").expect("create worktree");
+
+        assert!(worktree_root.ends_with("ragnarok/run1/c1"));
+        assert!(worktree_root.join("file.txt").exists());
+
+        // A real branch checkout, not a detached HEAD: `symbolic-ref` only
+        // resolves on a branch.
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&worktree_root)
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()
+            .expect("git symbolic-ref");
+        assert!(
+            output.status.success(),
+            "expected a real branch, not detached HEAD"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "ragnarok/run1/c1"
+        );
+    }
+
+    #[test]
+    fn create_on_new_branch_rejects_duplicate_branch_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("file.txt"), "hello").expect("write file");
+        run_git(dir.path(), [OsStr::new("add"), OsStr::new(".")]).expect("git add");
+        commit_all(dir.path());
+
+        create_on_new_branch(dir.path(), "ragnarok/run1/c1").expect("first create");
+        let second = create_on_new_branch(dir.path(), "ragnarok/run1/c1");
+        assert!(
+            second.is_err(),
+            "creating the same branch/worktree twice should fail, not silently succeed"
+        );
     }
 
     fn init_git_repo(path: &Path) {

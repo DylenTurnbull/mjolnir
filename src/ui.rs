@@ -52,12 +52,14 @@ use crate::config;
 use crate::event::{PermissionDecision, PermissionPrompt, PromptImage, UiCommand, UiEvent};
 use crate::notifications::TerminalNotificationBackend;
 use crate::palette::TerminalTheme;
+use crate::ragnarok;
 use crate::speech::{dictation_error_message, run_dictation};
 use crate::spinner::SpinnerStyle;
 use crate::term::TrackedBackend;
 use crate::text::truncate_text_to_width;
 use crate::theme::TerminalThemeKind;
 use crate::version::mjolnir_version_label;
+use crate::worktree;
 
 const TRANSCRIPT_SCROLL_PAGE_STEP: usize = 5;
 const TRANSCRIPT_SCROLL_WHEEL_STEP: usize = 3;
@@ -293,6 +295,10 @@ pub struct UiRunOptions<'a> {
     pub spinner_style: SpinnerStyle,
     pub score_store: crate::scores::ScoreStore,
     pub session_boundary: Option<String>,
+    /// Project root for this session. `/ragnarok` needs a real filesystem
+    /// path (not just `HeaderLabels.project`'s display label) to create
+    /// competitor worktrees under.
+    pub cwd: PathBuf,
 }
 
 pub struct UiRunResult {
@@ -314,6 +320,7 @@ struct UiInitialState {
     theme_kind: TerminalThemeKind,
     spinner_style: SpinnerStyle,
     session_boundary: Option<String>,
+    cwd: PathBuf,
 }
 
 /// Internal result of [`ui_loop`]. `run` unpacks it into the public
@@ -327,10 +334,16 @@ struct UiLoopOutcome {
     history: Vec<String>,
 }
 
+// event_tx joins cmd_tx/event_rx as a third distinct channel-half
+// parameter (not folded into UiRunOptions, which is for cross-cutting
+// options, not channel plumbing) -- consistent with the existing pattern
+// beats satisfying the arg-count threshold by moving just this one out.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     terminal: &mut Terminal<TrackedBackend<Stdout>>,
     cmd_tx: &mpsc::UnboundedSender<UiCommand>,
     event_rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+    event_tx: &mpsc::UnboundedSender<UiEvent>,
     header_labels: HeaderLabels,
     initial_agent_label: Option<String>,
     initial_agent_source_id: Option<String>,
@@ -352,6 +365,7 @@ pub async fn run(
         terminal,
         cmd_tx,
         event_rx,
+        event_tx,
         UiInitialState {
             header_labels,
             agent_label: initial_agent_label,
@@ -366,6 +380,7 @@ pub async fn run(
             theme_kind: options.theme_kind,
             spinner_style: options.spinner_style,
             session_boundary: options.session_boundary,
+            cwd: options.cwd,
         },
         options.mode,
     )
@@ -488,6 +503,7 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::CancelPendingPermissions
         | UiEvent::PromptDone { .. }
         | UiEvent::ClaudeUsage(_)
+        | UiEvent::Ragnarok(_)
         | UiEvent::PromptFailed { .. }
         | UiEvent::SessionForkFailed { .. }
         | UiEvent::RemotePermissionDecision { .. }
@@ -520,10 +536,13 @@ async fn ui_loop(
     terminal: &mut Terminal<TrackedBackend<Stdout>>,
     cmd_tx: &mpsc::UnboundedSender<UiCommand>,
     event_rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+    event_tx: &mpsc::UnboundedSender<UiEvent>,
     initial: UiInitialState,
     mode: UiMode,
 ) -> Result<UiLoopOutcome> {
     let mut state = AppState::new();
+    state.ragnarok_event_tx = Some(event_tx.clone());
+    state.cwd = initial.cwd;
     state.set_prompt_history(initial.history);
     state.project_label = initial.header_labels.project;
     state.worktree_label = initial.header_labels.worktree;
@@ -1132,6 +1151,9 @@ fn needs_live_redraw(state: &AppState) -> bool {
         || state.config_picker.is_some()
         // Keep redrawing so the menu's live spinner previews keep animating.
         || state.mjconfig_menu.is_some()
+        // Keep redrawing so the combat scene and per-combatant elapsed-time
+        // labels keep animating for the lifetime of a tournament.
+        || state.ragnarok.is_some()
         || should_show_spinner(state)
 }
 
@@ -1513,6 +1535,17 @@ fn handle_crossterm(
         && !state.has_pending_elicitation()
     {
         return handle_mjconfig_menu_key(state, key.modifiers, key.code, mode);
+    }
+
+    // Same carve-out as /mjconfig above: the foreground session's own
+    // permission/elicitation prompts stay actionable even while a
+    // tournament overlay is open, since Ragnarok's connections are
+    // entirely separate from this one.
+    if state.ragnarok.is_some()
+        && !state.has_pending_permission()
+        && !state.has_pending_elicitation()
+    {
+        return handle_ragnarok_key(state, key.modifiers, key.code, mode);
     }
 
     if should_open_help(key.modifiers, key.code) {
@@ -2981,6 +3014,79 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
     }
 
     if images.is_empty()
+        && let Some(rest) = text.strip_prefix("/ragnarok")
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        let task = rest.trim().to_string();
+        state.input.clear();
+        clear_attachments(state);
+        state.input_cursor = 0;
+        state.scroll_input_to_bottom();
+        if task.is_empty() {
+            state.record_status_message(
+                StatusKind::Warning,
+                "usage: /ragnarok <what to build> -- e.g. /ragnarok add rate limiting to the api",
+            );
+        } else if state.ragnarok.is_some() {
+            state.record_status_message(
+                StatusKind::Warning,
+                "a ragnarok tournament is already running -- press Esc to cancel it first",
+            );
+        } else {
+            // Ragnarok spins up its own independent ACP connections (Thor,
+            // then whichever competitors Thor picks) -- unlike every other
+            // command here, it doesn't depend on the foreground session
+            // being connected, so there's no runtime_closed/session_id gate.
+            match worktree::git_toplevel(&state.cwd) {
+                Ok(project_root) => match state.ragnarok_event_tx.clone() {
+                    Some(event_tx) => {
+                        let (mut rag_event_rx, rag_cmd_tx) = ragnarok::spawn(
+                            ragnarok::RagnarokConfig {
+                                task: task.clone(),
+                                project_root,
+                                additional_directories: Vec::new(),
+                                agent_stderr: None,
+                                fs_max_text_bytes: crate::acp::DEFAULT_FS_TEXT_BYTES,
+                                score_store: state.score_store.clone(),
+                            },
+                            ragnarok::RagnarokTimeouts::default(),
+                        );
+                        state.start_ragnarok(task, rag_cmd_tx);
+                        state.record_status_message(
+                            StatusKind::Info,
+                            "thor is assessing the task...",
+                        );
+                        // Bridge RagnarokEvents into this session's own
+                        // UiEvent stream -- the same one ui_loop's
+                        // tokio::select! already reads -- mirroring
+                        // main.rs's Claude-usage poller task shape.
+                        tokio::spawn(async move {
+                            while let Some(ev) = rag_event_rx.recv().await {
+                                if event_tx.send(UiEvent::Ragnarok(ev)).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    None => {
+                        state.record_status_message(
+                            StatusKind::Warning,
+                            "ragnarok isn't available in this session",
+                        );
+                    }
+                },
+                Err(e) => {
+                    state.record_status_message(
+                        StatusKind::Warning,
+                        format!("/ragnarok requires a git repository: {e:#}"),
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    if images.is_empty()
         && let Some(rest) = text.strip_prefix("/mj:")
     {
         let other = rest.trim();
@@ -3059,6 +3165,89 @@ fn handle_mjconfig_menu_key(
         }
         (_, KeyCode::Down) | (_, KeyCode::Char('j')) => {
             state.mjconfig_menu_move(1);
+            TerminalRequest::None
+        }
+        _ => TerminalRequest::None,
+    }
+}
+
+fn handle_ragnarok_key(
+    state: &mut AppState,
+    modifiers: KeyModifiers,
+    code: KeyCode,
+    mode: UiMode,
+) -> TerminalRequest {
+    let Some(rag) = state.ragnarok.as_mut() else {
+        return TerminalRequest::None;
+    };
+    match (modifiers, code) {
+        (_, KeyCode::Esc | KeyCode::Enter)
+            if matches!(
+                rag.phase,
+                ragnarok::RagnarokPhase::Concluded | ragnarok::RagnarokPhase::Cancelled
+            ) =>
+        {
+            state.ragnarok = None;
+            inline_repair_request(mode)
+        }
+        (_, KeyCode::Esc) => {
+            // Optimistic: flip to Cancelled locally right away rather than
+            // waiting for the orchestrator's own teardown round trip (that
+            // happens async regardless of what this handler does) -- the
+            // user watching "cancelling..." for however long N worktree/
+            // connection teardowns take is a worse experience than an
+            // immediate, confidently-correct local transition.
+            if let Some(cmd_tx) = rag.cmd_tx.take() {
+                let _ = cmd_tx.send(ragnarok::RagnarokCommand::Cancel);
+            }
+            rag.cancel_requested = true;
+            rag.phase = ragnarok::RagnarokPhase::Cancelled;
+            state.record_status_message(StatusKind::Info, "ragnarok tournament cancelled");
+            TerminalRequest::None
+        }
+        (_, KeyCode::Up | KeyCode::Char('k'))
+            if rag.phase == ragnarok::RagnarokPhase::AwaitingUserPick =>
+        {
+            rag.decision_cursor = rag.decision_cursor.saturating_sub(1);
+            TerminalRequest::None
+        }
+        (_, KeyCode::Down | KeyCode::Char('j'))
+            if rag.phase == ragnarok::RagnarokPhase::AwaitingUserPick =>
+        {
+            rag.decision_cursor = (rag.decision_cursor + 1).min(1);
+            TerminalRequest::None
+        }
+        (_, KeyCode::Enter) if rag.phase == ragnarok::RagnarokPhase::AwaitingUserPick => {
+            // Resolved entirely client-side: by the time a pick is
+            // possible, Thor's turn has already ended and the backend has
+            // nothing further to do (see `ragnarok::thor`'s handling of
+            // `RagnarokCommand::ResolvePick`).
+            if let Some((a, b, _)) = rag.finalists.clone() {
+                let winner = if rag.decision_cursor == 0 { a } else { b };
+                for c in &mut rag.combatants {
+                    c.status = ragnarok::CombatantStatus::Judged {
+                        won: c.slot == winner,
+                    };
+                }
+                state.record_status_message(
+                    StatusKind::Info,
+                    format!("you picked {winner} as the winner"),
+                );
+                if let Some(rag) = state.ragnarok.as_mut() {
+                    rag.winner = Some(winner);
+                    rag.phase = ragnarok::RagnarokPhase::Concluded;
+                }
+            }
+            inline_repair_request(mode)
+        }
+        (_, KeyCode::Up | KeyCode::Char('k')) => {
+            rag.roster_cursor = rag.roster_cursor.saturating_sub(1);
+            TerminalRequest::None
+        }
+        (_, KeyCode::Down | KeyCode::Char('j')) => {
+            if rag.roster_cursor + 1 < rag.combatants.len() {
+                rag.roster_cursor += 1;
+            }
             TerminalRequest::None
         }
         _ => TerminalRequest::None,
@@ -3186,6 +3375,414 @@ fn draw_mjconfig_menu(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let footer = Paragraph::new("↑/↓ change · Tab switch · Enter save · Esc cancel")
         .style(Style::default().fg(theme.muted));
     f.render_widget(footer, rows[2]);
+}
+
+/// Wall-clock-driven frame index, mirroring `SpinnerStyle::current_frame`
+/// (spinner.rs) so the combat scene animates smoothly regardless of exact
+/// redraw cadence/jitter. `offset` (typically a combatant's roster index)
+/// staggers otherwise-identical animations so parallel competitors visibly
+/// desync from each other rather than pulsing in lockstep -- callers doing
+/// this for multiple instances (e.g. `hammer_row`) must offset by the
+/// instance's own index directly (`i`, not `i * k` for any `k` sharing a
+/// factor with `frame_count`), or the offsets can collapse back onto the
+/// same phase and silently synchronize everything. See
+/// `frame_index_desyncs_consecutive_offsets` below.
+fn ragnarok_frame_index(offset: usize, frame_count: usize) -> usize {
+    frame_index_at(wall_clock_millis(), offset, frame_count)
+}
+
+fn wall_clock_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Pure frame-selection math, split out from `ragnarok_frame_index` so the
+/// desync property is directly testable without depending on real time.
+fn frame_index_at(millis: u128, offset: usize, frame_count: usize) -> usize {
+    if frame_count == 0 {
+        return 0;
+    }
+    ((millis / 180) as usize + offset) % frame_count
+}
+
+fn draw_ragnarok_overlay(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    let Some(rag) = state.ragnarok.as_ref() else {
+        return;
+    };
+    let theme = state.theme;
+
+    if area.width.min(70) < 50 || area.height.min(20) < 14 {
+        return;
+    }
+    let width = area.width.saturating_sub(4).clamp(50, 100);
+    let height = area.height.saturating_sub(2).clamp(14, 34);
+    let rect = crate::term::centered_rect(area, width, height);
+    f.render_widget(Clear, rect);
+
+    let block = Block::default()
+        .title(format!(" ragnarok \u{2014} {} ", rag.phase.label()))
+        .borders(Borders::ALL)
+        .style(Style::default().fg(theme.text));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(format!(
+            "{}  \u{00b7}  {} elapsed",
+            truncate_text_to_width(rag.task.clone(), rows[0].width.saturating_sub(20)),
+            format_duration(rag.started_at.elapsed())
+        ))
+        .style(Style::default().fg(theme.muted)),
+        rows[0],
+    );
+
+    if rag.phase == ragnarok::RagnarokPhase::AwaitingUserPick {
+        draw_ragnarok_decision_panel(f, rows[1], theme, rag);
+        return;
+    }
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(rows[1]);
+
+    draw_ragnarok_roster(f, cols[0], theme, rag);
+    draw_ragnarok_scene(f, cols[1], theme, rag);
+
+    let footer = match rag.phase {
+        ragnarok::RagnarokPhase::Concluded | ragnarok::RagnarokPhase::Cancelled => {
+            "Enter/Esc dismiss"
+        }
+        _ => "\u{2191}/\u{2193} select \u{00b7} Esc cancel tournament",
+    };
+    f.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(theme.muted)),
+        rows[2],
+    );
+}
+
+/// True for a status that represents an actively-running connection --
+/// this is what earns a live spinner glyph and an activity line in the
+/// roster, as opposed to a settled/terminal status.
+fn combatant_is_active(status: &ragnarok::CombatantStatus) -> bool {
+    matches!(
+        status,
+        ragnarok::CombatantStatus::Spawning
+            | ragnarok::CombatantStatus::Implementing
+            | ragnarok::CombatantStatus::Waiting
+    )
+}
+
+/// Compact rotating glyph for a per-row "this connection is alive"
+/// indicator -- deliberately its own small cycle rather than reusing
+/// `SpinnerStyle::current_frame()`, whose frames are a full 12-column
+/// strip meant for the header, not a narrow roster row.
+const ROSTER_SPIN: [char; 4] = ['\u{25d0}', '\u{25d3}', '\u{25d1}', '\u{25d2}'];
+
+fn roster_spin_glyph(offset: usize) -> char {
+    ROSTER_SPIN[ragnarok_frame_index(offset, ROSTER_SPIN.len())]
+}
+
+fn draw_ragnarok_roster(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    theme: TerminalTheme,
+    rag: &ragnarok::RagnarokState,
+) {
+    if rag.combatants.is_empty() {
+        f.render_widget(
+            Paragraph::new(format!(
+                "{} thor is picking competitors...",
+                roster_spin_glyph(0)
+            ))
+            .style(Style::default().fg(theme.muted)),
+            area,
+        );
+        return;
+    }
+    let mut lines: Vec<Line> = Vec::with_capacity(rag.combatants.len());
+    for (idx, c) in rag.combatants.iter().enumerate() {
+        let marker = if idx == rag.roster_cursor {
+            "\u{25b6} "
+        } else {
+            "  "
+        };
+        let elapsed = format_duration(c.started_at.elapsed());
+        let style = match &c.status {
+            ragnarok::CombatantStatus::Failed { .. } => Style::default().fg(theme.error),
+            ragnarok::CombatantStatus::Judged { won: true } => Style::default()
+                .fg(theme.success)
+                .add_modifier(Modifier::BOLD),
+            _ => Style::default().fg(theme.text),
+        };
+        // Telemetry can tell us the review phase has started
+        // tournament-wide, but not honestly attribute a specific review
+        // connection back to a specific combatant -- so a combatant
+        // simply reads "reviewing" for the whole phase rather than the
+        // (indistinguishable-from-here) "waiting" `Waiting` label it'd
+        // otherwise show.
+        let status_label = if rag.phase == ragnarok::RagnarokPhase::Reviewing
+            && matches!(c.status, ragnarok::CombatantStatus::Waiting)
+        {
+            "reviewing"
+        } else {
+            c.status.label()
+        };
+        let active = combatant_is_active(&c.status);
+        // A live glyph on every active row, staggered by roster index, is
+        // the single biggest lever for "this doesn't look frozen" -- it's
+        // driven purely by wall-clock time, so it never needs a fresh
+        // event to keep moving, unlike the status text next to it.
+        let glyph = if active { roster_spin_glyph(idx) } else { ' ' };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{marker}{glyph} {:<4} {}/{}  {} elo  {:<13} {}",
+                c.slot, c.agent_label, c.model_label, c.elo, status_label, elapsed
+            ),
+            style,
+        )));
+        if let ragnarok::CombatantStatus::Failed { message } = &c.status {
+            lines.push(Line::from(Span::styled(
+                format!("        \u{2514} {message}"),
+                Style::default().fg(theme.muted),
+            )));
+        } else if active && let Some(activity) = &c.activity {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "        \u{2514} {}",
+                    truncate_text_to_width(activity.clone(), area.width.saturating_sub(10))
+                ),
+                Style::default().fg(theme.muted),
+            )));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// A figure with its arms up (mid-swing) or down (impact) -- alternating
+/// this per figure, offset by index, is what makes a row of figures read
+/// as genuinely hammering rather than a static picture of hammering.
+fn hammer_figure(arms_up: bool) -> &'static str {
+    if arms_up { "/o\\" } else { "\\o/" }
+}
+
+/// Caps how many individual figures/slots the scene draws explicitly --
+/// beyond this it falls back to a count, so a 10-competitor tournament
+/// doesn't overflow a ~55%-width panel with unreadable art.
+const SCENE_FIGURE_CAP: usize = 6;
+
+/// One line of `n` hammering figures (or reviewer pairs), each
+/// independently animated by wall-clock time, offset by its own index so
+/// they visibly desync rather than pulsing in lockstep -- reinforces that
+/// competitors are genuinely independent (constraint #10), not decoration
+/// for its own sake.
+fn hammer_row(n: usize) -> String {
+    // Offset by `i` (not a multiple of the 2-frame cycle length!) so
+    // consecutive figures land on opposite parity and visibly alternate --
+    // offsetting by an even number here would cancel out mod 2, leaving
+    // every figure on the same frame.
+    (0..n.min(SCENE_FIGURE_CAP))
+        .map(|i| hammer_figure(ragnarok_frame_index(i, 2) == 0))
+        .collect::<Vec<_>>()
+        .join("   ")
+}
+
+fn draw_ragnarok_scene(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    theme: TerminalTheme,
+    rag: &ragnarok::RagnarokState,
+) {
+    let accent = Style::default().fg(theme.accent);
+    let muted = Style::default().fg(theme.muted);
+    let mut lines: Vec<Line> = Vec::new();
+    let push = |lines: &mut Vec<Line>, s: String, style: Style| {
+        lines.push(Line::from(Span::styled(s, style)));
+    };
+
+    match rag.phase {
+        ragnarok::RagnarokPhase::Assessing => {
+            const ORBIT: [char; 4] = ['\u{25d0}', '\u{25d3}', '\u{25d1}', '\u{25d2}'];
+            let spin = ORBIT[ragnarok_frame_index(0, ORBIT.len())];
+            push(
+                &mut lines,
+                "  \u{26a1} THOR SIZES UP THE TASK \u{26a1}".to_string(),
+                accent,
+            );
+            lines.push(Line::from(""));
+            push(
+                &mut lines,
+                format!("        {spin}  weighing options  {spin}"),
+                accent,
+            );
+            push(
+                &mut lines,
+                "     assembling the roster...".to_string(),
+                muted,
+            );
+        }
+        ragnarok::RagnarokPhase::Implementing => {
+            let n = rag.combatants.len().max(1);
+            push(
+                &mut lines,
+                " \u{26a1} RAGNAROK: THE FORGES ARE LIT \u{26a1}".to_string(),
+                accent,
+            );
+            lines.push(Line::from(""));
+            push(&mut lines, format!("   {}", hammer_row(n)), accent);
+            const SPARK: [&str; 3] = [
+                "\u{2728}    \u{2728}",
+                "  \u{2728}\u{2728}  ",
+                "    \u{2728}    ",
+            ];
+            let spark = SPARK[ragnarok_frame_index(1, SPARK.len())];
+            push(&mut lines, format!("    {spark}"), muted);
+            push(
+                &mut lines,
+                "  each competitor hammers away...".to_string(),
+                muted,
+            );
+        }
+        ragnarok::RagnarokPhase::Reviewing => {
+            let n = rag.combatants.len().clamp(2, SCENE_FIGURE_CAP);
+            push(
+                &mut lines,
+                "   \u{2694} ADVERSARIAL REVIEW \u{2694}".to_string(),
+                accent,
+            );
+            lines.push(Line::from(""));
+            let eyes = ["\u{1f440}", "\u{1f50d}"];
+            let chain: Vec<String> = (0..n)
+                .map(|i| {
+                    let eye = eyes[ragnarok_frame_index(i, eyes.len())];
+                    format!("c{} {eye}", i + 1)
+                })
+                .collect();
+            push(&mut lines, format!(" {}", chain.join(" \u{2192} ")), accent);
+            lines.push(Line::from(""));
+            push(
+                &mut lines,
+                "  no one reviews their own work...".to_string(),
+                muted,
+            );
+        }
+        ragnarok::RagnarokPhase::Judging => {
+            const SCALE: [&str; 3] = [
+                "\u{2696}\u{fe0f} tips left ",
+                "\u{2696}\u{fe0f}  balanced  ",
+                " tips right \u{2696}\u{fe0f}",
+            ];
+            let tip = SCALE[ragnarok_frame_index(0, SCALE.len())];
+            const BOLT: [&str; 2] = ["\u{26a1}", "\u{00b7}"];
+            let bolt = BOLT[ragnarok_frame_index(0, BOLT.len())];
+            push(
+                &mut lines,
+                "     \u{2696} THOR JUDGES \u{2696}".to_string(),
+                accent,
+            );
+            push(&mut lines, format!("          {bolt}"), accent);
+            push(&mut lines, format!("      {tip}"), accent);
+            lines.push(Line::from(""));
+            push(
+                &mut lines,
+                " weighing honesty and validity...".to_string(),
+                muted,
+            );
+        }
+        ragnarok::RagnarokPhase::Concluded => {
+            const SHIMMER: [&str; 6] = [
+                "\u{00b7}", "\u{2219}", "\u{2022}", "\u{25cf}", "\u{2022}", "\u{2219}",
+            ];
+            let glow = SHIMMER[ragnarok_frame_index(0, SHIMMER.len())];
+            push(
+                &mut lines,
+                format!("      {glow} \u{1f3c6} VICTORY \u{1f3c6} {glow}"),
+                accent,
+            );
+            lines.push(Line::from(""));
+            push(&mut lines, "  a winner has been forged.".to_string(), muted);
+        }
+        ragnarok::RagnarokPhase::Cancelled | ragnarok::RagnarokPhase::AwaitingUserPick => {
+            push(&mut lines, "     tournament ended.".to_string(), muted);
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_ragnarok_decision_panel(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    theme: TerminalTheme,
+    rag: &ragnarok::RagnarokState,
+) {
+    let Some((a, b, reasoning)) = rag.finalists.as_ref() else {
+        return;
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    f.render_widget(
+        Paragraph::new("Thor couldn't separate these two. Reasoning:")
+            .style(Style::default().fg(theme.text)),
+        rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(reasoning.as_str())
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(theme.muted)),
+        rows[1],
+    );
+
+    let option_lines: Vec<Line> = [a, b]
+        .into_iter()
+        .enumerate()
+        .map(|(idx, slot)| {
+            let combatant = rag.combatants.iter().find(|c| &c.slot == slot);
+            let marker = if idx == rag.decision_cursor {
+                "\u{25b6} "
+            } else {
+                "  "
+            };
+            let label = match combatant {
+                Some(c) => format!("{slot}  {}/{}  {} elo", c.agent_label, c.model_label, c.elo),
+                None => slot.clone(),
+            };
+            let style = if idx == rag.decision_cursor {
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            Line::from(Span::styled(format!("{marker}{label}"), style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(option_lines), rows[2]);
+
+    f.render_widget(
+        Paragraph::new("\u{2191}/\u{2193} select \u{00b7} Enter confirm \u{00b7} Esc cancel")
+            .style(Style::default().fg(theme.muted)),
+        rows[3],
+    );
 }
 
 fn export_transcript(state: &AppState) -> Result<PathBuf> {
@@ -3965,6 +4562,10 @@ fn draw(
         draw_mjconfig_menu(f, f.area(), state);
     }
 
+    if state.ragnarok.is_some() {
+        draw_ragnarok_overlay(f, f.area(), state);
+    }
+
     if let Some(pending) = state.pending_permission() {
         draw_permission_modal(
             f,
@@ -4016,6 +4617,11 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
 
     if state.mjconfig_menu.is_some() {
         draw_mjconfig_menu(f, f.area(), state);
+        return;
+    }
+
+    if state.ragnarok.is_some() {
+        draw_ragnarok_overlay(f, f.area(), state);
         return;
     }
 
@@ -7342,6 +7948,76 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::backend::{Backend, TestBackend};
     use ratatui::layout::Position;
+
+    // -- ragnarok combat-scene animation --
+
+    #[test]
+    fn frame_index_at_advances_over_time_for_a_fixed_offset() {
+        let a = frame_index_at(0, 0, 5);
+        let b = frame_index_at(180, 0, 5);
+        assert_ne!(a, b, "180ms later should land on the next frame");
+    }
+
+    #[test]
+    fn frame_index_at_wraps_around() {
+        assert_eq!(frame_index_at(180 * 5, 0, 5), frame_index_at(0, 0, 5));
+    }
+
+    #[test]
+    fn frame_index_at_offset_by_one_desyncs_from_offset_zero_at_some_point() {
+        // Regression test: an earlier version staggered multi-figure
+        // animations by `i * frame_count`, which -- because that's always
+        // a multiple of frame_count -- collapsed every figure onto the
+        // *same* frame instead of desyncing them. Any two adjacent
+        // instances (offsets differing by exactly 1) must disagree at
+        // least once per cycle for any frame_count > 1.
+        for frame_count in 2..=8 {
+            let disagrees = (0..frame_count as u128 * 180).step_by(180).any(|millis| {
+                frame_index_at(millis, 0, frame_count) != frame_index_at(millis, 1, frame_count)
+            });
+            assert!(
+                disagrees,
+                "offset 0 and 1 never disagree for frame_count={frame_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn hammer_row_shows_more_than_one_arm_position_over_a_full_cycle() {
+        // hammer_figure alternates on a 2-frame cycle (360ms); sampling a
+        // couple of cycles' worth of instants must see both "/o\" and
+        // "\o/" somewhere in the row, or the scene isn't actually animated.
+        let mut saw_up = false;
+        let mut saw_down = false;
+        for tick in 0..8u128 {
+            let up = frame_index_at(tick * 180, 0, 2) == 0;
+            if up {
+                saw_up = true;
+            } else {
+                saw_down = true;
+            }
+        }
+        assert!(saw_up && saw_down, "hammer_figure never alternates");
+    }
+
+    #[test]
+    fn hammer_row_composes_hammer_figure_per_position() {
+        // hammer_row is a thin composition over hammer_figure -- pin that
+        // composition down directly (position i's glyph must match what
+        // hammer_figure says for i's own frame index) so a future edit that
+        // reintroduces the "offset by a multiple of frame_count" bug (see
+        // the regression test above) still leaves this assertion checking
+        // the right thing.
+        let row = hammer_row(3);
+        let figures: Vec<&str> = row.split("   ").collect();
+        assert_eq!(figures.len(), 3);
+        for figure in figures {
+            assert!(
+                figure == "/o\\" || figure == "\\o/",
+                "unexpected figure {figure:?}"
+            );
+        }
+    }
 
     fn key(code: KeyCode) -> CtEvent {
         key_with_modifiers(code, KeyModifiers::NONE)

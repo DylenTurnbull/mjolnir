@@ -402,6 +402,19 @@ impl ScoreCatalog {
             .into_iter()
             .find_map(|key| self.by_key.get(&key).copied())
     }
+
+    /// Structured score lookup for callers that need the raw Elo/provisional
+    /// pair rather than a rendered suffix (e.g. Ragnarok's eligibility
+    /// ranking, which sorts and filters on the numeric Elo itself).
+    pub fn lookup_score(
+        &self,
+        agent_id: &str,
+        value: &str,
+        name: &str,
+        description: &str,
+    ) -> Option<ModelScore> {
+        self.lookup(agent_id, value, name, description)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -450,6 +463,27 @@ impl ScoreStore {
         } else {
             format!("{} elo", score.elo)
         })
+    }
+
+    /// Structured passthrough to `ScoreCatalog::lookup_score`, for callers
+    /// that need the raw Elo (e.g. Ragnarok's eligibility ranking) rather
+    /// than a rendered suffix. Same "disabled or unmatched -> None" gate as
+    /// `score_suffix`: if the user turned scoring off, every model reads as
+    /// unscored, which is the correct input to a "no score -> ineligible"
+    /// rule rather than a silent bypass of that preference.
+    pub fn lookup_score(
+        &self,
+        agent_id: &str,
+        value: &str,
+        name: &str,
+        description: &str,
+    ) -> Option<ModelScore> {
+        let guard = self.catalog.read().ok()?;
+        let catalog = guard.as_ref()?;
+        if !catalog.enabled {
+            return None;
+        }
+        catalog.lookup_score(agent_id, value, name, description)
     }
 }
 

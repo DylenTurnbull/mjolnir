@@ -23,6 +23,7 @@ mod paths;
 mod picker;
 mod probe;
 mod qr;
+mod ragnarok;
 mod registry;
 mod remote;
 mod scores;
@@ -177,7 +178,15 @@ enum Commands {
 }
 
 #[derive(Debug, clap::Args, Default)]
-struct McpArgs {}
+struct McpArgs {
+    /// Restrict `connect` to these agent source_ids (see `list_agents`),
+    /// comma-separated. Rejects ad-hoc `program` launches outright. Used to
+    /// give a supervising agent (e.g. Ragnarok's Thor) tool access to `mj
+    /// mcp` without letting it spawn arbitrary executables. Omit for the
+    /// default, unrestricted behavior.
+    #[arg(long, value_delimiter = ',')]
+    allowed_agents: Vec<String>,
+}
 
 #[derive(Debug, clap::Args, Default)]
 struct DumpModelsArgs {
@@ -373,7 +382,7 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
-            Commands::Mcp(_) => {
+            Commands::Mcp(args) => {
                 let workspace_roots =
                     validate_workspace_roots(&cwd, &top_level_additional_directories)?;
                 mcp::serve(mcp::McpConfig {
@@ -381,6 +390,8 @@ async fn main() -> Result<()> {
                     additional_directories: workspace_roots.additional_directories().to_vec(),
                     agent_stderr: cli.agent_stderr,
                     fs_max_text_bytes,
+                    allowed_agents: (!args.allowed_agents.is_empty())
+                        .then_some(args.allowed_agents),
                 })
                 .await
             }
@@ -1545,6 +1556,7 @@ async fn run_session(
         env: agent.env.clone(),
         agent_stderr: runtime_options.agent_stderr.clone(),
         fs_max_text_bytes: runtime_options.fs_max_text_bytes,
+        mcp_servers: Vec::new(),
     };
 
     // Drive the ACP runtime on its own task so the UI can own the
@@ -1574,6 +1586,10 @@ async fn run_session(
         Some(runtime_cmd_tx.clone()),
         Some(ui_event_tx.clone()),
     );
+    // `ui_event_tx` itself is moved into the event-proxy task below; take
+    // this clone first so `/ragnarok` can hand it to a bridging task that
+    // folds a tournament's progress back into the same UiEvent stream.
+    let ragnarok_ui_event_tx = ui_event_tx.clone();
 
     let event_tracker = remote_tracker.clone();
     let event_proxy = tokio::spawn(async move {
@@ -1611,6 +1627,7 @@ async fn run_session(
             &mut terminal.term,
             &cmd_tx,
             &mut ui_event_rx,
+            &ragnarok_ui_event_tx,
             header_labels.clone(),
             agent_display_name.clone(),
             agent_source_id.clone(),
@@ -1625,6 +1642,7 @@ async fn run_session(
                 spinner_style,
                 score_store: score_store.clone(),
                 session_boundary: session_boundary.take(),
+                cwd: cwd.clone(),
             },
         )
         .await;

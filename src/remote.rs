@@ -544,6 +544,9 @@ impl TrackerState {
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::Info(_)
             | UiEvent::SessionForkFailed { .. }
+            // A `/ragnarok` tournament renders in the local TUI overlay
+            // only; the remote viewer has no equivalent surface (yet).
+            | UiEvent::Ragnarok(_)
             | UiEvent::Warning(_) => {}
         }
     }
@@ -1372,6 +1375,7 @@ fn start_server_agent_session(
         env: agent.env,
         agent_stderr: None,
         fs_max_text_bytes,
+        mcp_servers: Vec::new(),
     };
     let command_tx = runtime_cmd_tx.clone();
     let shutdown_tx = runtime_cmd_tx;

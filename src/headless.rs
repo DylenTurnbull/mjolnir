@@ -140,6 +140,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         env: agent.env,
         agent_stderr: cfg.agent_stderr,
         fs_max_text_bytes: cfg.fs_max_text_bytes,
+        mcp_servers: Vec::new(),
     };
 
     let runtime = tokio::spawn(async move { acp::run(runtime_cfg, event_tx, cmd_rx).await });
@@ -256,6 +257,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             UiEvent::Info(_) => {}
             UiEvent::CancelPendingPermissions => {}
             UiEvent::ClaudeUsage(_) => {}
+            // This connection's own turn, not a `/ragnarok` tournament —
+            // Ragnarok events only ever flow to the foreground TUI session.
+            UiEvent::Ragnarok(_) => {}
             // Headless runs never receive remote decisions (no UI event
             // channel is registered with the tracker).
             UiEvent::RemotePermissionDecision { .. } => {}

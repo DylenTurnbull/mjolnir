@@ -55,6 +55,7 @@ use crate::labels::{
     permission_option_kind_label, stop_reason_label, tool_kind_label, tool_status_label,
 };
 use crate::remote;
+use crate::worktree;
 
 /// How long `connect` waits for the agent to reach a started session before
 /// giving up. Agents may install packages or authenticate on first launch, so
@@ -119,6 +120,12 @@ pub struct McpConfig {
     pub agent_stderr: Option<PathBuf>,
     /// Maximum text bytes for ACP filesystem reads/writes.
     pub fs_max_text_bytes: u64,
+    /// When set, `connect` only accepts a named `agent` from this list (by
+    /// `source_id`) and rejects ad-hoc `program` launches outright,
+    /// regardless of `MJ_MCP_ALLOW_ADHOC_PROGRAM`. `None` is the default,
+    /// unrestricted behavior. Used to give a supervising agent tool access
+    /// to this server without letting it spawn arbitrary executables.
+    pub allowed_agents: Option<Vec<String>>,
 }
 
 // Enum→label mappers live in `crate::labels`, shared with the headless runner.
@@ -392,11 +399,14 @@ impl ConnState {
                 let _ = prompt.responder.send(ElicitationOutcome::Decline);
             }
             // The MCP server does not host an embedded terminal view, never
-            // injects remote permission decisions of its own, and does not
-            // surface Claude Code's local quota scrape.
+            // injects remote permission decisions of its own, does not
+            // surface Claude Code's local quota scrape, and this connection
+            // is never itself the foreground session a `/ragnarok`
+            // tournament's events flow to.
             UiEvent::TerminalOutput(_)
             | UiEvent::RemotePermissionDecision { .. }
-            | UiEvent::ClaudeUsage(_) => {}
+            | UiEvent::ClaudeUsage(_)
+            | UiEvent::Ragnarok(_) => {}
         }
     }
 
@@ -511,6 +521,19 @@ pub struct McpServer {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NoArgs {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CreateWorktreeArgs {
+    /// Branch name for the new worktree (e.g. `ragnarok/<run-id>/c1`).
+    /// Slashes become nested directories under `.mjolnir/worktrees/`.
+    branch_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateWorktreeResult {
+    branch_name: String,
+    worktree_path: String,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ConnectArgs {
@@ -678,6 +701,19 @@ struct RespondPermissionArgs {
     option_id: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct RespondPermissionResult {
+    ok: bool,
+    /// Whether the chosen option was an allow-kind (`allow_once`/
+    /// `allow_always`) rather than reject-kind. `None` when `option_id` was
+    /// omitted (an implicit cancel, neither approved nor denied).
+    approved: Option<bool>,
+    /// The permission request's own title, echoed back so the caller (an
+    /// LLM reasoning about its own actions, or a caller deriving UI events
+    /// from this tool's result) has the "what" alongside the "approved/not."
+    title: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetResultArgs {
     connection_id: String,
@@ -799,8 +835,37 @@ impl McpServer {
             .ok_or_else(|| err(format!("unknown connection_id: {id}")))
     }
 
+    /// When `McpConfig.allowed_agents` is set, require a named `agent` from
+    /// that list and reject `program` outright — independent of (and
+    /// stricter than) `adhoc_program_allowed()`, so a restricted server
+    /// can't be reopened by an inherited `MJ_MCP_ALLOW_ADHOC_PROGRAM`.
+    fn check_allowed_agent(&self, args: &ConnectArgs) -> Result<(), String> {
+        let Some(allowed) = &self.config.allowed_agents else {
+            return Ok(());
+        };
+        if args.program.is_some() {
+            return Err(
+                "this server instance is restricted to pre-configured agents (--allowed-agents); \
+                 connect via `agent`, not `program`"
+                    .to_string(),
+            );
+        }
+        match &args.agent {
+            Some(agent) if allowed.iter().any(|a| a == agent) => Ok(()),
+            Some(agent) => Err(format!(
+                "agent '{agent}' is not in this server's --allowed-agents list"
+            )),
+            None => Err(
+                "this server instance is restricted to pre-configured agents (--allowed-agents); \
+                 pass `agent` (see list_agents)"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Resolve a `ConnectArgs` into an `AcpRuntimeConfig`.
     fn build_runtime_config(&self, args: &ConnectArgs) -> Result<AcpRuntimeConfig, String> {
+        self.check_allowed_agent(args)?;
         let resolved = if let Some(program) = &args.program {
             // Launching an arbitrary executable chosen by the MCP client is a
             // process-spawn capability; require an explicit opt-in so the default
@@ -833,6 +898,7 @@ impl McpServer {
             env: resolved.env,
             agent_stderr: self.config.agent_stderr.clone(),
             fs_max_text_bytes: self.config.fs_max_text_bytes,
+            mcp_servers: Vec::new(),
         })
     }
 
@@ -945,6 +1011,22 @@ impl McpServer {
             });
         }
         json_result(&agents)
+    }
+
+    #[tool(
+        description = "Create a git worktree on a new branch under .mjolnir/worktrees/, rooted at this server's launch cwd (--cwd). Returns the branch name and absolute worktree path to use as `cwd` in a subsequent `connect` call."
+    )]
+    async fn create_worktree(
+        &self,
+        Parameters(args): Parameters<CreateWorktreeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let worktree_path =
+            worktree::create_on_new_branch(&self.config.default_cwd, &args.branch_name)
+                .map_err(|e| err(format!("create_worktree failed: {e:#}")))?;
+        json_result(&CreateWorktreeResult {
+            branch_name: args.branch_name,
+            worktree_path: worktree_path.display().to_string(),
+        })
     }
 
     #[tool(
@@ -1221,6 +1303,13 @@ impl McpServer {
                     args.perm_id
                 ))
             })?;
+        let approved = args.option_id.as_ref().and_then(|id| {
+            pending
+                .options
+                .iter()
+                .find(|o| &o.option_id == id)
+                .map(|o| o.kind.starts_with("allow"))
+        });
         let decision = match args.option_id {
             Some(option_id) => PermissionDecision::Selected(option_id),
             None => PermissionDecision::Cancelled,
@@ -1229,7 +1318,11 @@ impl McpServer {
         if st.pending_permissions.is_empty() && st.turn.status == TurnStatus::AwaitingPermission {
             st.turn.status = TurnStatus::Running;
         }
-        ack("permission answered")
+        json_result(&RespondPermissionResult {
+            ok: true,
+            approved,
+            title: pending.title,
+        })
     }
 
     #[tool(
@@ -1409,6 +1502,83 @@ mod tests {
         UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(ContentChunk::new(
             ContentBlock::Text(TextContent::new(text)),
         )))
+    }
+
+    fn test_config(allowed_agents: Option<Vec<String>>) -> McpConfig {
+        McpConfig {
+            default_cwd: std::env::temp_dir(),
+            additional_directories: Vec::new(),
+            agent_stderr: None,
+            fs_max_text_bytes: 1_000_000,
+            allowed_agents,
+        }
+    }
+
+    fn connect_args(agent: Option<&str>, program: Option<&str>) -> ConnectArgs {
+        ConnectArgs {
+            agent: agent.map(str::to_string),
+            program: program.map(str::to_string),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            additional_directories: Vec::new(),
+            resume_session: None,
+        }
+    }
+
+    #[test]
+    fn check_allowed_agent_permits_everything_when_unset() {
+        let server = McpServer::new(test_config(None));
+        assert!(
+            server
+                .check_allowed_agent(&connect_args(None, Some("/bin/anything")))
+                .is_ok()
+        );
+        assert!(
+            server
+                .check_allowed_agent(&connect_args(Some("whatever"), None))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_allowed_agent_rejects_program_when_restricted() {
+        let server = McpServer::new(test_config(Some(vec!["claude-acp".to_string()])));
+        assert!(
+            server
+                .check_allowed_agent(&connect_args(None, Some("/bin/sh")))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn check_allowed_agent_rejects_agent_not_in_allow_list() {
+        let server = McpServer::new(test_config(Some(vec!["claude-acp".to_string()])));
+        assert!(
+            server
+                .check_allowed_agent(&connect_args(Some("codex-acp"), None))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn check_allowed_agent_permits_agent_in_allow_list() {
+        let server = McpServer::new(test_config(Some(vec!["claude-acp".to_string()])));
+        assert!(
+            server
+                .check_allowed_agent(&connect_args(Some("claude-acp"), None))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_allowed_agent_rejects_missing_agent_when_restricted() {
+        let server = McpServer::new(test_config(Some(vec!["claude-acp".to_string()])));
+        assert!(
+            server
+                .check_allowed_agent(&connect_args(None, None))
+                .is_err()
+        );
     }
 
     #[test]
