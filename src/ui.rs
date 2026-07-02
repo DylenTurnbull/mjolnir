@@ -54,6 +54,7 @@ use crate::event::{PermissionDecision, PermissionPrompt, PromptImage, UiCommand,
 use crate::notifications::TerminalNotificationBackend;
 use crate::palette::TerminalTheme;
 use crate::ragnarok;
+use crate::ragnarok_sprites::{self, SpriteKind};
 use crate::speech::{dictation_error_message, run_dictation};
 use crate::spinner::SpinnerStyle;
 use crate::term::TrackedBackend;
@@ -7755,7 +7756,9 @@ fn draw_ragnarok_fighters(
     }
     let n = arena.fighters.len() as u16;
     const CARD_MIN_WIDTH: u16 = 24;
-    const CARD_HEIGHT: u16 = 8;
+    // Borders (2) + agent/elo line + 7 half-block sprite rows + vigor bar +
+    // action caption.
+    const CARD_HEIGHT: u16 = 12;
     let cols = (area.width / CARD_MIN_WIDTH).clamp(1, n);
     let rows = n.div_ceil(cols);
 
@@ -7849,6 +7852,34 @@ fn action_glyph(kind: ragnarok::ActionKind) -> &'static str {
         ragnarok::ActionKind::Ponder => "💭",
         ragnarok::ActionKind::Wound => "🩸",
         ragnarok::ActionKind::Guard => "🛡",
+    }
+}
+
+/// Which pixel-art animation a fighter plays right now, plus the accent color
+/// for its `M` pixels (sparks, lightning, orb, notes, blood).
+fn sprite_for(fighter: &RagnarokFighterUi, theme: TerminalTheme) -> (SpriteKind, Color) {
+    const GOLD: Color = Color::Rgb(240, 196, 60);
+    const BLOOD: Color = Color::Rgb(202, 44, 44);
+    let live_action = fighter
+        .action
+        .as_ref()
+        .filter(|(_, _, at)| at.elapsed() < RAGNAROK_ACTION_TTL)
+        .map(|(kind, _, _)| *kind);
+    match &fighter.state {
+        ragnarok::FighterState::Slain(_) => (SpriteKind::Slain, BLOOD),
+        ragnarok::FighterState::Standing => (SpriteKind::Victor, GOLD),
+        ragnarok::FighterState::Summoned
+        | ragnarok::FighterState::Forging
+        | ragnarok::FighterState::Connecting => (SpriteKind::March, theme.muted),
+        _ => match live_action {
+            Some(ragnarok::ActionKind::Forge) => (SpriteKind::Swing, Color::Rgb(255, 150, 60)),
+            Some(ragnarok::ActionKind::Strike) => (SpriteKind::Swing, Color::Rgb(250, 224, 84)),
+            Some(ragnarok::ActionKind::Scry) => (SpriteKind::Cast, Color::Rgb(196, 112, 240)),
+            Some(ragnarok::ActionKind::Ponder) => (SpriteKind::Cast, Color::Rgb(176, 176, 188)),
+            Some(ragnarok::ActionKind::Chant) => (SpriteKind::Cast, GOLD),
+            Some(ragnarok::ActionKind::Wound) => (SpriteKind::Wound, BLOOD),
+            Some(ragnarok::ActionKind::Guard) | None => (SpriteKind::Idle, theme.accent),
+        },
     }
 }
 
@@ -7979,24 +8010,17 @@ fn draw_fighter_card(
         Style::default().fg(theme.muted),
     )));
 
-    let pose = pose_for(fighter);
-    let glyph = fighter
-        .action
-        .as_ref()
-        .filter(|(_, _, at)| at.elapsed() < RAGNAROK_ACTION_TTL)
-        .map(|(kind, _, _)| action_glyph(*kind))
-        .unwrap_or(" ");
-    let pad = inner_width.saturating_sub(6) / 2;
-    for (i, row) in pose.iter().enumerate() {
-        let decorated = if i == 1 {
-            format!("{}{row} {glyph}", " ".repeat(pad))
-        } else {
-            format!("{}{row}", " ".repeat(pad))
-        };
-        lines.push(Line::from(Span::styled(
-            fit_width(&decorated, inner_width),
-            Style::default().fg(color),
-        )));
+    let (sprite_kind, accent) = sprite_for(fighter, theme);
+    let frame_set = ragnarok_sprites::frames(sprite_kind);
+    // Offset each viking's animation by their id so the shield wall doesn't
+    // march in eerie unison.
+    let frame = &frame_set[arena_frame().wrapping_add(fighter.card.id) % frame_set.len()];
+    let pad = " ".repeat(inner_width.saturating_sub(ragnarok_sprites::SPRITE_W) / 2);
+    for sprite_line in ragnarok_sprites::render(frame, color, accent) {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(sprite_line.spans.len() + 1);
+        spans.push(Span::raw(pad.clone()));
+        spans.extend(sprite_line.spans);
+        lines.push(Line::from(spans));
     }
 
     let bar_width = inner_width.saturating_sub(state_word.len() + 2).max(4);
