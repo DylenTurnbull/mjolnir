@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
@@ -30,6 +30,8 @@ use crossterm::{
 use hmac::{Hmac, Mac};
 use rcgen::generate_simple_self_signed;
 use rusqlite::{Connection, OptionalExtension, params};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use time::OffsetDateTime;
@@ -1247,8 +1249,10 @@ fn build_client(cert_path: &Path) -> Option<reqwest::Client> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     hostname: Option<String>,
+    tailscale: bool,
     history_days: u32,
     session_ttl_days: u32,
     logout_all: bool,
@@ -1269,7 +1273,15 @@ pub async fn run_server(
     })?;
 
     let requested_hostname = normalize_requested_hostname(hostname.as_deref());
-    let listen = server_listen_config(requested_hostname.as_deref())?;
+    let tailscale_tls = if tailscale {
+        Some(prepare_tailscale_tls(&remote_control_dir())?)
+    } else {
+        None
+    };
+    let listen = match &tailscale_tls {
+        Some(ts) => tailscale_listen_config(&ts.tailscale.cert_domain),
+        None => server_listen_config(requested_hostname.as_deref())?,
+    };
     let paths = ensure_server_paths(requested_hostname.as_deref())?;
     init_db(&paths.db_path)?;
     let token = ensure_token(&paths.token_path)?;
@@ -1290,10 +1302,22 @@ pub async fn run_server(
         session_ttl,
     });
 
-    let tls_config =
-        axum_server::tls_rustls::RustlsConfig::from_pem_file(&paths.cert_path, &paths.key_path)
-            .await
-            .context("load remote-control TLS certificate")?;
+    let tls_config = match &tailscale_tls {
+        Some(ts) => {
+            let resolver = Arc::new(SniCertResolver {
+                default_key: load_certified_key(&paths.cert_path, &paths.key_path)?,
+                tailscale_domain: ts.tailscale.cert_domain.to_ascii_lowercase(),
+                tailscale_key: RwLock::new(load_certified_key(&ts.cert_path, &ts.key_path)?),
+            });
+            spawn_tailscale_cert_renewer(ts.clone(), resolver.clone());
+            sni_rustls_config(resolver)?
+        }
+        None => {
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&paths.cert_path, &paths.key_path)
+                .await
+                .context("load remote-control TLS certificate")?
+        }
+    };
 
     let listener = bind_server_listener(&listen.bind_addr)?;
 
@@ -1305,6 +1329,12 @@ pub async fn run_server(
         "Remote control listening on https://{}:11921",
         listen.viewer_host
     );
+    if let Some(ts) = &tailscale_tls {
+        println!(
+            "tls: trusted tailscale certificate for {} (auto-renews daily)",
+            ts.tailscale.cert_domain
+        );
+    }
     println!("{}", crate::qr::render_qr(&viewer_url)?);
     println!("viewer code: {viewer_code}");
     if logout_all {
@@ -1558,6 +1588,144 @@ fn remote_qr_login_url(host: &str, token: &str) -> String {
 /// a second call is a no-op.
 fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// The tailscale daemon handle plus where its issued certificate lives on
+/// disk. Kept separate from the self-signed `cert.pem`/`key.pem` pair, which
+/// local `mj` processes pin when reporting sessions.
+#[derive(Debug, Clone)]
+struct TailscaleTls {
+    tailscale: crate::tailscale::Tailscale,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+}
+
+fn prepare_tailscale_tls(root: &Path) -> Result<TailscaleTls> {
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("create remote-control dir {}", root.display()))?;
+    let tailscale = crate::tailscale::Tailscale::discover()?;
+    let cert_path = root.join("tailscale-cert.pem");
+    let key_path = root.join("tailscale-key.pem");
+    println!(
+        "obtaining https certificate for {} via tailscale (first issuance can take ~30s)…",
+        tailscale.cert_domain
+    );
+    tailscale.mint_cert(&cert_path, &key_path)?;
+    restrict_permissions(&key_path)?;
+    Ok(TailscaleTls {
+        tailscale,
+        cert_path,
+        key_path,
+    })
+}
+
+/// In tailscale mode the server must accept connections from tailnet peers
+/// (the phone) *and* local `mj` processes reporting sessions to
+/// `https://localhost:11921`, so it binds all interfaces exactly like
+/// `--hostname` mode. Access is still gated by the bearer token/viewer code.
+fn tailscale_listen_config(cert_domain: &str) -> ServerListenConfig {
+    ServerListenConfig {
+        bind_addr: REMOTE_CONTROL_PUBLIC_ADDR.to_string(),
+        viewer_host: cert_domain.to_string(),
+    }
+}
+
+/// Serves the tailscale (Let's Encrypt) certificate to clients whose SNI is
+/// the ts.net name, and the self-signed certificate to everyone else — so
+/// local `mj` processes hitting `https://localhost:11921` keep validating
+/// against the pinned `cert.pem` unchanged.
+#[derive(Debug)]
+struct SniCertResolver {
+    default_key: Arc<CertifiedKey>,
+    /// Lowercase; SNI hostnames are compared case-insensitively.
+    tailscale_domain: String,
+    /// Behind a lock so the daily renewer can hot-swap the certificate
+    /// without restarting the listener.
+    tailscale_key: RwLock<Arc<CertifiedKey>>,
+}
+
+impl ResolvesServerCert for SniCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        if sni_matches(client_hello.server_name(), &self.tailscale_domain) {
+            Some(
+                self.tailscale_key
+                    .read()
+                    .expect("tailscale cert lock")
+                    .clone(),
+            )
+        } else {
+            Some(self.default_key.clone())
+        }
+    }
+}
+
+fn sni_matches(server_name: Option<&str>, tailscale_domain: &str) -> bool {
+    server_name.is_some_and(|name| name.eq_ignore_ascii_case(tailscale_domain))
+}
+
+fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<CertifiedKey>> {
+    let cert_pem =
+        std::fs::read(cert_path).with_context(|| format!("read {}", cert_path.display()))?;
+    let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parse certificates in {}", cert_path.display()))?;
+    if certs.is_empty() {
+        return Err(anyhow!("no certificates found in {}", cert_path.display()));
+    }
+    let key_pem =
+        std::fs::read(key_path).with_context(|| format!("read {}", key_path.display()))?;
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .with_context(|| format!("parse private key in {}", key_path.display()))?
+        .ok_or_else(|| anyhow!("no private key found in {}", key_path.display()))?;
+    let signing_key = rustls::crypto::ring::default_provider()
+        .key_provider
+        .load_private_key(key)
+        .map_err(|error| anyhow!("load private key {}: {error}", key_path.display()))?;
+    Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
+}
+
+fn sni_rustls_config(
+    resolver: Arc<SniCertResolver>,
+) -> Result<axum_server::tls_rustls::RustlsConfig> {
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("configure TLS protocol versions")?
+    .with_no_client_auth()
+    .with_cert_resolver(resolver);
+    // Match the ALPN set RustlsConfig::from_pem_file installs.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        Arc::new(config),
+    ))
+}
+
+/// Let's Encrypt certificates last 90 days and `mj server` can easily run
+/// longer. Re-run `tailscale cert` daily — a cheap local call while the
+/// cached certificate is fresh; tailscaled only contacts Let's Encrypt when
+/// renewal is due — and hot-swap the served certificate.
+fn spawn_tailscale_cert_renewer(ts: TailscaleTls, resolver: Arc<SniCertResolver>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        interval.tick().await; // first tick fires immediately; the cert is fresh
+        loop {
+            interval.tick().await;
+            let mint = ts.clone();
+            let renewed = tokio::task::spawn_blocking(move || {
+                mint.tailscale.mint_cert(&mint.cert_path, &mint.key_path)?;
+                load_certified_key(&mint.cert_path, &mint.key_path)
+            })
+            .await;
+            match renewed {
+                Ok(Ok(key)) => {
+                    *resolver.tailscale_key.write().expect("tailscale cert lock") = key;
+                }
+                Ok(Err(error)) => warn!("tailscale certificate renewal failed: {error:#}"),
+                Err(error) => warn!("tailscale certificate renewal task failed: {error}"),
+            }
+        }
+    });
 }
 
 /// Inputs needed to build the remote-control router. Grouping these into named
@@ -4684,6 +4852,124 @@ mod tests {
             std::fs::read_to_string(dir.path().join("cert-hostname")).expect("read hostname"),
             "localhost"
         );
+    }
+
+    #[test]
+    fn tailscale_listen_config_binds_all_interfaces_with_ts_domain() {
+        assert_eq!(
+            tailscale_listen_config("mybox.tail1234.ts.net"),
+            ServerListenConfig {
+                bind_addr: REMOTE_CONTROL_PUBLIC_ADDR.to_string(),
+                viewer_host: "mybox.tail1234.ts.net".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sni_matches_only_the_tailscale_domain() {
+        let domain = "mybox.tail1234.ts.net";
+        assert!(sni_matches(Some("mybox.tail1234.ts.net"), domain));
+        assert!(sni_matches(Some("MyBox.Tail1234.TS.NET"), domain));
+        assert!(!sni_matches(Some("localhost"), domain));
+        assert!(!sni_matches(Some("evil-mybox.tail1234.ts.net"), domain));
+        assert!(!sni_matches(None, domain));
+    }
+
+    #[test]
+    fn load_certified_key_reads_generated_pem_pair() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = generate_simple_self_signed(vec!["mybox.tail1234.ts.net".to_string()])
+            .expect("generate cert");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).expect("write cert");
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key");
+        let key = load_certified_key(&cert_path, &key_path).expect("load");
+        assert_eq!(key.cert.len(), 1);
+    }
+
+    // Real-handshake check of the SNI split: a client that asks for the
+    // ts.net name must be served (and validate against) the tailscale
+    // certificate, while a client hitting the raw IP — like local `mj`
+    // processes hitting localhost — must still get the self-signed one it
+    // pins. If the resolver picked the wrong certificate either handshake
+    // would fail hostname validation.
+    #[tokio::test]
+    async fn sni_resolver_serves_each_client_its_own_certificate() {
+        install_crypto_provider();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ts_domain = "mybox.tail1234.ts.net";
+
+        let default_cert =
+            generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .expect("default cert");
+        let ts_cert =
+            generate_simple_self_signed(vec![ts_domain.to_string()]).expect("tailscale cert");
+        let default_cert_path = dir.path().join("cert.pem");
+        let default_key_path = dir.path().join("key.pem");
+        let ts_cert_path = dir.path().join("tailscale-cert.pem");
+        let ts_key_path = dir.path().join("tailscale-key.pem");
+        std::fs::write(&default_cert_path, default_cert.cert.pem()).expect("write default cert");
+        std::fs::write(&default_key_path, default_cert.key_pair.serialize_pem())
+            .expect("write default key");
+        std::fs::write(&ts_cert_path, ts_cert.cert.pem()).expect("write ts cert");
+        std::fs::write(&ts_key_path, ts_cert.key_pair.serialize_pem()).expect("write ts key");
+
+        let resolver = Arc::new(SniCertResolver {
+            default_key: load_certified_key(&default_cert_path, &default_key_path)
+                .expect("default key"),
+            tailscale_domain: ts_domain.to_string(),
+            tailscale_key: RwLock::new(
+                load_certified_key(&ts_cert_path, &ts_key_path).expect("ts key"),
+            ),
+        });
+        let tls_config = sni_rustls_config(resolver).expect("tls config");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let app = Router::new().route("/ping", get(|| async { "pong" }));
+        let server_task = tokio::spawn(
+            axum_server::from_tcp_rustls(listener, tls_config).serve(app.into_make_service()),
+        );
+
+        let ts_client = reqwest::Client::builder()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(ts_cert.cert.pem().as_bytes()).expect("ts root"),
+            )
+            .resolve(ts_domain, addr)
+            .build()
+            .expect("ts client");
+        let body = ts_client
+            .get(format!("https://{ts_domain}:{}/ping", addr.port()))
+            .send()
+            .await
+            .expect("request via ts.net SNI")
+            .text()
+            .await
+            .expect("ts body");
+        assert_eq!(body, "pong");
+
+        let pinned_local_client = reqwest::Client::builder()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(default_cert.cert.pem().as_bytes())
+                    .expect("default root"),
+            )
+            .build()
+            .expect("local client");
+        let body = pinned_local_client
+            .get(format!("https://127.0.0.1:{}/ping", addr.port()))
+            .send()
+            .await
+            .expect("request via raw IP")
+            .text()
+            .await
+            .expect("local body");
+        assert_eq!(body, "pong");
+
+        server_task.abort();
     }
 
     #[cfg(unix)]

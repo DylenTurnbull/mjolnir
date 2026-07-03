@@ -31,6 +31,7 @@ mod session;
 mod speech;
 mod spinner;
 mod spinner_picker;
+mod tailscale;
 mod term;
 mod text;
 mod theme;
@@ -221,6 +222,12 @@ struct ServerArgs {
     /// Public hostname to embed in the login QR code and TLS certificate.
     #[arg(long)]
     hostname: Option<String>,
+    /// Serve a trusted HTTPS certificate for this machine's tailscale
+    /// (ts.net) name, minted via `tailscale cert`, so tailnet devices get no
+    /// browser certificate warning. Requires tailscale to be running with
+    /// MagicDNS and HTTPS Certificates enabled on the tailnet.
+    #[arg(long, conflicts_with = "hostname")]
+    tailscale: bool,
     /// Days of disconnected-session history to keep. Sessions (and their
     /// queued prompts) whose last update is older are deleted by the
     /// periodic sweeper. Pass 0 to keep history forever.
@@ -375,6 +382,7 @@ async fn main() -> Result<()> {
                     validate_workspace_roots(&cwd, &top_level_additional_directories)?;
                 remote::run_server(
                     args.hostname,
+                    args.tailscale,
                     args.history_days,
                     args.session_ttl_days,
                     args.logout_all,
@@ -2370,6 +2378,7 @@ mod tests {
         match cli.command {
             Some(Commands::Server(args)) => {
                 assert!(args.hostname.is_none());
+                assert!(!args.tailscale);
                 assert_eq!(args.session_ttl_days, 30);
                 assert!(!args.logout_all);
             }
@@ -2407,6 +2416,26 @@ mod tests {
             }
             _ => panic!("expected Server subcommand"),
         }
+    }
+
+    #[test]
+    fn parse_server_subcommand_with_tailscale() {
+        let cli = Cli::try_parse_from(["mj", "server", "--tailscale"]).expect("parse");
+        match cli.command {
+            Some(Commands::Server(args)) => {
+                assert!(args.tailscale);
+                assert!(args.hostname.is_none());
+            }
+            _ => panic!("expected Server subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_server_rejects_tailscale_with_hostname() {
+        let error =
+            Cli::try_parse_from(["mj", "server", "--tailscale", "--hostname", "example.com"])
+                .expect_err("conflicting flags");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
