@@ -1,10 +1,20 @@
 //! Prompt dictation support.
 //!
-//! Non-Android platforms use an in-process, fully local pipeline built on
-//! sherpa-onnx: cpal microphone capture, Silero VAD speech segmentation, and
-//! the multilingual NeMo Parakeet TDT 0.6b v3 offline recognizer. Models are
+//! Non-Android platforms use a fully local pipeline built on sherpa-onnx:
+//! cpal microphone capture, Silero VAD speech segmentation, and the
+//! multilingual NeMo Parakeet TDT 0.6b v3 offline recognizer. Models are
 //! downloaded once into the user cache and then reused without any API key or
 //! network call during dictation.
+//!
+//! The pipeline runs in a separate worker process (the hidden `voice-worker`
+//! subcommand of this same binary, see [`run_voice_worker`]). The native
+//! speech stack can raise foreign C++ exceptions across the FFI boundary or
+//! abort outright when system libraries are incompatible or model files are
+//! corrupt; Rust cannot catch those, so in-process use would `SIGABRT` the
+//! whole TUI. Isolating dictation in a child process turns any such crash
+//! into a status-line warning while the chat session keeps running. The
+//! worker streams progress to the parent as JSON lines on stdout, and stops
+//! when its stdin reaches EOF (cancellation or parent exit).
 
 use anyhow::Result;
 #[cfg(target_os = "android")]
@@ -38,8 +48,11 @@ mod backend {
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
     const VAD_MODEL_FILE: &str = "silero_vad.onnx";
 
-    const DICTATION_TIMEOUT: Duration = Duration::from_secs(600);
+    pub(super) const DICTATION_TIMEOUT: Duration = Duration::from_secs(600);
     const DICTATION_SILENCE: Duration = Duration::from_secs(20);
+    /// cpal delivers callbacks continuously (silence arrives as zeros), so a
+    /// stream that produces no frames at all is broken, not quiet.
+    const NO_AUDIO_TIMEOUT: Duration = Duration::from_secs(5);
 
     const SAMPLE_RATE: i32 = 16000;
     const VAD_WINDOW_SIZE: usize = 512;
@@ -71,12 +84,20 @@ mod backend {
         }
 
         pub(super) fn is_installed(&self) -> bool {
-            self.encoder.is_file()
-                && self.decoder.is_file()
-                && self.joiner.is_file()
-                && self.tokens.is_file()
-                && self.vad.is_file()
+            has_model_data(&self.encoder)
+                && has_model_data(&self.decoder)
+                && has_model_data(&self.joiner)
+                && has_model_data(&self.tokens)
+                && has_model_data(&self.vad)
         }
+    }
+
+    /// A zero-byte model file is as unusable as a missing one; an interrupted
+    /// download or extraction can leave either behind.
+    pub(super) fn has_model_data(path: &Path) -> bool {
+        fs::metadata(path)
+            .map(|meta| meta.is_file() && meta.len() > 0)
+            .unwrap_or(false)
     }
 
     fn mjolnir_cache_dir() -> Result<PathBuf> {
@@ -196,7 +217,7 @@ mod backend {
             .context("resolve voice model cache parent")?;
         fs::create_dir_all(voice_dir).with_context(|| format!("create {}", voice_dir.display()))?;
 
-        if !paths.vad.is_file() {
+        if !has_model_data(&paths.vad) {
             on_status("downloading voice activity model...".to_string());
             let tmp = paths.vad.with_extension("onnx.part");
             download_to_file(VAD_MODEL_URL, &tmp, |_, _| {})
@@ -205,10 +226,10 @@ mod backend {
                 .with_context(|| format!("install {}", paths.vad.display()))?;
         }
 
-        if !(paths.encoder.is_file()
-            && paths.decoder.is_file()
-            && paths.joiner.is_file()
-            && paths.tokens.is_file())
+        if !(has_model_data(&paths.encoder)
+            && has_model_data(&paths.decoder)
+            && has_model_data(&paths.joiner)
+            && has_model_data(&paths.tokens))
         {
             let archive = voice_dir.join(format!("{ASR_MODEL_DIR}.tar.bz2.part"));
             let mut last_percent = u64::MAX;
@@ -234,8 +255,24 @@ mod backend {
             })
             .context("download voice recognition model")?;
             on_status("unpacking voice model...".to_string());
-            extract_tar_bz2_file(&archive, voice_dir).context("extract voice model")?;
+            // Extract into a staging directory and move the finished model dir
+            // into place in one rename, so an interrupted unpack can never
+            // leave a plausible-looking but truncated install behind.
+            let staging = voice_dir.join(format!("{ASR_MODEL_DIR}.extracting"));
+            let _ = fs::remove_dir_all(&staging);
+            extract_tar_bz2_file(&archive, &staging).context("extract voice model")?;
             let _ = fs::remove_file(&archive);
+            let extracted = staging.join(ASR_MODEL_DIR);
+            if !extracted.is_dir() {
+                bail!("voice model archive did not contain {ASR_MODEL_DIR}");
+            }
+            if paths.dir.exists() {
+                fs::remove_dir_all(&paths.dir)
+                    .with_context(|| format!("remove incomplete {}", paths.dir.display()))?;
+            }
+            fs::rename(&extracted, &paths.dir)
+                .with_context(|| format!("install {}", paths.dir.display()))?;
+            let _ = fs::remove_dir_all(&staging);
         }
 
         if !paths.is_installed() {
@@ -276,11 +313,17 @@ mod backend {
             .unwrap_or(2)
     }
 
+    /// Samples from the capture callback, or the stream error that ended it.
+    /// cpal reports stream failures through a separate callback; carrying them
+    /// on the same channel lets the capture loop fail loudly instead of
+    /// waiting out the silence timeout with a dead microphone.
+    type AudioMessage = std::result::Result<Vec<f32>, String>;
+
     /// Build a cpal input stream that forwards mono f32 samples at the
     /// device's native rate.
     fn build_input_stream(
         device: &cpal::Device,
-        tx: mpsc::Sender<Vec<f32>>,
+        tx: mpsc::Sender<AudioMessage>,
     ) -> Result<(cpal::Stream, i32)> {
         let supported = device
             .default_input_config()
@@ -289,35 +332,49 @@ mod backend {
         let sample_format = supported.sample_format();
         let channels = config.channels.max(1) as usize;
         let sample_rate = config.sample_rate.0 as i32;
-        let err_fn = |_err| {};
+        let make_err_fn = || {
+            let tx = tx.clone();
+            move |err: cpal::StreamError| {
+                let _ = tx.send(Err(err.to_string()));
+            }
+        };
 
         let stream = match sample_format {
-            SampleFormat::F32 => device.build_input_stream(
-                &config,
-                move |data: &[f32], _| {
-                    let _ = tx.send(downmix(data.iter().copied(), channels));
-                },
-                err_fn,
-                None,
-            ),
-            SampleFormat::I16 => device.build_input_stream(
-                &config,
-                move |data: &[i16], _| {
-                    let samples = data.iter().map(|&s| s as f32 / i16::MAX as f32);
-                    let _ = tx.send(downmix(samples, channels));
-                },
-                err_fn,
-                None,
-            ),
-            SampleFormat::U16 => device.build_input_stream(
-                &config,
-                move |data: &[u16], _| {
-                    let samples = data.iter().map(|&s| (s as f32 - 32768.0) / 32768.0);
-                    let _ = tx.send(downmix(samples, channels));
-                },
-                err_fn,
-                None,
-            ),
+            SampleFormat::F32 => {
+                let err_fn = make_err_fn();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[f32], _| {
+                        let _ = tx.send(Ok(downmix(data.iter().copied(), channels)));
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            SampleFormat::I16 => {
+                let err_fn = make_err_fn();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[i16], _| {
+                        let samples = data.iter().map(|&s| s as f32 / i16::MAX as f32);
+                        let _ = tx.send(Ok(downmix(samples, channels)));
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            SampleFormat::U16 => {
+                let err_fn = make_err_fn();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[u16], _| {
+                        let samples = data.iter().map(|&s| (s as f32 - 32768.0) / 32768.0);
+                        let _ = tx.send(Ok(downmix(samples, channels)));
+                    },
+                    err_fn,
+                    None,
+                )
+            }
             other => bail!("unsupported microphone sample format: {other:?}"),
         }
         .context("open microphone input stream")?;
@@ -377,14 +434,26 @@ mod backend {
         ensure_models_installed(&paths, &mut on_status)?;
 
         on_status("loading voice model...".to_string());
-        let vad = create_vad(&paths)?;
-        let recognizer = create_recognizer(&paths)?;
+        let load_hint = || {
+            format!(
+                "load voice models (if this keeps failing, delete {} and retry)",
+                paths.dir.display()
+            )
+        };
+        let vad = create_vad(&paths).with_context(load_hint)?;
+        let recognizer = create_recognizer(&paths).with_context(load_hint)?;
+
+        // Model loading takes a moment; honor a cancellation that arrived in
+        // the meantime without ever opening the microphone.
+        if cancel_rx.try_recv().is_ok() {
+            return Ok(String::new());
+        }
 
         let host = cpal::default_host();
         let device = host
             .default_input_device()
             .context("no microphone input device was found")?;
-        let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>();
+        let (audio_tx, audio_rx) = mpsc::channel::<AudioMessage>();
         let (stream, mic_sample_rate) = build_input_stream(&device, audio_tx)?;
         let resampler = if mic_sample_rate != SAMPLE_RATE {
             Some(
@@ -398,6 +467,7 @@ mod backend {
         on_status("listening...".to_string());
 
         let started_at = Instant::now();
+        let mut received_audio = false;
         let mut last_activity_at = Instant::now();
         let mut last_level_at = Instant::now() - LEVEL_EMIT_INTERVAL;
         let mut last_interim_decode_at = Instant::now();
@@ -424,7 +494,8 @@ mod backend {
             }
 
             match audio_rx.recv_timeout(Duration::from_millis(30)) {
-                Ok(samples) => {
+                Ok(Ok(samples)) => {
+                    received_audio = true;
                     if last_level_at.elapsed() >= LEVEL_EMIT_INTERVAL {
                         on_level(normalized_level(chunk_rms(&samples)));
                         last_level_at = Instant::now();
@@ -436,10 +507,19 @@ mod backend {
                         None => buffer.extend_from_slice(&samples),
                     }
                 }
+                Ok(Err(message)) => bail!("microphone capture failed: {message}"),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     bail!("microphone capture stopped unexpectedly")
                 }
+            }
+
+            if !received_audio && started_at.elapsed() >= NO_AUDIO_TIMEOUT {
+                bail!(
+                    "microphone delivered no audio within {} seconds; it may be muted, in use \
+                     by another application, or the audio backend may be incompatible",
+                    NO_AUDIO_TIMEOUT.as_secs()
+                );
             }
 
             while vad_offset + VAD_WINDOW_SIZE <= buffer.len() {
@@ -528,12 +608,297 @@ mod backend {
     }
 }
 
+#[cfg(not(target_os = "android"))]
+mod worker {
+    use super::backend;
+    use anyhow::{Context, Result, anyhow};
+    use serde::{Deserialize, Serialize};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// One JSON line on the worker's stdout.
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[serde(tag = "event", rename_all = "snake_case")]
+    pub(super) enum WorkerEvent {
+        Status { message: String },
+        Partial { text: String },
+        Level { value: f32 },
+        Result { text: String },
+        Error { message: String },
+    }
+
+    pub(super) fn parse_event(line: &str) -> Option<WorkerEvent> {
+        serde_json::from_str(line.trim()).ok()
+    }
+
+    fn emit(event: &WorkerEvent) {
+        if let Ok(line) = serde_json::to_string(event) {
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "{line}");
+            let _ = stdout.flush();
+        }
+    }
+
+    /// Child-process entry point for the hidden `voice-worker` subcommand.
+    ///
+    /// Runs the whole dictation pipeline and reports through [`WorkerEvent`]
+    /// JSON lines on stdout. Stdin EOF (or any line on it) cancels dictation;
+    /// the parent holds stdin open for the session's lifetime, so a dying
+    /// parent also stops the worker instead of leaving the microphone open.
+    pub(super) fn run_worker() -> i32 {
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::stdin().lock().read_line(&mut line);
+            let _ = cancel_tx.send(());
+        });
+        match backend::run(
+            |text| emit(&WorkerEvent::Partial { text }),
+            |value| emit(&WorkerEvent::Level { value }),
+            |message| emit(&WorkerEvent::Status { message }),
+            cancel_rx,
+        ) {
+            Ok(text) => {
+                emit(&WorkerEvent::Result { text });
+                0
+            }
+            Err(error) => {
+                emit(&WorkerEvent::Error {
+                    message: format!("{error:#}"),
+                });
+                1
+            }
+        }
+    }
+
+    /// How long after cancellation the worker gets to flush a final
+    /// transcript before it is killed.
+    const CANCEL_GRACE: Duration = Duration::from_secs(10);
+    /// The worker enforces the dictation timeout itself; the parent allows
+    /// some slack on top before declaring it hung.
+    const WORKER_GRACE: Duration = Duration::from_secs(30);
+
+    /// Parent-side dictation: spawn this binary's `voice-worker` subcommand
+    /// and relay its events, so a native-library crash cannot take down the
+    /// TUI process.
+    pub(super) fn run<F, G, H>(
+        on_partial: F,
+        on_level: G,
+        on_status: H,
+        cancel_rx: mpsc::Receiver<()>,
+    ) -> Result<String>
+    where
+        F: FnMut(String),
+        G: FnMut(f32),
+        H: FnMut(String),
+    {
+        let exe = std::env::current_exe().context("locate the mj executable")?;
+        let child = Command::new(&exe)
+            .arg("voice-worker")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("start voice worker {}", exe.display()))?;
+        drive_worker(child, on_partial, on_level, on_status, cancel_rx)
+    }
+
+    /// Relay worker events to the UI callbacks and translate every way the
+    /// worker can end — result, reported error, crash, or hang — into a
+    /// `Result`. Non-protocol stdout lines (native-library noise) are ignored.
+    pub(super) fn drive_worker<F, G, H>(
+        mut child: Child,
+        mut on_partial: F,
+        mut on_level: G,
+        mut on_status: H,
+        cancel_rx: mpsc::Receiver<()>,
+    ) -> Result<String>
+    where
+        F: FnMut(String),
+        G: FnMut(f32),
+        H: FnMut(String),
+    {
+        let mut stdin = child.stdin.take();
+        let stdout = child
+            .stdout
+            .take()
+            .context("voice worker stdout was not captured")?;
+        let stderr = child.stderr.take();
+
+        // None marks stdout EOF: the worker is gone without a verdict.
+        let (event_tx, event_rx) = mpsc::channel::<Option<WorkerEvent>>();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if let Some(event) = parse_event(&line)
+                    && event_tx.send(Some(event)).is_err()
+                {
+                    return;
+                }
+            }
+            let _ = event_tx.send(None);
+        });
+        let stderr_reader = stderr.map(|stderr| thread::spawn(move || read_tail(stderr)));
+
+        let started_at = Instant::now();
+        let mut cancelled_at: Option<Instant> = None;
+        let mut last_partial = String::new();
+        let outcome = loop {
+            if cancelled_at.is_none() && cancel_rx.try_recv().is_ok() {
+                cancelled_at = Some(Instant::now());
+                // Closing stdin is the cancellation signal; the worker then
+                // flushes and reports whatever it recognized so far.
+                stdin = None;
+            }
+            if let Some(at) = cancelled_at
+                && at.elapsed() >= CANCEL_GRACE
+            {
+                let _ = child.kill();
+                break Some(Ok(last_partial.clone()));
+            }
+            if started_at.elapsed() >= backend::DICTATION_TIMEOUT + WORKER_GRACE {
+                let _ = child.kill();
+                break Some(Err(anyhow!("voice dictation timed out")));
+            }
+            match event_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Some(WorkerEvent::Partial { text })) => {
+                    last_partial.clone_from(&text);
+                    on_partial(text);
+                }
+                Ok(Some(WorkerEvent::Level { value })) => on_level(value),
+                Ok(Some(WorkerEvent::Status { message })) => on_status(message),
+                Ok(Some(WorkerEvent::Result { text })) => break Some(Ok(text)),
+                Ok(Some(WorkerEvent::Error { message })) => break Some(Err(anyhow!(message))),
+                Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        };
+        drop(stdin);
+
+        let status = reap(child);
+        let stderr_tail = stderr_reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        match outcome {
+            Some(result) => result,
+            None => {
+                if !stderr_tail.trim().is_empty() {
+                    tracing::warn!("voice worker stderr: {stderr_tail}");
+                }
+                Err(worker_crash_error(status, &stderr_tail))
+            }
+        }
+    }
+
+    /// Wait briefly for the worker to exit, killing it if it lingers.
+    fn reap(mut child: Child) -> Option<ExitStatus> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+                _ => {
+                    let _ = child.kill();
+                    return child.wait().ok();
+                }
+            }
+        }
+    }
+
+    /// Keep the last few KB of the worker's stderr for crash diagnostics.
+    fn read_tail<R: Read>(mut reader: R) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while let Ok(read) = reader.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if buffer.len() > 8192 {
+                let cut = buffer.len() - 4096;
+                buffer.drain(..cut);
+            }
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    /// The worker vanished without reporting a result or an error: a native
+    /// crash (foreign exception, abort) or an outright kill. Explain what
+    /// happened without taking the session with it.
+    pub(super) fn worker_crash_error(
+        status: Option<ExitStatus>,
+        stderr_tail: &str,
+    ) -> anyhow::Error {
+        let mut message = match status {
+            Some(status) => format!("voice dictation {}", describe_exit(status)),
+            None => "voice dictation stopped unexpectedly".to_string(),
+        };
+        if let Some(line) = last_meaningful_line(stderr_tail) {
+            message.push_str(&format!(": {line}"));
+        }
+        let cache = backend::model_paths()
+            .map(|paths| paths.dir.display().to_string())
+            .unwrap_or_else(|_| "the voice model cache".to_string());
+        message.push_str(&format!(
+            " — the dictation engine runs in a separate process, so your session is unaffected; \
+             this usually means an incompatible or outdated system library (try updating system \
+             packages, or delete {cache} and retry)"
+        ));
+        anyhow!(message)
+    }
+
+    #[cfg(unix)]
+    fn describe_exit(status: ExitStatus) -> String {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            let name = match signal {
+                4 => " (SIGILL)",
+                6 => " (SIGABRT)",
+                8 => " (SIGFPE)",
+                11 => " (SIGSEGV)",
+                _ => "",
+            };
+            return format!("crashed with signal {signal}{name}");
+        }
+        describe_exit_code(status)
+    }
+
+    #[cfg(not(unix))]
+    fn describe_exit(status: ExitStatus) -> String {
+        describe_exit_code(status)
+    }
+
+    fn describe_exit_code(status: ExitStatus) -> String {
+        match status.code() {
+            Some(code) => format!("exited unexpectedly (code {code})"),
+            None => "stopped unexpectedly".to_string(),
+        }
+    }
+
+    fn last_meaningful_line(stderr_tail: &str) -> Option<String> {
+        let line = stderr_tail
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())?;
+        let truncated: String = line.chars().take(200).collect();
+        Some(truncated)
+    }
+}
+
 /// Capture microphone audio and return the recognized transcript.
 ///
 /// `on_partial` receives the cumulative transcript as it grows, `on_level`
 /// receives normalized microphone levels for the input meter, and `on_status`
 /// receives transient progress messages (model download, loading). Sending on
 /// `cancel_rx` stops capture and returns whatever was recognized so far.
+///
+/// Dictation runs in a separate worker process (see the module docs); a crash
+/// in the native speech stack surfaces here as an error instead of aborting
+/// the TUI.
 #[cfg(not(target_os = "android"))]
 pub fn run_dictation<F, G, H>(
     on_partial: F,
@@ -546,7 +911,22 @@ where
     G: FnMut(f32),
     H: FnMut(String),
 {
-    backend::run(on_partial, on_level, on_status, cancel_rx)
+    worker::run(on_partial, on_level, on_status, cancel_rx)
+}
+
+/// Entry point for the hidden `voice-worker` subcommand; returns the process
+/// exit code.
+#[cfg(not(target_os = "android"))]
+pub fn run_voice_worker() -> i32 {
+    worker::run_worker()
+}
+
+/// The worker subcommand exists on every platform so the CLI shape is
+/// uniform, but Android has no dictation backend to run.
+#[cfg(target_os = "android")]
+pub fn run_voice_worker() -> i32 {
+    eprintln!("voice dictation is not supported on Android");
+    1
 }
 
 #[cfg(target_os = "android")]
@@ -674,5 +1054,188 @@ mod tests {
             dictation_error_message(&err),
             "voice dictation is not supported on Android"
         );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn worker_events_round_trip_as_json_lines() {
+        use super::worker::{WorkerEvent, parse_event};
+        let events = [
+            WorkerEvent::Status {
+                message: "loading voice model...".to_string(),
+            },
+            WorkerEvent::Partial {
+                text: "hello".to_string(),
+            },
+            WorkerEvent::Level { value: 0.25 },
+            WorkerEvent::Result {
+                text: "hello world".to_string(),
+            },
+            WorkerEvent::Error {
+                message: "microphone capture failed".to_string(),
+            },
+        ];
+        for event in events {
+            let line = serde_json::to_string(&event).expect("serialize event");
+            assert!(!line.contains('\n'), "protocol lines must be single-line");
+            assert_eq!(parse_event(&line), Some(event));
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn parse_event_ignores_non_protocol_output() {
+        use super::worker::parse_event;
+        assert_eq!(parse_event(""), None);
+        assert_eq!(parse_event("onnxruntime init log line"), None);
+        assert_eq!(parse_event("{\"event\":\"unknown\"}"), None);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn zero_byte_model_files_are_not_installed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = backend::ModelPaths::in_cache(tmp.path().to_path_buf());
+        std::fs::create_dir_all(&paths.dir).expect("create model dir");
+        let files = [
+            &paths.encoder,
+            &paths.decoder,
+            &paths.joiner,
+            &paths.tokens,
+            &paths.vad,
+        ];
+        for path in files {
+            std::fs::write(path, b"").expect("write empty file");
+        }
+        assert!(
+            !paths.is_installed(),
+            "zero-byte model files must not count as installed"
+        );
+        for path in files {
+            std::fs::write(path, b"model data").expect("write file");
+        }
+        assert!(paths.is_installed());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn crash_error_includes_stderr_line_and_recovery_hint() {
+        let err = super::worker::worker_crash_error(
+            None,
+            "onnx init\nfatal runtime error: Rust cannot catch foreign exceptions, aborting\n",
+        );
+        let message = err.to_string();
+        assert!(message.contains("voice dictation stopped unexpectedly"));
+        assert!(message.contains("Rust cannot catch foreign exceptions"));
+        assert!(message.contains("session is unaffected"));
+    }
+
+    /// Fake-worker tests: drive_worker against short shell scripts standing
+    /// in for the real worker, covering each way the child can end.
+    #[cfg(all(unix, not(target_os = "android")))]
+    mod fake_worker {
+        use super::super::worker::drive_worker;
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+
+        fn spawn_fake(script: &str) -> std::process::Child {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn fake worker")
+        }
+
+        fn drive(
+            script: &str,
+            cancel_rx: mpsc::Receiver<()>,
+        ) -> (anyhow::Result<String>, Vec<String>, Vec<String>) {
+            let mut partials = Vec::new();
+            let mut statuses = Vec::new();
+            let result = drive_worker(
+                spawn_fake(script),
+                |text| partials.push(text),
+                |_level| {},
+                |message| statuses.push(message),
+                cancel_rx,
+            );
+            (result, partials, statuses)
+        }
+
+        fn never_cancelled() -> mpsc::Receiver<()> {
+            let (tx, rx) = mpsc::channel();
+            std::mem::forget(tx);
+            rx
+        }
+
+        #[test]
+        fn forwards_events_and_returns_result() {
+            let script = r#"
+                printf '%s\n' '{"event":"status","message":"listening..."}'
+                printf '%s\n' '{"event":"level","value":0.5}'
+                printf '%s\n' '{"event":"partial","text":"hello"}'
+                printf 'native library noise\n'
+                printf '%s\n' '{"event":"result","text":"hello world"}'
+            "#;
+            let (result, partials, statuses) = drive(script, never_cancelled());
+            assert_eq!(result.expect("transcript"), "hello world");
+            assert_eq!(partials, vec!["hello".to_string()]);
+            assert_eq!(statuses, vec!["listening...".to_string()]);
+        }
+
+        #[test]
+        fn error_event_surfaces_as_error() {
+            let script = r#"
+                printf '%s\n' '{"event":"error","message":"microphone capture failed: boom"}'
+                exit 1
+            "#;
+            let (result, _, _) = drive(script, never_cancelled());
+            let message = result.expect_err("error").to_string();
+            assert_eq!(message, "microphone capture failed: boom");
+        }
+
+        #[test]
+        fn abort_is_contained_and_described() {
+            let script = r#"
+                echo 'fatal runtime error: Rust cannot catch foreign exceptions, aborting' >&2
+                kill -ABRT $$
+            "#;
+            let (result, _, _) = drive(script, never_cancelled());
+            let message = result.expect_err("crash error").to_string();
+            assert!(message.contains("signal 6"), "got: {message}");
+            assert!(message.contains("SIGABRT"), "got: {message}");
+            assert!(
+                message.contains("Rust cannot catch foreign exceptions"),
+                "got: {message}"
+            );
+            assert!(message.contains("session is unaffected"), "got: {message}");
+        }
+
+        #[test]
+        fn silent_exit_is_reported_with_code() {
+            let (result, _, _) = drive("exit 3", never_cancelled());
+            let message = result.expect_err("exit error").to_string();
+            assert!(
+                message.contains("exited unexpectedly (code 3)"),
+                "got: {message}"
+            );
+        }
+
+        #[test]
+        fn cancel_closes_stdin_and_returns_flushed_result() {
+            // The fake worker mirrors the real cancellation handshake: wait
+            // for stdin EOF, then flush a final transcript.
+            let script = r#"
+                while read -r _; do :; done
+                printf '%s\n' '{"event":"result","text":"flushed"}'
+            "#;
+            let (cancel_tx, cancel_rx) = mpsc::channel();
+            cancel_tx.send(()).expect("queue cancel");
+            let (result, _, _) = drive(script, cancel_rx);
+            assert_eq!(result.expect("flushed transcript"), "flushed");
+        }
     }
 }
