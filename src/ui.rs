@@ -4707,10 +4707,25 @@ fn push_markdown_lines(
     indent: usize,
     theme: TerminalTheme,
 ) {
+    push_markdown_lines_limited(out, text, indent, None, theme);
+}
+
+fn push_markdown_lines_limited(
+    out: &mut Vec<Line<'static>>,
+    text: String,
+    indent: usize,
+    collapse_limit: Option<usize>,
+    theme: TerminalTheme,
+) {
     let prefix = " ".repeat(indent);
     let mut in_code_block = false;
     let mut code_lang = String::new();
-    for raw in text.split('\n') {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (visible_count, hidden) = match collapse_limit {
+        Some(limit) if lines.len() > limit => (limit, lines.len() - limit),
+        _ => (lines.len(), 0),
+    };
+    for raw in &lines[..visible_count] {
         let trimmed = raw.trim_start();
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
@@ -4800,6 +4815,9 @@ fn push_markdown_lines(
         let mut spans = vec![Span::raw(prefix.clone())];
         spans.extend(inline_markdown_spans(raw, theme));
         out.push(Line::from(spans));
+    }
+    if hidden > 0 {
+        push_collapse_hint(out, indent, hidden, theme);
     }
 }
 
@@ -5021,7 +5039,7 @@ fn push_tool_outputs(
     for output in outputs {
         match output {
             ToolCallOutput::Text(text) => {
-                push_tool_text_lines(out, text.clone(), 2, collapse_limit, theme)
+                push_markdown_lines_limited(out, text.clone(), 2, collapse_limit, theme)
             }
             ToolCallOutput::Diff {
                 path,
@@ -10569,11 +10587,53 @@ mod tests {
 
         assert!(rendered.iter().any(|line| line == "│ tool exec run checks"));
         assert!(rendered.iter().any(|line| line == "│   ## Output"));
-        assert!(rendered.iter().any(|line| line == "│   `ok`"));
+        assert!(rendered.iter().any(|line| line == "│   ok"));
         assert!(rendered.iter().any(|line| line == "│   diff src/main.rs"));
         assert!(rendered.iter().any(|line| line == "│     - old"));
         assert!(rendered.iter().any(|line| line == "│     + new"));
         assert!(rendered.iter().any(|line| line == "│   terminal term-1"));
+    }
+
+    #[test]
+    fn transcript_renders_markdown_in_tool_text_output() {
+        let mut state = AppState::new();
+        state.tool_calls.insert(
+            "call-1".to_string(),
+            crate::app::ToolCallView {
+                title: "activate_skill".to_string(),
+                kind: ToolKind::Read,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Text(
+                    "_Auto permissions **approved** this tool call._\n\nReason: `read/search/fetch`\n\n- visible from anvil"
+                        .to_string(),
+                )],
+            },
+        );
+        state.transcript.push(Entry::ToolCall("call-1".to_string()));
+
+        let rendered: Vec<String> = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "│   Auto permissions approved this tool call."),
+            "rendered lines: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "│   Reason: read/search/fetch"),
+            "rendered lines: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "│   - visible from anvil"),
+            "rendered lines: {rendered:?}"
+        );
     }
 
     #[test]
