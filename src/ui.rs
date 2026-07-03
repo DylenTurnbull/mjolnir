@@ -4858,6 +4858,14 @@ fn markdown_ordered_item(raw: &str) -> Option<(&str, &str)> {
 }
 
 fn inline_markdown_spans(raw: &str, theme: TerminalTheme) -> Vec<Span<'static>> {
+    inline_markdown_spans_with_style(raw, theme, Style::default())
+}
+
+fn inline_markdown_spans_with_style(
+    raw: &str,
+    theme: TerminalTheme,
+    base_style: Style,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut rest = raw;
     while !rest.is_empty() {
@@ -4865,10 +4873,7 @@ fn inline_markdown_spans(raw: &str, theme: TerminalTheme) -> Vec<Span<'static>> 
             && let Some(end) = after.find('`')
         {
             let (code, tail) = after.split_at(end);
-            spans.push(Span::styled(
-                code.to_string(),
-                Style::default().fg(theme.code),
-            ));
+            spans.push(Span::styled(code.to_string(), base_style.fg(theme.code)));
             rest = &tail[1..];
             continue;
         }
@@ -4876,9 +4881,22 @@ fn inline_markdown_spans(raw: &str, theme: TerminalTheme) -> Vec<Span<'static>> 
             && let Some(end) = after.find("**")
         {
             let (strong, tail) = after.split_at(end);
-            spans.push(Span::styled(
-                strong.to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
+            spans.extend(inline_markdown_spans_with_style(
+                strong,
+                theme,
+                base_style.add_modifier(Modifier::BOLD),
+            ));
+            rest = &tail[2..];
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("__")
+            && let Some(end) = after.find("__")
+        {
+            let (strong, tail) = after.split_at(end);
+            spans.extend(inline_markdown_spans_with_style(
+                strong,
+                theme,
+                base_style.add_modifier(Modifier::BOLD),
             ));
             rest = &tail[2..];
             continue;
@@ -4887,9 +4905,22 @@ fn inline_markdown_spans(raw: &str, theme: TerminalTheme) -> Vec<Span<'static>> 
             && let Some(end) = after.find('*')
         {
             let (em, tail) = after.split_at(end);
-            spans.push(Span::styled(
-                em.to_string(),
-                Style::default().add_modifier(Modifier::ITALIC),
+            spans.extend(inline_markdown_spans_with_style(
+                em,
+                theme,
+                base_style.add_modifier(Modifier::ITALIC),
+            ));
+            rest = &tail[1..];
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("_")
+            && let Some(end) = after.find('_')
+        {
+            let (em, tail) = after.split_at(end);
+            spans.extend(inline_markdown_spans_with_style(
+                em,
+                theme,
+                base_style.add_modifier(Modifier::ITALIC),
             ));
             rest = &tail[1..];
             continue;
@@ -4898,10 +4929,10 @@ fn inline_markdown_spans(raw: &str, theme: TerminalTheme) -> Vec<Span<'static>> 
         let next = rest
             .char_indices()
             .skip(1)
-            .find_map(|(idx, ch)| (ch == '`' || ch == '*').then_some(idx))
+            .find_map(|(idx, ch)| (ch == '`' || ch == '*' || ch == '_').then_some(idx))
             .unwrap_or(rest.len());
         let (plain, tail) = rest.split_at(next);
-        spans.push(Span::raw(plain.to_string()));
+        spans.push(Span::styled(plain.to_string(), base_style));
         rest = tail;
     }
     spans
