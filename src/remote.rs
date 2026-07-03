@@ -2979,13 +2979,15 @@ fn format_tool_call(
             ToolCallContent::Diff(diff) => parts.push(format!("diff: {}", diff.path.display())),
             ToolCallContent::Terminal(terminal) => {
                 let terminal_id = terminal.terminal_id.to_string();
-                let mut text = format!("terminal: {terminal_id}");
+                let mut text = "background terminal".to_string();
                 if let Some(snapshot) = terminal_outputs.get(&terminal_id) {
                     let snapshot = format_terminal_snapshot(snapshot);
                     if !snapshot.is_empty() {
                         text.push('\n');
                         text.push_str(&snapshot);
                     }
+                } else {
+                    text.push_str("\nno terminal output received");
                 }
                 parts.push(text);
             }
@@ -3014,11 +3016,13 @@ fn format_terminal_snapshot(snapshot: &TerminalOutputSnapshot) -> String {
     if snapshot.truncated {
         parts.push("[output truncated]".to_string());
     }
-    if !snapshot.output.is_empty() {
+    if !snapshot.output.trim().is_empty() {
         parts.push(snapshot.output.clone());
     }
     if let Some(status) = &snapshot.exit_status {
         parts.push(format!("exit {}", terminal_exit_status_label(status)));
+    } else if parts.is_empty() {
+        parts.push("waiting for output".to_string());
     }
     parts.join("\n")
 }
@@ -3218,7 +3222,8 @@ mod tests {
         let snapshot = state.snapshot().expect("snapshot");
         assert_eq!(snapshot.transcript.len(), 1);
         assert_eq!(snapshot.transcript[0].kind, "tool");
-        assert!(snapshot.transcript[0].text.contains("terminal: term-1"));
+        assert!(snapshot.transcript[0].text.contains("background terminal"));
+        assert!(!snapshot.transcript[0].text.contains("term-1"));
         assert!(snapshot.transcript[0].text.contains("[output truncated]"));
         assert!(snapshot.transcript[0].text.contains("hello\n"));
         assert!(snapshot.transcript[0].text.contains("exit code 0"));
