@@ -97,7 +97,7 @@ fn adhoc_program_allowed() -> bool {
 /// Whether `path` is one of, or nested under, any of `roots`. All inputs are
 /// expected to be canonicalized; `Path::starts_with` is component-wise, so
 /// `/a/bc` is not considered under `/a/b`.
-pub(crate) fn path_within_any(path: &Path, roots: &[PathBuf]) -> bool {
+fn path_within_any(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 

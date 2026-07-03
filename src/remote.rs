@@ -18,8 +18,7 @@ use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, COOKIE, HeaderValue, SET_COOKIE};
 use axum::middleware::Next;
-use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
@@ -35,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -111,11 +110,6 @@ pub struct SessionRecord {
     pub transcript: Vec<TranscriptEntry>,
     #[serde(default)]
     pub queued_prompt_count: u64,
-    /// True while a prompt turn is in flight in the owning session. This is
-    /// the authoritative working/idle signal for viewers, replacing the old
-    /// client-side "transcript changed recently" heuristic.
-    #[serde(default)]
-    pub working: bool,
     /// Permission prompts currently waiting for an answer in this session.
     #[serde(default)]
     pub pending_permissions: Vec<PendingPermissionRecord>,
@@ -442,392 +436,12 @@ struct ServerState {
     /// no cookie `Max-Age`, so it dies when the browser/PWA closes.
     session_ttl: Duration,
     code_guard: Arc<Mutex<CodeAuthGuard>>,
-    /// Task spawner, present only when the operator passed `--allow-spawn`.
-    /// `None` makes every `/api/tasks` and `/api/agents` request answer 403.
-    tasks: Option<Arc<ServerTaskManager>>,
-    /// Fan-out for `/api/events` subscribers. Mutating handlers push here so
-    /// connected viewers see changes without waiting for a poll tick.
-    events: broadcast::Sender<ServerEvent>,
-}
-
-/// How many unconsumed server events a slow SSE subscriber may fall behind
-/// before it lags. A lagged subscriber is resynced with a fresh snapshot
-/// rather than dropped, so this capacity only bounds buffered memory.
-const SERVER_EVENT_CAPACITY: usize = 256;
-
-/// A change notification pushed to `/api/events` subscribers. Session
-/// payloads are `Arc`-shared so fanning out to N subscribers does not clone
-/// potentially large transcripts N times.
-#[derive(Debug, Clone)]
-enum ServerEvent {
-    /// A session record changed (registration, transcript growth, queued
-    /// prompt count, permissions, config, working state).
-    Session(Arc<SessionRecord>),
-    /// A session disconnected and should leave live views.
-    SessionDisconnected(String),
-    /// The server-owned task list changed (spawn or stop).
-    Tasks(Arc<Vec<ServerTaskStatus>>),
 }
 
 #[derive(Debug)]
 struct ServerAgentSession {
     command_tx: mpsc::UnboundedSender<UiCommand>,
     task: JoinHandle<()>,
-}
-
-/// Upper bound on concurrently running server-spawned tasks. Each task owns a
-/// full agent subprocess, so this caps host resources rather than protocol
-/// state; finished tasks are reaped before the cap is enforced.
-const MAX_SERVER_TASKS: usize = 16;
-
-/// A viewer-initiated request to spawn a new agent task.
-#[derive(Debug, Clone, Deserialize)]
-struct SpawnTaskRequest {
-    /// Agent `source_id` as listed by `GET /api/agents`. The configured
-    /// default agent when omitted.
-    #[serde(default)]
-    agent: Option<String>,
-    /// Session working directory. Must resolve under one of the roots the
-    /// operator allowed at launch (`--cwd` / `--additional-directory`).
-    #[serde(default)]
-    cwd: Option<String>,
-    /// Prompt sent automatically once the session is ready.
-    #[serde(default)]
-    prompt: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ServerTaskStatus {
-    task_id: String,
-    agent: String,
-    source_id: String,
-    cwd: String,
-    created_at: String,
-    /// ACP session id once the runtime reports `SessionStarted`; lets the
-    /// viewer match a task to its registry session record.
-    session_id: Option<String>,
-    running: bool,
-}
-
-/// Agent launch choice exposed to the viewer, mirroring `mj mcp list_agents`.
-#[derive(Debug, Clone, Serialize)]
-struct SpawnAgentInfo {
-    source_id: String,
-    label: String,
-    program: String,
-    args: Vec<String>,
-    kind: &'static str,
-}
-
-#[derive(Debug)]
-struct ServerTaskEntry {
-    session: ServerAgentSession,
-    /// Handle onto the task's session tracker, used to record live prompts
-    /// in the transcript before they are handed to the runtime.
-    tracker: RemoteSessionTracker,
-    agent_label: String,
-    source_id: String,
-    cwd: PathBuf,
-    created_at: String,
-    session_id: Arc<Mutex<Option<String>>>,
-}
-
-/// Owns every agent runtime spawned through `POST /api/tasks`. Present in
-/// `ServerState` only when the operator opted in with `mj server
-/// --allow-spawn`; absent, the task endpoints answer 403.
-#[derive(Debug)]
-pub struct ServerTaskManager {
-    default_cwd: PathBuf,
-    additional_directories: Vec<PathBuf>,
-    fs_max_text_bytes: u64,
-    tasks: Mutex<HashMap<String, ServerTaskEntry>>,
-}
-
-impl ServerTaskManager {
-    fn new(
-        default_cwd: PathBuf,
-        additional_directories: Vec<PathBuf>,
-        fs_max_text_bytes: u64,
-    ) -> Self {
-        Self {
-            default_cwd,
-            additional_directories,
-            fs_max_text_bytes,
-            tasks: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Canonicalized roots the operator allowed at launch. Spawn requests may
-    /// only place a session cwd under one of these.
-    fn allowed_roots(&self) -> Vec<PathBuf> {
-        std::iter::once(&self.default_cwd)
-            .chain(self.additional_directories.iter())
-            .filter_map(|path| std::fs::canonicalize(path).ok())
-            .collect()
-    }
-
-    fn spawn_task(
-        &self,
-        cfg: &config::Config,
-        request: &SpawnTaskRequest,
-    ) -> std::result::Result<ServerTaskStatus, (StatusCode, String)> {
-        let agent = resolve_spawn_agent(cfg, request.agent.as_deref())
-            .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-        let cwd = resolve_spawn_cwd(
-            request.cwd.as_deref(),
-            &self.default_cwd,
-            &self.allowed_roots(),
-        )
-        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-        let prompt = request
-            .prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|prompt| !prompt.is_empty())
-            .map(str::to_string);
-
-        let mut tasks = self.tasks.lock().expect("server task registry lock");
-        tasks.retain(|_, entry| !entry.session.task.is_finished());
-        if tasks.len() >= MAX_SERVER_TASKS {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("task limit reached ({MAX_SERVER_TASKS}); stop an existing task first"),
-            ));
-        }
-
-        let task_id = generate_task_id().map_err(internal_error)?;
-        let agent_label = agent_display_label(&agent);
-        let source_id = agent.source_id.clone();
-        let created_at = now_rfc3339();
-        let session_id = Arc::new(Mutex::new(None));
-        let (session, tracker) = start_server_agent_session_ext(
-            agent,
-            cwd.clone(),
-            self.additional_directories.clone(),
-            self.fs_max_text_bytes,
-            prompt,
-            Some(Arc::clone(&session_id)),
-        );
-        let status = ServerTaskStatus {
-            task_id: task_id.clone(),
-            agent: agent_label.clone(),
-            source_id: source_id.clone(),
-            cwd: cwd.display().to_string(),
-            created_at: created_at.clone(),
-            session_id: None,
-            running: true,
-        };
-        tasks.insert(
-            task_id,
-            ServerTaskEntry {
-                session,
-                tracker,
-                agent_label,
-                source_id,
-                cwd,
-                created_at,
-                session_id,
-            },
-        );
-        Ok(status)
-    }
-
-    /// Send a prompt straight to a running task's runtime — the live-send
-    /// path, as opposed to the queued-prompt path that waits for an idle
-    /// session. Rejected with 409 while a turn is already in flight so the
-    /// transcript never interleaves two user prompts mid-stream; the caller
-    /// can fall back to queueing.
-    fn prompt_task(
-        &self,
-        task_id: &str,
-        text: String,
-    ) -> std::result::Result<(), (StatusCode, String)> {
-        let (tracker, command_tx) = {
-            let tasks = self.tasks.lock().expect("server task registry lock");
-            let entry = tasks
-                .get(task_id)
-                .ok_or((StatusCode::NOT_FOUND, format!("unknown task: {task_id}")))?;
-            if entry.session.task.is_finished() {
-                return Err((
-                    StatusCode::CONFLICT,
-                    "task has exited; spawn a new one".to_string(),
-                ));
-            }
-            (entry.tracker.clone(), entry.session.command_tx.clone())
-        };
-        let command = UiCommand::SendPrompt {
-            text,
-            images: Vec::new(),
-        };
-        if !tracker.try_begin_prompt(&command) {
-            return Err((
-                StatusCode::CONFLICT,
-                "task is busy with a turn; cancel it or queue the prompt instead".to_string(),
-            ));
-        }
-        if command_tx.send(command).is_err() {
-            tracker.release_prompt_slot();
-            return Err((StatusCode::CONFLICT, "task is shutting down".to_string()));
-        }
-        Ok(())
-    }
-
-    /// Cancel a running task's in-flight prompt turn. Always accepted for a
-    /// live task: cancelling an idle session is a no-op in the runtime.
-    fn cancel_task_turn(&self, task_id: &str) -> std::result::Result<(), (StatusCode, String)> {
-        let tasks = self.tasks.lock().expect("server task registry lock");
-        let entry = tasks
-            .get(task_id)
-            .ok_or((StatusCode::NOT_FOUND, format!("unknown task: {task_id}")))?;
-        if entry
-            .session
-            .command_tx
-            .send(UiCommand::CancelPrompt)
-            .is_err()
-        {
-            return Err((StatusCode::CONFLICT, "task is shutting down".to_string()));
-        }
-        Ok(())
-    }
-
-    /// Stop a task and remove it from the registry. Returns false when the
-    /// task id is unknown (including tasks that already exited and were
-    /// reaped).
-    async fn stop_task(&self, task_id: &str) -> bool {
-        let entry = self
-            .tasks
-            .lock()
-            .expect("server task registry lock")
-            .remove(task_id);
-        match entry {
-            Some(entry) => {
-                entry.session.shutdown().await;
-                true
-            }
-            None => false,
-        }
-    }
-
-    fn list_tasks(&self) -> Vec<ServerTaskStatus> {
-        let tasks = self.tasks.lock().expect("server task registry lock");
-        let mut statuses: Vec<ServerTaskStatus> = tasks
-            .iter()
-            .map(|(task_id, entry)| ServerTaskStatus {
-                task_id: task_id.clone(),
-                agent: entry.agent_label.clone(),
-                source_id: entry.source_id.clone(),
-                cwd: entry.cwd.display().to_string(),
-                created_at: entry.created_at.clone(),
-                session_id: entry
-                    .session_id
-                    .lock()
-                    .expect("task session id slot")
-                    .clone(),
-                running: !entry.session.task.is_finished(),
-            })
-            .collect();
-        // Newest first; task_id tiebreak keeps the order deterministic.
-        statuses.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| a.task_id.cmp(&b.task_id))
-        });
-        statuses
-    }
-
-    async fn shutdown_all(&self) {
-        let entries: Vec<ServerTaskEntry> = {
-            let mut tasks = self.tasks.lock().expect("server task registry lock");
-            tasks.drain().map(|(_, entry)| entry).collect()
-        };
-        for entry in entries {
-            entry.session.shutdown().await;
-        }
-    }
-}
-
-/// Resolve a spawn request's agent choice against the persisted config: the
-/// configured default agent, or a named custom agent by `source_id`. Mirrors
-/// `mj mcp`'s resolution so the two control planes agree on agent ids.
-fn resolve_spawn_agent(
-    cfg: &config::Config,
-    want: Option<&str>,
-) -> std::result::Result<SelectedAgent, String> {
-    if let Some(selected) = &cfg.agent
-        && want.is_none_or(|w| selected.source_id == w)
-    {
-        return Ok(selected.clone());
-    }
-    if let Some(w) = want {
-        let name = w
-            .strip_prefix(config::CUSTOM_AGENT_SOURCE_PREFIX)
-            .unwrap_or(w);
-        if let Some(custom) = cfg.custom_agents.iter().find(|c| c.name == name) {
-            return Ok(SelectedAgent {
-                source_id: format!("{}{}", config::CUSTOM_AGENT_SOURCE_PREFIX, custom.name),
-                program: custom.program.clone(),
-                args: custom.args.clone(),
-                env: HashMap::new(),
-            });
-        }
-        return Err(format!(
-            "unknown agent '{w}'; list choices with GET /api/agents"
-        ));
-    }
-    Err("no agent configured; run interactive `mj` once to pick a default".to_string())
-}
-
-/// Resolve a spawn request's working directory, constraining any
-/// client-supplied path to live under a root the operator allowed at launch.
-/// This bounds the spawned agent's filesystem scope to the operator's intent
-/// rather than anywhere a signed-in viewer names.
-fn resolve_spawn_cwd(
-    raw: Option<&str>,
-    default_cwd: &Path,
-    allowed: &[PathBuf],
-) -> std::result::Result<PathBuf, String> {
-    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return Ok(default_cwd.to_path_buf());
-    };
-    let path = std::fs::canonicalize(raw)
-        .map_err(|error| format!("cwd {raw:?} is not a usable directory: {error}"))?;
-    if crate::mcp::path_within_any(&path, allowed) {
-        Ok(path)
-    } else {
-        Err(format!(
-            "cwd {raw:?} is outside the server's allowed workspace roots; \
-             launch `mj server` with --cwd/--additional-directory covering it"
-        ))
-    }
-}
-
-fn spawn_agent_infos(cfg: &config::Config) -> Vec<SpawnAgentInfo> {
-    let mut agents = Vec::new();
-    if let Some(agent) = &cfg.agent {
-        agents.push(SpawnAgentInfo {
-            source_id: agent.source_id.clone(),
-            label: agent_display_label(agent),
-            program: agent.program.display().to_string(),
-            args: agent.args.clone(),
-            kind: "default",
-        });
-    }
-    for custom in &cfg.custom_agents {
-        agents.push(SpawnAgentInfo {
-            source_id: format!("{}{}", config::CUSTOM_AGENT_SOURCE_PREFIX, custom.name),
-            label: custom.name.clone(),
-            program: custom.program.display().to_string(),
-            args: custom.args.clone(),
-            kind: "custom",
-        });
-    }
-    agents
-}
-
-fn generate_task_id() -> Result<String> {
-    let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).map_err(|error| anyhow!("generate task id: {error}"))?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 impl TrackerState {
@@ -1052,7 +666,6 @@ impl TrackerState {
             agent: self.agent.clone(),
             transcript: self.transcript.clone(),
             queued_prompt_count: 0,
-            working: self.prompt_in_flight,
             pending_permissions: self.pending_permissions.clone(),
             session_config: self.session_config.clone(),
         })
@@ -1234,33 +847,6 @@ impl RemoteSessionTracker {
             state.observe_command(command);
         }
         self.request_flush();
-    }
-
-    /// Atomically claim the session's single prompt slot and record the
-    /// prompt. Returns false when the session is not ready yet or a turn is
-    /// already in flight — the same idle gate the queued-prompt poller uses,
-    /// so live prompts can never interleave with a streaming turn.
-    fn try_begin_prompt(&self, command: &UiCommand) -> bool {
-        if self.shutting_down.load(Ordering::Relaxed) {
-            return false;
-        }
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
-        if state.reserve_remote_prompt_slot().is_none() {
-            return false;
-        }
-        state.observe_command(command);
-        drop(state);
-        self.request_flush();
-        true
-    }
-
-    /// Undo a `try_begin_prompt` claim whose command could not be delivered.
-    fn release_prompt_slot(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.release_remote_prompt_slot();
-        }
     }
 
     pub fn observe_event(&self, event: &UiEvent) {
@@ -1661,30 +1247,15 @@ fn build_client(cert_path: &Path) -> Option<reqwest::Client> {
     }
 }
 
-/// Options for [`run_server`], mirroring the `mj server` CLI surface.
-#[derive(Debug)]
-pub struct ServerOptions {
-    pub hostname: Option<String>,
-    pub history_days: u32,
-    pub session_ttl_days: u32,
-    pub logout_all: bool,
-    pub allow_spawn: bool,
-    pub cwd: PathBuf,
-    pub additional_directories: Vec<PathBuf>,
-    pub fs_max_text_bytes: u64,
-}
-
-pub async fn run_server(options: ServerOptions) -> Result<()> {
-    let ServerOptions {
-        hostname,
-        history_days,
-        session_ttl_days,
-        logout_all,
-        allow_spawn,
-        cwd,
-        additional_directories,
-        fs_max_text_bytes,
-    } = options;
+pub async fn run_server(
+    hostname: Option<String>,
+    history_days: u32,
+    session_ttl_days: u32,
+    logout_all: bool,
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
+    fs_max_text_bytes: u64,
+) -> Result<()> {
     clear_terminal_screen()?;
     install_crypto_provider();
 
@@ -1711,20 +1282,12 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     let viewer_code = generate_viewer_code()?;
     let viewer_url = remote_qr_login_url(&listen.viewer_host, &token);
 
-    let task_manager = allow_spawn.then(|| {
-        Arc::new(ServerTaskManager::new(
-            cwd.clone(),
-            additional_directories.clone(),
-            fs_max_text_bytes,
-        ))
-    });
     let app = build_router(RouterConfig {
         db_path: paths.db_path.clone(),
         token,
         viewer_code: viewer_code.clone(),
         cookie_key,
         session_ttl,
-        tasks: task_manager.clone(),
     });
 
     let tls_config =
@@ -1752,19 +1315,6 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     } else {
         println!("session lifetime: {session_ttl_days} days");
     }
-    if task_manager.is_some() {
-        println!("task spawning: enabled (viewers can launch agents under the allowed roots)");
-        // A public bind turns spawning into a network-reachable code-execution
-        // surface: anyone who can reach the port and holds viewer credentials
-        // can run processes on this host. Make that unmistakable at startup.
-        if listen.bind_addr == REMOTE_CONTROL_PUBLIC_ADDR {
-            println!(
-                "WARNING: task spawning is reachable from the network on {}. \
-                 Anyone with viewer credentials can run processes on this host.",
-                listen.bind_addr
-            );
-        }
-    }
 
     let server_handle = axum_server::Handle::new();
     let server = axum_server::from_tcp_rustls(listener, tls_config)
@@ -1786,18 +1336,12 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
             if let Some(session) = agent_session.take() {
                 session.shutdown().await;
             }
-            if let Some(manager) = &task_manager {
-                manager.shutdown_all().await;
-            }
             server_handle.graceful_shutdown(Some(Duration::from_secs(2)));
             server_task.await.context("remote-control server task join after shutdown")?
         }
     };
     if let Some(session) = agent_session.take() {
         session.shutdown().await;
-    }
-    if let Some(manager) = &task_manager {
-        manager.shutdown_all().await;
     }
     result.with_context(|| format!("serve remote-control API on {}", listen.bind_addr))
 }
@@ -1808,31 +1352,6 @@ fn start_server_agent_session(
     additional_directories: Vec<PathBuf>,
     fs_max_text_bytes: u64,
 ) -> ServerAgentSession {
-    start_server_agent_session_ext(
-        agent,
-        cwd,
-        additional_directories,
-        fs_max_text_bytes,
-        None,
-        None,
-    )
-    .0
-}
-
-/// `start_server_agent_session` plus the hooks server-spawned tasks need:
-/// an optional prompt fired on the first `SessionStarted`, and a shared slot
-/// that tracks the runtime's current session id (updated again if the
-/// session ever switches, e.g. after a fork). Also returns the session's
-/// tracker so callers can drive live prompts through the same
-/// observe-then-send path the queued-prompt poller uses.
-fn start_server_agent_session_ext(
-    agent: SelectedAgent,
-    cwd: PathBuf,
-    additional_directories: Vec<PathBuf>,
-    fs_max_text_bytes: u64,
-    initial_prompt: Option<String>,
-    session_id_slot: Option<Arc<Mutex<Option<String>>>>,
-) -> (ServerAgentSession, RemoteSessionTracker) {
     let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
     let (runtime_cmd_tx, runtime_cmd_rx) = mpsc::unbounded_channel();
     let (remote_event_tx, mut remote_event_rx) = mpsc::unbounded_channel();
@@ -1856,9 +1375,6 @@ fn start_server_agent_session_ext(
     };
     let command_tx = runtime_cmd_tx.clone();
     let shutdown_tx = runtime_cmd_tx;
-    // Clones share the tracker's inner Arcs, so the handle returned to the
-    // caller observes and publishes through the same state the pump uses.
-    let caller_tracker = tracker.clone();
 
     let task = tokio::spawn(async move {
         let runtime = tokio::spawn(async move {
@@ -1869,7 +1385,6 @@ fn start_server_agent_session_ext(
         tokio::pin!(runtime);
         let mut pending_permissions = std::collections::HashMap::new();
         let mut runtime_done = false;
-        let mut initial_prompt = initial_prompt;
 
         loop {
             tokio::select! {
@@ -1877,31 +1392,7 @@ fn start_server_agent_session_ext(
                     let Some(event) = event else {
                         break;
                     };
-                    let started_session_id = match &event {
-                        UiEvent::SessionStarted { session_id, .. } => Some(session_id.clone()),
-                        _ => None,
-                    };
-                    // Let the tracker observe SessionStarted BEFORE the
-                    // initial prompt: observing it resets prompt_in_flight,
-                    // so the reverse order would erase the in-flight state
-                    // the prompt just set and break the live-send busy gate.
                     handle_server_agent_event(event, &tracker, &mut pending_permissions);
-                    if let Some(session_id) = started_session_id {
-                        if let Some(slot) = &session_id_slot {
-                            *slot.lock().expect("task session id slot") = Some(session_id);
-                        }
-                        if let Some(text) = initial_prompt.take() {
-                            let command = UiCommand::SendPrompt {
-                                text,
-                                images: Vec::new(),
-                            };
-                            // Record the prompt in the tracker like the
-                            // queued-prompt path does, so the task's first
-                            // user message shows up in viewer transcripts.
-                            tracker.observe_command(&command);
-                            let _ = shutdown_tx.send(command);
-                        }
-                    }
                 }
                 event = remote_event_rx.recv() => {
                     let Some(event) = event else {
@@ -1935,7 +1426,7 @@ fn start_server_agent_session_ext(
         tracker.shutdown().await;
     });
 
-    (ServerAgentSession { command_tx, task }, caller_tracker)
+    ServerAgentSession { command_tx, task }
 }
 
 impl ServerAgentSession {
@@ -2079,11 +1570,9 @@ struct RouterConfig {
     viewer_code: String,
     cookie_key: String,
     session_ttl: Duration,
-    tasks: Option<Arc<ServerTaskManager>>,
 }
 
 fn build_router(config: RouterConfig) -> Router {
-    let (events, _) = broadcast::channel(SERVER_EVENT_CAPACITY);
     let state = ServerState {
         db_path: Arc::new(config.db_path),
         token: Arc::new(config.token),
@@ -2091,8 +1580,6 @@ fn build_router(config: RouterConfig) -> Router {
         cookie_key: Arc::new(config.cookie_key),
         session_ttl: config.session_ttl,
         code_guard: Arc::new(Mutex::new(CodeAuthGuard::default())),
-        tasks: config.tasks,
-        events,
     };
 
     let protected = Router::new()
@@ -2115,15 +1602,6 @@ fn build_router(config: RouterConfig) -> Router {
         )
         .route("/api/config-changes", post(queue_config_change))
         .route("/api/config-changes/claim", post(claim_config_change))
-        .route("/api/events", get(server_events))
-        .route("/api/agents", get(list_spawn_agents))
-        .route("/api/tasks", get(list_server_tasks).post(spawn_server_task))
-        .route(
-            "/api/tasks/{task_id}",
-            axum::routing::delete(stop_server_task),
-        )
-        .route("/api/tasks/{task_id}/prompt", post(prompt_server_task))
-        .route("/api/tasks/{task_id}/cancel", post(cancel_server_task))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_token,
@@ -2135,11 +1613,6 @@ fn build_router(config: RouterConfig) -> Router {
         // load before sign-in so the app is installable and can launch offline.
         .route("/manifest.webmanifest", get(remote_manifest))
         .route("/service-worker.js", get(remote_service_worker))
-        .route("/assets/app.js", get(remote_asset_app))
-        .route("/assets/dom.js", get(remote_asset_dom))
-        .route("/assets/markdown.js", get(remote_asset_markdown))
-        .route("/assets/palette.js", get(remote_asset_palette))
-        .route("/assets/notify.js", get(remote_asset_notify))
         .route("/icons/icon.svg", get(remote_icon_svg))
         .route("/icons/icon-192.png", get(remote_icon_192))
         .route("/icons/icon-512.png", get(remote_icon_512))
@@ -2273,61 +1746,14 @@ fn session_cookie_valid(cookie_key: &str, value: &str, now_unix: u64) -> bool {
     constant_time_eq(expected.as_bytes(), value.as_bytes())
 }
 
-async fn remote_viewer() -> Response {
-    // `no-cache` (revalidate, not no-store): the shell references versioned
-    // ES modules, and a heuristically cached stale shell paired with fresh
-    // modules (or vice versa) would skew the app across mj upgrades.
-    (
-        [
-            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (axum::http::header::CACHE_CONTROL, "no-cache"),
-        ],
-        include_str!("remote_viewer.html"),
-    )
-        .into_response()
+async fn remote_viewer() -> Html<&'static str> {
+    Html(include_str!("remote_viewer.html"))
 }
 
 /// Serve a compiled-in static asset with an explicit content type. Used for the
 /// PWA manifest, service worker, and icons.
 fn static_asset(content_type: &'static str, body: &'static [u8]) -> Response {
     ([(axum::http::header::CONTENT_TYPE, content_type)], body).into_response()
-}
-
-/// Serve a compiled-in ES module. Same skew concern as the shell: modules
-/// must revalidate so one release's `app.js` never imports another release's
-/// `dom.js` from a heuristic browser cache.
-fn module_asset(body: &'static [u8]) -> Response {
-    (
-        [
-            (
-                axum::http::header::CONTENT_TYPE,
-                "text/javascript; charset=utf-8",
-            ),
-            (axum::http::header::CACHE_CONTROL, "no-cache"),
-        ],
-        body,
-    )
-        .into_response()
-}
-
-async fn remote_asset_app() -> Response {
-    module_asset(include_bytes!("remote_assets/app.js"))
-}
-
-async fn remote_asset_dom() -> Response {
-    module_asset(include_bytes!("remote_assets/dom.js"))
-}
-
-async fn remote_asset_markdown() -> Response {
-    module_asset(include_bytes!("remote_assets/markdown.js"))
-}
-
-async fn remote_asset_palette() -> Response {
-    module_asset(include_bytes!("remote_assets/palette.js"))
-}
-
-async fn remote_asset_notify() -> Response {
-    module_asset(include_bytes!("remote_assets/notify.js"))
 }
 
 async fn remote_manifest() -> Response {
@@ -2520,14 +1946,12 @@ async fn upsert_session(
     Json(session): Json<SessionRecord>,
 ) -> std::result::Result<StatusCode, (StatusCode, String)> {
     let db_path = Arc::clone(&state.db_path);
-    let session_id = session.session_id.clone();
     tokio::task::spawn_blocking(move || {
         upsert_session_record(db_path.as_ref().as_path(), &session)
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
-    push_session_event(&state, session_id);
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -2536,16 +1960,12 @@ async fn disconnect_session(
     AxumPath(session_id): AxumPath<String>,
 ) -> std::result::Result<StatusCode, (StatusCode, String)> {
     let db_path = Arc::clone(&state.db_path);
-    let disconnected_id = session_id.clone();
     tokio::task::spawn_blocking(move || {
         disconnect_session_record(db_path.as_ref().as_path(), &session_id)
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
-    let _ = state
-        .events
-        .send(ServerEvent::SessionDisconnected(disconnected_id));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2601,7 +2021,6 @@ async fn queue_prompt(
         ));
     }
     let db_path = Arc::clone(&state.db_path);
-    let session_id = request.session_id.clone();
     tokio::task::spawn_blocking(move || {
         queue_prompt_record(
             db_path.as_ref().as_path(),
@@ -2612,7 +2031,6 @@ async fn queue_prompt(
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
-    push_session_event(&state, session_id);
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -2622,16 +2040,12 @@ async fn claim_queued_prompt(
 ) -> std::result::Result<Json<Option<QueuedPrompt>>, (StatusCode, String)> {
     let db_path = Arc::clone(&state.db_path);
     let session_id = request.session_id;
-    let event_session_id = session_id.clone();
     let prompt = tokio::task::spawn_blocking(move || {
         claim_queued_prompt_record(db_path.as_ref().as_path(), &session_id)
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
-    if prompt.is_some() {
-        push_session_event(&state, event_session_id);
-    }
     Ok(Json(prompt))
 }
 
@@ -2723,190 +2137,6 @@ async fn claim_config_change(
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-}
-
-/// Load the current record for one session and push it to `/api/events`
-/// subscribers. Loading from sqlite (rather than echoing the request body)
-/// means the pushed record carries the derived fields — queued prompt count
-/// and the stale-snapshot conflict resolution — exactly as a poll would see
-/// them. Fire-and-forget so mutating handlers never wait on the fan-out.
-fn push_session_event(state: &ServerState, session_id: String) {
-    let db_path = Arc::clone(&state.db_path);
-    let events = state.events.clone();
-    tokio::spawn(async move {
-        let loaded = tokio::task::spawn_blocking(move || {
-            load_session_record(db_path.as_ref().as_path(), &session_id)
-        })
-        .await;
-        if let Ok(Ok(Some(record))) = loaded {
-            let _ = events.send(ServerEvent::Session(Arc::new(record)));
-        }
-    });
-}
-
-/// The `snapshot` SSE event payload: every live session plus the task list
-/// (when spawning is enabled). Sent on connect and again whenever a
-/// subscriber lags the broadcast channel.
-async fn sse_snapshot_event(state: &ServerState) -> SseEvent {
-    let db_path = Arc::clone(&state.db_path);
-    let cutoff = connected_session_cutoff_rfc3339();
-    let sessions = tokio::task::spawn_blocking(move || {
-        load_connected_session_records(db_path.as_ref().as_path(), &cutoff)
-    })
-    .await
-    .map(|result| result.unwrap_or_default())
-    .unwrap_or_default();
-    let tasks = state.tasks.as_ref().map(|manager| manager.list_tasks());
-    let payload = serde_json::json!({ "sessions": sessions, "tasks": tasks });
-    SseEvent::default()
-        .event("snapshot")
-        .data(payload.to_string())
-}
-
-fn sse_live_event(event: &ServerEvent) -> SseEvent {
-    match event {
-        ServerEvent::Session(record) => SseEvent::default()
-            .event("session")
-            .data(serde_json::to_string(record.as_ref()).unwrap_or_else(|_| "{}".to_string())),
-        ServerEvent::SessionDisconnected(session_id) => SseEvent::default()
-            .event("session_disconnected")
-            .data(serde_json::json!({ "session_id": session_id }).to_string()),
-        ServerEvent::Tasks(tasks) => SseEvent::default()
-            .event("tasks")
-            .data(serde_json::to_string(tasks.as_ref()).unwrap_or_else(|_| "[]".to_string())),
-    }
-}
-
-/// Server-push stream for viewers: a `snapshot` event on connect, then one
-/// event per change. Lagged subscribers get a fresh snapshot instead of a
-/// closed stream, and `EventSource` reconnects transparently otherwise.
-async fn server_events(
-    State(state): State<ServerState>,
-) -> Sse<impl futures::Stream<Item = std::result::Result<SseEvent, std::convert::Infallible>>> {
-    enum Phase {
-        Snapshot,
-        Live,
-    }
-    let rx = state.events.subscribe();
-    let stream = futures::stream::unfold(
-        (Phase::Snapshot, rx, state),
-        |(phase, mut rx, state)| async move {
-            match phase {
-                Phase::Snapshot => {
-                    let event = sse_snapshot_event(&state).await;
-                    Some((Ok(event), (Phase::Live, rx, state)))
-                }
-                Phase::Live => match rx.recv().await {
-                    Ok(event) => {
-                        let event = sse_live_event(&event);
-                        Some((Ok(event), (Phase::Live, rx, state)))
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        debug!("sse subscriber lagged {skipped} events; resyncing");
-                        let event = sse_snapshot_event(&state).await;
-                        Some((Ok(event), (Phase::Live, rx, state)))
-                    }
-                    Err(broadcast::error::RecvError::Closed) => None,
-                },
-            }
-        },
-    );
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    )
-}
-
-/// Task endpoints exist only when the operator enabled spawning; without the
-/// opt-in they answer 403 so the viewer can hide the task UI.
-fn require_task_manager(
-    state: &ServerState,
-) -> std::result::Result<Arc<ServerTaskManager>, (StatusCode, String)> {
-    state.tasks.clone().ok_or((
-        StatusCode::FORBIDDEN,
-        "task spawning is disabled; start the server with `mj server --allow-spawn`".to_string(),
-    ))
-}
-
-async fn list_spawn_agents(
-    State(state): State<ServerState>,
-) -> std::result::Result<Json<Vec<SpawnAgentInfo>>, (StatusCode, String)> {
-    require_task_manager(&state)?;
-    let cfg = config::Config::load(&config::default_config_path()).map_err(internal_error)?;
-    Ok(Json(spawn_agent_infos(&cfg)))
-}
-
-async fn list_server_tasks(
-    State(state): State<ServerState>,
-) -> std::result::Result<Json<Vec<ServerTaskStatus>>, (StatusCode, String)> {
-    let manager = require_task_manager(&state)?;
-    Ok(Json(manager.list_tasks()))
-}
-
-async fn spawn_server_task(
-    State(state): State<ServerState>,
-    Json(request): Json<SpawnTaskRequest>,
-) -> std::result::Result<(StatusCode, Json<ServerTaskStatus>), (StatusCode, String)> {
-    let manager = require_task_manager(&state)?;
-    let cfg = config::Config::load(&config::default_config_path()).map_err(internal_error)?;
-    let status = manager.spawn_task(&cfg, &request)?;
-    let _ = state
-        .events
-        .send(ServerEvent::Tasks(Arc::new(manager.list_tasks())));
-    Ok((StatusCode::CREATED, Json(status)))
-}
-
-/// Body for `POST /api/tasks/{task_id}/prompt`.
-#[derive(Debug, Clone, Deserialize)]
-struct TaskPromptRequest {
-    text: String,
-}
-
-/// Live-send a prompt to a server-owned task. Unlike `/api/queued-prompts`
-/// this hands the prompt to the runtime immediately; the transcript update
-/// then flows back through the tracker like any other turn.
-async fn prompt_server_task(
-    State(state): State<ServerState>,
-    AxumPath(task_id): AxumPath<String>,
-    Json(request): Json<TaskPromptRequest>,
-) -> std::result::Result<StatusCode, (StatusCode, String)> {
-    let manager = require_task_manager(&state)?;
-    let text = request.text.trim().to_string();
-    if text.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "prompt text must not be empty".to_string(),
-        ));
-    }
-    manager.prompt_task(&task_id, text)?;
-    Ok(StatusCode::ACCEPTED)
-}
-
-/// Cancel a server-owned task's in-flight turn (the web equivalent of Esc /
-/// Ctrl-C in the TUI). The task itself keeps running and accepts new prompts.
-async fn cancel_server_task(
-    State(state): State<ServerState>,
-    AxumPath(task_id): AxumPath<String>,
-) -> std::result::Result<StatusCode, (StatusCode, String)> {
-    let manager = require_task_manager(&state)?;
-    manager.cancel_task_turn(&task_id)?;
-    Ok(StatusCode::ACCEPTED)
-}
-
-async fn stop_server_task(
-    State(state): State<ServerState>,
-    AxumPath(task_id): AxumPath<String>,
-) -> std::result::Result<StatusCode, (StatusCode, String)> {
-    let manager = require_task_manager(&state)?;
-    if manager.stop_task(&task_id).await {
-        let _ = state
-            .events
-            .send(ServerEvent::Tasks(Arc::new(manager.list_tasks())));
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err((StatusCode::NOT_FOUND, format!("unknown task: {task_id}")))
-    }
 }
 
 fn remote_control_dir() -> PathBuf {
@@ -3117,7 +2347,6 @@ fn init_db(db_path: &Path) -> Result<()> {
         "text not null default '[]'",
     )?;
     ensure_sessions_column(&conn, "session_config_json", "text not null default '[]'")?;
-    ensure_sessions_column(&conn, "working", "integer not null default 0")?;
     Ok(())
 }
 
@@ -3175,9 +2404,8 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             transcript_json,
             pending_permissions_json,
             session_config_json,
-            working,
             connected
-        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)
         on conflict(session_id) do update set
             name = excluded.name,
             start_time = sessions.start_time,
@@ -3188,7 +2416,6 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             transcript_json = excluded.transcript_json,
             pending_permissions_json = excluded.pending_permissions_json,
             session_config_json = excluded.session_config_json,
-            working = excluded.working,
             connected = 1
         where excluded.last_update >= sessions.last_update",
         params![
@@ -3202,7 +2429,6 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             transcript_json,
             pending_permissions_json,
             session_config_json,
-            session.working,
         ],
     )
     .context("upsert remote-control session")?;
@@ -3341,8 +2567,7 @@ fn load_session_records(db_path: &Path) -> Result<Vec<SessionRecord>> {
                     select count(*)
                     from queued_prompts
                     where queued_prompts.session_id = sessions.session_id
-                ) as queued_prompt_count,
-                working
+                ) as queued_prompt_count
             from sessions
             order by last_update desc, session_id asc",
         )
@@ -3375,8 +2600,7 @@ fn load_connected_session_records(db_path: &Path, cutoff: &str) -> Result<Vec<Se
                     select count(*)
                     from queued_prompts
                     where queued_prompts.session_id = sessions.session_id
-                ) as queued_prompt_count,
-                working
+                ) as queued_prompt_count
             from sessions
             where connected = 1 and last_update >= ?1
             order by last_update desc, session_id asc",
@@ -3390,44 +2614,12 @@ fn load_connected_session_records(db_path: &Path, cutoff: &str) -> Result<Vec<Se
         .context("collect connected sessions")
 }
 
-fn load_session_record(db_path: &Path, session_id: &str) -> Result<Option<SessionRecord>> {
-    init_db(db_path)?;
-    let conn = open_db(db_path)?;
-    let mut stmt = conn
-        .prepare(
-            "select
-                session_id,
-                name,
-                start_time,
-                last_update,
-                total_messages,
-                project,
-                agent,
-                transcript_json,
-                pending_permissions_json,
-                session_config_json,
-                (
-                    select count(*)
-                    from queued_prompts
-                    where queued_prompts.session_id = sessions.session_id
-                ) as queued_prompt_count,
-                working
-            from sessions
-            where session_id = ?1",
-        )
-        .context("prepare single session query")?;
-    stmt.query_row(params![session_id], session_record_from_row)
-        .optional()
-        .context("query single session")
-}
-
 fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     let total_messages: i64 = row.get(4)?;
     let transcript_json: String = row.get(7)?;
     let pending_permissions_json: String = row.get(8)?;
     let session_config_json: String = row.get(9)?;
     let queued_prompt_count: i64 = row.get(10)?;
-    let working: bool = row.get(11)?;
     let transcript = serde_json::from_str(&transcript_json).unwrap_or_default();
     let pending_permissions = serde_json::from_str(&pending_permissions_json).unwrap_or_default();
     let session_config = serde_json::from_str(&session_config_json).unwrap_or_default();
@@ -3441,7 +2633,6 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         agent: row.get(6)?,
         transcript,
         queued_prompt_count: u64::try_from(queued_prompt_count).unwrap_or(0),
-        working,
         pending_permissions,
         session_config,
     })
@@ -4129,7 +3320,6 @@ mod tests {
                 },
             ],
             queued_prompt_count: 0,
-            working: false,
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
         };
@@ -4185,7 +3375,6 @@ mod tests {
             agent: "agent".to_string(),
             transcript: Vec::new(),
             queued_prompt_count: 0,
-            working: false,
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
         };
@@ -4278,7 +3467,6 @@ mod tests {
             agent: "agent".to_string(),
             transcript: Vec::new(),
             queued_prompt_count: 0,
-            working: false,
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
         }
@@ -4697,7 +3885,6 @@ mod tests {
             agent: "anvil".to_string(),
             transcript: Vec::new(),
             queued_prompt_count: 0,
-            working: false,
             pending_permissions: vec![pending.clone()],
             session_config: Vec::new(),
         };
@@ -4768,7 +3955,6 @@ mod tests {
             viewer_code: "123456".to_string(),
             cookie_key: "test-cookie-key".to_string(),
             session_ttl: DEFAULT_SESSION_TTL,
-            tasks: None,
         });
 
         let decision_body = |request_id: &str, option_id: &str| {
@@ -4984,7 +4170,6 @@ mod tests {
             viewer_code: "123456".to_string(),
             cookie_key: "test-cookie-key".to_string(),
             session_ttl: DEFAULT_SESSION_TTL,
-            tasks: None,
         });
 
         let change_body = |target_kind: &str, config_id: Option<&str>, value: &str| {
@@ -5260,435 +4445,6 @@ mod tests {
         assert!(code.chars().all(|ch| ch.is_ascii_digit()));
     }
 
-    #[test]
-    fn task_id_is_hex_and_unique_enough() {
-        let a = generate_task_id().expect("task id");
-        let b = generate_task_id().expect("task id");
-        assert_eq!(a.len(), 16);
-        assert!(a.chars().all(|ch| ch.is_ascii_hexdigit()));
-        assert_ne!(a, b);
-    }
-
-    fn spawn_test_config() -> config::Config {
-        config::Config {
-            agent: Some(SelectedAgent {
-                source_id: "anvil".to_string(),
-                program: PathBuf::from("uvx"),
-                args: vec!["brokk".to_string(), "acp".to_string()],
-                env: HashMap::new(),
-            }),
-            custom_agents: vec![config::CustomAgent {
-                name: "echo-agent".to_string(),
-                program: PathBuf::from("echo"),
-                args: vec!["hi".to_string()],
-                description: String::new(),
-            }],
-            ..config::Config::default()
-        }
-    }
-
-    #[test]
-    fn resolve_spawn_agent_prefers_default_and_finds_custom() {
-        let cfg = spawn_test_config();
-
-        let default = resolve_spawn_agent(&cfg, None).expect("default agent");
-        assert_eq!(default.source_id, "anvil");
-
-        let by_id = resolve_spawn_agent(&cfg, Some("anvil")).expect("default by id");
-        assert_eq!(by_id.source_id, "anvil");
-
-        let custom = resolve_spawn_agent(&cfg, Some("custom:echo-agent")).expect("custom agent");
-        assert_eq!(custom.source_id, "custom:echo-agent");
-        assert_eq!(custom.program, PathBuf::from("echo"));
-
-        let bare = resolve_spawn_agent(&cfg, Some("echo-agent")).expect("custom without prefix");
-        assert_eq!(bare.source_id, "custom:echo-agent");
-
-        let unknown = resolve_spawn_agent(&cfg, Some("no-such-agent"));
-        assert!(unknown.is_err(), "unknown agent ids must be rejected");
-
-        let empty = resolve_spawn_agent(&config::Config::default(), None);
-        assert!(empty.is_err(), "no configured agent must be an error");
-    }
-
-    #[test]
-    fn resolve_spawn_cwd_constrains_to_allowed_roots() {
-        let root = tempfile::tempdir().expect("root");
-        let inside = root.path().join("project");
-        std::fs::create_dir(&inside).expect("mkdir");
-        let outside = tempfile::tempdir().expect("outside");
-        let allowed = vec![std::fs::canonicalize(root.path()).expect("canonical root")];
-
-        let default =
-            resolve_spawn_cwd(None, root.path(), &allowed).expect("default cwd passes through");
-        assert_eq!(default, root.path());
-
-        let blank = resolve_spawn_cwd(Some("   "), root.path(), &allowed)
-            .expect("blank cwd falls back to default");
-        assert_eq!(blank, root.path());
-
-        let ok = resolve_spawn_cwd(Some(inside.to_str().expect("utf8")), root.path(), &allowed)
-            .expect("cwd under an allowed root");
-        assert_eq!(
-            ok,
-            std::fs::canonicalize(&inside).expect("canonical inside")
-        );
-
-        let rejected = resolve_spawn_cwd(
-            Some(outside.path().to_str().expect("utf8")),
-            root.path(),
-            &allowed,
-        );
-        assert!(
-            rejected.is_err(),
-            "cwd outside the allowed roots must be rejected"
-        );
-
-        let missing = resolve_spawn_cwd(Some("/no/such/dir/mj-task"), root.path(), &allowed);
-        assert!(missing.is_err(), "nonexistent cwd must be rejected");
-    }
-
-    #[tokio::test]
-    async fn task_manager_stop_and_list_without_spawns() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let manager = ServerTaskManager::new(dir.path().to_path_buf(), Vec::new(), 65536);
-        assert!(manager.list_tasks().is_empty());
-        assert!(
-            !manager.stop_task("0011223344556677").await,
-            "stopping an unknown task must report not-found"
-        );
-        manager.shutdown_all().await;
-    }
-
-    #[tokio::test]
-    async fn task_endpoints_forbidden_without_allow_spawn() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("sessions.sqlite3");
-        init_db(&db_path).expect("init db");
-        let token = "integration-token".to_string();
-        let app = build_router(RouterConfig {
-            db_path,
-            token: token.clone(),
-            viewer_code: "123456".to_string(),
-            cookie_key: "test-cookie-key".to_string(),
-            session_ttl: DEFAULT_SESSION_TTL,
-            tasks: None,
-        });
-
-        // Without credentials the endpoints reject before the spawn gate.
-        let unauthorized = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("GET")
-                    .uri("/api/tasks")
-                    .body(axum::body::Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("send unauthenticated");
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-
-        // With credentials but no --allow-spawn every task endpoint answers 403.
-        for (method, uri, body) in [
-            ("GET", "/api/tasks", axum::body::Body::empty()),
-            ("GET", "/api/agents", axum::body::Body::empty()),
-            (
-                "POST",
-                "/api/tasks",
-                axum::body::Body::from(r#"{"prompt":"hi"}"#),
-            ),
-            (
-                "DELETE",
-                "/api/tasks/0011223344556677",
-                axum::body::Body::empty(),
-            ),
-            (
-                "POST",
-                "/api/tasks/0011223344556677/prompt",
-                axum::body::Body::from(r#"{"text":"hi"}"#),
-            ),
-            (
-                "POST",
-                "/api/tasks/0011223344556677/cancel",
-                axum::body::Body::empty(),
-            ),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    axum::http::Request::builder()
-                        .method(method)
-                        .uri(uri)
-                        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
-                        .header(axum::http::header::CONTENT_TYPE, "application/json")
-                        .body(body)
-                        .expect("request"),
-                )
-                .await
-                .expect("send request");
-            assert_eq!(
-                response.status(),
-                StatusCode::FORBIDDEN,
-                "{method} {uri} must be forbidden without --allow-spawn"
-            );
-        }
-    }
-
-    /// The spawn handler validates before launching anything. Depending on the
-    /// host the 400 comes from agent resolution (no configured agent on CI) or
-    /// from the cwd sandbox (workstation with a real config); both are
-    /// pre-spawn rejections, and the precise cwd rules are covered by
-    /// `resolve_spawn_cwd_constrains_to_allowed_roots`.
-    #[tokio::test]
-    async fn spawn_endpoint_rejects_invalid_requests_when_enabled() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("sessions.sqlite3");
-        init_db(&db_path).expect("init db");
-        let token = "integration-token".to_string();
-        let workspace = tempfile::tempdir().expect("workspace");
-        let manager = Arc::new(ServerTaskManager::new(
-            workspace.path().to_path_buf(),
-            Vec::new(),
-            65536,
-        ));
-        let app = build_router(RouterConfig {
-            db_path,
-            token: token.clone(),
-            viewer_code: "123456".to_string(),
-            cookie_key: "test-cookie-key".to_string(),
-            session_ttl: DEFAULT_SESSION_TTL,
-            tasks: Some(Arc::clone(&manager)),
-        });
-
-        let elsewhere = tempfile::tempdir().expect("elsewhere");
-        let body = serde_json::json!({ "cwd": elsewhere.path() }).to_string();
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/api/tasks")
-                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(body))
-                    .expect("request"),
-            )
-            .await
-            .expect("send spawn");
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "invalid spawn requests must be rejected before any spawn"
-        );
-        assert!(manager.list_tasks().is_empty(), "nothing may be spawned");
-        manager.shutdown_all().await;
-    }
-
-    fn sse_test_record(session_id: &str, working: bool, last_update: &str) -> SessionRecord {
-        SessionRecord {
-            session_id: session_id.to_string(),
-            name: session_id.to_string(),
-            start_time: "2026-07-03T10:00:00Z".to_string(),
-            last_update: last_update.to_string(),
-            total_messages: 1,
-            project: "proj".to_string(),
-            agent: "agent".to_string(),
-            transcript: Vec::new(),
-            queued_prompt_count: 0,
-            working,
-            pending_permissions: Vec::new(),
-            session_config: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn working_flag_round_trips_through_sqlite() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("sessions.sqlite3");
-        init_db(&db_path).expect("init db");
-
-        let record = sse_test_record("sess-w", true, "2026-07-03T10:00:01Z");
-        upsert_session_record(&db_path, &record).expect("upsert working");
-        let loaded = load_session_record(&db_path, "sess-w")
-            .expect("load")
-            .expect("record exists");
-        assert!(loaded.working, "working=true must survive the round trip");
-
-        let record = sse_test_record("sess-w", false, "2026-07-03T10:00:02Z");
-        upsert_session_record(&db_path, &record).expect("upsert idle");
-        let loaded = load_session_record(&db_path, "sess-w")
-            .expect("load")
-            .expect("record exists");
-        assert!(!loaded.working, "working must clear on the next snapshot");
-    }
-
-    /// Pull one complete SSE event (terminated by a blank line) off a
-    /// streaming response body.
-    async fn read_sse_event(body: &mut axum::body::Body) -> String {
-        let mut buf = String::new();
-        loop {
-            let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
-                .await
-                .expect("timed out waiting for SSE frame")
-                .expect("SSE stream ended unexpectedly")
-                .expect("SSE frame error");
-            if let Some(data) = frame.data_ref() {
-                buf.push_str(std::str::from_utf8(data).expect("utf8 SSE frame"));
-                if buf.contains("\n\n") {
-                    return buf;
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn sse_stream_sends_snapshot_then_session_events() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("sessions.sqlite3");
-        init_db(&db_path).expect("init db");
-        let token = "integration-token".to_string();
-        let app = build_router(RouterConfig {
-            db_path,
-            token: token.clone(),
-            viewer_code: "123456".to_string(),
-            cookie_key: "test-cookie-key".to_string(),
-            session_ttl: DEFAULT_SESSION_TTL,
-            tasks: None,
-        });
-
-        let response = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("GET")
-                    .uri("/api/events")
-                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(axum::body::Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("open sse stream");
-        assert_eq!(response.status(), StatusCode::OK);
-        let content_type = response
-            .headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        assert!(
-            content_type.starts_with("text/event-stream"),
-            "unexpected content type: {content_type}"
-        );
-        let mut body = response.into_body();
-
-        let snapshot = read_sse_event(&mut body).await;
-        assert!(
-            snapshot.contains("event: snapshot"),
-            "first event must be the snapshot, got: {snapshot}"
-        );
-
-        // A session registration flows through the broadcast to the
-        // already-connected subscriber.
-        let record = sse_test_record("sess-sse-1", true, "2026-07-03T10:00:03Z");
-        let upsert = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/api/sessions")
-                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(
-                        serde_json::to_vec(&record).expect("record json"),
-                    ))
-                    .expect("request"),
-            )
-            .await
-            .expect("upsert session");
-        assert_eq!(upsert.status(), StatusCode::ACCEPTED);
-
-        let event = read_sse_event(&mut body).await;
-        assert!(
-            event.contains("event: session"),
-            "expected a session event, got: {event}"
-        );
-        assert!(event.contains("sess-sse-1"));
-        assert!(
-            event.contains("\"working\":true"),
-            "session event must carry the authoritative working flag"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_prompt_and_cancel_validate_when_enabled() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("sessions.sqlite3");
-        init_db(&db_path).expect("init db");
-        let token = "integration-token".to_string();
-        let workspace = tempfile::tempdir().expect("workspace");
-        let manager = Arc::new(ServerTaskManager::new(
-            workspace.path().to_path_buf(),
-            Vec::new(),
-            65536,
-        ));
-        let app = build_router(RouterConfig {
-            db_path,
-            token: token.clone(),
-            viewer_code: "123456".to_string(),
-            cookie_key: "test-cookie-key".to_string(),
-            session_ttl: DEFAULT_SESSION_TTL,
-            tasks: Some(Arc::clone(&manager)),
-        });
-
-        // Empty prompt text is rejected before the task lookup.
-        let empty = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/api/tasks/ffffffffffffffff/prompt")
-                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(r#"{"text":"   "}"#))
-                    .expect("request"),
-            )
-            .await
-            .expect("send empty prompt");
-        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
-
-        // Unknown task ids answer 404 for both prompt and cancel.
-        for (uri, body) in [
-            (
-                "/api/tasks/ffffffffffffffff/prompt",
-                axum::body::Body::from(r#"{"text":"hi"}"#),
-            ),
-            (
-                "/api/tasks/ffffffffffffffff/cancel",
-                axum::body::Body::empty(),
-            ),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    axum::http::Request::builder()
-                        .method("POST")
-                        .uri(uri)
-                        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
-                        .header(axum::http::header::CONTENT_TYPE, "application/json")
-                        .body(body)
-                        .expect("request"),
-                )
-                .await
-                .expect("send request");
-            assert_eq!(
-                response.status(),
-                StatusCode::NOT_FOUND,
-                "{uri} must 404 for unknown tasks"
-            );
-        }
-        manager.shutdown_all().await;
-    }
-
     fn test_state() -> ServerState {
         ServerState {
             db_path: Arc::new(PathBuf::from("unused.sqlite3")),
@@ -5697,8 +4453,6 @@ mod tests {
             cookie_key: Arc::new("test-cookie-signing-key".to_string()),
             session_ttl: DEFAULT_SESSION_TTL,
             code_guard: Arc::new(Mutex::new(CodeAuthGuard::default())),
-            tasks: None,
-            events: broadcast::channel(SERVER_EVENT_CAPACITY).0,
         }
     }
 
@@ -5793,7 +4547,6 @@ mod tests {
             viewer_code: "123456".to_string(),
             cookie_key: "integration-cookie-key".to_string(),
             session_ttl: DEFAULT_SESSION_TTL,
-            tasks: None,
         });
 
         // (path, expected content-type prefix). The shell assets must be reachable
@@ -5972,7 +4725,6 @@ mod tests {
             viewer_code: viewer_code.clone(),
             cookie_key: "integration-cookie-key".to_string(),
             session_ttl: DEFAULT_SESSION_TTL,
-            tasks: None,
         });
 
         let _client = build_client(&cert_path).expect("pinned client");
@@ -5988,7 +4740,6 @@ mod tests {
             agent: "agent".to_string(),
             transcript: Vec::new(),
             queued_prompt_count: 0,
-            working: false,
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
         };
