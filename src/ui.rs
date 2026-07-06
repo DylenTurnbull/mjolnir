@@ -7618,13 +7618,6 @@ fn handle_ragnarok_key(
                 arena.esc_armed = true;
             }
         }
-        KeyCode::Tab => {
-            arena.pane = match arena.pane {
-                ArenaPane::Arena => ArenaPane::Transcript,
-                ArenaPane::Transcript => ArenaPane::Arena,
-            };
-            return inline_repair_request(mode);
-        }
         KeyCode::Up | KeyCode::Char('k') => arena.scroll_feed(1),
         KeyCode::Down | KeyCode::Char('j') => arena.scroll_feed(-1),
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('[') => arena.cycle_fighter(-1),
@@ -7653,12 +7646,24 @@ fn handle_ragnarok_key(
         KeyCode::Enter if arena.awaiting_approval() => {
             arena.unleash();
         }
+        KeyCode::Enter | KeyCode::Tab | KeyCode::Char('t') | KeyCode::Char('T') => {
+            arena.esc_armed = false;
+            toggle_ragnarok_pane(arena);
+            return inline_repair_request(mode);
+        }
         _ => {}
     }
     if disarm && let Some(arena) = state.ragnarok.as_mut() {
         arena.esc_armed = false;
     }
     TerminalRequest::None
+}
+
+fn toggle_ragnarok_pane(arena: &mut RagnarokUi) {
+    arena.pane = match arena.pane {
+        ArenaPane::Arena => ArenaPane::Transcript,
+        ArenaPane::Transcript => ArenaPane::Arena,
+    };
 }
 
 /// Wall-clock animation frame, shared by every arena element.
@@ -7749,20 +7754,21 @@ fn ragnarok_footer_line(arena: &RagnarokUi, theme: TerminalTheme, width: u16) ->
         "⚠ Esc again to FLEE RAGNAROK (any other key stays) ⚠".to_string()
     } else if over {
         match arena.verdict.as_ref().and_then(|v| v.finalists) {
-            Some(_) => "1/2 choose finalist · Enter accept & close · Tab transcripts · ←/→ fighter"
+            Some(_) => "1/2 choose finalist · Enter accept & close · t transcripts · ←/→ fighter"
                 .to_string(),
-            None => "Enter/q close · Tab transcripts · ↑/↓ feed · ←/→ fighter · r review lane"
-                .to_string(),
+            None => {
+                "Enter/q close · t transcripts · ↑/↓ feed · ←/→ fighter · r review lane".to_string()
+            }
         }
     } else if arena.awaiting_approval() {
         "⚔ Enter to UNLEASH RAGNAROK (no combat spend yet) · ↑/↓ feed · Esc Esc flee".to_string()
     } else {
         match arena.pane {
             ArenaPane::Arena => {
-                "↑/↓ feed · ←/→ fighter · 1-9 select · Tab transcripts · Esc Esc flee".to_string()
+                "Enter transcript · ↑/↓ feed · ←/→ fighter · 1-9 select · Esc Esc flee".to_string()
             }
             ArenaPane::Transcript => {
-                "Tab arena · ←/→ fighter · r review lane · Esc Esc flee".to_string()
+                "Enter arena · ←/→ fighter · r review lane · Esc Esc flee".to_string()
             }
         }
     };
@@ -13913,14 +13919,31 @@ mod tests {
             },
         ]));
 
-        // Tab toggles panes.
+        // Enter opens the selected fighter transcript during active combat.
         handle_ragnarok_key(
             &mut state,
             KeyModifiers::NONE,
-            KeyCode::Tab,
+            KeyCode::Enter,
             UiMode::InlineChat,
         );
         assert_eq!(state.ragnarok.as_ref().unwrap().pane, ArenaPane::Transcript);
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Enter,
+            UiMode::InlineChat,
+        );
+        assert_eq!(state.ragnarok.as_ref().unwrap().pane, ArenaPane::Arena);
+        // Tab remains as a compatibility alias, and t is the mnemonic fallback
+        // when Enter is reserved for approval or closing.
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Char('t'),
+            UiMode::InlineChat,
+        );
+        assert_eq!(state.ragnarok.as_ref().unwrap().pane, ArenaPane::Transcript);
+        state.ragnarok.as_mut().unwrap().esc_armed = true;
         handle_ragnarok_key(
             &mut state,
             KeyModifiers::NONE,
@@ -13928,6 +13951,10 @@ mod tests {
             UiMode::InlineChat,
         );
         assert_eq!(state.ragnarok.as_ref().unwrap().pane, ArenaPane::Arena);
+        assert!(
+            !state.ragnarok.as_ref().unwrap().esc_armed,
+            "pane toggles disarm the flee confirmation"
+        );
         // Arrows cycle fighters.
         handle_ragnarok_key(
             &mut state,

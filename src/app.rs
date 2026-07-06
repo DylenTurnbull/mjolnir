@@ -2290,7 +2290,7 @@ const RAGNAROK_TRANSCRIPT_CAP: usize = 96 * 1024;
 /// Cap on Thor's streamed text.
 const RAGNAROK_THOR_CAP: usize = 32 * 1024;
 
-/// Which pane the arena shows. `Tab` toggles.
+/// Which pane the arena shows. `Enter` toggles during active combat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArenaPane {
     Arena,
