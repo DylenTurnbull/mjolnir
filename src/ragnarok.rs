@@ -297,6 +297,9 @@ pub struct BattleConfig {
     pub config_path: PathBuf,
     /// The UI's score store; when it has no catalog Ragnarok loads its own.
     pub score_store: ScoreStore,
+    /// Active session agent/model used for Thor. Competitors are selected from
+    /// the scored pool; Thor follows the user's current session config.
+    pub thor_host: Option<ThorHost>,
 }
 
 /// Run one full battle. Never panics the UI: any error surfaces as
@@ -424,13 +427,16 @@ async fn battle(
     // ---- Phase: Thor routes ------------------------------------------------
     emit(tx, RagnarokEvent::Phase(Phase::Routing))?;
     emit(tx, RagnarokEvent::ThorAction(ThorAction::Descending))?;
-    let thor_pick = pool[0].clone(); // pool is sorted best-Elo-first
+    let thor_host = cfg
+        .thor_host
+        .clone()
+        .unwrap_or_else(|| ThorHost::from_candidate(&pool[0]));
     feed(
         tx,
         None,
         format!(
             "⚡ THOR descends, wearing the guise of {}.",
-            thor_pick.card.tag()
+            thor_host.tag()
         ),
     )?;
     let thor_camp = {
@@ -440,7 +446,7 @@ async fn battle(
             .context("thor camp task failed")?
             .context("could not forge Thor's camp")?
     };
-    let mut thor = Thor::summon(thor_pick, thor_camp, abort.clone()).await?;
+    let mut thor = Thor::summon(thor_host, thor_camp, abort.clone()).await?;
     emit(tx, RagnarokEvent::ThorAction(ThorAction::Deciding))?;
     let route = thor.route(&cfg.task, tx).await?;
     let cap = user_cfg.ragnarok.max_competitors;
@@ -761,6 +767,35 @@ pub struct Candidate {
     pub bedrock: bool,
 }
 
+/// The active session's agent/model used for Thor's router/judge role.
+#[derive(Debug, Clone)]
+pub struct ThorHost {
+    pub agent_source_id: String,
+    pub launch: Launch,
+    pub model_value: Option<String>,
+    pub model_name: Option<String>,
+}
+
+impl ThorHost {
+    fn from_candidate(candidate: &Candidate) -> Self {
+        Self {
+            agent_source_id: candidate.card.agent_source_id.clone(),
+            launch: candidate.launch.clone(),
+            model_value: Some(candidate.card.model_value.clone()),
+            model_name: Some(candidate.card.model_name.clone()),
+        }
+    }
+
+    fn tag(&self) -> String {
+        match self.model_name.as_deref() {
+            Some(model_name) if !model_name.trim().is_empty() => {
+                format!("{model_name} [{}]", self.agent_source_id)
+            }
+            _ => format!("{} [current model]", self.agent_source_id),
+        }
+    }
+}
+
 /// Clonable launch command (mirror of `picker::LaunchCommand`).
 #[derive(Debug, Clone)]
 pub struct Launch {
@@ -957,14 +992,16 @@ fn adjusted_selection_score(
     if candidate.bedrock {
         score -= BEDROCK_SELECTION_PENALTY;
     }
-    if candidate
-        .vendor
-        .as_deref()
-        .is_some_and(|vendor| !used_vendors.contains(vendor))
+    let diversity_applies = !used_agents.is_empty();
+    if diversity_applies
+        && candidate
+            .vendor
+            .as_deref()
+            .is_some_and(|vendor| !used_vendors.contains(vendor))
     {
         score += NEW_VENDOR_SELECTION_BONUS;
     }
-    if !used_agents.contains(&candidate.card.agent_source_id) {
+    if diversity_applies && !used_agents.contains(&candidate.card.agent_source_id) {
         score += NEW_AGENT_SELECTION_BONUS;
     }
     score
@@ -2354,22 +2391,24 @@ pub struct RouteDecision {
 
 impl Thor {
     async fn summon(
-        pick: Candidate,
+        host: ThorHost,
         camp: worktree::CreatedWorktree,
         abort: watch::Receiver<bool>,
     ) -> Result<Self> {
         let mut handle = AgentHandle::connect(
-            &pick.launch,
+            &host.launch,
             &camp.session_cwd,
             abort,
             acp::RuntimeAccessMode::Full,
         )
         .await
         .context("Thor could not descend (agent connect failed)")?;
-        handle
-            .arm_model(&pick.card.model_value)
-            .await
-            .context("Thor could not take form (model select failed)")?;
+        if let Some(model_value) = host.model_value.as_deref() {
+            handle
+                .arm_model(model_value)
+                .await
+                .context("Thor could not take form (model select failed)")?;
+        }
         Ok(Self { handle, camp })
     }
 
@@ -3064,6 +3103,7 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 config_path,
                 score_store: ScoreStore::default(),
+                thor_host: None,
             },
             tx,
             abort_rx,
@@ -3148,6 +3188,25 @@ mod tests {
 
         assert_eq!(picked[0].card.agent_source_id, "claude-acp");
         assert_eq!(picked[0].card.model_name, "opus");
+    }
+
+    #[test]
+    fn select_does_not_award_diversity_before_first_pick() {
+        let pool = sorted(vec![
+            candidate("agent-a", "alpha", 1500, "openai/alpha"),
+            candidate("agent-b", "beta", 1499, "anthropic/beta"),
+            candidate("agent-c", "gamma", 1498, "google/gamma"),
+        ]);
+        let picked = select_fighters_with_picker(&pool, 1, |upper| {
+            assert_eq!(upper, pool.len());
+            0
+        });
+
+        assert_eq!(picked[0].card.model_name, "alpha");
+        assert_eq!(
+            adjusted_selection_score(&pool[0], &HashSet::new(), &HashSet::new()),
+            1500
+        );
     }
 
     #[test]

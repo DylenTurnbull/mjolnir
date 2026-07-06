@@ -295,6 +295,7 @@ pub struct UiRunOptions<'a> {
     pub theme_kind: TerminalThemeKind,
     pub spinner_style: SpinnerStyle,
     pub score_store: crate::scores::ScoreStore,
+    pub active_agent_launch: Option<ragnarok::Launch>,
     pub session_boundary: Option<String>,
     /// The ACP session cwd; `/ragnarok` battles are rooted here.
     pub session_cwd: PathBuf,
@@ -313,6 +314,7 @@ struct UiInitialState {
     agent_label: Option<String>,
     agent_source_id: Option<String>,
     score_store: crate::scores::ScoreStore,
+    active_agent_launch: Option<ragnarok::Launch>,
     history: Vec<String>,
     transcript_export_dir: Option<PathBuf>,
     config_path: Option<PathBuf>,
@@ -363,6 +365,7 @@ pub async fn run(
             agent_label: initial_agent_label,
             agent_source_id: initial_agent_source_id,
             score_store: options.score_store.clone(),
+            active_agent_launch: options.active_agent_launch.clone(),
             history: initial_history,
             transcript_export_dir: options
                 .persistence
@@ -545,6 +548,7 @@ async fn ui_loop(
         state.agent_source_id = source_id;
     }
     state.score_store = initial.score_store;
+    state.active_agent_launch = initial.active_agent_launch;
     state.session_cwd = initial.session_cwd;
     state.transcript_export_dir = initial.transcript_export_dir;
     state.set_theme(initial.theme_kind);
@@ -7582,9 +7586,33 @@ fn start_ragnarok(
             .clone()
             .unwrap_or_else(config::default_config_path),
         score_store: state.score_store.clone(),
+        thor_host: active_thor_host(state),
     };
     state.ragnarok = Some(RagnarokUi::new(task, abort_tx, proceed_tx));
     tokio::spawn(ragnarok::run_battle(cfg, tx, abort_rx, proceed_rx));
+}
+
+fn active_thor_host(state: &AppState) -> Option<ragnarok::ThorHost> {
+    let launch = state.active_agent_launch.clone()?;
+    let model = active_model_config(state);
+    Some(ragnarok::ThorHost {
+        agent_source_id: state.agent_source_id.clone(),
+        launch,
+        model_value: model.as_ref().map(|(value, _)| value.clone()),
+        model_name: model.map(|(_, name)| name),
+    })
+}
+
+fn active_model_config(state: &AppState) -> Option<(String, String)> {
+    state
+        .session_config_options
+        .iter()
+        .find(|option| crate::app::is_model_config_option(option))
+        .and_then(|option| {
+            let value = crate::app::config_option_current_value_id(option)?.to_string();
+            let name = crate::app::config_option_current_value_label(option);
+            Some((value, name))
+        })
 }
 
 fn handle_ragnarok_key(
@@ -8789,6 +8817,8 @@ fn wrap_tail_lines(text: &str, width: usize, max_lines: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use crate::app::StatusKind;
     use crate::claude_usage::ClaudeUsageReport;
     use crate::event::{ElicitationPrompt, SessionConfigTarget};
@@ -8798,9 +8828,9 @@ mod tests {
         AvailableCommand, ContentBlock, ContentChunk, ElicitationFormMode, ElicitationId,
         ElicitationMode, ElicitationSchema, ElicitationSessionScope, ElicitationUrlMode,
         EnumOption, PermissionOption, PermissionOptionKind, SessionConfigOption,
-        SessionConfigSelectOption, SessionConfigValueId, SessionUpdate, StopReason,
-        StringPropertySchema, TerminalExitStatus, TextContent, ToolCallStatus, ToolCallUpdate,
-        ToolCallUpdateFields, ToolKind,
+        SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
+        SessionUpdate, StopReason, StringPropertySchema, TerminalExitStatus, TextContent,
+        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::backend::{Backend, TestBackend};
@@ -13869,6 +13899,48 @@ mod tests {
             state.transcript.last(),
             Some(Entry::System(text)) if text.contains("Ragnarok summoned")
         ));
+    }
+
+    #[test]
+    fn active_thor_host_uses_current_agent_and_model_config() {
+        let mut state = AppState::new();
+        state.agent_source_id = "anvil".to_string();
+        state.active_agent_launch = Some(ragnarok::Launch {
+            program: PathBuf::from("anvil"),
+            args: vec!["--max-turns".to_string(), "7".to_string()],
+            env: HashMap::from([("ANVIL_TEST".to_string(), "1".to_string())]),
+        });
+        state.session_config_options = vec![
+            SessionConfigOption::select(
+                "mode",
+                "Mode",
+                "code",
+                vec![SessionConfigSelectOption::new("code", "Code")],
+            )
+            .category(Some(SessionConfigOptionCategory::Mode)),
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "codex::gpt-5-codex",
+                vec![
+                    SessionConfigSelectOption::new("codex::gpt-5-codex", "GPT-5 Codex"),
+                    SessionConfigSelectOption::new("bedrock::us.anthropic.claude-opus-4-8", "Opus"),
+                ],
+            )
+            .category(Some(SessionConfigOptionCategory::Model)),
+        ];
+
+        let host = active_thor_host(&state).expect("host");
+
+        assert_eq!(host.agent_source_id, "anvil");
+        assert_eq!(host.launch.program, PathBuf::from("anvil"));
+        assert_eq!(host.launch.args, vec!["--max-turns", "7"]);
+        assert_eq!(
+            host.launch.env.get("ANVIL_TEST").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(host.model_value.as_deref(), Some("codex::gpt-5-codex"));
+        assert_eq!(host.model_name.as_deref(), Some("GPT-5 Codex"));
     }
 
     #[test]

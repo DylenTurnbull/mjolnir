@@ -1654,6 +1654,11 @@ async fn run_session(
                 theme_kind,
                 spinner_style,
                 score_store: score_store.clone(),
+                active_agent_launch: Some(ragnarok::Launch {
+                    program: agent.program.clone(),
+                    args: agent.args.clone(),
+                    env: agent.env.clone(),
+                }),
                 session_boundary: session_boundary.take(),
                 session_cwd: cwd.clone(),
             },
