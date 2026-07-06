@@ -3296,7 +3296,7 @@ fn transcript_export_markdown(state: &AppState) -> String {
                         tool_status_label(view.status)
                     ));
                     for output in &view.body {
-                        push_export_tool_output(&mut out, output);
+                        push_export_tool_output(&mut out, output, view.status);
                     }
                 }
             }
@@ -3312,7 +3312,7 @@ fn push_export_text(out: &mut String, heading: &str, text: &str) {
     out.push_str("\n\n");
 }
 
-fn push_export_tool_output(out: &mut String, output: &ToolCallOutput) {
+fn push_export_tool_output(out: &mut String, output: &ToolCallOutput, tool_status: ToolCallStatus) {
     match output {
         ToolCallOutput::Text(text) => push_export_fence(out, text),
         ToolCallOutput::Diff {
@@ -3325,17 +3325,22 @@ fn push_export_tool_output(out: &mut String, output: &ToolCallOutput) {
             push_export_fence(out, new_text);
         }
         ToolCallOutput::Terminal {
-            terminal_id,
             output,
             truncated,
             exit_status,
+            ..
         } => {
-            out.push_str(&format!(
-                "### Terminal: {}\n\n",
-                escape_markdown_text(terminal_id)
-            ));
+            out.push_str("### Background terminal\n\n");
             if *truncated {
                 out.push_str("_Output truncated._\n\n");
+            }
+            if !output.trim().is_empty() {
+                push_export_fence(out, output);
+            } else if exit_status.is_none() {
+                out.push_str(&format!(
+                    "_{}._\n\n",
+                    terminal_empty_state_label(tool_status)
+                ));
             }
             if let Some(status) = exit_status {
                 out.push_str(&format!(
@@ -3343,7 +3348,6 @@ fn push_export_tool_output(out: &mut String, output: &ToolCallOutput) {
                     terminal_exit_status_label(status)
                 ));
             }
-            push_export_fence(out, output);
         }
         ToolCallOutput::Note(note) => {
             out.push_str(&format!("_Note: {}_\n\n", escape_markdown_text(note)));
@@ -5065,13 +5069,7 @@ fn push_tool_outputs(
                 if !output.trim().is_empty() {
                     push_tool_text_lines(out, output.clone(), 4, collapse_limit, theme);
                 } else if exit_status.is_none() {
-                    let state = match tool_status {
-                        agent_client_protocol::schema::v1::ToolCallStatus::Pending
-                        | agent_client_protocol::schema::v1::ToolCallStatus::InProgress => {
-                            "waiting for output"
-                        }
-                        _ => "no terminal output received",
-                    };
+                    let state = terminal_empty_state_label(tool_status);
                     out.push(Line::from(Span::styled(
                         format!("    {state}"),
                         Style::default().fg(theme.muted),
@@ -5091,6 +5089,13 @@ fn push_tool_outputs(
                 )));
             }
         }
+    }
+}
+
+fn terminal_empty_state_label(tool_status: ToolCallStatus) -> &'static str {
+    match tool_status {
+        ToolCallStatus::Pending | ToolCallStatus::InProgress => "waiting for output",
+        _ => "no terminal output received",
     }
 }
 
@@ -9069,7 +9074,15 @@ mod tests {
                 title: "cargo `test`".to_string(),
                 kind: ToolKind::Execute,
                 status: ToolCallStatus::Completed,
-                body: vec![ToolCallOutput::Text("```\nnot markdown".to_string())],
+                body: vec![
+                    ToolCallOutput::Text("```\nnot markdown".to_string()),
+                    ToolCallOutput::Terminal {
+                        terminal_id: "call_q403CLAwcOWdujDT6Xylsua6".to_string(),
+                        output: String::new(),
+                        truncated: false,
+                        exit_status: None,
+                    },
+                ],
             },
         );
         state.transcript.push(Entry::ToolCall("call-1".to_string()));
@@ -9082,6 +9095,12 @@ mod tests {
         assert!(markdown.contains("- Kind: exec"));
         assert!(markdown.contains("- Status: done"));
         assert!(markdown.contains("````text\n```\nnot markdown\n````"));
+        assert!(markdown.contains("### Background terminal"));
+        assert!(markdown.contains("_no terminal output received._"));
+        assert!(
+            !markdown.contains("call_q403"),
+            "terminal ids should not leak into exported transcript markdown: {markdown}"
+        );
     }
 
     #[test]

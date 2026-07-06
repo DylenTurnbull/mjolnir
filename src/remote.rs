@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use agent_client_protocol::schema::v1::{
     ContentBlock, PermissionOptionKind, SessionConfigId, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOptions, SessionConfigValueId, SessionUpdate,
-    ToolCallContent,
+    ToolCallContent, ToolCallStatus,
 };
 use anyhow::{Context, Result, anyhow};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
@@ -402,8 +402,10 @@ struct TrackerState {
 
 #[derive(Debug, Clone)]
 struct ToolTranscriptEntry {
+    tool_call_id: String,
     title: String,
     content: Vec<ToolCallContent>,
+    status: ToolCallStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -569,20 +571,30 @@ impl TrackerState {
             }
             SessionUpdate::ToolCall(tool_call) => {
                 self.agent_message_open = false;
-                self.push_tool_transcript_entry(tool_call.title.clone(), tool_call.content.clone());
+                self.push_tool_transcript_entry(
+                    tool_call.tool_call_id.to_string(),
+                    tool_call.title.clone(),
+                    tool_call.content.clone(),
+                    tool_call.status,
+                );
                 self.touch();
             }
             SessionUpdate::ToolCallUpdate(update) => {
                 self.agent_message_open = false;
                 if let Some(content) = &update.fields.content {
                     self.push_tool_transcript_entry(
+                        update.tool_call_id.to_string(),
                         update
                             .fields
                             .title
                             .clone()
                             .unwrap_or_else(|| "tool".to_string()),
                         content.clone(),
+                        update.fields.status.unwrap_or(ToolCallStatus::Pending),
                     );
+                }
+                if let Some(status) = update.fields.status {
+                    self.update_tool_transcript_status(&update.tool_call_id.to_string(), status);
                 }
                 self.touch();
             }
@@ -613,6 +625,7 @@ impl TrackerState {
                 entry.text = format_tool_call(
                     &tool_entry.title,
                     &tool_entry.content,
+                    tool_entry.status,
                     &self.terminal_outputs,
                 );
                 changed = true;
@@ -643,13 +656,43 @@ impl TrackerState {
         index
     }
 
-    fn push_tool_transcript_entry(&mut self, title: String, content: Vec<ToolCallContent>) {
+    fn push_tool_transcript_entry(
+        &mut self,
+        tool_call_id: String,
+        title: String,
+        content: Vec<ToolCallContent>,
+        status: ToolCallStatus,
+    ) {
         let index = self.push_transcript_entry(
             "tool",
-            format_tool_call(&title, &content, &self.terminal_outputs),
+            format_tool_call(&title, &content, status, &self.terminal_outputs),
         );
-        self.tool_transcript_entries
-            .insert(index, ToolTranscriptEntry { title, content });
+        self.tool_transcript_entries.insert(
+            index,
+            ToolTranscriptEntry {
+                tool_call_id,
+                title,
+                content,
+                status,
+            },
+        );
+    }
+
+    fn update_tool_transcript_status(&mut self, tool_call_id: &str, status: ToolCallStatus) {
+        for (index, tool_entry) in &mut self.tool_transcript_entries {
+            if tool_entry.tool_call_id != tool_call_id || tool_entry.status == status {
+                continue;
+            }
+            tool_entry.status = status;
+            if let Some(entry) = self.transcript.get_mut(*index) {
+                entry.text = format_tool_call(
+                    &tool_entry.title,
+                    &tool_entry.content,
+                    tool_entry.status,
+                    &self.terminal_outputs,
+                );
+            }
+        }
     }
 
     fn snapshot(&self) -> Option<SessionRecord> {
@@ -2970,6 +3013,7 @@ fn content_block_text(block: &ContentBlock) -> String {
 fn format_tool_call(
     title: &str,
     content: &[ToolCallContent],
+    tool_status: ToolCallStatus,
     terminal_outputs: &HashMap<String, TerminalOutputSnapshot>,
 ) -> String {
     let mut parts = Vec::new();
@@ -2981,13 +3025,14 @@ fn format_tool_call(
                 let terminal_id = terminal.terminal_id.to_string();
                 let mut text = "background terminal".to_string();
                 if let Some(snapshot) = terminal_outputs.get(&terminal_id) {
-                    let snapshot = format_terminal_snapshot(snapshot);
+                    let snapshot = format_terminal_snapshot(snapshot, tool_status);
                     if !snapshot.is_empty() {
                         text.push('\n');
                         text.push_str(&snapshot);
                     }
                 } else {
-                    text.push_str("\nno terminal output received");
+                    text.push('\n');
+                    text.push_str(terminal_empty_state_label(tool_status));
                 }
                 parts.push(text);
             }
@@ -3011,7 +3056,10 @@ fn tool_call_references_terminal(content: &[ToolCallContent], terminal_id: &str)
     })
 }
 
-fn format_terminal_snapshot(snapshot: &TerminalOutputSnapshot) -> String {
+fn format_terminal_snapshot(
+    snapshot: &TerminalOutputSnapshot,
+    tool_status: ToolCallStatus,
+) -> String {
     let mut parts = Vec::new();
     if snapshot.truncated {
         parts.push("[output truncated]".to_string());
@@ -3022,9 +3070,16 @@ fn format_terminal_snapshot(snapshot: &TerminalOutputSnapshot) -> String {
     if let Some(status) = &snapshot.exit_status {
         parts.push(format!("exit {}", terminal_exit_status_label(status)));
     } else if parts.is_empty() {
-        parts.push("waiting for output".to_string());
+        parts.push(terminal_empty_state_label(tool_status).to_string());
     }
     parts.join("\n")
+}
+
+fn terminal_empty_state_label(tool_status: ToolCallStatus) -> &'static str {
+    match tool_status {
+        ToolCallStatus::Pending | ToolCallStatus::InProgress => "waiting for output",
+        _ => "no terminal output received",
+    }
 }
 
 fn terminal_exit_status_label(
@@ -3059,7 +3114,7 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
         PermissionOption, SessionConfigSelect, SessionConfigSelectOption, Terminal,
-        TerminalExitStatus, TerminalId, ToolCall, ToolCallContent, ToolCallUpdate,
+        TerminalExitStatus, TerminalId, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
         ToolCallUpdateFields,
     };
     use http_body_util::BodyExt;
@@ -3240,6 +3295,67 @@ mod tests {
         assert!(!snapshot.transcript[0].text.contains("[output truncated]"));
         assert!(snapshot.transcript[0].text.contains("done\n"));
         assert!(snapshot.transcript[0].text.contains("exit signal SIGTERM"));
+    }
+
+    #[test]
+    fn tracker_renders_pending_terminal_without_snapshot_as_waiting() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+
+        let mut tool_call = ToolCall::new("call-1", "running command");
+        tool_call.status = ToolCallStatus::InProgress;
+        tool_call.content = vec![ToolCallContent::Terminal(Terminal::new(TerminalId::new(
+            "term-1",
+        )))];
+        state.observe_session_update(&SessionUpdate::ToolCall(tool_call));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert!(snapshot.transcript[0].text.contains("background terminal"));
+        assert!(snapshot.transcript[0].text.contains("waiting for output"));
+        assert!(
+            !snapshot.transcript[0]
+                .text
+                .contains("no terminal output received"),
+            "pending terminal should not be rendered as finished-empty: {:?}",
+            snapshot.transcript[0].text
+        );
+    }
+
+    #[test]
+    fn tracker_updates_empty_terminal_placeholder_when_status_completes() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+
+        let mut tool_call = ToolCall::new("call-1", "running command");
+        tool_call.status = ToolCallStatus::InProgress;
+        tool_call.content = vec![ToolCallContent::Terminal(Terminal::new(TerminalId::new(
+            "term-1",
+        )))];
+        state.observe_session_update(&SessionUpdate::ToolCall(tool_call));
+
+        let mut fields = ToolCallUpdateFields::default();
+        fields.status = Some(ToolCallStatus::Completed);
+        state.observe_session_update(&SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "call-1", fields,
+        )));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert!(
+            snapshot.transcript[0]
+                .text
+                .contains("no terminal output received")
+        );
+        assert!(
+            !snapshot.transcript[0].text.contains("waiting for output"),
+            "completed empty terminal should not keep the pending placeholder: {:?}",
+            snapshot.transcript[0].text
+        );
     }
 
     #[test]
