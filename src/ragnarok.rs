@@ -25,7 +25,8 @@ use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
-    SessionConfigOption, SessionUpdate, StopReason, ToolCallStatus, ToolKind,
+    PermissionOption, PermissionOptionKind, SessionConfigOption, SessionUpdate, StopReason,
+    ToolCallStatus, ToolKind,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
@@ -1197,7 +1198,9 @@ impl AgentHandle {
                 UiEvent::SessionConfigOptions { options, targets } => {
                     self.store_config(options, targets);
                 }
-                UiEvent::PermissionRequest(p) => self.answer_permission(p),
+                UiEvent::PermissionRequest(p) => {
+                    let _ = self.answer_permission(p);
+                }
                 UiEvent::ElicitationRequest(e) => {
                     let _ = e.responder.send(ElicitationOutcome::Decline);
                 }
@@ -1219,21 +1222,32 @@ impl AgentHandle {
         }
     }
 
-    fn answer_permission(&self, prompt: crate::event::PermissionPrompt) {
+    fn answer_permission(&self, prompt: crate::event::PermissionPrompt) -> String {
+        let selected = self.select_permission_option(&prompt);
+        let note = permission_answer_note(&prompt, selected.as_deref());
+        let decision = selected
+            .map(PermissionDecision::Selected)
+            .unwrap_or(PermissionDecision::Cancelled);
+        let _ = prompt.responder.send(decision);
+        note
+    }
+
+    fn select_permission_option(&self, prompt: &crate::event::PermissionPrompt) -> Option<String> {
+        if is_plan_approval_prompt(prompt)
+            && let Some(option) = choose_allow_option_by_id(&prompt.options, "accept_plan")
+        {
+            return Some(option);
+        }
         let allow = self.access_mode == acp::RuntimeAccessMode::Full
             || matches!(
                 prompt.tool_call.fields.kind,
                 Some(ToolKind::Read | ToolKind::Search | ToolKind::Think)
             );
-        let selected = if allow {
+        if allow {
             choose_allow_option(&prompt.options).or_else(|| choose_reject_option(&prompt.options))
         } else {
             choose_reject_option(&prompt.options)
-        };
-        let decision = selected
-            .map(PermissionDecision::Selected)
-            .unwrap_or(PermissionDecision::Cancelled);
-        let _ = prompt.responder.send(decision);
+        }
     }
 
     /// Select `model_value` through the session's Model config option and
@@ -1266,7 +1280,9 @@ impl AgentHandle {
                 Some(UiEvent::SessionConfigOptions { options, targets }) => {
                     self.store_config(options, targets)
                 }
-                Some(UiEvent::PermissionRequest(p)) => self.answer_permission(p),
+                Some(UiEvent::PermissionRequest(p)) => {
+                    let _ = self.answer_permission(p);
+                }
                 Some(UiEvent::ElicitationRequest(e)) => {
                     let _ = e.responder.send(ElicitationOutcome::Decline);
                 }
@@ -1299,7 +1315,9 @@ impl AgentHandle {
                 Some(UiEvent::Warning(w)) if w.contains("session config update failed") => {
                     bail!("agent refused model '{model_value}': {w}")
                 }
-                Some(UiEvent::PermissionRequest(p)) => self.answer_permission(p),
+                Some(UiEvent::PermissionRequest(p)) => {
+                    let _ = self.answer_permission(p);
+                }
                 Some(UiEvent::ElicitationRequest(e)) => {
                     let _ = e.responder.send(ElicitationOutcome::Decline);
                 }
@@ -1426,8 +1444,8 @@ impl AgentHandle {
                     self.store_config(options, targets)
                 }
                 UiEvent::PermissionRequest(p) => {
-                    on_event(TurnEvent::Note("permission auto-answered".to_string()));
-                    self.answer_permission(p);
+                    let note = self.answer_permission(p);
+                    on_event(TurnEvent::Note(note));
                 }
                 UiEvent::ElicitationRequest(e) => {
                     let _ = e.responder.send(ElicitationOutcome::Decline);
@@ -1481,10 +1499,7 @@ fn turn_succeeded(stop: StopReason) -> bool {
 /// First `RejectOnce` option, else first `RejectAlways`. Used only when an
 /// agent offers no allow option at all: an explicit rejection lets the turn
 /// continue, whereas cancelling the request cancels the whole turn.
-fn choose_reject_option(
-    options: &[agent_client_protocol::schema::v1::PermissionOption],
-) -> Option<String> {
-    use agent_client_protocol::schema::v1::PermissionOptionKind;
+fn choose_reject_option(options: &[PermissionOption]) -> Option<String> {
     options
         .iter()
         .find(|option| option.kind == PermissionOptionKind::RejectOnce)
@@ -1494,6 +1509,57 @@ fn choose_reject_option(
                 .find(|option| option.kind == PermissionOptionKind::RejectAlways)
         })
         .map(|option| option.option_id.to_string())
+}
+
+fn choose_allow_option_by_id(options: &[PermissionOption], option_id: &str) -> Option<String> {
+    options
+        .iter()
+        .find(|option| {
+            option.option_id.0.as_ref() == option_id
+                && matches!(
+                    option.kind,
+                    PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
+                )
+        })
+        .map(|option| option.option_id.to_string())
+}
+
+fn is_plan_approval_prompt(prompt: &crate::event::PermissionPrompt) -> bool {
+    prompt.tool_call.tool_call_id.to_string() == "planning-gate-approval"
+        || prompt
+            .tool_call
+            .fields
+            .title
+            .as_deref()
+            .is_some_and(|title| title.to_ascii_lowercase().contains("approve plan"))
+        || prompt
+            .options
+            .iter()
+            .any(|option| option.option_id.0.as_ref() == "accept_plan")
+}
+
+fn permission_answer_note(
+    prompt: &crate::event::PermissionPrompt,
+    selected: Option<&str>,
+) -> String {
+    let title = prompt
+        .tool_call
+        .fields
+        .title
+        .as_deref()
+        .unwrap_or("permission request");
+    match selected {
+        Some(option_id) => {
+            let option_name = prompt
+                .options
+                .iter()
+                .find(|option| option.option_id.0.as_ref() == option_id)
+                .map(|option| option.name.as_str())
+                .unwrap_or("unnamed option");
+            format!("permission auto-answered: {title} -> {option_id} ({option_name})")
+        }
+        None => format!("permission auto-cancelled: {title}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1937,6 +2003,21 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
                 id,
                 stat: a.diffstat.clone(),
             });
+            if !artifact_has_changes(&a) {
+                report.artifact = Some(a);
+                let _ = tx.send(RagnarokEvent::Log {
+                    fighter: Some(id),
+                    text: format!(
+                        "☠ {} completed without changing any files.",
+                        fighter.card.model_name
+                    ),
+                });
+                return slain(
+                    report,
+                    set_state,
+                    "completed without changing any files".to_string(),
+                );
+            }
             report.artifact = Some(a);
         }
         Err(e) => {
@@ -2057,6 +2138,15 @@ fn forward_turn_event(
                 action: ActionKind::Guard,
                 detail: first_line(&note, 60),
             });
+            let _ = tx.send(RagnarokEvent::Log {
+                fighter: Some(id),
+                text: first_line(&note, 140),
+            });
+            let _ = tx.send(RagnarokEvent::FighterText {
+                id,
+                lane: TextLane::Tool,
+                chunk: format!("\n{}\n", first_line(&note, 240)),
+            });
         }
     }
 }
@@ -2104,6 +2194,10 @@ async fn capture_artifact(worktree_root: &Path, base_sha: &str) -> Result<Captur
         diff: diff.text,
         truncated,
     })
+}
+
+fn artifact_has_changes(artifact: &CapturedArtifact) -> bool {
+    !artifact.diff.trim().is_empty()
 }
 
 async fn git_capture(dir: &Path, args: &[&str]) -> Result<String> {
@@ -3822,6 +3916,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anvil_plan_approval_prefers_accept_plan_and_reports_choice() {
+        use agent_client_protocol::schema::v1::{
+            PermissionOption, PermissionOptionKind, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let rig = test_rig();
+        let mut fields = ToolCallUpdateFields::default();
+        fields.kind = Some(ToolKind::Think);
+        fields.title = Some("Approve plan before execution".to_string());
+        let (ptx, prx) = tokio::sync::oneshot::channel();
+
+        let note = rig
+            .handle
+            .answer_permission(crate::event::PermissionPrompt {
+                tool_call: ToolCallUpdate::new("planning-gate-approval", fields),
+                options: vec![
+                    PermissionOption::new(
+                        "allow_all",
+                        "Allow all",
+                        PermissionOptionKind::AllowAlways,
+                    ),
+                    PermissionOption::new(
+                        "accept_plan",
+                        "Accept plan",
+                        PermissionOptionKind::AllowOnce,
+                    ),
+                    PermissionOption::new(
+                        "reject_plan",
+                        "Cancel",
+                        PermissionOptionKind::RejectOnce,
+                    ),
+                ],
+                responder: ptx,
+            });
+
+        assert!(matches!(prx.await, Ok(PermissionDecision::Selected(id)) if id == "accept_plan"));
+        assert!(note.contains("accept_plan"), "note: {note}");
+        assert!(
+            note.contains("Approve plan before execution"),
+            "note: {note}"
+        );
+    }
+
+    #[tokio::test]
     async fn read_only_review_permissions_reject_mutating_tools() {
         use agent_client_protocol::schema::v1::{
             PermissionOption, PermissionOptionKind, ToolCallUpdate, ToolCallUpdateFields,
@@ -3855,6 +3992,20 @@ mod tests {
                 responder: ptx,
             });
         assert!(matches!(prx.await, Ok(PermissionDecision::Selected(id)) if id == "allow"));
+    }
+
+    #[test]
+    fn artifact_with_empty_diff_has_no_changes() {
+        assert!(!artifact_has_changes(&CapturedArtifact {
+            diffstat: String::new(),
+            diff: String::new(),
+            truncated: false,
+        }));
+        assert!(artifact_has_changes(&CapturedArtifact {
+            diffstat: "src/main.rs | 1 +".to_string(),
+            diff: "diff --git a/src/main.rs b/src/main.rs\n".to_string(),
+            truncated: false,
+        }));
     }
 
     #[tokio::test]
