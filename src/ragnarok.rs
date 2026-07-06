@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
     SessionConfigOption, SessionUpdate, StopReason, ToolCallStatus, ToolKind,
@@ -42,7 +42,7 @@ use crate::event::{
 use crate::headless::choose_allow_option;
 use crate::labels::stop_reason_label;
 use crate::scores::{ScoreCatalog, ScoreStore};
-use crate::{install, picker, probe, registry, scores, worktree};
+use crate::{install, model_resolve, picker, probe, registry, scores, worktree};
 
 /// Thor may field at most this many champions.
 pub const MAX_FIGHTERS: usize = 10;
@@ -51,6 +51,14 @@ pub const MIN_FIGHTERS: usize = 2;
 
 /// Per-agent budget for the muster probe (spawn + `session/new` + model list).
 const MUSTER_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bedrock models are useful, but slow enough to lose one concrete selection tier.
+const BEDROCK_SELECTION_PENALTY: i32 = 100;
+/// Diversity bonus for a model vendor not already represented in the roster.
+const NEW_VENDOR_SELECTION_BONUS: i32 = 50;
+/// Diversity bonus for an ACP agent not already represented in the roster.
+const NEW_AGENT_SELECTION_BONUS: i32 = 50;
+/// After scoring with penalties/bonuses, pick randomly from this many top rows.
+const SELECTION_RANDOM_TOP_N: usize = 4;
 /// Budget for an agent to reach `SessionStarted` (covers cold npx/uvx runs).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(180);
 /// Budget for one champion to implement the task.
@@ -749,6 +757,8 @@ pub struct Candidate {
     pub card: FighterCard,
     pub launch: Launch,
     pub match_key: String,
+    pub vendor: Option<String>,
+    pub bedrock: bool,
 }
 
 /// Clonable launch command (mirror of `picker::LaunchCommand`).
@@ -873,6 +883,14 @@ async fn muster(
                                 provisional: score.provisional,
                             },
                             launch: launch.clone(),
+                            vendor: selection_vendor(
+                                &source_id,
+                                &m.value,
+                                &m.name,
+                                &description,
+                                &key,
+                            ),
+                            bedrock: is_bedrock_model(&m.value) || is_bedrock_model(&m.name),
                             match_key: key,
                         });
                     }
@@ -911,41 +929,143 @@ async fn muster(
     Ok(pool)
 }
 
-/// Pick `want` champions from the Elo-sorted pool. Models must be genuinely
-/// distinct (dedup by leaderboard match key); agents should be distinct when
-/// possible (first pass takes each agent's best model, second pass fills the
-/// remainder best-Elo-first).
-pub fn select_fighters(pool: &[Candidate], want: usize) -> Vec<Candidate> {
-    let mut picked: Vec<Candidate> = Vec::new();
-    let mut used_keys: HashSet<&str> = HashSet::new();
-    let mut used_agents: HashSet<&str> = HashSet::new();
+fn selection_vendor(
+    agent_id: &str,
+    value: &str,
+    name: &str,
+    description: &str,
+    match_key: &str,
+) -> Option<String> {
+    match_key
+        .split_once('/')
+        .and_then(|(provider, _)| model_resolve::canonical_provider_id(provider))
+        .or_else(|| model_resolve::agent_provider(agent_id, value, name, description))
+}
 
-    for c in pool {
-        if picked.len() >= want {
+fn is_bedrock_model(model_id: &str) -> bool {
+    model_id
+        .split_once("::")
+        .is_some_and(|(backend, _)| backend.eq_ignore_ascii_case("bedrock"))
+}
+
+fn adjusted_selection_score(
+    candidate: &Candidate,
+    used_agents: &HashSet<String>,
+    used_vendors: &HashSet<String>,
+) -> i32 {
+    let mut score = candidate.card.elo as i32;
+    if candidate.bedrock {
+        score -= BEDROCK_SELECTION_PENALTY;
+    }
+    if candidate
+        .vendor
+        .as_deref()
+        .is_some_and(|vendor| !used_vendors.contains(vendor))
+    {
+        score += NEW_VENDOR_SELECTION_BONUS;
+    }
+    if !used_agents.contains(&candidate.card.agent_source_id) {
+        score += NEW_AGENT_SELECTION_BONUS;
+    }
+    score
+}
+
+fn selection_random_index(upper: usize) -> usize {
+    if upper <= 1 {
+        return 0;
+    }
+    let upper = upper as u64;
+    let zone = u64::MAX - (u64::MAX % upper);
+    for _ in 0..8 {
+        let mut bytes = [0u8; 8];
+        if getrandom::fill(&mut bytes).is_err() {
             break;
         }
-        if used_agents.contains(c.card.agent_source_id.as_str())
-            || used_keys.contains(c.match_key.as_str())
-        {
-            continue;
-        }
-        used_agents.insert(c.card.agent_source_id.as_str());
-        used_keys.insert(c.match_key.as_str());
-        picked.push(c.clone());
-    }
-    if picked.len() < want {
-        for c in pool {
-            if picked.len() >= want {
-                break;
-            }
-            if used_keys.contains(c.match_key.as_str()) {
-                continue;
-            }
-            used_keys.insert(c.match_key.as_str());
-            picked.push(c.clone());
+        let value = u64::from_ne_bytes(bytes);
+        if value < zone {
+            return (value % upper) as usize;
         }
     }
+    selection_fallback_index(upper as usize)
+}
+
+fn selection_fallback_index(upper: usize) -> usize {
+    if upper <= 1 {
+        return 0;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mixed = (nanos as usize)
+        .wrapping_add((nanos >> 64) as usize)
+        .wrapping_mul(0x9E37_79B9)
+        .wrapping_add(std::process::id() as usize);
+    mixed % upper
+}
+
+fn select_fighters_with_picker<F>(
+    pool: &[Candidate],
+    want: usize,
+    mut pick_index: F,
+) -> Vec<Candidate>
+where
+    F: FnMut(usize) -> usize,
+{
+    let mut picked: Vec<Candidate> = Vec::new();
+    let mut used_keys: HashSet<String> = HashSet::new();
+    let mut used_agents: HashSet<String> = HashSet::new();
+    let mut used_vendors: HashSet<String> = HashSet::new();
+
+    while picked.len() < want {
+        let mut ranked: Vec<(usize, i32)> = pool
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| !used_keys.contains(&candidate.match_key))
+            .map(|(idx, candidate)| {
+                (
+                    idx,
+                    adjusted_selection_score(candidate, &used_agents, &used_vendors),
+                )
+            })
+            .collect();
+        if ranked.is_empty() {
+            break;
+        }
+        ranked.sort_by(|(a_idx, a_score), (b_idx, b_score)| {
+            let a = &pool[*a_idx];
+            let b = &pool[*b_idx];
+            b_score
+                .cmp(a_score)
+                .then_with(|| b.card.elo.cmp(&a.card.elo))
+                .then_with(|| a.card.model_name.cmp(&b.card.model_name))
+                .then_with(|| a.card.agent_source_id.cmp(&b.card.agent_source_id))
+        });
+        let base_window = ranked.len().min(SELECTION_RANDOM_TOP_N.max(1));
+        let cutoff = ranked[base_window - 1].1;
+        let top_len = ranked
+            .iter()
+            .take_while(|(_, score)| *score >= cutoff)
+            .count();
+        let choice = pick_index(top_len).min(top_len.saturating_sub(1));
+        let selected = pool[ranked[choice].0].clone();
+        used_keys.insert(selected.match_key.clone());
+        used_agents.insert(selected.card.agent_source_id.clone());
+        if let Some(vendor) = &selected.vendor {
+            used_vendors.insert(vendor.clone());
+        }
+        picked.push(selected);
+    }
+
     picked
+}
+
+/// Pick `want` champions from the pool. Models must be genuinely distinct
+/// (dedup by leaderboard match key). Selection is greedy on adjusted Elo:
+/// Bedrock takes a concrete speed penalty, new vendors and agents get diversity
+/// bonuses, then the final choice is randomized within the top ranked window.
+pub fn select_fighters(pool: &[Candidate], want: usize) -> Vec<Candidate> {
+    select_fighters_with_picker(pool, want, selection_random_index)
 }
 
 // ---------------------------------------------------------------------------
@@ -2918,6 +3038,8 @@ mod tests {
                 args: vec![],
                 env: HashMap::new(),
             },
+            vendor: selection_vendor(agent, model, model, "", key),
+            bedrock: is_bedrock_model(model),
             match_key: key.to_string(),
         }
     }
@@ -2963,29 +3085,22 @@ mod tests {
     }
 
     #[test]
-    fn select_prefers_distinct_agents_first() {
+    fn select_uses_agent_diversity_as_weight_not_hard_rule() {
         let pool = sorted(vec![
-            candidate("claude-acp", "opus", 1456, "anthropic/opus48"),
-            candidate("claude-acp", "sonnet", 1457, "anthropic/sonnet46"),
-            candidate("codex-acp", "gpt-5.5", 1463, "openai/gpt55"),
-            candidate("anvil", "glm-5", 1446, "zhipuai/glm5"),
+            candidate("agent-a", "alpha", 1500, "openai/alpha"),
+            candidate("agent-a", "beta", 1490, "anthropic/beta"),
+            candidate("agent-b", "gamma", 1484, "openai/gamma"),
         ]);
-        let picked = select_fighters(&pool, 3);
+        let picked = select_fighters_with_picker(&pool, 2, |_| 0);
         let agents: Vec<&str> = picked
             .iter()
             .map(|c| c.card.agent_source_id.as_str())
             .collect();
-        assert_eq!(picked.len(), 3);
-        // One model per agent while agents remain unused.
-        assert!(agents.contains(&"codex-acp"));
-        assert!(agents.contains(&"claude-acp"));
-        assert!(agents.contains(&"anvil"));
-        // The claude pick is its best model (sonnet at 1457 beats opus 1456).
-        let claude = picked
-            .iter()
-            .find(|c| c.card.agent_source_id == "claude-acp")
-            .unwrap();
-        assert_eq!(claude.card.model_name, "sonnet");
+        assert_eq!(picked.len(), 2);
+        // beta keeps enough raw Elo edge to beat gamma even though gamma has a
+        // new-agent bonus. This is intentionally not a hard one-agent pass.
+        assert_eq!(agents, vec!["agent-a", "agent-a"]);
+        assert_eq!(picked[1].card.model_name, "beta");
     }
 
     #[test]
@@ -2995,11 +3110,61 @@ mod tests {
             candidate("claude-acp", "sonnet", 1457, "anthropic/sonnet46"),
             candidate("codex-acp", "gpt-5.5", 1463, "openai/gpt55"),
         ]);
-        let picked = select_fighters(&pool, 3);
+        let picked = select_fighters_with_picker(&pool, 3, |_| 0);
         assert_eq!(picked.len(), 3);
         // Distinct models even when agents repeat.
         let keys: HashSet<&str> = picked.iter().map(|c| c.match_key.as_str()).collect();
         assert_eq!(keys.len(), 3);
+    }
+
+    #[test]
+    fn select_rewards_new_vendor_and_agent_together() {
+        let pool = sorted(vec![
+            candidate("agent-a", "alpha", 1500, "openai/alpha"),
+            candidate("agent-a", "beta", 1490, "anthropic/beta"),
+            candidate("agent-b", "gamma", 1490, "openai/gamma"),
+            candidate("agent-c", "delta", 1445, "google/delta"),
+        ]);
+        let picked = select_fighters_with_picker(&pool, 2, |_| 0);
+
+        assert_eq!(picked[0].card.model_name, "alpha");
+        // delta is 45 Elo lower than beta/gamma, but gets both +50 diversity
+        // bonuses after alpha is selected. beta and gamma get only one bonus.
+        assert_eq!(picked[1].card.model_name, "delta");
+    }
+
+    #[test]
+    fn select_penalizes_bedrock_models() {
+        let pool = sorted(vec![
+            candidate(
+                "anvil",
+                "bedrock::us.anthropic.claude-opus-4-8",
+                1500,
+                "anthropic/opus48",
+            ),
+            candidate("claude-acp", "opus", 1425, "anthropic/opus47"),
+        ]);
+        let picked = select_fighters_with_picker(&pool, 1, |_| 0);
+
+        assert_eq!(picked[0].card.agent_source_id, "claude-acp");
+        assert_eq!(picked[0].card.model_name, "opus");
+    }
+
+    #[test]
+    fn select_can_pick_lower_ranked_candidate_inside_top_window() {
+        let pool = sorted(vec![
+            candidate("agent-a", "alpha", 1500, "openai/alpha"),
+            candidate("agent-b", "beta", 1499, "anthropic/beta"),
+            candidate("agent-c", "gamma", 1498, "google/gamma"),
+            candidate("agent-d", "delta", 1497, "deepseek/delta"),
+            candidate("agent-e", "epsilon", 1200, "xai/epsilon"),
+        ]);
+        let picked = select_fighters_with_picker(&pool, 1, |upper| {
+            assert_eq!(upper, SELECTION_RANDOM_TOP_N);
+            upper - 1
+        });
+
+        assert_eq!(picked[0].card.model_name, "delta");
     }
 
     #[test]
@@ -3015,7 +3180,7 @@ mod tests {
             ),
             candidate("codex-acp", "gpt-5.5", 1463, "openai/gpt55"),
         ]);
-        let picked = select_fighters(&pool, 3);
+        let picked = select_fighters_with_picker(&pool, 3, |_| 0);
         assert_eq!(picked.len(), 2, "duplicate model must be excluded");
     }
 
