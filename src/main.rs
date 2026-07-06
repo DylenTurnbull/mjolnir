@@ -33,6 +33,7 @@ mod session;
 mod speech;
 mod spinner;
 mod spinner_picker;
+mod tailscale;
 mod term;
 mod text;
 mod theme;
@@ -176,7 +177,17 @@ enum Commands {
     /// key. Used to verify model-score matching against real agent output.
     #[command(hide = true)]
     DumpModels(DumpModelsArgs),
+    /// Internal: voice dictation worker spawned by the TUI.
+    ///
+    /// Runs the native speech pipeline in its own process so a crash in the
+    /// speech stack (incompatible system libraries, corrupt models) cannot
+    /// abort the TUI. Speaks JSON-line events on stdout; stdin EOF cancels.
+    #[command(hide = true)]
+    VoiceWorker(VoiceWorkerArgs),
 }
+
+#[derive(Debug, clap::Args, Default)]
+struct VoiceWorkerArgs {}
 
 #[derive(Debug, clap::Args, Default)]
 struct McpArgs {}
@@ -213,6 +224,12 @@ struct ServerArgs {
     /// Public hostname to embed in the login QR code and TLS certificate.
     #[arg(long)]
     hostname: Option<String>,
+    /// Serve a trusted HTTPS certificate for this machine's tailscale
+    /// (ts.net) name, minted via `tailscale cert`, so tailnet devices get no
+    /// browser certificate warning. Requires tailscale to be running with
+    /// MagicDNS and HTTPS Certificates enabled on the tailnet.
+    #[arg(long, conflicts_with = "hostname")]
+    tailscale: bool,
     /// Days of disconnected-session history to keep. Sessions (and their
     /// queued prompts) whose last update is older are deleted by the
     /// periodic sweeper. Pass 0 to keep history forever.
@@ -330,6 +347,7 @@ fn should_run_startup_update_check(cli: &Cli) -> bool {
         Some(Commands::Server(_)) => false,
         Some(Commands::Mcp(_)) => false,
         Some(Commands::DumpModels(_)) => false,
+        Some(Commands::VoiceWorker(_)) => false,
         None => true,
     }
 }
@@ -364,15 +382,16 @@ async fn main() -> Result<()> {
             Commands::Server(args) => {
                 let workspace_roots =
                     validate_workspace_roots(&cwd, &top_level_additional_directories)?;
-                remote::run_server(
-                    args.hostname,
-                    args.history_days,
-                    args.session_ttl_days,
-                    args.logout_all,
+                remote::run_server(remote::ServerOptions {
+                    hostname: args.hostname,
+                    tailscale: args.tailscale,
+                    history_days: args.history_days,
+                    session_ttl_days: args.session_ttl_days,
+                    logout_all: args.logout_all,
                     cwd,
-                    workspace_roots.additional_directories().to_vec(),
+                    additional_directories: workspace_roots.additional_directories().to_vec(),
                     fs_max_text_bytes,
-                )
+                })
                 .await
             }
             Commands::Mcp(_) => {
@@ -388,6 +407,14 @@ async fn main() -> Result<()> {
             }
             Commands::DumpModels(args) => {
                 run_dump_models(args.agent, args.program, args.args).await
+            }
+            Commands::VoiceWorker(_) => {
+                // The pipeline is fully blocking (native model load, mic
+                // capture loop); keep it off the async runtime's core thread.
+                let code = tokio::task::spawn_blocking(speech::run_voice_worker)
+                    .await
+                    .context("voice worker task")?;
+                std::process::exit(code);
             }
         };
     }
@@ -2359,6 +2386,7 @@ mod tests {
         match cli.command {
             Some(Commands::Server(args)) => {
                 assert!(args.hostname.is_none());
+                assert!(!args.tailscale);
                 assert_eq!(args.session_ttl_days, 30);
                 assert!(!args.logout_all);
             }
@@ -2396,6 +2424,26 @@ mod tests {
             }
             _ => panic!("expected Server subcommand"),
         }
+    }
+
+    #[test]
+    fn parse_server_subcommand_with_tailscale() {
+        let cli = Cli::try_parse_from(["mj", "server", "--tailscale"]).expect("parse");
+        match cli.command {
+            Some(Commands::Server(args)) => {
+                assert!(args.tailscale);
+                assert!(args.hostname.is_none());
+            }
+            _ => panic!("expected Server subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_server_rejects_tailscale_with_hostname() {
+        let error =
+            Cli::try_parse_from(["mj", "server", "--tailscale", "--hostname", "example.com"])
+                .expect_err("conflicting flags");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
