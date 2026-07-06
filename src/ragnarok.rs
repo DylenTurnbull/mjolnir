@@ -191,6 +191,15 @@ pub enum ReviewProgress {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThorAction {
+    Descending,
+    Deciding,
+    Assigning,
+    Judging,
+    Mercy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Assignment {
     pub reviewer: FighterId,
     pub defender: FighterId,
@@ -227,6 +236,8 @@ pub enum RagnarokEvent {
     },
     /// Thor's streamed words (rationale, judgment prose).
     ThorSpeaks(String),
+    /// Thor's current visible action for the arena animation.
+    ThorAction(ThorAction),
     /// The chosen roster, in fighter-id order.
     Roster(Vec<FighterCard>),
     FighterState {
@@ -348,6 +359,22 @@ pub fn field_size(routed: usize, cap: usize) -> usize {
     routed.clamp(MIN_FIGHTERS, MAX_FIGHTERS).min(cap)
 }
 
+/// Same user cap as [`field_size`], plus a sanity ceiling from Thor's stated
+/// complexity so easy tasks do not accidentally summon a costly army.
+pub fn field_size_for_route(route: &RouteDecision, cap: usize) -> usize {
+    field_size(route.competitors, cap).min(complexity_field_ceiling(&route.complexity))
+}
+
+fn complexity_field_ceiling(complexity: &str) -> usize {
+    match complexity.trim().to_ascii_lowercase().as_str() {
+        "trivial" | "simple" => 2,
+        "moderate" => 3,
+        "complex" => 5,
+        "epic" => MAX_FIGHTERS,
+        _ => MAX_FIGHTERS,
+    }
+}
+
 async fn battle(
     cfg: &BattleConfig,
     tx: &mpsc::UnboundedSender<RagnarokEvent>,
@@ -388,6 +415,7 @@ async fn battle(
 
     // ---- Phase: Thor routes ------------------------------------------------
     emit(tx, RagnarokEvent::Phase(Phase::Routing))?;
+    emit(tx, RagnarokEvent::ThorAction(ThorAction::Descending))?;
     let thor_pick = pool[0].clone(); // pool is sorted best-Elo-first
     feed(
         tx,
@@ -405,9 +433,12 @@ async fn battle(
             .context("could not forge Thor's camp")?
     };
     let mut thor = Thor::summon(thor_pick, thor_camp, abort.clone()).await?;
+    emit(tx, RagnarokEvent::ThorAction(ThorAction::Deciding))?;
     let route = thor.route(&cfg.task, tx).await?;
     let cap = user_cfg.ragnarok.max_competitors;
-    let want = field_size(route.competitors, cap);
+    let bounded_route = route.competitors.clamp(MIN_FIGHTERS, MAX_FIGHTERS);
+    let complexity_cap = complexity_field_ceiling(&route.complexity);
+    let want = field_size_for_route(&route, cap);
     feed(
         tx,
         None,
@@ -416,7 +447,17 @@ async fn battle(
             route.complexity, route.competitors, route.rationale
         ),
     )?;
-    if want < route.competitors.clamp(MIN_FIGHTERS, MAX_FIGHTERS) {
+    if want < bounded_route && want == complexity_cap {
+        feed(
+            tx,
+            None,
+            format!(
+                "🧭 The runes temper the field to {want} for a {} task.",
+                route.complexity
+            ),
+        )?;
+    }
+    if want < bounded_route && want < complexity_cap {
         feed(
             tx,
             None,
@@ -581,6 +622,7 @@ async fn battle(
 
     // ---- Phase: Thor assigns adversarial reviews ----------------------------
     let survivor_ids: Vec<FighterId> = survivors.iter().map(|r| r.id).collect();
+    emit(tx, RagnarokEvent::ThorAction(ThorAction::Assigning))?;
     let assignments = thor
         .assign(&survivor_ids, &cards, tx)
         .await
@@ -638,6 +680,7 @@ async fn battle(
 
     // ---- Phase: judgment -----------------------------------------------------
     emit(tx, RagnarokEvent::Phase(Phase::Judgment))?;
+    emit(tx, RagnarokEvent::ThorAction(ThorAction::Judging))?;
     let dossier = judgment_dossier(&cfg.task, &cards, &survivor_ids, &by_id, &reviews);
     let verdict = thor.judge(&dossier, &survivor_ids, tx).await;
     thor.dismiss().await;
@@ -1413,6 +1456,7 @@ async fn judge_stragglers(
                 card.model_name
             ),
         )?;
+        emit(tx, RagnarokEvent::ThorAction(ThorAction::Mercy))?;
         let (cut, reason) = thor
             .mercy(&card.tag(), elapsed, median, &tally, &recent, tx)
             .await;
@@ -2406,8 +2450,12 @@ fn route_prompt(task: &str) -> String {
         "You are THOR, arbiter of RAGNAROK: a tournament where several rival AI coding \
          agents each implement the same task in parallel and the best implementation \
          wins. Assess the complexity of the task below and decree how many champions \
-         shall battle — an integer from {MIN_FIGHTERS} to {MAX_FIGHTERS}. Trivial tasks \
-         deserve few champions; epic, ambiguous, or high-stakes tasks deserve many.\n\n\
+         shall battle — an integer from {MIN_FIGHTERS} to {MAX_FIGHTERS}. Keep the field \
+         small by default: trivial/simple tasks should normally use 2 champions, ordinary \
+         moderate tasks should use 3, complex tasks should use 4-5, and 6+ champions should \
+         be reserved for broad, risky, ambiguous, cross-cutting architecture/security/migration \
+         work. UI polish, spacing, copy, and small animation tasks are usually simple unless \
+         they require a major state-machine or rendering rewrite.\n\n\
          Do not use any tools. Respond with ONLY this JSON object — no prose, no code \
          fences:\n\
          {{\"complexity\":\"trivial|simple|moderate|complex|epic\",\
@@ -2592,7 +2640,6 @@ pub fn route_by_runes(task: &str) -> RouteDecision {
         "parallel",
         "protocol",
         "database",
-        " ui",
         "test",
         "security",
     ];
@@ -3028,6 +3075,37 @@ mod tests {
     }
 
     #[test]
+    fn field_size_for_route_tempers_easy_tasks() {
+        let simple = RouteDecision {
+            complexity: "simple".to_string(),
+            competitors: 8,
+            rationale: String::new(),
+        };
+        assert_eq!(field_size_for_route(&simple, 10), 2);
+
+        let moderate = RouteDecision {
+            complexity: "moderate".to_string(),
+            competitors: 8,
+            rationale: String::new(),
+        };
+        assert_eq!(field_size_for_route(&moderate, 10), 3);
+
+        let complex = RouteDecision {
+            complexity: "complex".to_string(),
+            competitors: 8,
+            rationale: String::new(),
+        };
+        assert_eq!(field_size_for_route(&complex, 10), 5);
+
+        let epic = RouteDecision {
+            complexity: "epic".to_string(),
+            competitors: 8,
+            rationale: String::new(),
+        };
+        assert_eq!(field_size_for_route(&epic, 3), 3);
+    }
+
+    #[test]
     fn route_by_runes_stays_in_bounds() {
         for task in [
             "fix typo",
@@ -3037,6 +3115,13 @@ mod tests {
             let route = route_by_runes(task);
             assert!((MIN_FIGHTERS..=MAX_FIGHTERS).contains(&route.competitors));
         }
+    }
+
+    #[test]
+    fn route_by_runes_keeps_small_ui_polish_small() {
+        let route = route_by_runes("adjust the ui spacing and add a small thor animation");
+        assert_eq!(route.competitors, 2);
+        assert_eq!(route.complexity, "simple");
     }
 
     #[test]

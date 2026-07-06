@@ -657,6 +657,7 @@ async fn ui_loop(
                     let cause = match &ev {
                         ragnarok::RagnarokEvent::FighterText { .. }
                         | ragnarok::RagnarokEvent::FighterAction { .. }
+                        | ragnarok::RagnarokEvent::ThorAction(_)
                         | ragnarok::RagnarokEvent::ThorSpeaks(_)
                         | ragnarok::RagnarokEvent::Log { .. } => RedrawCause::Stream,
                         _ => RedrawCause::Interactive,
@@ -7436,6 +7437,12 @@ fn model_choice_score(
 const RAGNAROK_ACTION_TTL: Duration = Duration::from_secs(4);
 /// Animation frame cadence (shares the spinner heartbeat).
 const RAGNAROK_FRAME_MS: u128 = 250;
+const RAGNAROK_CARD_MIN_WIDTH: u16 = 24;
+// Borders (2) + agent/elo line + 7 half-block sprite rows + vigor bar +
+// action caption.
+const RAGNAROK_CARD_HEIGHT: u16 = 12;
+const RAGNAROK_THOR_STRIP_HEIGHT: u16 = 3;
+const RAGNAROK_FEED_MIN_HEIGHT: u16 = 3;
 
 /// Arena-local convenience over [`truncate_text_to_width`], which takes an
 /// owned `String` and a `u16` width.
@@ -7629,7 +7636,7 @@ fn ragnarok_footer_line(arena: &RagnarokUi, theme: TerminalTheme, width: u16) ->
             None => "Enter/q close · Tab transcripts · ←/→ fighter · r review lane".to_string(),
         }
     } else if arena.awaiting_approval() {
-        "⚔ Enter to UNLEASH RAGNAROK (nothing spent yet) · Esc Esc flee · Tab transcripts"
+        "⚔ Enter to UNLEASH RAGNAROK (no combat spend yet) · Esc Esc flee · Tab transcripts"
             .to_string()
     } else {
         match arena.pane {
@@ -7657,6 +7664,37 @@ fn ragnarok_footer_line(arena: &RagnarokUi, theme: TerminalTheme, width: u16) ->
     Line::from(Span::styled(fit_width(&hints, width as usize), style)).centered()
 }
 
+fn ragnarok_stage_height(arena: &RagnarokUi, width: u16, max_height: u16) -> u16 {
+    if max_height == 0 {
+        return 0;
+    }
+
+    match arena.phase {
+        ragnarok::Phase::Judgment | ragnarok::Phase::Verdict => return max_height,
+        ragnarok::Phase::Mustering | ragnarok::Phase::Routing if arena.fighters.is_empty() => {
+            return max_height.clamp(1, 10);
+        }
+        _ => {}
+    }
+
+    if arena.fighters.is_empty() {
+        return max_height.clamp(1, 8);
+    }
+
+    let n = arena.fighters.len() as u16;
+    let cols = (width / RAGNAROK_CARD_MIN_WIDTH).clamp(1, n);
+    let rows = n.div_ceil(cols);
+    let thor_height = if arena.thor_action.is_some() {
+        RAGNAROK_THOR_STRIP_HEIGHT
+    } else {
+        0
+    };
+    rows.saturating_mul(RAGNAROK_CARD_HEIGHT)
+        .saturating_add(thor_height)
+        .min(max_height)
+        .max(1)
+}
+
 fn draw_ragnarok_arena_pane(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -7664,13 +7702,21 @@ fn draw_ragnarok_arena_pane(
     theme: TerminalTheme,
 ) {
     // Banner / task / stage / feed / footer.
-    let feed_height = (area.height / 4).clamp(3, 9);
+    let middle_height = area.height.saturating_sub(3);
+    let feed_min = if middle_height > RAGNAROK_FEED_MIN_HEIGHT {
+        RAGNAROK_FEED_MIN_HEIGHT
+    } else {
+        middle_height.saturating_sub(1)
+    };
+    let stage_max = middle_height.saturating_sub(feed_min);
+    let stage_height = ragnarok_stage_height(arena, area.width, stage_max);
+    let feed_height = middle_height.saturating_sub(stage_height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Min(4),
+            Constraint::Length(stage_height),
             Constraint::Length(feed_height),
             Constraint::Length(1),
         ])
@@ -7708,7 +7754,92 @@ fn draw_ragnarok_arena_pane(
     );
 }
 
-/// Pre-roster splash: Thor descends, ravens fly, runes glow.
+fn current_thor_action(arena: &RagnarokUi) -> ragnarok::ThorAction {
+    arena.thor_action.unwrap_or(match arena.phase {
+        ragnarok::Phase::Routing => ragnarok::ThorAction::Deciding,
+        ragnarok::Phase::Review => ragnarok::ThorAction::Assigning,
+        ragnarok::Phase::Judgment | ragnarok::Phase::Verdict => ragnarok::ThorAction::Judging,
+        _ => ragnarok::ThorAction::Descending,
+    })
+}
+
+fn thor_action_lines(arena: &RagnarokUi, theme: TerminalTheme, width: u16) -> Vec<Line<'static>> {
+    let frame = arena_frame();
+    let action = current_thor_action(arena);
+    let pulse = ["·", "✦", "✶", "✦"][frame % 4];
+    let drift = ["  ", " ", "", " "][frame % 4];
+    let (title, art): (&str, [&str; 2]) = match action {
+        ragnarok::ThorAction::Descending => (
+            "THOR DESCENDS",
+            ["      \\  |  /      ", "        MJOLNIR     "],
+        ),
+        ragnarok::ThorAction::Deciding => (
+            "THOR DECIDES",
+            ["   [ task ] <=?=> [ field ]", "       runes turn in place "],
+        ),
+        ragnarok::ThorAction::Assigning => (
+            "THOR ASSIGNS RIVALS",
+            [
+                "   champion -> rival -> champion",
+                "       blades cross on command ",
+            ],
+        ),
+        ragnarok::ThorAction::Judging => (
+            "THOR JUDGES",
+            [
+                "          verdict scales       ",
+                "       hammer over the record  ",
+            ],
+        ),
+        ragnarok::ThorAction::Mercy => (
+            "THOR WEIGHS MERCY",
+            [
+                "      hourglass against hammer ",
+                "        spare or strike now    ",
+            ],
+        ),
+    };
+    let age = arena.thor_action_at.elapsed().as_millis() / RAGNAROK_FRAME_MS;
+    let intensity = match age {
+        0..=3 => "!!!",
+        4..=10 => "!! ",
+        _ => "!  ",
+    };
+    [
+        format!("{pulse} {title} {intensity} {pulse}"),
+        format!("{drift}{}", art[0]),
+        format!("{}{}", " ".repeat(frame % 3), art[1]),
+    ]
+    .into_iter()
+    .map(|line| {
+        Line::from(Span::styled(
+            fit_width(line, width as usize),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .centered()
+    })
+    .collect()
+}
+
+fn draw_thor_action_strip(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    arena: &RagnarokUi,
+    theme: TerminalTheme,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let lines: Vec<Line> = thor_action_lines(arena, theme, area.width)
+        .into_iter()
+        .take(area.height as usize)
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Pre-roster splash: Thor descends and the route visibly changes state.
 fn draw_ragnarok_summoning(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -7716,14 +7847,11 @@ fn draw_ragnarok_summoning(
     theme: TerminalTheme,
 ) {
     let frame = arena_frame();
-    let raven = ["    >o)   ", "   (o<    ", "    >o)   ", "     (o<  "][frame % 4];
     let bolt = ["      ⌁⌁", "     ⌁⌁ ", "    ⌁⌁  ", "     ⌁⌁ "][frame % 4];
+    let mut lines = thor_action_lines(arena, theme, area.width);
+    lines.push(Line::default());
     let art = [
         String::new(),
-        format!(
-            "        {raven}        {}",
-            raven.chars().rev().collect::<String>()
-        ),
         "          ___________".to_string(),
         "         |  MJÖLNIR  |".to_string(),
         format!("         |___________|{bolt}"),
@@ -7737,10 +7865,10 @@ fn draw_ragnarok_summoning(
         }
         .to_string(),
     ];
-    let lines: Vec<Line> = art
-        .into_iter()
-        .map(|l| Line::from(Span::styled(l, Style::default().fg(theme.accent))).centered())
-        .collect();
+    lines.extend(
+        art.into_iter()
+            .map(|l| Line::from(Span::styled(l, Style::default().fg(theme.accent))).centered()),
+    );
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -7754,35 +7882,48 @@ fn draw_ragnarok_fighters(
     if arena.fighters.is_empty() {
         return;
     }
+    let cards_area = if arena.thor_action.is_some() && area.height > RAGNAROK_THOR_STRIP_HEIGHT {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(RAGNAROK_THOR_STRIP_HEIGHT),
+                Constraint::Min(0),
+            ])
+            .split(area);
+        draw_thor_action_strip(f, chunks[0], arena, theme);
+        chunks[1]
+    } else {
+        area
+    };
+    if cards_area.height == 0 {
+        return;
+    }
+
     let n = arena.fighters.len() as u16;
-    const CARD_MIN_WIDTH: u16 = 24;
-    // Borders (2) + agent/elo line + 7 half-block sprite rows + vigor bar +
-    // action caption.
-    const CARD_HEIGHT: u16 = 12;
-    let cols = (area.width / CARD_MIN_WIDTH).clamp(1, n);
+    let cols = (cards_area.width / RAGNAROK_CARD_MIN_WIDTH).clamp(1, n);
     let rows = n.div_ceil(cols);
 
     // Not enough vertical room for cards: compact one-line-per-fighter view.
-    if area.height < rows * CARD_HEIGHT {
+    if cards_area.height < rows * RAGNAROK_CARD_HEIGHT {
         let lines: Vec<Line> = arena
             .fighters
             .iter()
             .enumerate()
-            .take(area.height as usize)
-            .map(|(i, fighter)| compact_fighter_line(arena, fighter, i, theme, area.width))
+            .take(cards_area.height as usize)
+            .map(|(i, fighter)| compact_fighter_line(arena, fighter, i, theme, cards_area.width))
             .collect();
-        f.render_widget(Paragraph::new(lines), area);
+        f.render_widget(Paragraph::new(lines), cards_area);
         return;
     }
 
     let row_rects = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
-            std::iter::repeat_n(Constraint::Length(CARD_HEIGHT), rows as usize)
+            std::iter::repeat_n(Constraint::Length(RAGNAROK_CARD_HEIGHT), rows as usize)
                 .chain(std::iter::once(Constraint::Min(0)))
                 .collect::<Vec<_>>(),
         )
-        .split(area);
+        .split(cards_area);
     for row in 0..rows {
         let start = (row * cols) as usize;
         let in_row = arena
@@ -13386,6 +13527,42 @@ mod tests {
         assert!(*abort_rx.borrow(), "second Esc flees the battle");
         // The arena stays up until the battle task reports Failed/Done.
         assert!(state.ragnarok.is_some());
+    }
+
+    #[test]
+    fn ragnarok_stage_height_uses_card_rows_instead_of_dead_air() {
+        let mut state = AppState::new();
+        let (abort_tx, _abort_rx) = tokio::sync::watch::channel(false);
+        let (proceed_tx, _proceed_rx) = tokio::sync::watch::channel(false);
+        state.ragnarok = Some(RagnarokUi::new("task".into(), abort_tx, proceed_tx));
+        state.apply_ragnarok_event(ragnarok::RagnarokEvent::Roster(vec![
+            crate::ragnarok::FighterCard {
+                id: 0,
+                agent_source_id: "a".into(),
+                model_value: "m0".into(),
+                model_name: "M0".into(),
+                elo: 1400,
+                provisional: false,
+            },
+            crate::ragnarok::FighterCard {
+                id: 1,
+                agent_source_id: "b".into(),
+                model_value: "m1".into(),
+                model_name: "M1".into(),
+                elo: 1500,
+                provisional: false,
+            },
+        ]));
+        state.apply_ragnarok_event(ragnarok::RagnarokEvent::ThorAction(
+            ragnarok::ThorAction::Deciding,
+        ));
+        state.apply_ragnarok_event(ragnarok::RagnarokEvent::Phase(ragnarok::Phase::Combat));
+        let arena = state.ragnarok.as_ref().unwrap();
+
+        assert_eq!(
+            ragnarok_stage_height(arena, 200, 54),
+            RAGNAROK_THOR_STRIP_HEIGHT + RAGNAROK_CARD_HEIGHT
+        );
     }
 
     #[test]

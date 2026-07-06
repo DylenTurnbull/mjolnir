@@ -2338,6 +2338,8 @@ pub struct RagnarokUi {
     /// The scrolling battle feed: (fighter, themed line).
     pub feed: VecDeque<(Option<ragnarok::FighterId>, String)>,
     pub thor_text: String,
+    pub thor_action: Option<ragnarok::ThorAction>,
+    pub thor_action_at: Instant,
     pub assignments: Vec<ragnarok::Assignment>,
     pub verdict: Option<ragnarok::Verdict>,
     pub failed: Option<String>,
@@ -2368,6 +2370,8 @@ impl RagnarokUi {
             fighters: Vec::new(),
             feed: VecDeque::new(),
             thor_text: String::new(),
+            thor_action: None,
+            thor_action_at: Instant::now(),
             assignments: Vec::new(),
             verdict: None,
             failed: None,
@@ -2471,6 +2475,10 @@ impl AppState {
             }
             E::Log { fighter, text } => arena.push_feed(fighter, text),
             E::ThorSpeaks(chunk) => push_capped(&mut arena.thor_text, &chunk, RAGNAROK_THOR_CAP),
+            E::ThorAction(action) => {
+                arena.thor_action = Some(action);
+                arena.thor_action_at = Instant::now();
+            }
             E::Roster(cards) => {
                 arena.fighters = cards.into_iter().map(RagnarokFighterUi::new).collect();
                 arena.selected_fighter = 0;
