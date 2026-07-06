@@ -66,13 +66,14 @@ fn create_for_project_cwd(project_root: &Path, cwd: &Path) -> Result<CreatedWork
         .with_context(|| format!("create {}", worktrees_dir.display()))?;
 
     let worktree_root = unique_worktree_path(&worktrees_dir)?;
+    let worktree_arg = path_for_git(&worktree_root);
     run_git(
         project_root,
         [
             OsStr::new("worktree"),
             OsStr::new("add"),
             OsStr::new("--detach"),
-            worktree_root.as_os_str(),
+            worktree_arg.as_os_str(),
             OsStr::new("HEAD"),
         ],
     )
@@ -114,6 +115,7 @@ pub fn create_detached(cwd: &Path) -> Result<CreatedWorktree> {
     std::fs::create_dir_all(&worktrees_dir)
         .with_context(|| format!("create {}", worktrees_dir.display()))?;
     let worktree_root = unique_worktree_path(&worktrees_dir)?;
+    let worktree_arg = path_for_git(&worktree_root);
 
     // Run from the current worktree so `HEAD` resolves to what the user is on,
     // while the new worktree lives under the main repo.
@@ -123,7 +125,7 @@ pub fn create_detached(cwd: &Path) -> Result<CreatedWorktree> {
             OsStr::new("worktree"),
             OsStr::new("add"),
             OsStr::new("--detach"),
-            worktree_root.as_os_str(),
+            worktree_arg.as_os_str(),
             OsStr::new("HEAD"),
         ],
     )
@@ -209,9 +211,10 @@ pub fn diff(worktree_root: &Path) -> Result<WorktreeDiff> {
 
 /// Run a git subcommand in `dir` and return its stdout as a `String`.
 fn git_stdout(dir: &Path, args: &[&str]) -> Result<String> {
+    let dir_arg = path_for_git(dir);
     let output = Command::new("git")
         .arg("-C")
-        .arg(dir)
+        .arg(&dir_arg)
         .args(args)
         .output()
         .with_context(|| format!("run git {args:?} in {}", dir.display()))?;
@@ -345,13 +348,14 @@ pub fn prompt_remove_on_exit(
 /// project root; also cleans up the directory on disk if Git left it
 /// behind (e.g. when the .git metadata is stale).
 fn remove_worktree(project_root: &Path, worktree_root: &Path) -> Result<()> {
+    let worktree_arg = path_for_git(worktree_root);
     run_git(
         project_root,
         [
             OsStr::new("worktree"),
             OsStr::new("remove"),
             OsStr::new("--force"),
-            worktree_root.as_os_str(),
+            worktree_arg.as_os_str(),
         ],
     )
     .with_context(|| format!("git worktree remove {}", worktree_root.display()))?;
@@ -405,9 +409,10 @@ fn prompt_to_ignore_worktrees(
 }
 
 fn git_toplevel(cwd: &Path) -> Result<PathBuf> {
+    let cwd_arg = path_for_git(cwd);
     let output = Command::new("git")
         .arg("-C")
-        .arg(cwd)
+        .arg(&cwd_arg)
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .with_context(|| format!("run git rev-parse in {}", cwd.display()))?;
@@ -427,9 +432,10 @@ fn git_toplevel(cwd: &Path) -> Result<PathBuf> {
 }
 
 fn git_check_ignores_worktrees(project_root: &Path) -> Result<bool> {
+    let project_root_arg = path_for_git(project_root);
     let output = Command::new("git")
         .arg("-C")
-        .arg(project_root)
+        .arg(&project_root_arg)
         .args(["check-ignore", "-q", "--no-index", "--"])
         .arg(WORKTREE_IGNORE_ENTRY)
         .output()
@@ -568,10 +574,28 @@ fn worktrees_dir(project_root: &Path) -> PathBuf {
     project_root.join(".mjolnir").join("worktrees")
 }
 
+#[cfg(windows)]
+fn path_for_git(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if let Some(stripped) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{stripped}"))
+    } else if let Some(stripped) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(not(windows))]
+fn path_for_git(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 fn run_git<'a>(project_root: &Path, args: impl IntoIterator<Item = &'a OsStr>) -> Result<()> {
+    let project_root_arg = path_for_git(project_root);
     let output = Command::new("git")
         .arg("-C")
-        .arg(project_root)
+        .arg(&project_root_arg)
         .args(args)
         .output()
         .with_context(|| format!("run git in {}", project_root.display()))?;
