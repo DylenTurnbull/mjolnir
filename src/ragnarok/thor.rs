@@ -134,6 +134,12 @@ async fn run_tournament(
     let _ = event_tx.send(RagnarokEvent::EligibilityScanned {
         eligible_count: competitor_pool.len(),
     });
+    let _ = event_tx.send(RagnarokEvent::ThorActivity {
+        summary: format!(
+            "summoning thor via {}/{} ({} elo)",
+            thor_voice.agent_label, thor_voice.model_name, thor_voice.elo
+        ),
+    });
     let mut allowed_ids: Vec<String> = competitor_pool
         .iter()
         .map(|c| c.agent_source_id.clone())
@@ -185,6 +191,8 @@ async fn run_tournament(
     let mut prompt_sent = false;
     let mut final_text = String::new();
     let mut aborted_reason: Option<String> = None;
+    let mut reported_thought = false;
+    let mut reported_message = false;
 
     let drive = async {
         loop {
@@ -203,14 +211,37 @@ async fn run_tournament(
                     match event {
                         UiEvent::SessionStarted { .. } if !prompt_sent => {
                             prompt_sent = true;
+                            let _ = event_tx.send(RagnarokEvent::ThorActivity {
+                                summary: "thor connected; tournament prompt sent".to_string(),
+                            });
                             let _ = thor_cmd_tx.send(UiCommand::SendPrompt {
                                 text: prompt.clone(),
                                 images: Vec::new(),
                             });
                         }
                         UiEvent::SessionUpdate(update) => {
-                            if let SessionUpdate::AgentMessageChunk(chunk) = &update {
-                                final_text.push_str(&crate::event::content_block_text(&chunk.content));
+                            match &update {
+                                SessionUpdate::AgentMessageChunk(chunk) => {
+                                    let text = crate::event::content_block_text(&chunk.content);
+                                    final_text.push_str(&text);
+                                    if !reported_message
+                                        && let Some(summary) = summarize_thor_text("thor says", &text)
+                                    {
+                                        reported_message = true;
+                                        let _ = event_tx.send(RagnarokEvent::ThorActivity { summary });
+                                    }
+                                }
+                                SessionUpdate::AgentThoughtChunk(chunk) if !reported_thought => {
+                                    let text = crate::event::content_block_text(&chunk.content);
+                                    if let Some(summary) =
+                                        summarize_thor_text("thor thinking", &text)
+                                    {
+                                        reported_thought = true;
+                                        let _ =
+                                            event_tx.send(RagnarokEvent::ThorActivity { summary });
+                                    }
+                                }
+                                _ => {}
                             }
                             driver.observe(update);
                         }
@@ -534,6 +565,10 @@ struct ThorDriver<'a> {
     /// `ToolCallUpdate` for the same call (e.g. a second `Completed`
     /// notification) doesn't emit duplicate events.
     settled: std::collections::HashSet<String>,
+    /// Tool calls already announced when they started. Classified completion
+    /// events can arrive much later; announcing starts keeps the arena from
+    /// looking dead while Thor is inside a long MCP call.
+    announced_tool_calls: std::collections::HashSet<String>,
     /// mj-mcp `connection_id` -> last activity summary sent, so repeated
     /// polling of an unchanged state doesn't re-emit the same
     /// `CompetitorActivity` on every `poll_progress` call.
@@ -554,6 +589,7 @@ impl<'a> ThorDriver<'a> {
             competitor_worktrees: std::collections::HashSet::new(),
             review_phase_announced: false,
             settled: std::collections::HashSet::new(),
+            announced_tool_calls: std::collections::HashSet::new(),
         }
     }
 
@@ -561,6 +597,7 @@ impl<'a> ThorDriver<'a> {
         match update {
             SessionUpdate::ToolCall(call) => {
                 let id = call.tool_call_id.to_string();
+                self.announce_tool_call(&id, &call.title);
                 if let Some(input) = &call.raw_input {
                     self.pending_input.insert(id.clone(), input.clone());
                 }
@@ -573,6 +610,9 @@ impl<'a> ThorDriver<'a> {
             }
             SessionUpdate::ToolCallUpdate(update) => {
                 let id = update.tool_call_id.to_string();
+                if let Some(title) = &update.fields.title {
+                    self.announce_tool_call(&id, title);
+                }
                 if let Some(input) = &update.fields.raw_input {
                     self.pending_input.insert(id.clone(), input.clone());
                 }
@@ -585,6 +625,15 @@ impl<'a> ThorDriver<'a> {
             }
             _ => {}
         }
+    }
+
+    fn announce_tool_call(&mut self, id: &str, title: &str) {
+        if title.trim().is_empty() || !self.announced_tool_calls.insert(id.to_string()) {
+            return;
+        }
+        let _ = self.event_tx.send(RagnarokEvent::ThorActivity {
+            summary: format!("thor tool: {}", truncate_for_feed(title.trim(), 72)),
+        });
     }
 
     fn settle(&mut self, tool_call_id: &str, raw_output: Option<&serde_json::Value>) {
@@ -817,28 +866,36 @@ fn is_competitor_branch_name(branch_name: &str) -> bool {
 /// showing as ongoing activity (permission requests/warnings surface
 /// through their own dedicated events elsewhere).
 fn summarize_progress_item(item: &serde_json::Value) -> Option<String> {
-    const MAX_LEN: usize = 48;
-    let truncate = |s: &str| -> String {
-        if s.chars().count() <= MAX_LEN {
-            s.to_string()
-        } else {
-            format!("{}…", s.chars().take(MAX_LEN).collect::<String>())
-        }
-    };
     match item.get("type").and_then(|v| v.as_str())? {
         "tool_call" | "tool_call_update" => {
             let title = item.get("title").and_then(|v| v.as_str())?;
-            Some(truncate(title))
+            Some(truncate_for_feed(title, 48))
         }
         "agent_message" => {
             let text = item.get("text").and_then(|v| v.as_str())?;
-            Some(truncate(text.trim()))
+            Some(truncate_for_feed(text.trim(), 48))
         }
         "agent_thought" => {
             let text = item.get("text").and_then(|v| v.as_str())?;
-            Some(format!("thinking: {}", truncate(text.trim())))
+            Some(format!("thinking: {}", truncate_for_feed(text.trim(), 48)))
         }
         _ => None,
+    }
+}
+
+fn summarize_thor_text(prefix: &str, text: &str) -> Option<String> {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(format!("{prefix}: {}", truncate_for_feed(&collapsed, 96)))
+}
+
+fn truncate_for_feed(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        format!("{}...", text.chars().take(max_chars).collect::<String>())
     }
 }
 
@@ -1008,6 +1065,32 @@ mod tests {
         assert!(!is_competitor_branch_name("ragnarok/run/review-c1"));
         assert!(!is_competitor_branch_name("ragnarok/run/c"));
         assert!(!is_competitor_branch_name("ragnarok/run/c1-review"));
+    }
+
+    #[test]
+    fn thor_driver_announces_tool_call_start_before_completion() {
+        let eligible = vec![competitor("agent-a", "model-a", 2500)];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut driver = ThorDriver::new(&eligible, &tx);
+
+        let call = agent_client_protocol::schema::v1::ToolCall::new("call-1", "create worktree c1");
+        driver.observe(SessionUpdate::ToolCall(call));
+
+        match rx.try_recv().expect("activity event") {
+            RagnarokEvent::ThorActivity { summary } => {
+                assert_eq!(summary, "thor tool: create worktree c1");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn summarize_thor_text_collapses_whitespace_and_ignores_empty_chunks() {
+        assert_eq!(
+            summarize_thor_text("thor thinking", "  I\nneed\ttools  "),
+            Some("thor thinking: I need tools".to_string())
+        );
+        assert_eq!(summarize_thor_text("thor thinking", " \n\t "), None);
     }
 
     // -- extract_json_block --

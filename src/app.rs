@@ -1057,6 +1057,10 @@ impl AppState {
                     ),
                 );
             }
+            RagnarokEvent::ThorActivity { summary } => {
+                rag.push_feed(None, summary.clone());
+                self.record_status_message(StatusKind::Info, summary);
+            }
             RagnarokEvent::Aborted { reason } => {
                 rag.push_feed(None, format!("tournament aborted: {reason}"));
                 rag.verdict_summary = Some(reason);

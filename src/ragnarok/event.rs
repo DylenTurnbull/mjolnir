@@ -78,6 +78,10 @@ pub enum RagnarokEvent {
     /// Eligibility scan finished; `eligible_count` (agent, model, Elo)
     /// pairs are usable. Sent once, before Thor is even spawned.
     EligibilityScanned { eligible_count: usize },
+    /// Thor's own supervising connection made observable progress. Unlike
+    /// competitor telemetry, this is not slot-scoped; it explains what the
+    /// judge/router is doing before or between nested MCP calls.
+    ThorActivity { summary: String },
     /// Not enough eligible pairs to hold a tournament, or every competitor
     /// failed before producing a result — no verdict was possible.
     /// Terminal.
