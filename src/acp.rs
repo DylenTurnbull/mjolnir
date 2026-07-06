@@ -3561,23 +3561,43 @@ fn sanitize_ragnarok_id(raw: &str) -> String {
     }
 }
 
+fn reserve_unique_ragnarok_id(raw: &str, used: &mut HashSet<String>) -> String {
+    let base = sanitize_ragnarok_id(raw);
+    let mut candidate = base.clone();
+    let mut suffix = 2usize;
+    while used.contains(&candidate) {
+        candidate = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+    used.insert(candidate.clone());
+    candidate
+}
+
 fn default_ragnarok_champions(base_config: &AcpRuntimeConfig) -> Vec<RagnarokChampion> {
+    let mut used_ids = HashSet::new();
     let mut champions: Vec<RagnarokChampion> = DEFAULT_RAGNAROK_CHAMPIONS
         .iter()
-        .map(|c| RagnarokChampion {
-            id: c.id.to_string(),
-            name: c.name.to_string(),
-            role: c.role.to_string(),
-            instructions: c.instructions.to_string(),
-            runtime_config: Some(base_config.clone()),
+        .map(|c| {
+            let id = reserve_unique_ragnarok_id(c.id, &mut used_ids);
+            RagnarokChampion {
+                id,
+                name: c.name.to_string(),
+                role: c.role.to_string(),
+                instructions: c.instructions.to_string(),
+                runtime_config: Some(base_config.clone()),
+            }
         })
         .collect();
 
     if let Ok(cfg) = config::Config::load(&config::default_config_path()) {
         for custom in cfg.custom_agents {
             let name = custom.name.clone();
+            let id = reserve_unique_ragnarok_id(
+                &format!("custom-{}", sanitize_ragnarok_id(&name)),
+                &mut used_ids,
+            );
             champions.push(RagnarokChampion {
-                id: format!("custom-{}", sanitize_ragnarok_id(&name)),
+                id,
                 name: name.clone(),
                 role: "configured custom agent".to_string(),
                 instructions: if custom.description.trim().is_empty() {
@@ -3697,6 +3717,15 @@ fn copy_dir_for_ragnarok_sync(src: &Path, dst: &Path) -> Result<()> {
 }
 
 async fn ragnarok_workspace_diff(path: &Path) -> String {
+    let _ = Command::new("git")
+        .arg("add")
+        .arg("--intent-to-add")
+        .arg("--all")
+        .arg("--")
+        .arg(".")
+        .current_dir(path)
+        .status()
+        .await;
     match Command::new("git")
         .arg("diff")
         .arg("--")
@@ -3856,11 +3885,11 @@ fn ragnarok_permission_decision(
     if allow
         && let Some(option) = options
             .iter()
-            .find(|option| option.kind == PermissionOptionKind::AllowAlways)
+            .find(|option| option.kind == PermissionOptionKind::AllowOnce)
             .or_else(|| {
                 options
                     .iter()
-                    .find(|option| option.kind == PermissionOptionKind::AllowOnce)
+                    .find(|option| option.kind == PermissionOptionKind::AllowAlways)
             })
     {
         PermissionDecision::Selected(option.option_id.to_string())
@@ -4786,6 +4815,63 @@ mod tests {
             }
             other => panic!("unexpected image block: {other:?}"),
         }
+    }
+
+    #[test]
+    fn ragnarok_permission_decision_prefers_one_shot_allow() {
+        let decision = ragnarok_permission_decision(
+            RagnarokPermissionMode::ChampionSandbox,
+            Some(ToolKind::Execute),
+            &[
+                PermissionOption::new("always", "Allow always", PermissionOptionKind::AllowAlways),
+                PermissionOption::new("once", "Allow once", PermissionOptionKind::AllowOnce),
+            ],
+        );
+
+        match decision {
+            PermissionDecision::Selected(id) => assert_eq!(id, "once"),
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ragnarok_unique_ids_avoid_workspace_collisions() {
+        let mut used = HashSet::new();
+        assert_eq!(
+            reserve_unique_ragnarok_id("custom-agent", &mut used),
+            "custom-agent"
+        );
+        assert_eq!(
+            reserve_unique_ragnarok_id("custom_agent", &mut used),
+            "custom-agent-2"
+        );
+        assert_eq!(
+            reserve_unique_ragnarok_id("custom agent", &mut used),
+            "customagent"
+        );
+    }
+
+    #[tokio::test]
+    async fn ragnarok_workspace_diff_includes_untracked_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init = Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(dir.path())
+            .status()
+            .await;
+        let Ok(status) = init else {
+            return;
+        };
+        assert!(status.success(), "git init failed: {status}");
+        tokio::fs::write(dir.path().join("new.txt"), "new\n")
+            .await
+            .expect("write untracked file");
+
+        let diff = ragnarok_workspace_diff(dir.path()).await;
+
+        assert!(diff.contains("new file mode"), "diff:\n{diff}");
+        assert!(diff.contains("+new"), "diff:\n{diff}");
     }
 
     #[test]
