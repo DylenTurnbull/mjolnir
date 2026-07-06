@@ -19,13 +19,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
-    McpServer, McpServerStdio, PermissionOption, PermissionOptionKind, SessionUpdate, StopReason,
-    ToolCallStatus, ToolCallUpdate, ToolKind,
+    McpServer, McpServerStdio, PermissionOption, PermissionOptionKind, SessionConfigOption,
+    SessionConfigValueId, SessionUpdate, StopReason, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use tokio::sync::mpsc;
 
 use crate::acp::{self, AcpRuntimeConfig};
-use crate::event::{PermissionDecision, UiCommand, UiEvent};
+use crate::event::{PermissionDecision, SessionConfigTarget, UiCommand, UiEvent};
 
 use super::eligibility::{self, EligibleCompetitor};
 use super::event::{
@@ -64,6 +64,8 @@ impl Default for RagnarokTimeouts {
         }
     }
 }
+
+const THOR_MODEL_SELECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Spawn a tournament as a background task. Returns immediately; the caller
 /// polls `RagnarokEvent`s off the receiver and can send
@@ -188,7 +190,13 @@ async fn run_tournament(
 
     let prompt = build_prompt(&cfg.task, &competitor_pool);
     let mut driver = ThorDriver::new(&competitor_pool, &event_tx);
+    let mut thor_model = ThorModelSelector::new(
+        thor_voice.model_value.clone(),
+        thor_voice.model_name.clone(),
+    );
+    let mut session_started = false;
     let mut prompt_sent = false;
+    let mut model_select_deadline: Option<tokio::time::Instant> = None;
     let mut final_text = String::new();
     let mut aborted_reason: Option<String> = None;
     let mut reported_thought = false;
@@ -210,14 +218,40 @@ async fn run_tournament(
                     let Some(event) = event else { return };
                     match event {
                         UiEvent::SessionStarted { .. } if !prompt_sent => {
-                            prompt_sent = true;
+                            session_started = true;
+                            model_select_deadline =
+                                Some(tokio::time::Instant::now() + THOR_MODEL_SELECT_TIMEOUT);
                             let _ = event_tx.send(RagnarokEvent::ThorActivity {
-                                summary: "thor connected; tournament prompt sent".to_string(),
+                                summary: format!(
+                                    "thor connected; selecting model {}",
+                                    thor_model.model_name
+                                ),
                             });
-                            let _ = thor_cmd_tx.send(UiCommand::SendPrompt {
-                                text: prompt.clone(),
-                                images: Vec::new(),
-                            });
+                            if let Some(reason) = try_start_thor_prompt(
+                                &mut thor_model,
+                                &thor_cmd_tx,
+                                &event_tx,
+                                &prompt,
+                                &mut prompt_sent,
+                            ) {
+                                aborted_reason = Some(reason);
+                                return;
+                            }
+                        }
+                        UiEvent::SessionConfigOptions { options, targets } if !prompt_sent => {
+                            thor_model.store_config(options, targets);
+                            if session_started
+                                && let Some(reason) = try_start_thor_prompt(
+                                    &mut thor_model,
+                                    &thor_cmd_tx,
+                                    &event_tx,
+                                    &prompt,
+                                    &mut prompt_sent,
+                                )
+                            {
+                                aborted_reason = Some(reason);
+                                return;
+                            }
                         }
                         UiEvent::SessionUpdate(update) => {
                             match &update {
@@ -271,6 +305,18 @@ async fn run_tournament(
                         _ => {}
                     }
                 }
+                _ = async {
+                    match model_select_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if session_started && !prompt_sent => {
+                    aborted_reason = Some(format!(
+                        "thor model '{}' was not selected before the tournament prompt",
+                        thor_model.model_name
+                    ));
+                    return;
+                }
             }
         }
     };
@@ -293,6 +339,118 @@ async fn run_tournament(
             let verdict = validate_judgment(&final_text);
             let _ = event_tx.send(RagnarokEvent::TournamentDone { verdict });
         }
+    }
+}
+
+struct ThorModelSelector {
+    model_value: String,
+    model_name: String,
+    options: Vec<SessionConfigOption>,
+    targets: Vec<SessionConfigTarget>,
+    requested: bool,
+    ready: bool,
+}
+
+impl ThorModelSelector {
+    fn new(model_value: String, model_name: String) -> Self {
+        Self {
+            model_value,
+            model_name,
+            options: Vec::new(),
+            targets: Vec::new(),
+            requested: false,
+            ready: false,
+        }
+    }
+
+    fn store_config(
+        &mut self,
+        options: Vec<SessionConfigOption>,
+        targets: Vec<SessionConfigTarget>,
+    ) {
+        if options.len() == targets.len() {
+            self.options = options;
+            self.targets = targets;
+        }
+        self.ready = self.model_is_current();
+    }
+
+    fn maybe_request_selection(
+        &mut self,
+        cmd_tx: &mpsc::UnboundedSender<UiCommand>,
+    ) -> Result<ModelSelectionState, String> {
+        if self.ready {
+            return Ok(ModelSelectionState::Ready);
+        }
+        if self.requested {
+            return Ok(ModelSelectionState::Waiting);
+        }
+        let Some((target, value)) = self.find_model_choice() else {
+            if self.options.is_empty() {
+                return Ok(ModelSelectionState::Waiting);
+            }
+            return Err(format!(
+                "thor agent did not offer model '{}' for selection",
+                self.model_name
+            ));
+        };
+        let _ = cmd_tx.send(UiCommand::SetSessionConfigOption { target, value });
+        self.requested = true;
+        Ok(ModelSelectionState::Waiting)
+    }
+
+    fn model_is_current(&self) -> bool {
+        self.options.iter().any(|option| {
+            crate::app::is_model_config_option(option)
+                && crate::app::config_option_current_value_id(option)
+                    .is_some_and(|current| current.to_string() == self.model_value)
+        })
+    }
+
+    fn find_model_choice(&self) -> Option<(SessionConfigTarget, SessionConfigValueId)> {
+        for (option, target) in self.options.iter().zip(&self.targets) {
+            if !crate::app::is_model_config_option(option) {
+                continue;
+            }
+            let Some(choices) = crate::app::config_option_choices(option) else {
+                continue;
+            };
+            for choice in choices {
+                if choice.value.to_string() == self.model_value {
+                    return Some((target.clone(), choice.value));
+                }
+            }
+        }
+        None
+    }
+}
+
+enum ModelSelectionState {
+    Ready,
+    Waiting,
+}
+
+fn try_start_thor_prompt(
+    thor_model: &mut ThorModelSelector,
+    cmd_tx: &mpsc::UnboundedSender<UiCommand>,
+    event_tx: &mpsc::UnboundedSender<RagnarokEvent>,
+    prompt: &str,
+    prompt_sent: &mut bool,
+) -> Option<String> {
+    match thor_model.maybe_request_selection(cmd_tx) {
+        Ok(ModelSelectionState::Ready) => {
+            *prompt_sent = true;
+            let _ = event_tx.send(RagnarokEvent::ThorActivity {
+                summary: "thor model selected; tournament prompt sent".to_string(),
+            });
+            let _ = cmd_tx.send(UiCommand::SendPrompt {
+                text: prompt.to_string(),
+                images: Vec::new(),
+            });
+            None
+        }
+        Ok(ModelSelectionState::Waiting) => None,
+        Err(reason) => Some(reason),
     }
 }
 
@@ -962,7 +1120,9 @@ fn classify(raw_input: &serde_json::Value) -> ClassifiedCall {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::ToolCallUpdateFields;
+    use agent_client_protocol::schema::v1::{
+        SessionConfigOptionCategory, SessionConfigSelectOption, ToolCallUpdateFields,
+    };
     use serde_json::json;
 
     fn competitor(agent: &str, model: &str, elo: u32) -> EligibleCompetitor {
@@ -988,6 +1148,25 @@ mod tests {
         ToolCallUpdate::new("permission-test", fields)
     }
 
+    fn model_config(current: &str) -> SessionConfigOption {
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            current.to_string(),
+            vec![
+                SessionConfigSelectOption::new("model-1", "Model 1"),
+                SessionConfigSelectOption::new("model-2", "Model 2"),
+            ],
+        )
+        .category(Some(SessionConfigOptionCategory::Model))
+    }
+
+    fn model_target() -> SessionConfigTarget {
+        SessionConfigTarget::ConfigOption {
+            config_id: "model".into(),
+        }
+    }
+
     #[test]
     fn split_thor_voice_removes_highest_ranked_pair_from_competitors() {
         let ranked = vec![
@@ -1011,6 +1190,74 @@ mod tests {
                 ("agent-b".to_string(), "model-b".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn thor_model_selector_sends_prompt_when_requested_model_is_current() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut selector = ThorModelSelector::new("model-2".to_string(), "Model 2".to_string());
+        selector.store_config(vec![model_config("model-2")], vec![model_target()]);
+        let mut prompt_sent = false;
+
+        let reason =
+            try_start_thor_prompt(&mut selector, &cmd_tx, &event_tx, "fight", &mut prompt_sent);
+
+        assert!(reason.is_none());
+        assert!(prompt_sent);
+        match event_rx.try_recv().expect("activity event") {
+            RagnarokEvent::ThorActivity { summary } => {
+                assert_eq!(summary, "thor model selected; tournament prompt sent");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        match cmd_rx.try_recv().expect("prompt command") {
+            UiCommand::SendPrompt { text, .. } => assert_eq!(text, "fight"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thor_model_selector_requests_model_before_prompting() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut selector = ThorModelSelector::new("model-2".to_string(), "Model 2".to_string());
+        selector.store_config(vec![model_config("model-1")], vec![model_target()]);
+        let mut prompt_sent = false;
+
+        let reason =
+            try_start_thor_prompt(&mut selector, &cmd_tx, &event_tx, "fight", &mut prompt_sent);
+
+        assert!(reason.is_none());
+        assert!(!prompt_sent);
+        assert!(event_rx.try_recv().is_err());
+        match cmd_rx.try_recv().expect("model selection command") {
+            UiCommand::SetSessionConfigOption { target, value } => {
+                assert_eq!(target, model_target());
+                assert_eq!(value.to_string(), "model-2");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thor_model_selector_aborts_when_model_is_unavailable() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut selector = ThorModelSelector::new("missing".to_string(), "Missing".to_string());
+        selector.store_config(vec![model_config("model-1")], vec![model_target()]);
+        let mut prompt_sent = false;
+
+        let reason =
+            try_start_thor_prompt(&mut selector, &cmd_tx, &event_tx, "fight", &mut prompt_sent);
+
+        assert_eq!(
+            reason,
+            Some("thor agent did not offer model 'Missing' for selection".to_string())
+        );
+        assert!(!prompt_sent);
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]
