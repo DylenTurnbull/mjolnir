@@ -4707,10 +4707,36 @@ fn push_markdown_lines(
     indent: usize,
     theme: TerminalTheme,
 ) {
+    push_markdown_lines_limited_inner(out, text, indent, None, theme, false);
+}
+
+fn push_tool_markdown_lines_limited(
+    out: &mut Vec<Line<'static>>,
+    text: String,
+    indent: usize,
+    collapse_limit: Option<usize>,
+    theme: TerminalTheme,
+) {
+    push_markdown_lines_limited_inner(out, text, indent, collapse_limit, theme, true);
+}
+
+fn push_markdown_lines_limited_inner(
+    out: &mut Vec<Line<'static>>,
+    text: String,
+    indent: usize,
+    collapse_limit: Option<usize>,
+    theme: TerminalTheme,
+    use_tool_output_style: bool,
+) {
     let prefix = " ".repeat(indent);
     let mut in_code_block = false;
     let mut code_lang = String::new();
-    for raw in text.split('\n') {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (visible_count, hidden) = match collapse_limit {
+        Some(limit) if lines.len() > limit => (limit, lines.len() - limit),
+        _ => (lines.len(), 0),
+    };
+    for raw in &lines[..visible_count] {
         let trimmed = raw.trim_start();
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
@@ -4745,6 +4771,12 @@ fn push_markdown_lines(
             out.push(Line::from(""));
             continue;
         }
+
+        let base_style = if use_tool_output_style {
+            tool_output_line_style(raw, theme)
+        } else {
+            Style::default()
+        };
 
         if let Some((level, heading)) = markdown_heading(raw) {
             let marker = "#".repeat(level);
@@ -4782,7 +4814,7 @@ fn push_markdown_lines(
                 format!("{prefix}- "),
                 Style::default().fg(theme.muted),
             )];
-            spans.extend(inline_markdown_spans(item, theme));
+            spans.extend(inline_markdown_spans_with_style(item, theme, base_style));
             out.push(Line::from(spans));
             continue;
         }
@@ -4792,14 +4824,17 @@ fn push_markdown_lines(
                 format!("{prefix}{number}. "),
                 Style::default().fg(theme.muted),
             )];
-            spans.extend(inline_markdown_spans(item, theme));
+            spans.extend(inline_markdown_spans_with_style(item, theme, base_style));
             out.push(Line::from(spans));
             continue;
         }
 
-        let mut spans = vec![Span::raw(prefix.clone())];
-        spans.extend(inline_markdown_spans(raw, theme));
+        let mut spans = vec![Span::styled(prefix.clone(), base_style)];
+        spans.extend(inline_markdown_spans_with_style(raw, theme, base_style));
         out.push(Line::from(spans));
+    }
+    if hidden > 0 {
+        push_collapse_hint(out, indent, hidden, theme);
     }
 }
 
@@ -4839,54 +4874,107 @@ fn markdown_ordered_item(raw: &str) -> Option<(&str, &str)> {
     }
 }
 
-fn inline_markdown_spans(raw: &str, theme: TerminalTheme) -> Vec<Span<'static>> {
+fn inline_markdown_spans_with_style(
+    raw: &str,
+    theme: TerminalTheme,
+    base_style: Style,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut rest = raw;
+    let mut previous = None;
     while !rest.is_empty() {
         if let Some(after) = rest.strip_prefix("`")
             && let Some(end) = after.find('`')
         {
             let (code, tail) = after.split_at(end);
-            spans.push(Span::styled(
-                code.to_string(),
-                Style::default().fg(theme.code),
-            ));
+            spans.push(Span::styled(code.to_string(), base_style.fg(theme.code)));
             rest = &tail[1..];
+            previous = code.chars().next_back();
             continue;
         }
         if let Some(after) = rest.strip_prefix("**")
             && let Some(end) = after.find("**")
         {
             let (strong, tail) = after.split_at(end);
-            spans.push(Span::styled(
-                strong.to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
+            spans.extend(inline_markdown_spans_with_style(
+                strong,
+                theme,
+                base_style.add_modifier(Modifier::BOLD),
             ));
             rest = &tail[2..];
+            previous = strong.chars().next_back();
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("__")
+            && underscore_can_open(previous, after)
+            && let Some(end) = find_underscore_emphasis_end(after, "__")
+        {
+            let (strong, tail) = after.split_at(end);
+            spans.extend(inline_markdown_spans_with_style(
+                strong,
+                theme,
+                base_style.add_modifier(Modifier::BOLD),
+            ));
+            rest = &tail[2..];
+            previous = strong.chars().next_back();
             continue;
         }
         if let Some(after) = rest.strip_prefix("*")
             && let Some(end) = after.find('*')
         {
             let (em, tail) = after.split_at(end);
-            spans.push(Span::styled(
-                em.to_string(),
-                Style::default().add_modifier(Modifier::ITALIC),
+            spans.extend(inline_markdown_spans_with_style(
+                em,
+                theme,
+                base_style.add_modifier(Modifier::ITALIC),
             ));
             rest = &tail[1..];
+            previous = em.chars().next_back();
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("_")
+            && underscore_can_open(previous, after)
+            && let Some(end) = find_underscore_emphasis_end(after, "_")
+        {
+            let (em, tail) = after.split_at(end);
+            spans.extend(inline_markdown_spans_with_style(
+                em,
+                theme,
+                base_style.add_modifier(Modifier::ITALIC),
+            ));
+            rest = &tail[1..];
+            previous = em.chars().next_back();
             continue;
         }
 
         let next = rest
             .char_indices()
             .skip(1)
-            .find_map(|(idx, ch)| (ch == '`' || ch == '*').then_some(idx))
+            .find_map(|(idx, ch)| (ch == '`' || ch == '*' || ch == '_').then_some(idx))
             .unwrap_or(rest.len());
         let (plain, tail) = rest.split_at(next);
-        spans.push(Span::raw(plain.to_string()));
+        spans.push(Span::styled(plain.to_string(), base_style));
+        previous = plain.chars().next_back().or(previous);
         rest = tail;
     }
     spans
+}
+
+fn underscore_can_open(previous: Option<char>, after: &str) -> bool {
+    let Some(next) = after.chars().next() else {
+        return false;
+    };
+    !next.is_whitespace() && !previous.is_some_and(|ch| ch.is_alphanumeric())
+}
+
+fn find_underscore_emphasis_end(after: &str, marker: &str) -> Option<usize> {
+    after.match_indices(marker).find_map(|(idx, _)| {
+        let before = after[..idx].chars().next_back()?;
+        let next = after[idx + marker.len()..].chars().next();
+        (!(before.is_whitespace()
+            || before.is_alphanumeric() && next.is_some_and(|ch| ch.is_alphanumeric())))
+        .then_some(idx)
+    })
 }
 
 /// Left rail drawn before every line of a tool-call block, and its width in
@@ -5021,7 +5109,7 @@ fn push_tool_outputs(
     for output in outputs {
         match output {
             ToolCallOutput::Text(text) => {
-                push_tool_text_lines(out, text.clone(), 2, collapse_limit, theme)
+                push_tool_markdown_lines_limited(out, text.clone(), 2, collapse_limit, theme)
             }
             ToolCallOutput::Diff {
                 path,
@@ -10569,11 +10657,128 @@ mod tests {
 
         assert!(rendered.iter().any(|line| line == "│ tool exec run checks"));
         assert!(rendered.iter().any(|line| line == "│   ## Output"));
-        assert!(rendered.iter().any(|line| line == "│   `ok`"));
+        assert!(rendered.iter().any(|line| line == "│   ok"));
         assert!(rendered.iter().any(|line| line == "│   diff src/main.rs"));
         assert!(rendered.iter().any(|line| line == "│     - old"));
         assert!(rendered.iter().any(|line| line == "│     + new"));
         assert!(rendered.iter().any(|line| line == "│   terminal term-1"));
+    }
+
+    #[test]
+    fn transcript_renders_markdown_in_tool_text_output() {
+        let mut state = AppState::new();
+        state.tool_calls.insert(
+            "call-1".to_string(),
+            crate::app::ToolCallView {
+                title: "activate_skill".to_string(),
+                kind: ToolKind::Read,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Text(
+                    "_Auto permissions **approved** this tool call._\n\nReason: `read/search/fetch`\n\n- visible from anvil"
+                        .to_string(),
+                )],
+            },
+        );
+        state.transcript.push(Entry::ToolCall("call-1".to_string()));
+
+        let rendered: Vec<String> = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "│   Auto permissions approved this tool call."),
+            "rendered lines: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "│   Reason: read/search/fetch"),
+            "rendered lines: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "│   - visible from anvil"),
+            "rendered lines: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_tool_markdown_preserves_technical_underscores() {
+        let mut state = AppState::new();
+        state.tool_calls.insert(
+            "call-1".to_string(),
+            crate::app::ToolCallView {
+                title: "log".to_string(),
+                kind: ToolKind::Execute,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Text(
+                    "src/my_file.rs\nfoo_bar_baz\n_Auto permissions approved._".to_string(),
+                )],
+            },
+        );
+        state.transcript.push(Entry::ToolCall("call-1".to_string()));
+
+        let rendered: Vec<String> = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line == "│   src/my_file.rs"));
+        assert!(rendered.iter().any(|line| line == "│   foo_bar_baz"));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "│   Auto permissions approved."),
+            "rendered lines: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_tool_markdown_preserves_log_severity_styles() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state.tool_calls.insert(
+            "call-1".to_string(),
+            crate::app::ToolCallView {
+                title: "log".to_string(),
+                kind: ToolKind::Execute,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Text("warning: **check**".to_string())],
+            },
+        );
+        state.transcript.push(Entry::ToolCall("call-1".to_string()));
+
+        let lines = render_transcript_lines(&state, 80);
+        let warning_line = lines
+            .iter()
+            .find(|line| line_text(line) == "│   warning: check")
+            .unwrap_or_else(|| {
+                panic!(
+                    "rendered lines: {:?}",
+                    lines.iter().map(line_text).collect::<Vec<_>>()
+                )
+            });
+
+        assert!(
+            warning_line
+                .spans
+                .iter()
+                .skip(1)
+                .any(|span| span.style.fg == Some(theme.warning)),
+            "warning line should retain tool-output severity color: {warning_line:?}"
+        );
+        assert!(
+            warning_line.spans.iter().skip(1).any(|span| {
+                span.content.as_ref() == "check"
+                    && span.style.fg == Some(theme.warning)
+                    && span.style.add_modifier.contains(Modifier::BOLD)
+            }),
+            "inline markdown should still style the strong segment: {warning_line:?}"
+        );
     }
 
     #[test]
@@ -10668,7 +10873,7 @@ mod tests {
     }
 
     #[test]
-    fn user_prompts_and_tool_text_render_as_plain_text() {
+    fn user_prompts_render_plain_text_tool_text_renders_markdown() {
         let mut state = AppState::new();
         state.transcript.push(Entry::UserPrompt(
             "# literal\n`code` and **bold**".to_string(),
@@ -10694,7 +10899,7 @@ mod tests {
         assert!(rendered.iter().any(|line| line == "# literal"));
         assert!(rendered.iter().any(|line| line == "`code` and **bold**"));
         assert!(rendered.iter().any(|line| line == "│   # stdout"));
-        assert!(rendered.iter().any(|line| line == "│   `ok` and **bold**"));
+        assert!(rendered.iter().any(|line| line == "│   ok and bold"));
     }
 
     #[test]
