@@ -109,6 +109,9 @@ const SUMMARY_LIMIT: usize = 4 * 1024;
 const FINAL_TEXT_LIMIT: usize = 1024 * 1024;
 /// Per-field budget inside Thor's permission court prompt.
 const PERMISSION_CONTEXT_LIMIT: usize = 6 * 1024;
+/// How many times a participant can be sent back to work after Thor denies a
+/// procedural permission request.
+const PERMISSION_REMAND_LIMIT: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Events consumed by the arena UI
@@ -1164,10 +1167,25 @@ enum TurnEvent {
     Note(String),
 }
 
+#[derive(Debug, Clone)]
+struct PermissionDenial {
+    title: String,
+    option_id: Option<String>,
+    option_name: Option<String>,
+    reason: String,
+}
+
+#[derive(Debug)]
+struct PermissionAnswer {
+    note: String,
+    denial: Option<PermissionDenial>,
+}
+
 #[derive(Debug)]
 struct TurnOutcome {
     text: String,
     stop: StopReason,
+    permission_denials: Vec<PermissionDenial>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1319,33 +1337,48 @@ impl AgentHandle {
         }
     }
 
-    fn answer_permission(&self, prompt: crate::event::PermissionPrompt) -> String {
+    fn answer_permission(&self, prompt: crate::event::PermissionPrompt) -> PermissionAnswer {
         let selected = self.select_permission_option(&prompt);
         let mut note =
             permission_answer_note("permission auto-answered", &prompt, selected.as_deref());
+        let denial = permission_denial(
+            &prompt,
+            selected.as_deref(),
+            "Ragnarok auto-selected this permission option.",
+        );
         let decision = selected
             .map(PermissionDecision::Selected)
             .unwrap_or(PermissionDecision::Cancelled);
-        append_permission_delivery(&mut note, prompt.responder.send(decision).is_ok());
-        note
+        let delivered = prompt.responder.send(decision).is_ok();
+        append_permission_delivery(&mut note, delivered);
+        PermissionAnswer {
+            note,
+            denial: denial.filter(|_| delivered),
+        }
     }
 
     async fn answer_permission_through_court(
         &self,
         prompt: crate::event::PermissionPrompt,
         court: &PermissionCourtClient,
-    ) -> String {
+    ) -> PermissionAnswer {
         let ruling = match court.rule(&prompt, self.access_mode).await {
             Ok(ruling) => normalize_permission_ruling(&prompt, self.access_mode, ruling),
             Err(e) => deny_permission_ruling(&prompt, format!("Thor could not rule: {e:#}")),
         };
         let mut note = permission_ruling_note(&prompt, &ruling);
+        let selected = ruling.option_id.clone();
+        let denial = permission_denial(&prompt, selected.as_deref(), &ruling.reason);
         let decision = ruling
             .option_id
             .map(PermissionDecision::Selected)
             .unwrap_or(PermissionDecision::Cancelled);
-        append_permission_delivery(&mut note, prompt.responder.send(decision).is_ok());
-        note
+        let delivered = prompt.responder.send(decision).is_ok();
+        append_permission_delivery(&mut note, delivered);
+        PermissionAnswer {
+            note,
+            denial: denial.filter(|_| delivered),
+        }
     }
 
     fn select_permission_option(&self, prompt: &crate::event::PermissionPrompt) -> Option<String> {
@@ -1494,6 +1527,7 @@ impl AgentHandle {
         let deadline = tokio::time::Instant::now() + budget;
         let mut acc = String::new();
         let mut truncated = false;
+        let mut permission_denials = Vec::new();
         let mut known_tools: HashMap<String, (String, Option<ToolKind>)> = HashMap::new();
         loop {
             let ev = tokio::select! {
@@ -1556,12 +1590,15 @@ impl AgentHandle {
                     self.store_config(options, targets)
                 }
                 UiEvent::PermissionRequest(p) => {
-                    let note = if let Some(court) = permission_court {
+                    let answer = if let Some(court) = permission_court {
                         self.answer_permission_through_court(p, court).await
                     } else {
                         self.answer_permission(p)
                     };
-                    on_event(TurnEvent::Note(note));
+                    if let Some(denial) = answer.denial {
+                        permission_denials.push(denial);
+                    }
+                    on_event(TurnEvent::Note(answer.note));
                 }
                 UiEvent::ElicitationRequest(e) => {
                     let _ = e.responder.send(ElicitationOutcome::Decline);
@@ -1573,6 +1610,7 @@ impl AgentHandle {
                     return Ok(TurnOutcome {
                         text: acc,
                         stop: stop_reason,
+                        permission_denials,
                     });
                 }
                 UiEvent::PromptFailed { message } => {
@@ -1674,6 +1712,66 @@ fn append_permission_delivery(note: &mut String, delivered: bool) {
     } else {
         note.push_str(" [not delivered: ACP runtime no longer waiting]");
     }
+}
+
+fn permission_denial(
+    prompt: &crate::event::PermissionPrompt,
+    selected: Option<&str>,
+    reason: &str,
+) -> Option<PermissionDenial> {
+    let title = prompt
+        .tool_call
+        .fields
+        .title
+        .as_deref()
+        .unwrap_or("permission request")
+        .to_string();
+    let Some(option_id) = selected else {
+        return Some(PermissionDenial {
+            title,
+            option_id: None,
+            option_name: None,
+            reason: reason.trim().to_string(),
+        });
+    };
+    let option = prompt
+        .options
+        .iter()
+        .find(|option| option.option_id.0.as_ref() == option_id)?;
+    matches!(
+        option.kind,
+        PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways
+    )
+    .then(|| PermissionDenial {
+        title,
+        option_id: Some(option_id.to_string()),
+        option_name: Some(option.name.clone()),
+        reason: reason.trim().to_string(),
+    })
+}
+
+fn permission_remand_prompt(
+    original_prompt: &str,
+    denial: &PermissionDenial,
+    attempt: usize,
+) -> String {
+    let option = match (&denial.option_id, &denial.option_name) {
+        (Some(id), Some(name)) => format!("{id} ({name})"),
+        (Some(id), None) => id.clone(),
+        (None, _) => "cancelled".to_string(),
+    };
+    format!(
+        "THOR REMAND #{attempt}. A procedural permission request in your previous turn was \
+         denied by the court. This is not elimination and not completion. Continue the original \
+         request, revise your plan or actions to satisfy the ruling, and do not repeat the same \
+         denied request unchanged.\n\n\
+         Denied permission: {title}\n\
+         Selected court option: {option}\n\
+         Thor's reason: {reason}\n\n\
+         ORIGINAL REQUEST:\n{original_prompt}",
+        title = denial.title,
+        reason = denial.reason,
+    )
 }
 
 fn normalize_permission_ruling(
@@ -2349,55 +2447,89 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
         actor_tag: fighter.card.tag(),
         role: CourtActorRole::Champion,
     };
-    let tx_events = tx.clone();
-    let outcome = handle
-        .prompt(
-            fight_prompt(&task),
-            FIGHT_TIMEOUT,
-            Some(&permission_court),
-            |ev| {
-                if let TurnEvent::Tool {
-                    title,
-                    started: true,
-                    ..
-                } = &ev
-                {
-                    let _ = ping.send(WatchdogPing {
+    let original_prompt = fight_prompt(&task);
+    let mut prompt_text = original_prompt.clone();
+    let mut remands = 0usize;
+    loop {
+        let tx_events = tx.clone();
+        let outcome = handle
+            .prompt(
+                prompt_text.clone(),
+                FIGHT_TIMEOUT,
+                Some(&permission_court),
+                |ev| {
+                    if let TurnEvent::Tool {
+                        title,
+                        started: true,
+                        ..
+                    } = &ev
+                    {
+                        let _ = ping.send(WatchdogPing {
+                            id,
+                            title: title.clone(),
+                        });
+                    }
+                    forward_turn_event(
+                        &tx_events,
                         id,
-                        title: title.clone(),
-                    });
-                }
-                forward_turn_event(
-                    &tx_events,
-                    id,
-                    &fighter_name,
-                    ev,
-                    TextLane::Message,
-                    &mut cry_roll,
-                    &mut chunk_count,
+                        &fighter_name,
+                        ev,
+                        TextLane::Message,
+                        &mut cry_roll,
+                        &mut chunk_count,
+                    );
+                },
+            )
+            .await;
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                handle.dismiss().await;
+                return slain(
+                    report,
+                    set_state,
+                    kill_note(format!("fell in battle: {e:#}")),
                 );
-            },
-        )
-        .await;
-    handle.dismiss().await;
-    let outcome = match outcome {
-        Ok(o) => o,
-        Err(e) => {
+            }
+        };
+        if !turn_succeeded(outcome.stop) {
+            handle.dismiss().await;
             return slain(
                 report,
                 set_state,
-                kill_note(format!("fell in battle: {e:#}")),
+                kill_note(format!("yielded ({})", stop_reason_label(outcome.stop))),
             );
         }
-    };
-    if !turn_succeeded(outcome.stop) {
-        return slain(
-            report,
-            set_state,
-            kill_note(format!("yielded ({})", stop_reason_label(outcome.stop))),
-        );
+        if !outcome.text.trim().is_empty() {
+            if !report.final_text.is_empty() {
+                report.final_text.push_str("\n\n");
+            }
+            report.final_text.push_str(&outcome.text);
+        }
+        if let Some(denial) = outcome.permission_denials.last() {
+            remands += 1;
+            if remands > PERMISSION_REMAND_LIMIT {
+                handle.dismiss().await;
+                return slain(
+                    report,
+                    set_state,
+                    format!("could not complete after {PERMISSION_REMAND_LIMIT} court remand(s)"),
+                );
+            }
+            let _ = tx.send(RagnarokEvent::Log {
+                fighter: Some(id),
+                text: format!(
+                    "⚖ THOR remands {}: {}",
+                    fighter.card.model_name,
+                    first_line(&denial.reason, 100)
+                ),
+            });
+            prompt_text = permission_remand_prompt(&original_prompt, denial, remands);
+            continue;
+        }
+        break;
     }
-    report.final_text = outcome.text;
+    handle.dismiss().await;
 
     set_state(FighterState::Capturing);
     let root = created.worktree_root.clone();
@@ -2787,23 +2919,66 @@ async fn review(
         actor_tag: reviewer.card.tag(),
         role: CourtActorRole::Reviewer,
     };
-    let tx_events = tx.clone();
-    let outcome = handle
-        .prompt(prompt, REVIEW_TIMEOUT, Some(&permission_court), |ev| {
-            forward_turn_event(
-                &tx_events,
-                id,
-                &name,
-                ev,
-                TextLane::Review,
-                &mut cry_roll,
-                &mut chunk_count,
-            );
-        })
-        .await;
+    let original_prompt = prompt;
+    let mut prompt_text = original_prompt.clone();
+    let mut remands = 0usize;
+    let mut review_text = String::new();
+    let delivered = loop {
+        let tx_events = tx.clone();
+        let outcome = handle
+            .prompt(
+                prompt_text.clone(),
+                REVIEW_TIMEOUT,
+                Some(&permission_court),
+                |ev| {
+                    forward_turn_event(
+                        &tx_events,
+                        id,
+                        &name,
+                        ev,
+                        TextLane::Review,
+                        &mut cry_roll,
+                        &mut chunk_count,
+                    );
+                },
+            )
+            .await;
+        match outcome {
+            Ok(o) if turn_succeeded(o.stop) => {
+                if !o.text.trim().is_empty() {
+                    if !review_text.is_empty() {
+                        review_text.push_str("\n\n");
+                    }
+                    review_text.push_str(&o.text);
+                }
+                if let Some(denial) = o.permission_denials.last() {
+                    remands += 1;
+                    if remands > PERMISSION_REMAND_LIMIT {
+                        break Err(format!(
+                            "review not delivered: exceeded {PERMISSION_REMAND_LIMIT} court remand(s)"
+                        ));
+                    }
+                    let _ = tx.send(RagnarokEvent::Log {
+                        fighter: Some(id),
+                        text: format!("⚖ THOR remands {name}: {}", first_line(&denial.reason, 100)),
+                    });
+                    prompt_text = permission_remand_prompt(&original_prompt, denial, remands);
+                    continue;
+                }
+                break Ok(review_text);
+            }
+            Ok(o) => {
+                break Err(format!(
+                    "review not delivered: {}",
+                    stop_reason_label(o.stop)
+                ));
+            }
+            Err(e) => break Err(format!("review not delivered: {e:#}")),
+        }
+    };
     handle.dismiss().await;
-    match outcome {
-        Ok(o) if turn_succeeded(o.stop) => {
+    match delivered {
+        Ok(text) => {
             set_progress(ReviewProgress::Done);
             let _ = tx.send(RagnarokEvent::Log {
                 fighter: Some(id),
@@ -2811,23 +2986,15 @@ async fn review(
             });
             ReviewReport {
                 assignment,
-                text: o.text,
+                text,
                 delivered: true,
             }
         }
-        Ok(o) => {
+        Err(message) => {
             set_progress(ReviewProgress::Failed);
             ReviewReport {
                 assignment,
-                text: format!("(review not delivered: {})", stop_reason_label(o.stop)),
-                delivered: false,
-            }
-        }
-        Err(e) => {
-            set_progress(ReviewProgress::Failed);
-            ReviewReport {
-                assignment,
-                text: format!("(review not delivered: {e:#})"),
+                text: format!("({message})"),
                 delivered: false,
             }
         }
@@ -4432,11 +4599,12 @@ mod tests {
                 })
                 .expect("send ruling");
         };
-        let (note, ()) = tokio::join!(answer, court_side);
+        let (answer, ()) = tokio::join!(answer, court_side);
 
-        assert!(note.contains("Thor ruled on permission"));
-        assert!(note.contains("-> accept_plan (Accept plan)"));
-        assert!(note.contains("[queued to ACP runtime]"));
+        assert!(answer.note.contains("Thor ruled on permission"));
+        assert!(answer.note.contains("-> accept_plan (Accept plan)"));
+        assert!(answer.note.contains("[queued to ACP runtime]"));
+        assert!(answer.denial.is_none());
         assert!(matches!(prx.await, Ok(PermissionDecision::Selected(id)) if id == "accept_plan"));
     }
 
@@ -4488,10 +4656,15 @@ mod tests {
                 })
                 .expect("send ruling");
         };
-        let (note, ()) = tokio::join!(answer, court_side);
+        let (answer, ()) = tokio::join!(answer, court_side);
 
-        assert!(note.contains("-> accept_plan (Accept plan)"));
-        assert!(note.contains("[not delivered: ACP runtime no longer waiting]"));
+        assert!(answer.note.contains("-> accept_plan (Accept plan)"));
+        assert!(
+            answer
+                .note
+                .contains("[not delivered: ACP runtime no longer waiting]")
+        );
+        assert!(answer.denial.is_none());
     }
 
     #[test]
@@ -4586,6 +4759,12 @@ mod tests {
         let outcome = prompt.await.expect("prompt task").expect("prompt succeeds");
 
         assert_eq!(outcome.stop, StopReason::EndTurn);
+        assert_eq!(outcome.permission_denials.len(), 1);
+        assert_eq!(outcome.permission_denials[0].title, "run risky command");
+        assert_eq!(
+            outcome.permission_denials[0].reason,
+            "not needed for the task"
+        );
         assert!(matches!(prx.await, Ok(PermissionDecision::Selected(id)) if id == "deny"));
     }
 
