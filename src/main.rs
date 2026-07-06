@@ -1807,6 +1807,8 @@ async fn run_session(
     //    task. `kill_on_drop(true)` on the `Command` then signals the
     //    child when the `Child` value is dropped during unwind.
     remote_tracker.shutdown().await;
+    cancel_optional_token(&ragnarok_cancel);
+    drop(cmd_tx);
 
     let abort_handle = acp_handle.abort_handle();
     match tokio::time::timeout(Duration::from_secs(2), acp_handle).await {
@@ -1956,6 +1958,14 @@ async fn wait_for_optional_task(
     }
 }
 
+fn cancel_optional_token(token: &Arc<Mutex<Option<CancellationToken>>>) {
+    if let Ok(slot) = token.lock()
+        && let Some(token) = slot.as_ref()
+    {
+        token.cancel();
+    }
+}
+
 fn init_logging(path: Option<&std::path::Path>) -> Result<()> {
     use tracing_subscriber::{EnvFilter, fmt};
 
@@ -2028,6 +2038,16 @@ mod tests {
             Some("new claude-acp session started".to_string())
         );
         assert_eq!(new_session_boundary_for_agent(false, &agent), None);
+    }
+
+    #[test]
+    fn cancel_optional_token_cancels_present_token() {
+        let token = CancellationToken::new();
+        let slot = Arc::new(Mutex::new(Some(token.clone())));
+
+        cancel_optional_token(&slot);
+
+        assert!(token.is_cancelled());
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     McpServer, McpServerStdio, PermissionOption, PermissionOptionKind, SessionConfigOption,
-    SessionConfigValueId, SessionUpdate, StopReason, ToolCallUpdate,
+    SessionConfigValueId, SessionUpdate, StopReason, ToolCallUpdate, ToolKind,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -1938,8 +1938,17 @@ fn is_plan_approval_request(tool_call: &ToolCallUpdate) -> bool {
         .title
         .as_deref()
         .unwrap_or_default()
+        .trim()
         .to_ascii_lowercase();
-    title.contains("approve plan") || title.contains("plan before execution")
+    let is_known_plan_gate = matches!(
+        title.as_str(),
+        "approve plan" | "approve plan before execution"
+    );
+    is_known_plan_gate
+        && matches!(
+            tool_call.fields.kind,
+            None | Some(ToolKind::Other | ToolKind::Think)
+        )
 }
 
 fn choose_allow_once_option(options: &[PermissionOption]) -> Option<String> {
@@ -2576,6 +2585,32 @@ mod tests {
         .expect("permission decision");
 
         assert_eq!(decision.as_deref(), Some("allow"));
+    }
+
+    #[tokio::test]
+    async fn plan_approval_policy_rejects_actionable_spoofed_plan_title() {
+        let tool_call = ToolCallUpdate::new(
+            "shell",
+            ToolCallUpdateFields::new()
+                .title("Approve plan before execution")
+                .kind(ToolKind::Execute),
+        );
+        let options = vec![
+            PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
+            PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectOnce),
+        ];
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+
+        let decision = permission_decision(
+            &PermissionPolicy::AllowPlanApprovals,
+            &tool_call,
+            &options,
+            &ui_tx,
+        )
+        .await
+        .expect("permission decision");
+
+        assert_eq!(decision, None);
     }
 
     #[tokio::test]
