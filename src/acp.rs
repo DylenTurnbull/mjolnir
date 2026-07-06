@@ -3322,7 +3322,8 @@ mod tests {
     use agent_client_protocol::schema::v1::{
         AuthMethodAgent, AuthenticateResponse, CloseSessionResponse, ContentBlock, ContentChunk,
         ForkSessionResponse, InitializeResponse, LoadSessionResponse, NewSessionResponse,
-        PermissionOption, PermissionOptionKind, PromptResponse, ResumeSessionResponse,
+        PermissionOption, PermissionOptionKind, PromptResponse, RequestPermissionOutcome,
+        RequestPermissionResponse, ResumeSessionResponse, SelectedPermissionOutcome,
         SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
         SessionConfigId, SessionConfigValueId, SessionForkCapabilities, SessionId,
         SessionNotification, SessionResumeCapabilities, SessionUpdate,
@@ -3503,6 +3504,23 @@ mod tests {
                 .expect("send permission decision"),
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn selected_permission_response_serializes_to_acp_shape() {
+        let response = RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+            SelectedPermissionOutcome::new("accept_plan"),
+        ));
+
+        assert_eq!(
+            serde_json::to_value(response).expect("serialize response"),
+            serde_json::json!({
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": "accept_plan"
+                }
+            })
+        );
     }
 
     #[tokio::test]
