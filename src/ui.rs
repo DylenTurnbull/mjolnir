@@ -3036,6 +3036,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         && (rest.is_empty() || rest.starts_with(char::is_whitespace))
     {
         let task = rest.trim().to_string();
+        state.record_prompt_history(text.clone());
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
@@ -13711,6 +13712,7 @@ mod tests {
         submit_prompt(&mut state, &cmd_tx);
         assert!(cmd_rx.try_recv().is_err(), "nothing goes to the agent");
         assert!(state.take_ragnarok_launch().is_none());
+        assert_eq!(state.prompt_history(), vec!["/ragnarok".to_string()]);
         let status = state.status_line.clone().expect("status");
         assert_eq!(status.kind, StatusKind::Warning);
         assert!(status.text.contains("usage: /ragnarok"));
@@ -13729,7 +13731,13 @@ mod tests {
             state.take_ragnarok_launch().as_deref(),
             Some("forge me a hammer")
         );
+        assert_eq!(
+            state.prompt_history(),
+            vec!["/ragnarok forge me a hammer".to_string()]
+        );
         assert!(state.input.is_empty());
+        assert!(state.prompt_history_previous());
+        assert_eq!(state.input, "/ragnarok forge me a hammer");
         assert!(matches!(
             state.transcript.last(),
             Some(Entry::System(text)) if text.contains("Ragnarok summoned")
@@ -13746,6 +13754,10 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
         submit_prompt(&mut state, &cmd_tx);
         assert!(state.take_ragnarok_launch().is_none());
+        assert_eq!(
+            state.prompt_history(),
+            vec!["/ragnarok second task".to_string()]
+        );
         let status = state.status_line.clone().expect("status");
         assert_eq!(status.kind, StatusKind::Warning);
         assert!(status.text.contains("already raging"));

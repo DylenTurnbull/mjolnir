@@ -1039,6 +1039,15 @@ impl AppState {
         self.prompt_history = entries;
     }
 
+    pub fn record_prompt_history(&mut self, text: String) {
+        // Deduplicate consecutive identical prompts, matching the normal
+        // agent prompt path and shell-style history behavior.
+        if self.prompt_history.last().map(String::as_str) != Some(&text) {
+            self.prompt_history.push(text);
+        }
+        self.reset_history_navigation();
+    }
+
     /// Navigate to the previous (older) prompt in history. Returns `true`
     /// if the navigation moved (i.e. there is an older entry available).
     /// Saves the current input the first time in a navigation sequence.
@@ -1510,12 +1519,7 @@ impl AppState {
     /// command reaches the runtime. Keeps the UI responsive.
     pub fn record_user_prompt(&mut self, text: String) {
         self.transcript.push(Entry::UserPrompt(text.clone()));
-        // Record in prompt history for Up/Down navigation, deduplicating
-        // consecutive identical prompts.
-        if self.prompt_history.last().map(String::as_str) != Some(&text) {
-            self.prompt_history.push(text);
-        }
-        self.reset_history_navigation();
+        self.record_prompt_history(text);
         self.bump_transcript_revision();
         self.set_connection_state(ConnectionState::Streaming);
         self.turn_started_at = Some(Instant::now());
