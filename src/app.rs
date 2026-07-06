@@ -2341,6 +2341,9 @@ pub struct RagnarokUi {
     pub fighters: Vec<RagnarokFighterUi>,
     /// The scrolling battle feed: (fighter, themed line).
     pub feed: VecDeque<(Option<ragnarok::FighterId>, String)>,
+    /// Number of newest feed lines hidden below the viewport. Zero follows
+    /// live output at the bottom.
+    pub feed_scroll: usize,
     pub thor_text: String,
     pub thor_action: Option<ragnarok::ThorAction>,
     pub thor_action_at: Instant,
@@ -2373,6 +2376,7 @@ impl RagnarokUi {
             phase: ragnarok::Phase::Mustering,
             fighters: Vec::new(),
             feed: VecDeque::new(),
+            feed_scroll: 0,
             thor_text: String::new(),
             thor_action: None,
             thor_action_at: Instant::now(),
@@ -2426,10 +2430,39 @@ impl RagnarokUi {
     }
 
     fn push_feed(&mut self, fighter: Option<ragnarok::FighterId>, text: String) {
+        let preserve_scrolled_view = self.feed_scroll > 0;
         self.feed.push_back((fighter, text));
+        if preserve_scrolled_view {
+            self.feed_scroll = self.feed_scroll.saturating_add(1);
+        }
         while self.feed.len() > RAGNAROK_FEED_CAP {
             self.feed.pop_front();
         }
+        self.feed_scroll = self.feed_scroll.min(self.feed.len().saturating_sub(1));
+    }
+
+    pub fn scroll_feed(&mut self, delta: isize) {
+        if delta > 0 {
+            self.feed_scroll = self
+                .feed_scroll
+                .saturating_add(delta as usize)
+                .min(self.feed.len().saturating_sub(1));
+        } else if delta < 0 {
+            self.feed_scroll = self.feed_scroll.saturating_sub((-delta) as usize);
+        }
+    }
+
+    pub fn feed_max_scroll_for_rows(&self, visible_rows: usize) -> usize {
+        if visible_rows == 0 {
+            0
+        } else {
+            self.feed.len().saturating_sub(visible_rows)
+        }
+    }
+
+    pub fn feed_scroll_for_rows(&self, visible_rows: usize) -> usize {
+        self.feed_scroll
+            .min(self.feed_max_scroll_for_rows(visible_rows))
     }
 
     pub fn cycle_fighter(&mut self, delta: isize) {
@@ -5123,5 +5156,31 @@ mod tests {
         assert_eq!(arena.selected_fighter, 2);
         arena.cycle_fighter(1);
         assert_eq!(arena.selected_fighter, 0);
+    }
+
+    #[test]
+    fn ragnarok_feed_scroll_preserves_scrolled_view() {
+        let mut s = arena_state();
+        for line in ["one", "two", "three", "four"] {
+            s.apply_ragnarok_event(crate::ragnarok::RagnarokEvent::Log {
+                fighter: None,
+                text: line.to_string(),
+            });
+        }
+        let arena = s.ragnarok.as_mut().expect("arena");
+
+        assert_eq!(arena.feed_scroll_for_rows(2), 0);
+        arena.scroll_feed(1);
+        assert_eq!(arena.feed_scroll_for_rows(2), 1);
+        arena.scroll_feed(99);
+        assert_eq!(arena.feed_scroll_for_rows(2), 2);
+
+        arena.push_feed(None, "five".to_string());
+        assert_eq!(arena.feed_scroll_for_rows(2), 3);
+
+        arena.scroll_feed(-2);
+        assert_eq!(arena.feed_scroll_for_rows(2), 2);
+        arena.scroll_feed(-99);
+        assert_eq!(arena.feed_scroll_for_rows(2), 0);
     }
 }

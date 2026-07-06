@@ -7550,7 +7550,7 @@ fn model_choice_score(
 // ===========================================================================
 
 /// How long an action flourish keeps driving a fighter's pose.
-const RAGNAROK_ACTION_TTL: Duration = Duration::from_secs(4);
+const RAGNAROK_ACTION_TTL: Duration = Duration::from_secs(12);
 /// Animation frame cadence (shares the spinner heartbeat).
 const RAGNAROK_FRAME_MS: u128 = 250;
 const RAGNAROK_CARD_MIN_WIDTH: u16 = 24;
@@ -7625,6 +7625,8 @@ fn handle_ragnarok_key(
             };
             return inline_repair_request(mode);
         }
+        KeyCode::Up | KeyCode::Char('k') => arena.scroll_feed(1),
+        KeyCode::Down | KeyCode::Char('j') => arena.scroll_feed(-1),
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('[') => arena.cycle_fighter(-1),
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(']') => arena.cycle_fighter(1),
         KeyCode::Char('r') => arena.show_review_lane = !arena.show_review_lane,
@@ -7749,15 +7751,15 @@ fn ragnarok_footer_line(arena: &RagnarokUi, theme: TerminalTheme, width: u16) ->
         match arena.verdict.as_ref().and_then(|v| v.finalists) {
             Some(_) => "1/2 choose finalist · Enter accept & close · Tab transcripts · ←/→ fighter"
                 .to_string(),
-            None => "Enter/q close · Tab transcripts · ←/→ fighter · r review lane".to_string(),
+            None => "Enter/q close · Tab transcripts · ↑/↓ feed · ←/→ fighter · r review lane"
+                .to_string(),
         }
     } else if arena.awaiting_approval() {
-        "⚔ Enter to UNLEASH RAGNAROK (no combat spend yet) · Esc Esc flee · Tab transcripts"
-            .to_string()
+        "⚔ Enter to UNLEASH RAGNAROK (no combat spend yet) · ↑/↓ feed · Esc Esc flee".to_string()
     } else {
         match arena.pane {
             ArenaPane::Arena => {
-                "Tab transcripts · ←/→ fighter · 1-9 select · Esc Esc flee".to_string()
+                "↑/↓ feed · ←/→ fighter · 1-9 select · Tab transcripts · Esc Esc flee".to_string()
             }
             ArenaPane::Transcript => {
                 "Tab arena · ←/→ fighter · r review lane · Esc Esc flee".to_string()
@@ -8375,11 +8377,21 @@ fn draw_ragnarok_feed(
     arena: &RagnarokUi,
     theme: TerminalTheme,
 ) {
+    let visible_rows = area.height.saturating_sub(1) as usize;
+    let scroll = arena.feed_scroll_for_rows(visible_rows);
+    let max_scroll = arena.feed_max_scroll_for_rows(visible_rows);
+    let title = if max_scroll == 0 {
+        " ⚔ battle feed ".to_string()
+    } else if scroll == 0 {
+        format!(" ⚔ battle feed · live · ↑ {max_scroll} ")
+    } else {
+        format!(" ⚔ battle feed · {scroll}/{max_scroll} older · ↓ live ")
+    };
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(theme.muted))
         .title(Span::styled(
-            " ⚔ battle feed ",
+            fit_width(title, area.width as usize),
             Style::default().fg(theme.muted),
         ));
     let inner = block.inner(area);
@@ -8388,14 +8400,14 @@ fn draw_ragnarok_feed(
         return;
     }
     let take = inner.height as usize;
+    let scroll = arena.feed_scroll_for_rows(take);
+    let end = arena.feed.len().saturating_sub(scroll);
+    let start = end.saturating_sub(take);
     let lines: Vec<Line> = arena
         .feed
         .iter()
-        .rev()
-        .take(take)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
+        .skip(start)
+        .take(end.saturating_sub(start))
         .map(|(fighter, text)| {
             let color = match fighter {
                 Some(id) => fighter_color(theme, *id),
@@ -13855,6 +13867,13 @@ mod tests {
             UiMode::InlineChat,
         );
         assert_eq!(state.ragnarok.as_ref().unwrap().pane, ArenaPane::Transcript);
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Tab,
+            UiMode::InlineChat,
+        );
+        assert_eq!(state.ragnarok.as_ref().unwrap().pane, ArenaPane::Arena);
         // Arrows cycle fighters.
         handle_ragnarok_key(
             &mut state,
@@ -13863,6 +13882,26 @@ mod tests {
             UiMode::InlineChat,
         );
         assert_eq!(state.ragnarok.as_ref().unwrap().selected_fighter, 1);
+        for line in ["one", "two", "three"] {
+            state.apply_ragnarok_event(ragnarok::RagnarokEvent::Log {
+                fighter: None,
+                text: line.to_string(),
+            });
+        }
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Up,
+            UiMode::InlineChat,
+        );
+        assert_eq!(state.ragnarok.as_ref().unwrap().feed_scroll, 1);
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Down,
+            UiMode::InlineChat,
+        );
+        assert_eq!(state.ragnarok.as_ref().unwrap().feed_scroll, 0);
 
         // Enter at the approval gate unleashes combat without closing.
         state.apply_ragnarok_event(ragnarok::RagnarokEvent::Phase(ragnarok::Phase::Approval));
