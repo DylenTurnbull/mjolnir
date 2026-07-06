@@ -7887,7 +7887,10 @@ fn thor_action_lines(arena: &RagnarokUi, theme: TerminalTheme, width: u16) -> Ve
     let (title, art): (&str, [&str; 2]) = match action {
         ragnarok::ThorAction::Descending => (
             "THOR DESCENDS",
-            ["      \\  |  /      ", "        MJOLNIR     "],
+            [
+                "      storm splits open     ",
+                "        helm first           ",
+            ],
         ),
         ragnarok::ThorAction::Deciding => (
             "THOR DECIDES",
@@ -7955,6 +7958,52 @@ fn draw_thor_action_strip(
     f.render_widget(Paragraph::new(lines), area);
 }
 
+fn thor_descending_scene_rows(frame: usize) -> Vec<String> {
+    let drop = ["      ", "    ", "  ", " "][frame % 4];
+    let cape = [" /|\\ ", " \\|/ ", " /|\\ ", "\\ | /"][frame % 4];
+    let sparks = ["  \\ | /", "-- ᚦ --", "  / | \\", "-- ⚡ --"][frame % 4];
+    vec![
+        format!("{drop}{sparks}"),
+        format!("{drop}        _/\\_        "),
+        format!("{drop}      _/ᛏ  ᛏ\\_      "),
+        format!("{drop}     /_( ᚨ ᚨ )_\\     "),
+        format!("{drop}       \\_===_/   __==#"),
+        format!("{drop}       {cape}   /"),
+        format!("{drop}      /_| ᛉ  |_\\/ "),
+        format!("{drop}        /_/ \\_\\     "),
+    ]
+}
+
+fn thor_summoning_scene_rows(arena: &RagnarokUi, frame: usize) -> Vec<String> {
+    match current_thor_action(arena) {
+        ragnarok::ThorAction::Descending => thor_descending_scene_rows(frame),
+        ragnarok::ThorAction::Deciding => {
+            let glow = ["✦", "✧", "✶", "✧"][frame % 4];
+            vec![
+                format!("        {glow} ᚱ  ᚢ  ᚾ  ᛖ {glow}        "),
+                "      .-----------------.     ".to_string(),
+                "      | task | field | cost | ".to_string(),
+                "      '-----------------'     ".to_string(),
+                "          \\  judgment  /      ".to_string(),
+                "           \\_  ___  _/        ".to_string(),
+                "             /_/ \\_\\          ".to_string(),
+            ]
+        }
+        _ => {
+            let spark = ["✦", "✧", "✶", "✧"][frame % 4];
+            vec![
+                format!("          {spark} THOR STANDS READY {spark}"),
+                "              _/\\_              ".to_string(),
+                "            _/ᛏ  ᛏ\\_            ".to_string(),
+                "            (  ᚨ ᚨ  )     __==# ".to_string(),
+                "             \\_===_/     /      ".to_string(),
+                "             /| ᛉ |\\   /       ".to_string(),
+                "            /_|___|_\\          ".to_string(),
+            ]
+        }
+    }
+}
+
 /// Pre-roster splash: Thor descends and the route visibly changes state.
 fn draw_ragnarok_summoning(
     f: &mut ratatui::Frame,
@@ -7963,27 +8012,22 @@ fn draw_ragnarok_summoning(
     theme: TerminalTheme,
 ) {
     let frame = arena_frame();
-    let bolt = ["      ⌁⌁", "     ⌁⌁ ", "    ⌁⌁  ", "     ⌁⌁ "][frame % 4];
     let mut lines = thor_action_lines(arena, theme, area.width);
     lines.push(Line::default());
-    let art = [
-        String::new(),
-        "          ___________".to_string(),
-        "         |  MJÖLNIR  |".to_string(),
-        format!("         |___________|{bolt}"),
-        "              | |".to_string(),
-        "              | |".to_string(),
-        "             (___)".to_string(),
-        String::new(),
-        match arena.phase {
-            ragnarok::Phase::Mustering => "« ravens scour the nine realms for champions »",
-            _ => "« Thor weighs the quest upon his scales »",
-        }
-        .to_string(),
-    ];
+    let art = thor_summoning_scene_rows(arena, frame);
     lines.extend(
         art.into_iter()
             .map(|l| Line::from(Span::styled(l, Style::default().fg(theme.accent))).centered()),
+    );
+    lines.push(
+        Line::from(Span::styled(
+            match arena.phase {
+                ragnarok::Phase::Mustering => "« the war horn calls champions to the arena »",
+                _ => "« Thor weighs the quest upon his scales »",
+            },
+            Style::default().fg(theme.muted),
+        ))
+        .centered(),
     );
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -13887,6 +13931,16 @@ mod tests {
             ragnarok_stage_height(arena, 200, 54),
             RAGNAROK_THOR_STRIP_HEIGHT + RAGNAROK_CARD_HEIGHT
         );
+    }
+
+    #[test]
+    fn thor_descending_scene_uses_viking_figure() {
+        let scene = thor_descending_scene_rows(0).join("\n");
+
+        assert!(scene.contains("_/\\_"), "scene:\n{scene}");
+        assert!(scene.contains("ᛏ"), "scene:\n{scene}");
+        assert!(scene.contains("__==#"), "scene:\n{scene}");
+        assert!(!scene.contains("MJÖLNIR"), "scene:\n{scene}");
     }
 
     #[test]
