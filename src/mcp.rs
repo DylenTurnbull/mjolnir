@@ -833,6 +833,7 @@ impl McpServer {
             env: resolved.env,
             agent_stderr: self.config.agent_stderr.clone(),
             fs_max_text_bytes: self.config.fs_max_text_bytes,
+            access_mode: acp::RuntimeAccessMode::Full,
         })
     }
 

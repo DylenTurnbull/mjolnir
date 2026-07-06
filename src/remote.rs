@@ -1372,6 +1372,7 @@ fn start_server_agent_session(
         env: agent.env,
         agent_stderr: None,
         fs_max_text_bytes,
+        access_mode: crate::acp::RuntimeAccessMode::Full,
     };
     let command_tx = runtime_cmd_tx.clone();
     let shutdown_tx = runtime_cmd_tx;

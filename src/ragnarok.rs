@@ -934,10 +934,16 @@ struct AgentHandle {
     config_options: Vec<SessionConfigOption>,
     config_targets: Vec<SessionConfigTarget>,
     abort: watch::Receiver<bool>,
+    access_mode: acp::RuntimeAccessMode,
 }
 
 impl AgentHandle {
-    async fn connect(launch: &Launch, cwd: &Path, abort: watch::Receiver<bool>) -> Result<Self> {
+    async fn connect(
+        launch: &Launch,
+        cwd: &Path,
+        abort: watch::Receiver<bool>,
+        access_mode: acp::RuntimeAccessMode,
+    ) -> Result<Self> {
         let (event_tx, events) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let runtime_cfg = acp::AcpRuntimeConfig {
@@ -949,6 +955,7 @@ impl AgentHandle {
             env: launch.env.clone(),
             agent_stderr: None,
             fs_max_text_bytes: acp::DEFAULT_FS_TEXT_BYTES,
+            access_mode,
         };
         let runtime = tokio::spawn(acp::run(runtime_cfg, event_tx, cmd_rx));
         let mut handle = Self {
@@ -958,6 +965,7 @@ impl AgentHandle {
             config_options: Vec::new(),
             config_targets: Vec::new(),
             abort,
+            access_mode,
         };
         handle.wait_session_started().await?;
         Ok(handle)
@@ -1002,8 +1010,17 @@ impl AgentHandle {
     }
 
     fn answer_permission(&self, prompt: crate::event::PermissionPrompt) {
-        let decision = choose_allow_option(&prompt.options)
-            .or_else(|| choose_reject_option(&prompt.options))
+        let allow = self.access_mode == acp::RuntimeAccessMode::Full
+            || matches!(
+                prompt.tool_call.fields.kind,
+                Some(ToolKind::Read | ToolKind::Search | ToolKind::Think)
+            );
+        let selected = if allow {
+            choose_allow_option(&prompt.options).or_else(|| choose_reject_option(&prompt.options))
+        } else {
+            choose_reject_option(&prompt.options)
+        };
+        let decision = selected
             .map(PermissionDecision::Selected)
             .unwrap_or(PermissionDecision::Cancelled);
         let _ = prompt.responder.send(decision);
@@ -1625,17 +1642,23 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
     report.worktree = Some(created.clone());
 
     set_state(FighterState::Connecting);
-    let mut handle =
-        match AgentHandle::connect(&fighter.launch, &created.session_cwd, merged.clone()).await {
-            Ok(h) => h,
-            Err(e) => {
-                return slain(
-                    report,
-                    set_state,
-                    kill_note(format!("never reached the arena: {e:#}")),
-                );
-            }
-        };
+    let mut handle = match AgentHandle::connect(
+        &fighter.launch,
+        &created.session_cwd,
+        merged.clone(),
+        acp::RuntimeAccessMode::Full,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            return slain(
+                report,
+                set_state,
+                kill_note(format!("never reached the arena: {e:#}")),
+            );
+        }
+    };
     if let Err(e) = handle.arm_model(&fighter.card.model_value).await {
         handle.dismiss().await;
         return slain(
@@ -1919,18 +1942,24 @@ async fn review(
         });
     };
     set_progress(ReviewProgress::Connecting);
-    let mut handle =
-        match AgentHandle::connect(&reviewer.launch, &defender_cwd, abort.clone()).await {
-            Ok(h) => h,
-            Err(e) => {
-                set_progress(ReviewProgress::Failed);
-                return ReviewReport {
-                    assignment,
-                    text: format!("(review not delivered: {e:#})"),
-                    delivered: false,
-                };
-            }
-        };
+    let mut handle = match AgentHandle::connect(
+        &reviewer.launch,
+        &defender_cwd,
+        abort.clone(),
+        acp::RuntimeAccessMode::ReadOnly,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            set_progress(ReviewProgress::Failed);
+            return ReviewReport {
+                assignment,
+                text: format!("(review not delivered: {e:#})"),
+                delivered: false,
+            };
+        }
+    };
     if let Err(e) = handle.arm_model(&reviewer.card.model_value).await {
         handle.dismiss().await;
         set_progress(ReviewProgress::Failed);
@@ -2059,9 +2088,14 @@ impl Thor {
         camp: worktree::CreatedWorktree,
         abort: watch::Receiver<bool>,
     ) -> Result<Self> {
-        let mut handle = AgentHandle::connect(&pick.launch, &camp.session_cwd, abort)
-            .await
-            .context("Thor could not descend (agent connect failed)")?;
+        let mut handle = AgentHandle::connect(
+            &pick.launch,
+            &camp.session_cwd,
+            abort,
+            acp::RuntimeAccessMode::Full,
+        )
+        .await
+        .context("Thor could not descend (agent connect failed)")?;
         handle
             .arm_model(&pick.card.model_value)
             .await
@@ -3137,6 +3171,10 @@ mod tests {
     }
 
     fn test_rig() -> TestRig {
+        test_rig_with_access(acp::RuntimeAccessMode::Full)
+    }
+
+    fn test_rig_with_access(access_mode: acp::RuntimeAccessMode) -> TestRig {
         let (event_tx, events) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (abort_tx, abort) = watch::channel(false);
@@ -3147,6 +3185,7 @@ mod tests {
             config_options: Vec::new(),
             config_targets: Vec::new(),
             abort,
+            access_mode,
         };
         TestRig {
             handle,
@@ -3313,6 +3352,42 @@ mod tests {
                 responder: ptx,
             });
         assert!(matches!(prx.await, Ok(PermissionDecision::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn read_only_review_permissions_reject_mutating_tools() {
+        use agent_client_protocol::schema::v1::{
+            PermissionOption, PermissionOptionKind, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let rig = test_rig_with_access(acp::RuntimeAccessMode::ReadOnly);
+
+        let mut fields = ToolCallUpdateFields::default();
+        fields.kind = Some(ToolKind::Edit);
+        let (ptx, prx) = tokio::sync::oneshot::channel();
+        rig.handle
+            .answer_permission(crate::event::PermissionPrompt {
+                tool_call: ToolCallUpdate::new("edit", fields),
+                options: vec![
+                    PermissionOption::new("deny", "Deny", PermissionOptionKind::RejectOnce),
+                    PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
+                ],
+                responder: ptx,
+            });
+        assert!(matches!(prx.await, Ok(PermissionDecision::Selected(id)) if id == "deny"));
+
+        let mut fields = ToolCallUpdateFields::default();
+        fields.kind = Some(ToolKind::Read);
+        let (ptx, prx) = tokio::sync::oneshot::channel();
+        rig.handle
+            .answer_permission(crate::event::PermissionPrompt {
+                tool_call: ToolCallUpdate::new("read", fields),
+                options: vec![
+                    PermissionOption::new("deny", "Deny", PermissionOptionKind::RejectOnce),
+                    PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
+                ],
+                responder: ptx,
+            });
+        assert!(matches!(prx.await, Ok(PermissionDecision::Selected(id)) if id == "allow"));
     }
 
     #[tokio::test]
