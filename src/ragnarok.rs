@@ -19,8 +19,9 @@
 //! battle. Dropping the UI receiver or firing the abort watch ends the battle
 //! and tears down every agent subprocess.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
@@ -29,6 +30,7 @@ use agent_client_protocol::schema::v1::{
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use serde::Deserialize;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{mpsc, watch};
 
 use crate::acp;
@@ -81,6 +83,9 @@ const RECENT_ACTIONS_CAP: usize = 30;
 
 /// Cap on a captured `git diff` artifact.
 const DIFF_CAPTURE_LIMIT: usize = 256 * 1024;
+/// Cap on captured diffstat/error streams before they reach the UI.
+const DIFFSTAT_CAPTURE_LIMIT: usize = 64 * 1024;
+const GIT_STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
 /// Diff budget inside a reviewer's prompt.
 const DIFF_FOR_REVIEW_LIMIT: usize = 24 * 1024;
 /// Per-champion diff budget inside Thor's judgment dossier.
@@ -353,7 +358,12 @@ async fn battle(
     emit(tx, RagnarokEvent::Phase(Phase::Mustering))?;
     feed(tx, None, "⚡ The Gjallarhorn sounds. Ragnarok begins.")?;
 
-    let user_cfg = Config::load(&cfg.config_path).unwrap_or_default();
+    let user_cfg = Config::load(&cfg.config_path)
+        .with_context(|| format!("load {}", cfg.config_path.display()))?;
+    let clean_cwd = cfg.cwd.clone();
+    tokio::task::spawn_blocking(move || worktree::ensure_clean_for_automation(&clean_cwd))
+        .await
+        .context("source tree cleanliness check failed")??;
     let store = ensure_scores(&cfg.score_store, &user_cfg).await;
     let pool = tokio::select! {
         pool = muster(cfg, &user_cfg, &store, tx) => pool?,
@@ -1880,17 +1890,17 @@ fn fight_prompt(task: &str) -> String {
 /// the rules).
 async fn capture_artifact(worktree_root: &Path, base_sha: &str) -> Result<CapturedArtifact> {
     let _ = git_capture(worktree_root, &["add", "-A", "-N"]).await;
-    let diffstat = git_capture(worktree_root, &["diff", "--stat", base_sha]).await?;
-    let diff = git_capture(worktree_root, &["diff", base_sha]).await?;
-    let truncated = diff.len() > DIFF_CAPTURE_LIMIT;
-    let diff = if truncated {
-        truncate_middle(&diff, DIFF_CAPTURE_LIMIT)
-    } else {
-        diff
-    };
+    let diffstat = git_capture_capped(
+        worktree_root,
+        &["diff", "--stat", base_sha],
+        DIFFSTAT_CAPTURE_LIMIT,
+    )
+    .await?;
+    let diff = git_capture_capped(worktree_root, &["diff", base_sha], DIFF_CAPTURE_LIMIT).await?;
+    let truncated = diff.truncated || diffstat.truncated;
     Ok(CapturedArtifact {
-        diffstat: diffstat.trim_end().to_string(),
-        diff,
+        diffstat: diffstat.text.trim_end().to_string(),
+        diff: diff.text,
         truncated,
     })
 }
@@ -1914,6 +1924,102 @@ async fn git_capture(dir: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+struct CappedOutput {
+    text: String,
+    truncated: bool,
+}
+
+async fn git_capture_capped(dir: &Path, args: &[&str], limit: usize) -> Result<CappedOutput> {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let joined = args.join(" ");
+    let mut child = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn git {joined} in {}", dir.display()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("git child stdout was not piped")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("git child stderr was not piped")?;
+    let stdout_task = tokio::spawn(read_capped_output(stdout, limit));
+    let stderr_task = tokio::spawn(read_capped_output(stderr, GIT_STDERR_CAPTURE_LIMIT));
+    let status = child
+        .wait()
+        .await
+        .with_context(|| format!("wait for git {joined} in {}", dir.display()))?;
+    let stdout = stdout_task
+        .await
+        .context("git stdout reader task failed")?
+        .context("read git stdout")?;
+    let stderr = stderr_task
+        .await
+        .context("git stderr reader task failed")?
+        .context("read git stderr")?;
+    if !status.success() {
+        bail!(
+            "git {joined} failed in {}: {}",
+            dir.display(),
+            stderr.text.trim()
+        );
+    }
+    Ok(stdout)
+}
+
+async fn read_capped_output<R>(mut reader: R, limit: usize) -> std::io::Result<CappedOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let head_budget = limit * 7 / 10;
+    let tail_budget = limit.saturating_sub(head_budget);
+    let mut head = Vec::with_capacity(head_budget);
+    let mut tail = VecDeque::with_capacity(tail_budget);
+    let mut total = 0usize;
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let read = reader.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read);
+        let mut chunk = &buf[..read];
+        if head.len() < head_budget {
+            let take = (head_budget - head.len()).min(chunk.len());
+            head.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+        }
+        if tail_budget > 0 {
+            for &byte in chunk {
+                if tail.len() == tail_budget {
+                    tail.pop_front();
+                }
+                tail.push_back(byte);
+            }
+        }
+    }
+
+    let tail: Vec<u8> = tail.into_iter().collect();
+    let stored = head.len() + tail.len();
+    let truncated = total > stored;
+    let mut out = head;
+    if truncated {
+        let excised = total.saturating_sub(stored);
+        out.extend_from_slice(format!("\n...[{excised} bytes excised]...\n").as_bytes());
+    }
+    out.extend_from_slice(&tail);
+    Ok(CappedOutput {
+        text: String::from_utf8_lossy(&out).into_owned(),
+        truncated,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2774,6 +2880,41 @@ mod tests {
         pool
     }
 
+    #[tokio::test]
+    async fn battle_surfaces_config_parse_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "not = valid = toml = @@@").expect("write config");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_abort_tx, abort_rx) = watch::channel(false);
+        let (_proceed_tx, proceed_rx) = watch::channel(false);
+
+        run_battle(
+            BattleConfig {
+                task: "fix the config".to_string(),
+                cwd: dir.path().to_path_buf(),
+                config_path,
+                score_store: ScoreStore::default(),
+            },
+            tx,
+            abort_rx,
+            proceed_rx,
+        )
+        .await;
+
+        let mut failed = None;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                RagnarokEvent::Failed(message) => failed = Some(message),
+                RagnarokEvent::Done => break,
+                _ => {}
+            }
+        }
+        let failed = failed.expect("failure event");
+        assert!(failed.contains("parse"), "failure: {failed}");
+        assert!(failed.contains("config.toml"), "failure: {failed}");
+    }
+
     #[test]
     fn select_prefers_distinct_agents_first() {
         let pool = sorted(vec![
@@ -3122,6 +3263,23 @@ mod tests {
         assert!(out.contains("excised"));
         // Must not panic and must remain valid UTF-8 (guaranteed by String).
         assert!(out.chars().count() > 0);
+    }
+
+    #[tokio::test]
+    async fn capped_output_keeps_head_and_tail() {
+        use tokio::io::AsyncWriteExt;
+
+        let input = format!("{}MIDDLE{}", "H".repeat(100), "T".repeat(100));
+        let (mut writer, reader) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            writer.write_all(input.as_bytes()).await.expect("write");
+        });
+
+        let out = read_capped_output(reader, 60).await.expect("read");
+        assert!(out.truncated, "output should be marked truncated");
+        assert!(out.text.starts_with("HHHH"), "out: {}", out.text);
+        assert!(out.text.ends_with("TTTT"), "out: {}", out.text);
+        assert!(out.text.contains("bytes excised"), "out: {}", out.text);
     }
 
     #[test]

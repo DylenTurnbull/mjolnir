@@ -126,6 +126,43 @@ pub fn create_for_automation(cwd: &Path, name_hint: &str) -> Result<CreatedWorkt
     })
 }
 
+/// Automated worktrees are created from committed `HEAD`. Refuse a dirty source
+/// tree rather than running agents against a different snapshot than the user
+/// currently sees.
+pub fn ensure_clean_for_automation(cwd: &Path) -> Result<()> {
+    let project_root = git_toplevel(cwd)?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&project_root)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .with_context(|| format!("run git status in {}", project_root.display()))?;
+    if !output.status.success() {
+        bail!(
+            "git status failed in {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let status = String::from_utf8_lossy(&output.stdout);
+    if status.trim().is_empty() {
+        return Ok(());
+    }
+    let shown: Vec<&str> = status.lines().take(20).collect();
+    let suffix = if status.lines().count() > shown.len() {
+        "\n  ... more dirty paths omitted"
+    } else {
+        ""
+    };
+    bail!(
+        "Ragnarok requires a clean git tree because automated worktrees are forged from committed HEAD.\n\
+         Commit or stash local changes before running /ragnarok.\n\
+         Dirty paths:\n  {}{}",
+        shown.join("\n  "),
+        suffix
+    )
+}
+
 /// Remove a linked worktree created by an automated flow (Thor's camp).
 /// Same cleanup as the interactive exit prompt, without the prompt.
 pub fn remove_automation_worktree(project_root: &Path, worktree_root: &Path) -> Result<()> {
@@ -737,6 +774,34 @@ mod tests {
         );
         // No prompting means the parent checkout's .gitignore is untouched.
         assert!(!dir.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn automation_cleanliness_allows_clean_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("file.txt"), "hello").expect("write file");
+        run_git(dir.path(), [OsStr::new("add"), OsStr::new(".")]).expect("git add");
+        commit_all(dir.path());
+
+        ensure_clean_for_automation(dir.path()).expect("clean repo");
+    }
+
+    #[test]
+    fn automation_cleanliness_rejects_dirty_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("file.txt"), "hello").expect("write file");
+        run_git(dir.path(), [OsStr::new("add"), OsStr::new(".")]).expect("git add");
+        commit_all(dir.path());
+        std::fs::write(dir.path().join("file.txt"), "changed").expect("modify tracked");
+        std::fs::write(dir.path().join("new.txt"), "untracked").expect("write untracked");
+
+        let err = ensure_clean_for_automation(dir.path()).expect_err("dirty repo rejected");
+        let text = format!("{err:#}");
+        assert!(text.contains("clean git tree"), "err: {text}");
+        assert!(text.contains("file.txt"), "err: {text}");
+        assert!(text.contains("new.txt"), "err: {text}");
     }
 
     #[test]
