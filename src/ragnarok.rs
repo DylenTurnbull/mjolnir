@@ -24,6 +24,7 @@ pub use thor::{RagnarokConfig, RagnarokTimeouts, spawn};
 
 pub const MIN_COMPETITORS: usize = 2;
 pub const MAX_COMPETITORS: usize = 10;
+const FEED_CAP: usize = 200;
 
 /// Tournament-wide phase. Drives the roster header/status line and which
 /// combat-scene visual is picked. Each combatant's own `CombatantStatus`
@@ -80,20 +81,6 @@ pub enum CombatantStatus {
     },
 }
 
-impl CombatantStatus {
-    /// Short status word for the roster row.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Spawning => "spawning",
-            Self::Implementing => "implementing",
-            Self::Waiting => "waiting",
-            Self::Judged { won: true } => "\u{2605} winner",
-            Self::Judged { won: false } => "judged",
-            Self::Failed { .. } => "\u{26a0} failed",
-        }
-    }
-}
-
 /// One roster row.
 #[derive(Debug, Clone)]
 pub struct Combatant {
@@ -118,6 +105,12 @@ pub struct Combatant {
     pub activity: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RagnarokFeedEntry {
+    pub slot: Option<String>,
+    pub text: String,
+}
+
 /// Full `/ragnarok` overlay state. One instance lives at
 /// `AppState.ragnarok` for the duration of one tournament.
 #[derive(Debug)]
@@ -127,6 +120,9 @@ pub struct RagnarokState {
     /// Roster, insertion order == the order Thor announced them in. Empty
     /// during `Assessing`.
     pub combatants: Vec<Combatant>,
+    /// The tournament feed rendered at the bottom of the arena. Slot-tagged
+    /// entries inherit that competitor's color.
+    pub feed: Vec<RagnarokFeedEntry>,
     /// Set only in `AwaitingUserPick`: the two finalist slots plus Thor's
     /// own reasoning for why it couldn't pick outright.
     pub finalists: Option<(String, String, String)>,
@@ -134,6 +130,8 @@ pub struct RagnarokState {
     /// user's resolution of `finalists`.
     pub winner: Option<String>,
     pub verdict_summary: Option<String>,
+    pub review_assessments: Vec<event::ReviewAssessment>,
+    pub fell_back_reason: Option<String>,
     /// Keyboard cursor into `combatants` (roster view) or `finalists`
     /// (decision panel, 0 or 1).
     pub roster_cursor: usize,
@@ -144,6 +142,7 @@ pub struct RagnarokState {
     /// this only exists so a second Esc during that window is a no-op
     /// rather than sending `Cancel` twice.
     pub cancel_requested: bool,
+    pub esc_armed: bool,
     pub started_at: Instant,
     /// Send `RagnarokCommand`s to the running orchestration task. `None`
     /// once the tournament has concluded/been cancelled and the task has
@@ -158,12 +157,16 @@ impl RagnarokState {
             task,
             phase: RagnarokPhase::Assessing,
             combatants: Vec::new(),
+            feed: Vec::new(),
             finalists: None,
             winner: None,
             verdict_summary: None,
+            review_assessments: Vec::new(),
+            fell_back_reason: None,
             roster_cursor: 0,
             decision_cursor: 0,
             cancel_requested: false,
+            esc_armed: false,
             started_at: Instant::now(),
             cmd_tx: Some(cmd_tx),
         }
@@ -172,5 +175,24 @@ impl RagnarokState {
     /// Find a combatant by slot for in-place status updates.
     pub fn combatant_mut(&mut self, slot: &str) -> Option<&mut Combatant> {
         self.combatants.iter_mut().find(|c| c.slot == slot)
+    }
+
+    pub fn combatant_index(&self, slot: &str) -> Option<usize> {
+        self.combatants.iter().position(|c| c.slot == slot)
+    }
+
+    pub fn combatant(&self, slot: &str) -> Option<&Combatant> {
+        self.combatants.iter().find(|c| c.slot == slot)
+    }
+
+    pub fn push_feed(&mut self, slot: Option<String>, text: impl Into<String>) {
+        self.feed.push(RagnarokFeedEntry {
+            slot,
+            text: text.into(),
+        });
+        if self.feed.len() > FEED_CAP {
+            let remove = self.feed.len() - FEED_CAP;
+            self.feed.drain(0..remove);
+        }
     }
 }

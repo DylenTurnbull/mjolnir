@@ -53,6 +53,7 @@ use crate::event::{PermissionDecision, PermissionPrompt, PromptImage, UiCommand,
 use crate::notifications::TerminalNotificationBackend;
 use crate::palette::TerminalTheme;
 use crate::ragnarok;
+use crate::ragnarok_sprites::{self, SpriteKind};
 use crate::speech::{dictation_error_message, run_dictation};
 use crate::spinner::SpinnerStyle;
 use crate::term::TrackedBackend;
@@ -3030,7 +3031,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         } else if state.ragnarok.is_some() {
             state.record_status_message(
                 StatusKind::Warning,
-                "a ragnarok tournament is already running -- press Esc to cancel it first",
+                "a ragnarok tournament is already running -- press Esc twice to cancel it first",
             );
         } else {
             // Ragnarok spins up its own independent ACP connections (Thor,
@@ -3180,48 +3181,80 @@ fn handle_ragnarok_key(
     let Some(rag) = state.ragnarok.as_mut() else {
         return TerminalRequest::None;
     };
-    match (modifiers, code) {
-        (_, KeyCode::Esc | KeyCode::Enter)
-            if matches!(
-                rag.phase,
-                ragnarok::RagnarokPhase::Concluded | ragnarok::RagnarokPhase::Cancelled
-            ) =>
-        {
-            state.ragnarok = None;
-            inline_repair_request(mode)
+    let terminal = matches!(
+        rag.phase,
+        ragnarok::RagnarokPhase::Concluded | ragnarok::RagnarokPhase::Cancelled
+    );
+
+    if modifiers == KeyModifiers::CONTROL && matches!(code, KeyCode::Char('c')) {
+        if let Some(cmd_tx) = rag.cmd_tx.take() {
+            let _ = cmd_tx.send(ragnarok::RagnarokCommand::Cancel);
         }
-        (_, KeyCode::Esc) => {
-            // Optimistic: flip to Cancelled locally right away rather than
-            // waiting for the orchestrator's own teardown round trip (that
-            // happens async regardless of what this handler does) -- the
-            // user watching "cancelling..." for however long N worktree/
-            // connection teardowns take is a worse experience than an
-            // immediate, confidently-correct local transition.
-            if let Some(cmd_tx) = rag.cmd_tx.take() {
-                let _ = cmd_tx.send(ragnarok::RagnarokCommand::Cancel);
+        state.ragnarok = None;
+        return inline_repair_request(mode);
+    }
+
+    let disarm = !matches!(code, KeyCode::Esc);
+    let request = match code {
+        KeyCode::Esc if terminal => {
+            state.ragnarok = None;
+            return inline_repair_request(mode);
+        }
+        KeyCode::Enter if terminal => {
+            state.ragnarok = None;
+            return inline_repair_request(mode);
+        }
+        KeyCode::Esc => {
+            if rag.esc_armed {
+                if let Some(cmd_tx) = rag.cmd_tx.take() {
+                    let _ = cmd_tx.send(ragnarok::RagnarokCommand::Cancel);
+                }
+                rag.cancel_requested = true;
+                rag.esc_armed = false;
+                rag.phase = ragnarok::RagnarokPhase::Cancelled;
+                rag.push_feed(None, "tournament cancelled by user");
+                state.record_status_message(StatusKind::Info, "ragnarok tournament cancelled");
+            } else {
+                rag.esc_armed = true;
+                state.record_status_message(StatusKind::Info, "press Esc again to cancel ragnarok");
             }
-            rag.cancel_requested = true;
-            rag.phase = ragnarok::RagnarokPhase::Cancelled;
-            state.record_status_message(StatusKind::Info, "ragnarok tournament cancelled");
             TerminalRequest::None
         }
-        (_, KeyCode::Up | KeyCode::Char('k'))
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('[')
             if rag.phase == ragnarok::RagnarokPhase::AwaitingUserPick =>
         {
             rag.decision_cursor = rag.decision_cursor.saturating_sub(1);
             TerminalRequest::None
         }
-        (_, KeyCode::Down | KeyCode::Char('j'))
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(']')
             if rag.phase == ragnarok::RagnarokPhase::AwaitingUserPick =>
         {
             rag.decision_cursor = (rag.decision_cursor + 1).min(1);
             TerminalRequest::None
         }
-        (_, KeyCode::Enter) if rag.phase == ragnarok::RagnarokPhase::AwaitingUserPick => {
+        KeyCode::Up | KeyCode::Char('k')
+            if rag.phase == ragnarok::RagnarokPhase::AwaitingUserPick =>
+        {
+            rag.decision_cursor = rag.decision_cursor.saturating_sub(1);
+            TerminalRequest::None
+        }
+        KeyCode::Down | KeyCode::Char('j')
+            if rag.phase == ragnarok::RagnarokPhase::AwaitingUserPick =>
+        {
+            rag.decision_cursor = (rag.decision_cursor + 1).min(1);
+            TerminalRequest::None
+        }
+        KeyCode::Char(c @ '1'..='9') if rag.phase == ragnarok::RagnarokPhase::AwaitingUserPick => {
+            let picked = (c as u8 - b'1') as usize;
+            if picked < 2 {
+                rag.decision_cursor = picked;
+            }
+            TerminalRequest::None
+        }
+        KeyCode::Enter if rag.phase == ragnarok::RagnarokPhase::AwaitingUserPick => {
             // Resolved entirely client-side: by the time a pick is
             // possible, Thor's turn has already ended and the backend has
-            // nothing further to do (see `ragnarok::thor`'s handling of
-            // `RagnarokCommand::ResolvePick`).
+            // nothing further to do.
             if let Some((a, b, _)) = rag.finalists.clone() {
                 let winner = if rag.decision_cursor == 0 { a } else { b };
                 for c in &mut rag.combatants {
@@ -3229,6 +3262,7 @@ fn handle_ragnarok_key(
                         won: c.slot == winner,
                     };
                 }
+                rag.push_feed(None, format!("you picked {winner} as the winner"));
                 state.record_status_message(
                     StatusKind::Info,
                     format!("you picked {winner} as the winner"),
@@ -3240,18 +3274,39 @@ fn handle_ragnarok_key(
             }
             inline_repair_request(mode)
         }
-        (_, KeyCode::Up | KeyCode::Char('k')) => {
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('[') => {
             rag.roster_cursor = rag.roster_cursor.saturating_sub(1);
             TerminalRequest::None
         }
-        (_, KeyCode::Down | KeyCode::Char('j')) => {
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(']') => {
             if rag.roster_cursor + 1 < rag.combatants.len() {
                 rag.roster_cursor += 1;
             }
             TerminalRequest::None
         }
+        KeyCode::Up | KeyCode::Char('k') => {
+            rag.roster_cursor = rag.roster_cursor.saturating_sub(1);
+            TerminalRequest::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if rag.roster_cursor + 1 < rag.combatants.len() {
+                rag.roster_cursor += 1;
+            }
+            TerminalRequest::None
+        }
+        KeyCode::Char(c @ '1'..='9') => {
+            let picked = (c as u8 - b'1') as usize;
+            if picked < rag.combatants.len() {
+                rag.roster_cursor = picked;
+            }
+            TerminalRequest::None
+        }
         _ => TerminalRequest::None,
+    };
+    if disarm && let Some(rag) = state.ragnarok.as_mut() {
+        rag.esc_armed = false;
     }
+    request
 }
 
 /// Persist the theme + spinner accepted in the `/mjconfig` menu. The live UI is
@@ -3407,382 +3462,711 @@ fn frame_index_at(millis: u128, offset: usize, frame_count: usize) -> usize {
     ((millis / 180) as usize + offset) % frame_count
 }
 
+fn fit_width(text: impl Into<String>, width: usize) -> String {
+    truncate_text_to_width(text.into(), width.min(u16::MAX as usize) as u16)
+}
+
+fn ragnarok_clock(rag: &ragnarok::RagnarokState) -> String {
+    let secs = rag.started_at.elapsed().as_secs();
+    if secs >= 3600 {
+        format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    } else {
+        format!("{:02}:{:02}", secs / 60, secs % 60)
+    }
+}
+
+fn ragnarok_phase_banner(rag: &ragnarok::RagnarokState) -> &'static str {
+    match rag.phase {
+        ragnarok::RagnarokPhase::Assessing => "THOR SIZES UP THE TASK",
+        ragnarok::RagnarokPhase::Implementing => "THE FORGES ARE LIT",
+        ragnarok::RagnarokPhase::Reviewing => "ADVERSARIAL REVIEW",
+        ragnarok::RagnarokPhase::Judging => "THOR SITS IN JUDGMENT",
+        ragnarok::RagnarokPhase::AwaitingUserPick => "SPLIT DECISION",
+        ragnarok::RagnarokPhase::Concluded => "VERDICT",
+        ragnarok::RagnarokPhase::Cancelled => "TOURNAMENT ENDED",
+    }
+}
+
+fn fighter_color(theme: TerminalTheme, id: usize) -> Color {
+    let cycle = [
+        theme.primary,
+        theme.secondary,
+        theme.success,
+        theme.warning,
+        theme.tool,
+        theme.accent,
+        theme.user,
+        theme.terminal,
+        theme.error,
+        theme.quote,
+    ];
+    cycle[id % cycle.len()]
+}
+
+fn ragnarok_banner_line(
+    rag: &ragnarok::RagnarokState,
+    theme: TerminalTheme,
+    width: u16,
+) -> Line<'static> {
+    let bolts = ["\u{26a1}", "\u{25c6}", "\u{26a1}", "\u{25c7}"];
+    let bolt = bolts[ragnarok_frame_index(0, bolts.len())];
+    let text = format!(
+        "{bolt} RAGNAROK - {} - {} {bolt}",
+        ragnarok_phase_banner(rag),
+        ragnarok_clock(rag)
+    );
+    let color = match rag.phase {
+        ragnarok::RagnarokPhase::Cancelled => theme.error,
+        ragnarok::RagnarokPhase::Concluded => theme.success,
+        _ => theme.warning,
+    };
+    Line::from(Span::styled(
+        fit_width(text, width as usize),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))
+    .centered()
+}
+
+fn ragnarok_footer_line(
+    rag: &ragnarok::RagnarokState,
+    theme: TerminalTheme,
+    width: u16,
+) -> Line<'static> {
+    let text = if rag.esc_armed {
+        "Esc again to cancel tournament (any other key stays)"
+    } else {
+        match rag.phase {
+            ragnarok::RagnarokPhase::Concluded | ragnarok::RagnarokPhase::Cancelled => {
+                "Enter/Esc close - left/right inspect"
+            }
+            ragnarok::RagnarokPhase::AwaitingUserPick => {
+                "left/right or 1/2 choose finalist - Enter confirm - Esc Esc cancel"
+            }
+            _ => "left/right select - 1-9 jump - Esc Esc cancel",
+        }
+    };
+    let style = if rag.esc_armed {
+        Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    Line::from(Span::styled(fit_width(text, width as usize), style)).centered()
+}
+
 fn draw_ragnarok_overlay(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let Some(rag) = state.ragnarok.as_ref() else {
         return;
     };
     let theme = state.theme;
+    f.render_widget(Clear, area);
 
-    if area.width.min(70) < 50 || area.height.min(20) < 14 {
-        return;
-    }
-    let width = area.width.saturating_sub(4).clamp(50, 100);
-    let height = area.height.saturating_sub(2).clamp(14, 34);
-    let rect = crate::term::centered_rect(area, width, height);
-    f.render_widget(Clear, rect);
-
-    let block = Block::default()
-        .title(format!(" ragnarok \u{2014} {} ", rag.phase.label()))
-        .borders(Borders::ALL)
-        .style(Style::default().fg(theme.text));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(4),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-    f.render_widget(
-        Paragraph::new(format!(
-            "{}  \u{00b7}  {} elapsed",
-            truncate_text_to_width(rag.task.clone(), rows[0].width.saturating_sub(20)),
-            format_duration(rag.started_at.elapsed())
-        ))
-        .style(Style::default().fg(theme.muted)),
-        rows[0],
-    );
-
-    if rag.phase == ragnarok::RagnarokPhase::AwaitingUserPick {
-        draw_ragnarok_decision_panel(f, rows[1], theme, rag);
-        return;
-    }
-
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(rows[1]);
-
-    draw_ragnarok_roster(f, cols[0], theme, rag);
-    draw_ragnarok_scene(f, cols[1], theme, rag);
-
-    let footer = match rag.phase {
-        ragnarok::RagnarokPhase::Concluded | ragnarok::RagnarokPhase::Cancelled => {
-            "Enter/Esc dismiss"
-        }
-        _ => "\u{2191}/\u{2193} select \u{00b7} Esc cancel tournament",
-    };
-    f.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(theme.muted)),
-        rows[2],
-    );
-}
-
-/// True for a status that represents an actively-running connection --
-/// this is what earns a live spinner glyph and an activity line in the
-/// roster, as opposed to a settled/terminal status.
-fn combatant_is_active(status: &ragnarok::CombatantStatus) -> bool {
-    matches!(
-        status,
-        ragnarok::CombatantStatus::Spawning
-            | ragnarok::CombatantStatus::Implementing
-            | ragnarok::CombatantStatus::Waiting
-    )
-}
-
-/// Compact rotating glyph for a per-row "this connection is alive"
-/// indicator -- deliberately its own small cycle rather than reusing
-/// `SpinnerStyle::current_frame()`, whose frames are a full 12-column
-/// strip meant for the header, not a narrow roster row.
-const ROSTER_SPIN: [char; 4] = ['\u{25d0}', '\u{25d3}', '\u{25d1}', '\u{25d2}'];
-
-fn roster_spin_glyph(offset: usize) -> char {
-    ROSTER_SPIN[ragnarok_frame_index(offset, ROSTER_SPIN.len())]
-}
-
-fn draw_ragnarok_roster(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    theme: TerminalTheme,
-    rag: &ragnarok::RagnarokState,
-) {
-    if rag.combatants.is_empty() {
+    if area.width < 10 || area.height < 4 {
         f.render_widget(
-            Paragraph::new(format!(
-                "{} thor is picking competitors...",
-                roster_spin_glyph(0)
-            ))
-            .style(Style::default().fg(theme.muted)),
+            Paragraph::new(Line::from(Span::styled(
+                "RAGNAROK",
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ))),
             area,
         );
         return;
     }
-    let mut lines: Vec<Line> = Vec::with_capacity(rag.combatants.len());
-    for (idx, c) in rag.combatants.iter().enumerate() {
-        let marker = if idx == rag.roster_cursor {
-            "\u{25b6} "
-        } else {
-            "  "
-        };
-        let elapsed = format_duration(c.started_at.elapsed());
-        let style = match &c.status {
-            ragnarok::CombatantStatus::Failed { .. } => Style::default().fg(theme.error),
-            ragnarok::CombatantStatus::Judged { won: true } => Style::default()
-                .fg(theme.success)
-                .add_modifier(Modifier::BOLD),
-            _ => Style::default().fg(theme.text),
-        };
-        // Telemetry can tell us the review phase has started
-        // tournament-wide, but not honestly attribute a specific review
-        // connection back to a specific combatant -- so a combatant
-        // simply reads "reviewing" for the whole phase rather than the
-        // (indistinguishable-from-here) "waiting" `Waiting` label it'd
-        // otherwise show.
-        let status_label = if rag.phase == ragnarok::RagnarokPhase::Reviewing
-            && matches!(c.status, ragnarok::CombatantStatus::Waiting)
-        {
-            "reviewing"
-        } else {
-            c.status.label()
-        };
-        let active = combatant_is_active(&c.status);
-        // A live glyph on every active row, staggered by roster index, is
-        // the single biggest lever for "this doesn't look frozen" -- it's
-        // driven purely by wall-clock time, so it never needs a fresh
-        // event to keep moving, unlike the status text next to it.
-        let glyph = if active { roster_spin_glyph(idx) } else { ' ' };
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{marker}{glyph} {:<4} {}/{}  {} elo  {:<13} {}",
-                c.slot, c.agent_label, c.model_label, c.elo, status_label, elapsed
-            ),
-            style,
-        )));
-        if let ragnarok::CombatantStatus::Failed { message } = &c.status {
-            lines.push(Line::from(Span::styled(
-                format!("        \u{2514} {message}"),
-                Style::default().fg(theme.muted),
-            )));
-        } else if active && let Some(activity) = &c.activity {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "        \u{2514} {}",
-                    truncate_text_to_width(activity.clone(), area.width.saturating_sub(10))
-                ),
-                Style::default().fg(theme.muted),
-            )));
-        }
-    }
-    f.render_widget(Paragraph::new(lines), area);
-}
 
-/// A figure with its arms up (mid-swing) or down (impact) -- alternating
-/// this per figure, offset by index, is what makes a row of figures read
-/// as genuinely hammering rather than a static picture of hammering.
-fn hammer_figure(arms_up: bool) -> &'static str {
-    if arms_up { "/o\\" } else { "\\o/" }
-}
-
-/// Caps how many individual figures/slots the scene draws explicitly --
-/// beyond this it falls back to a count, so a 10-competitor tournament
-/// doesn't overflow a ~55%-width panel with unreadable art.
-const SCENE_FIGURE_CAP: usize = 6;
-
-/// One line of `n` hammering figures (or reviewer pairs), each
-/// independently animated by wall-clock time, offset by its own index so
-/// they visibly desync rather than pulsing in lockstep -- reinforces that
-/// competitors are genuinely independent (constraint #10), not decoration
-/// for its own sake.
-fn hammer_row(n: usize) -> String {
-    // Offset by `i` (not a multiple of the 2-frame cycle length!) so
-    // consecutive figures land on opposite parity and visibly alternate --
-    // offsetting by an even number here would cancel out mod 2, leaving
-    // every figure on the same frame.
-    (0..n.min(SCENE_FIGURE_CAP))
-        .map(|i| hammer_figure(ragnarok_frame_index(i, 2) == 0))
-        .collect::<Vec<_>>()
-        .join("   ")
-}
-
-fn draw_ragnarok_scene(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    theme: TerminalTheme,
-    rag: &ragnarok::RagnarokState,
-) {
-    let accent = Style::default().fg(theme.accent);
-    let muted = Style::default().fg(theme.muted);
-    let mut lines: Vec<Line> = Vec::new();
-    let push = |lines: &mut Vec<Line>, s: String, style: Style| {
-        lines.push(Line::from(Span::styled(s, style)));
-    };
-
-    match rag.phase {
-        ragnarok::RagnarokPhase::Assessing => {
-            const ORBIT: [char; 4] = ['\u{25d0}', '\u{25d3}', '\u{25d1}', '\u{25d2}'];
-            let spin = ORBIT[ragnarok_frame_index(0, ORBIT.len())];
-            push(
-                &mut lines,
-                "  \u{26a1} THOR SIZES UP THE TASK \u{26a1}".to_string(),
-                accent,
-            );
-            lines.push(Line::from(""));
-            push(
-                &mut lines,
-                format!("        {spin}  weighing options  {spin}"),
-                accent,
-            );
-            push(
-                &mut lines,
-                "     assembling the roster...".to_string(),
-                muted,
-            );
-        }
-        ragnarok::RagnarokPhase::Implementing => {
-            let n = rag.combatants.len().max(1);
-            push(
-                &mut lines,
-                " \u{26a1} RAGNAROK: THE FORGES ARE LIT \u{26a1}".to_string(),
-                accent,
-            );
-            lines.push(Line::from(""));
-            push(&mut lines, format!("   {}", hammer_row(n)), accent);
-            const SPARK: [&str; 3] = [
-                "\u{2728}    \u{2728}",
-                "  \u{2728}\u{2728}  ",
-                "    \u{2728}    ",
-            ];
-            let spark = SPARK[ragnarok_frame_index(1, SPARK.len())];
-            push(&mut lines, format!("    {spark}"), muted);
-            push(
-                &mut lines,
-                "  each competitor hammers away...".to_string(),
-                muted,
-            );
-        }
-        ragnarok::RagnarokPhase::Reviewing => {
-            let n = rag.combatants.len().clamp(2, SCENE_FIGURE_CAP);
-            push(
-                &mut lines,
-                "   \u{2694} ADVERSARIAL REVIEW \u{2694}".to_string(),
-                accent,
-            );
-            lines.push(Line::from(""));
-            let eyes = ["\u{1f440}", "\u{1f50d}"];
-            let chain: Vec<String> = (0..n)
-                .map(|i| {
-                    let eye = eyes[ragnarok_frame_index(i, eyes.len())];
-                    format!("c{} {eye}", i + 1)
-                })
-                .collect();
-            push(&mut lines, format!(" {}", chain.join(" \u{2192} ")), accent);
-            lines.push(Line::from(""));
-            push(
-                &mut lines,
-                "  no one reviews their own work...".to_string(),
-                muted,
-            );
-        }
-        ragnarok::RagnarokPhase::Judging => {
-            const SCALE: [&str; 3] = [
-                "\u{2696}\u{fe0f} tips left ",
-                "\u{2696}\u{fe0f}  balanced  ",
-                " tips right \u{2696}\u{fe0f}",
-            ];
-            let tip = SCALE[ragnarok_frame_index(0, SCALE.len())];
-            const BOLT: [&str; 2] = ["\u{26a1}", "\u{00b7}"];
-            let bolt = BOLT[ragnarok_frame_index(0, BOLT.len())];
-            push(
-                &mut lines,
-                "     \u{2696} THOR JUDGES \u{2696}".to_string(),
-                accent,
-            );
-            push(&mut lines, format!("          {bolt}"), accent);
-            push(&mut lines, format!("      {tip}"), accent);
-            lines.push(Line::from(""));
-            push(
-                &mut lines,
-                " weighing honesty and validity...".to_string(),
-                muted,
-            );
-        }
-        ragnarok::RagnarokPhase::Concluded => {
-            const SHIMMER: [&str; 6] = [
-                "\u{00b7}", "\u{2219}", "\u{2022}", "\u{25cf}", "\u{2022}", "\u{2219}",
-            ];
-            let glow = SHIMMER[ragnarok_frame_index(0, SHIMMER.len())];
-            push(
-                &mut lines,
-                format!("      {glow} \u{1f3c6} VICTORY \u{1f3c6} {glow}"),
-                accent,
-            );
-            lines.push(Line::from(""));
-            push(&mut lines, "  a winner has been forged.".to_string(), muted);
-        }
-        ragnarok::RagnarokPhase::Cancelled | ragnarok::RagnarokPhase::AwaitingUserPick => {
-            push(&mut lines, "     tournament ended.".to_string(), muted);
-        }
-    }
-
-    f.render_widget(Paragraph::new(lines), area);
-}
-
-fn draw_ragnarok_decision_panel(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    theme: TerminalTheme,
-    rag: &ragnarok::RagnarokState,
-) {
-    let Some((a, b, reasoning)) = rag.finalists.as_ref() else {
-        return;
-    };
+    let feed_height = (area.height / 4).clamp(3, 9);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(4),
+            Constraint::Length(feed_height),
             Constraint::Length(1),
         ])
         .split(area);
 
     f.render_widget(
-        Paragraph::new("Thor couldn't separate these two. Reasoning:")
-            .style(Style::default().fg(theme.text)),
+        Paragraph::new(ragnarok_banner_line(rag, theme, rows[0].width)),
         rows[0],
     );
-    f.render_widget(
-        Paragraph::new(reasoning.as_str())
-            .wrap(Wrap { trim: true })
-            .style(Style::default().fg(theme.muted)),
-        rows[1],
-    );
+    let task_line = Line::from(vec![
+        Span::styled("quest: ", Style::default().fg(theme.muted)),
+        Span::styled(
+            fit_width(
+                rag.task.replace('\n', " "),
+                rows[1].width.saturating_sub(7) as usize,
+            ),
+            Style::default().fg(theme.text),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(task_line), rows[1]);
 
-    let option_lines: Vec<Line> = [a, b]
+    match rag.phase {
+        ragnarok::RagnarokPhase::Assessing if rag.combatants.is_empty() => {
+            draw_ragnarok_summoning(f, rows[2], rag, theme)
+        }
+        ragnarok::RagnarokPhase::AwaitingUserPick
+        | ragnarok::RagnarokPhase::Concluded
+        | ragnarok::RagnarokPhase::Cancelled => draw_ragnarok_verdict(f, rows[2], rag, theme),
+        _ => draw_ragnarok_combatants(f, rows[2], rag, theme),
+    }
+
+    draw_ragnarok_feed(f, rows[3], rag, theme);
+    f.render_widget(
+        Paragraph::new(ragnarok_footer_line(rag, theme, rows[4].width)),
+        rows[4],
+    );
+}
+
+fn draw_ragnarok_summoning(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    rag: &ragnarok::RagnarokState,
+    theme: TerminalTheme,
+) {
+    let frame = ragnarok_frame_index(0, 4);
+    let pulse = ["  .  ", " .*. ", ".***.", " .*. "][frame];
+    let art = [
+        String::new(),
+        "          ___________".to_string(),
+        "         |  MJOLNIR  |".to_string(),
+        format!("         |___________| {pulse}"),
+        "              | |".to_string(),
+        "              | |".to_string(),
+        "             (___)".to_string(),
+        String::new(),
+        match rag.phase {
+            ragnarok::RagnarokPhase::Assessing => "thor is choosing the field",
+            ragnarok::RagnarokPhase::Judging => "thor weighs the reviews",
+            _ => rag.phase.label(),
+        }
+        .to_string(),
+    ];
+    let lines: Vec<Line> = art
         .into_iter()
-        .enumerate()
-        .map(|(idx, slot)| {
-            let combatant = rag.combatants.iter().find(|c| &c.slot == slot);
-            let marker = if idx == rag.decision_cursor {
-                "\u{25b6} "
+        .map(|line| Line::from(Span::styled(line, Style::default().fg(theme.accent))).centered())
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_ragnarok_combatants(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    rag: &ragnarok::RagnarokState,
+    theme: TerminalTheme,
+) {
+    if rag.combatants.is_empty() {
+        draw_ragnarok_summoning(f, area, rag, theme);
+        return;
+    }
+    let n = rag.combatants.len() as u16;
+    const CARD_MIN_WIDTH: u16 = 24;
+    const CARD_HEIGHT: u16 = 12;
+    let cols = (area.width / CARD_MIN_WIDTH).clamp(1, n);
+    let rows = n.div_ceil(cols);
+
+    if area.height < rows * CARD_HEIGHT {
+        let lines: Vec<Line> = rag
+            .combatants
+            .iter()
+            .enumerate()
+            .take(area.height as usize)
+            .map(|(idx, combatant)| compact_combatant_line(rag, combatant, idx, theme, area.width))
+            .collect();
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let row_rects = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            std::iter::repeat_n(Constraint::Length(CARD_HEIGHT), rows as usize)
+                .chain(std::iter::once(Constraint::Min(0)))
+                .collect::<Vec<_>>(),
+        )
+        .split(area);
+
+    for row in 0..rows {
+        let start = (row * cols) as usize;
+        let in_row = rag
+            .combatants
+            .len()
+            .saturating_sub(start)
+            .min(cols as usize);
+        if in_row == 0 {
+            break;
+        }
+        let col_rects = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(vec![Constraint::Ratio(1, in_row as u32); in_row])
+            .split(row_rects[row as usize]);
+        for col in 0..in_row {
+            let idx = start + col;
+            draw_combatant_card(f, col_rects[col], rag, &rag.combatants[idx], idx, theme);
+        }
+    }
+}
+
+fn compact_combatant_line(
+    rag: &ragnarok::RagnarokState,
+    combatant: &ragnarok::Combatant,
+    idx: usize,
+    theme: TerminalTheme,
+    width: u16,
+) -> Line<'static> {
+    let selected = idx == rag.roster_cursor;
+    let marker = if selected { "\u{25b6}" } else { " " };
+    let (state_word, color) = combatant_state_label(rag, combatant, theme);
+    let activity = combatant
+        .activity
+        .as_deref()
+        .map(|text| format!(" - {text}"))
+        .unwrap_or_default();
+    let text = format!(
+        "{marker} {} {}/{} {} elo {} - {state_word}{activity}",
+        combatant.slot,
+        combatant.agent_label,
+        combatant.model_label,
+        combatant.elo,
+        format_duration(combatant.started_at.elapsed())
+    );
+    Line::from(Span::styled(
+        fit_width(text, width as usize),
+        Style::default().fg(color),
+    ))
+}
+
+fn combatant_state_label(
+    rag: &ragnarok::RagnarokState,
+    combatant: &ragnarok::Combatant,
+    theme: TerminalTheme,
+) -> (String, Color) {
+    match &combatant.status {
+        ragnarok::CombatantStatus::Spawning => ("MUSTERING".to_string(), theme.accent),
+        ragnarok::CombatantStatus::Implementing => ("FIGHTING".to_string(), theme.warning),
+        ragnarok::CombatantStatus::Waiting if rag.phase == ragnarok::RagnarokPhase::Reviewing => {
+            ("REVIEWING".to_string(), theme.secondary)
+        }
+        ragnarok::CombatantStatus::Waiting => ("STANDING".to_string(), theme.success),
+        ragnarok::CombatantStatus::Judged { won: true } => ("VICTOR".to_string(), theme.success),
+        ragnarok::CombatantStatus::Judged { won: false } => ("JUDGED".to_string(), theme.muted),
+        ragnarok::CombatantStatus::Failed { .. } => ("FAILED".to_string(), theme.error),
+    }
+}
+
+fn activity_sprite(summary: Option<&str>, theme: TerminalTheme) -> (SpriteKind, Color) {
+    const GOLD: Color = Color::Rgb(240, 196, 60);
+    const BLOOD: Color = Color::Rgb(202, 44, 44);
+    let Some(summary) = summary else {
+        return (SpriteKind::Idle, theme.accent);
+    };
+    let lower = summary.to_ascii_lowercase();
+    if lower.contains("failed") || lower.contains("error") || lower.contains("denied") {
+        (SpriteKind::Wound, BLOOD)
+    } else if lower.contains("read")
+        || lower.contains("search")
+        || lower.contains("grep")
+        || lower.contains("rg ")
+        || lower.contains("inspect")
+        || lower.contains("thinking")
+    {
+        (SpriteKind::Cast, Color::Rgb(196, 112, 240))
+    } else if lower.contains("permission") || lower.contains("approved") {
+        (SpriteKind::Idle, theme.accent)
+    } else if lower.contains("message") || lower.contains("summary") {
+        (SpriteKind::Cast, GOLD)
+    } else {
+        (SpriteKind::Swing, Color::Rgb(255, 150, 60))
+    }
+}
+
+fn combatant_sprite(
+    rag: &ragnarok::RagnarokState,
+    combatant: &ragnarok::Combatant,
+    theme: TerminalTheme,
+) -> (SpriteKind, Color) {
+    const GOLD: Color = Color::Rgb(240, 196, 60);
+    const BLOOD: Color = Color::Rgb(202, 44, 44);
+    match &combatant.status {
+        ragnarok::CombatantStatus::Failed { .. } => (SpriteKind::Slain, BLOOD),
+        ragnarok::CombatantStatus::Judged { won: true } => (SpriteKind::Victor, GOLD),
+        ragnarok::CombatantStatus::Judged { won: false } => (SpriteKind::Idle, theme.muted),
+        ragnarok::CombatantStatus::Spawning => (SpriteKind::March, theme.muted),
+        ragnarok::CombatantStatus::Implementing => {
+            activity_sprite(combatant.activity.as_deref(), theme)
+        }
+        ragnarok::CombatantStatus::Waiting if rag.phase == ragnarok::RagnarokPhase::Reviewing => {
+            (SpriteKind::Cast, theme.secondary)
+        }
+        ragnarok::CombatantStatus::Waiting => (SpriteKind::Idle, theme.accent),
+    }
+}
+
+fn vigor_bar(
+    rag: &ragnarok::RagnarokState,
+    combatant: &ragnarok::Combatant,
+    idx: usize,
+    width: usize,
+) -> String {
+    let width = width.max(4);
+    match &combatant.status {
+        ragnarok::CombatantStatus::Failed { .. } => "\u{2620} ".repeat(width / 2),
+        ragnarok::CombatantStatus::Judged { won: true } => "\u{2588}".repeat(width),
+        ragnarok::CombatantStatus::Implementing => {
+            let frame = ragnarok_frame_index(idx, 4);
+            (0..width)
+                .map(|i| {
+                    if (i + frame).is_multiple_of(4) {
+                        '\u{2591}'
+                    } else {
+                        '\u{2588}'
+                    }
+                })
+                .collect()
+        }
+        ragnarok::CombatantStatus::Waiting if rag.phase == ragnarok::RagnarokPhase::Reviewing => {
+            "\u{2592}".repeat(width)
+        }
+        ragnarok::CombatantStatus::Waiting | ragnarok::CombatantStatus::Judged { won: false } => {
+            "\u{2591}".repeat(width)
+        }
+        ragnarok::CombatantStatus::Spawning => "\u{2591}".repeat(width),
+    }
+}
+
+fn draw_combatant_card(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    rag: &ragnarok::RagnarokState,
+    combatant: &ragnarok::Combatant,
+    idx: usize,
+    theme: TerminalTheme,
+) {
+    if area.width < 6 || area.height < 3 {
+        return;
+    }
+    let selected = idx == rag.roster_cursor;
+    let color = fighter_color(theme, idx);
+    let (state_word, state_color) = combatant_state_label(rag, combatant, theme);
+    let border_style = if selected {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    let title = format!(
+        " {}{} ",
+        if selected { "\u{25b6} " } else { "" },
+        combatant.slot
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(Span::styled(
+            fit_width(title, area.width.saturating_sub(2) as usize),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let inner_width = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        fit_width(
+            format!(
+                "{} / {}  \u{26a1}{}  {}",
+                combatant.agent_label,
+                combatant.model_label,
+                combatant.elo,
+                format_duration(combatant.started_at.elapsed())
+            ),
+            inner_width,
+        ),
+        Style::default().fg(theme.muted),
+    )));
+
+    let (sprite_kind, accent) = combatant_sprite(rag, combatant, theme);
+    let frame_set = ragnarok_sprites::frames(sprite_kind);
+    let frame = &frame_set[ragnarok_frame_index(idx, frame_set.len())];
+    let pad = " ".repeat(inner_width.saturating_sub(ragnarok_sprites::SPRITE_W) / 2);
+    for sprite_line in ragnarok_sprites::render(frame, color, accent) {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(sprite_line.spans.len() + 1);
+        spans.push(Span::raw(pad.clone()));
+        spans.extend(sprite_line.spans);
+        lines.push(Line::from(spans));
+    }
+
+    let bar_width = inner_width.saturating_sub(state_word.len() + 2).max(4);
+    lines.push(Line::from(vec![
+        Span::styled(
+            vigor_bar(rag, combatant, idx, bar_width),
+            Style::default().fg(state_color),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            state_word,
+            Style::default()
+                .fg(state_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let caption = match &combatant.status {
+        ragnarok::CombatantStatus::Failed { message } => format!("failed: {message}"),
+        _ => combatant.activity.clone().unwrap_or_default(),
+    };
+    lines.push(Line::from(Span::styled(
+        fit_width(caption, inner_width),
+        Style::default().fg(theme.subtle),
+    )));
+
+    lines.truncate(inner.height as usize);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_ragnarok_feed(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    rag: &ragnarok::RagnarokState,
+    theme: TerminalTheme,
+) {
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(theme.muted))
+        .title(Span::styled(
+            " battle feed ",
+            Style::default().fg(theme.muted),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+    let take = inner.height as usize;
+    let lines: Vec<Line> = rag
+        .feed
+        .iter()
+        .rev()
+        .take(take)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|entry| {
+            let color = entry
+                .slot
+                .as_deref()
+                .and_then(|slot| rag.combatant_index(slot))
+                .map(|idx| fighter_color(theme, idx))
+                .unwrap_or(theme.text);
+            Line::from(Span::styled(
+                fit_width(&entry.text, inner.width as usize),
+                Style::default().fg(color),
+            ))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn combatant_label(rag: &ragnarok::RagnarokState, slot: &str) -> String {
+    rag.combatant(slot)
+        .map(|c| {
+            format!(
+                "{slot} {}/{} \u{26a1}{}",
+                c.agent_label, c.model_label, c.elo
+            )
+        })
+        .unwrap_or_else(|| slot.to_string())
+}
+
+fn draw_review_assessments(
+    lines: &mut Vec<Line<'static>>,
+    rag: &ragnarok::RagnarokState,
+    theme: TerminalTheme,
+    width: usize,
+) {
+    for assessment in &rag.review_assessments {
+        let marker = if assessment.credible {
+            "credible"
+        } else {
+            "suspect"
+        };
+        lines.push(Line::from(Span::styled(
+            fit_width(
+                format!(
+                    "{} on {} - {marker}: {}",
+                    assessment.reviewer_slot, assessment.reviewee_slot, assessment.note
+                ),
+                width,
+            ),
+            Style::default().fg(if assessment.credible {
+                theme.thought
             } else {
-                "  "
-            };
-            let label = match combatant {
-                Some(c) => format!("{slot}  {}/{}  {} elo", c.agent_label, c.model_label, c.elo),
-                None => slot.clone(),
-            };
-            let style = if idx == rag.decision_cursor {
+                theme.warning
+            }),
+        )));
+    }
+}
+
+fn draw_ragnarok_verdict(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    rag: &ragnarok::RagnarokState,
+    theme: TerminalTheme,
+) {
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    if rag.phase == ragnarok::RagnarokPhase::Cancelled {
+        lines.push(
+            Line::from(Span::styled(
+                "TOURNAMENT CANCELLED",
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .centered(),
+        );
+        if let Some(summary) = &rag.verdict_summary {
+            lines.push(Line::default());
+            for line in wrap_tail_lines(
+                summary,
+                width.max(8),
+                area.height.saturating_sub(3) as usize,
+            ) {
+                lines.push(Line::from(Span::styled(
+                    line,
+                    Style::default().fg(theme.text),
+                )));
+            }
+        }
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    if let Some(winner) = &rag.winner {
+        let crown =
+            ["\u{265b}", "\u{2726}\u{265b}\u{2726}", "\u{265b}"][ragnarok_frame_index(0, 3)];
+        lines.push(
+            Line::from(Span::styled(
+                format!("{crown} VICTOR: {} {crown}", combatant_label(rag, winner)),
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .centered(),
+        );
+    } else if let Some((a, b, _)) = &rag.finalists {
+        lines.push(
+            Line::from(Span::styled(
+                "SPLIT DECISION - choose your champion",
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .centered(),
+        );
+        for (idx, slot) in [a, b].into_iter().enumerate() {
+            let chosen = idx == rag.decision_cursor;
+            let marker = if chosen { "\u{25b6}" } else { " " };
+            let style = if chosen {
                 Style::default()
                     .fg(theme.selection_fg)
                     .bg(theme.selection_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme.text)
+                Style::default().fg(rag
+                    .combatant_index(slot)
+                    .map(|idx| fighter_color(theme, idx))
+                    .unwrap_or(theme.text))
             };
-            Line::from(Span::styled(format!("{marker}{label}"), style))
-        })
-        .collect();
-    f.render_widget(Paragraph::new(option_lines), rows[2]);
+            lines.push(Line::from(Span::styled(
+                fit_width(
+                    format!("{marker} [{}] {}", idx + 1, combatant_label(rag, slot)),
+                    width,
+                ),
+                style,
+            )));
+        }
+    } else if rag.phase == ragnarok::RagnarokPhase::Judging {
+        draw_ragnarok_summoning(f, area, rag, theme);
+        return;
+    }
 
-    f.render_widget(
-        Paragraph::new("\u{2191}/\u{2193} select \u{00b7} Enter confirm \u{00b7} Esc cancel")
-            .style(Style::default().fg(theme.muted)),
-        rows[3],
-    );
+    if let Some(reason) = &rag.fell_back_reason {
+        lines.push(Line::from(Span::styled(
+            fit_width(format!("fallback: {reason}"), width),
+            Style::default().fg(theme.warning),
+        )));
+    }
+    draw_review_assessments(&mut lines, rag, theme, width);
+
+    let summary = rag
+        .finalists
+        .as_ref()
+        .map(|(_, _, reasoning)| reasoning.as_str())
+        .or(rag.verdict_summary.as_deref());
+    if let Some(summary) = summary {
+        lines.push(Line::default());
+        let remaining = (area.height as usize).saturating_sub(lines.len());
+        for line in wrap_tail_lines(summary, width.max(8), remaining) {
+            lines.push(Line::from(Span::styled(
+                line,
+                Style::default().fg(theme.text),
+            )));
+        }
+    }
+
+    lines.truncate(area.height as usize);
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Wrap `text` to `width` display columns and keep only the last `max_lines`
+/// lines. Works on a bounded tail slice so huge buffers stay cheap.
+fn wrap_tail_lines(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let budget = width.saturating_mul(max_lines).saturating_mul(4).max(256);
+    let mut start = text.len().saturating_sub(budget);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &text[start..];
+
+    let mut lines: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    let push_line = |lines: &mut std::collections::VecDeque<String>, line: String| {
+        lines.push_back(line);
+        while lines.len() > max_lines {
+            lines.pop_front();
+        }
+    };
+    for ch in tail.chars() {
+        if ch == '\n' {
+            push_line(&mut lines, std::mem::take(&mut current));
+            current_width = 0;
+            continue;
+        }
+        if ch == '\r' {
+            continue;
+        }
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + w > width && !current.is_empty() {
+            push_line(&mut lines, std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += w;
+    }
+    if !current.is_empty() {
+        push_line(&mut lines, current);
+    }
+    lines.into_iter().collect()
 }
 
 fn export_transcript(state: &AppState) -> Result<PathBuf> {
@@ -7983,40 +8367,44 @@ mod tests {
     }
 
     #[test]
-    fn hammer_row_shows_more_than_one_arm_position_over_a_full_cycle() {
-        // hammer_figure alternates on a 2-frame cycle (360ms); sampling a
-        // couple of cycles' worth of instants must see both "/o\" and
-        // "\o/" somewhere in the row, or the scene isn't actually animated.
-        let mut saw_up = false;
-        let mut saw_down = false;
-        for tick in 0..8u128 {
-            let up = frame_index_at(tick * 180, 0, 2) == 0;
-            if up {
-                saw_up = true;
-            } else {
-                saw_down = true;
-            }
-        }
-        assert!(saw_up && saw_down, "hammer_figure never alternates");
+    fn ragnarok_activity_text_selects_distinct_sprite_modes() {
+        let theme = TerminalThemeKind::Dark.palette();
+        assert_eq!(
+            activity_sprite(Some("read src/ui.rs"), theme).0,
+            SpriteKind::Cast
+        );
+        assert_eq!(
+            activity_sprite(Some("permission approved: edit file"), theme).0,
+            SpriteKind::Idle
+        );
+        assert_eq!(
+            activity_sprite(Some("failed cargo test"), theme).0,
+            SpriteKind::Wound
+        );
+        assert_eq!(
+            activity_sprite(Some("edit src/main.rs"), theme).0,
+            SpriteKind::Swing
+        );
     }
 
     #[test]
-    fn hammer_row_composes_hammer_figure_per_position() {
-        // hammer_row is a thin composition over hammer_figure -- pin that
-        // composition down directly (position i's glyph must match what
-        // hammer_figure says for i's own frame index) so a future edit that
-        // reintroduces the "offset by a multiple of frame_count" bug (see
-        // the regression test above) still leaves this assertion checking
-        // the right thing.
-        let row = hammer_row(3);
-        let figures: Vec<&str> = row.split("   ").collect();
-        assert_eq!(figures.len(), 3);
-        for figure in figures {
-            assert!(
-                figure == "/o\\" || figure == "\\o/",
-                "unexpected figure {figure:?}"
-            );
-        }
+    fn wrap_tail_lines_wraps_and_keeps_only_the_tail() {
+        let text = "alpha\nbeta gamma delta\nepsilon";
+        let lines = wrap_tail_lines(text, 6, 10);
+        assert_eq!(
+            lines,
+            vec!["alpha", "beta g", "amma d", "elta", "epsilo", "n"]
+        );
+        let lines = wrap_tail_lines(text, 6, 2);
+        assert_eq!(lines, vec!["epsilo", "n"]);
+        let wide = "⚔⚔⚔⚔";
+        let lines = wrap_tail_lines(wide, 3, 10);
+        assert!(
+            lines
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= 3)
+        );
+        assert!(wrap_tail_lines("", 10, 5).is_empty());
     }
 
     fn key(code: KeyCode) -> CtEvent {
@@ -12973,6 +13361,39 @@ mod tests {
         for c in text.chars() {
             handle_crossterm(state, cmd_tx, key(KeyCode::Char(c)));
         }
+    }
+
+    #[test]
+    fn ragnarok_esc_requires_second_press_to_cancel() {
+        let mut state = AppState::new();
+        let (rag_cmd_tx, mut rag_cmd_rx) = mpsc::unbounded_channel();
+        state.start_ragnarok("task".to_string(), rag_cmd_tx);
+
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Esc,
+            UiMode::FullscreenTui,
+        );
+        let rag = state.ragnarok.as_ref().expect("ragnarok still open");
+        assert!(rag.esc_armed, "first Esc only arms cancellation");
+        assert!(
+            rag_cmd_rx.try_recv().is_err(),
+            "first Esc must not cancel the tournament"
+        );
+
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Esc,
+            UiMode::FullscreenTui,
+        );
+        match rag_cmd_rx.try_recv().expect("cancel sent on second Esc") {
+            ragnarok::RagnarokCommand::Cancel => {}
+        }
+        let rag = state.ragnarok.as_ref().expect("cancelled overlay remains");
+        assert_eq!(rag.phase, ragnarok::RagnarokPhase::Cancelled);
+        assert!(rag.cancel_requested);
     }
 
     #[test]

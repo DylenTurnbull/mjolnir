@@ -24,6 +24,7 @@ mod picker;
 mod probe;
 mod qr;
 mod ragnarok;
+mod ragnarok_sprites;
 mod registry;
 mod remote;
 mod scores;

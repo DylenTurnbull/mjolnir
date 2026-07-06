@@ -871,6 +871,9 @@ fn apply_judging_outcome(rag: &mut RagnarokState, verdict: ragnarok::event::Judg
             winner_slot,
             judgment,
         } => {
+            rag.review_assessments = judgment.review_assessments;
+            rag.fell_back_reason = None;
+            rag.push_feed(None, format!("thor crowns {winner_slot} the victor"));
             for c in &mut rag.combatants {
                 c.status = CombatantStatus::Judged {
                     won: c.slot == winner_slot,
@@ -884,9 +887,15 @@ fn apply_judging_outcome(rag: &mut RagnarokState, verdict: ragnarok::event::Judg
             finalist_slots: [a, b],
             judgment,
         } => {
-            let reasoning = judgment
-                .map(|j| j.reasoning)
-                .unwrap_or_else(|| "thor couldn't separate these two.".to_string());
+            let (reasoning, assessments) = judgment
+                .map(|j| (j.reasoning, j.review_assessments))
+                .unwrap_or_else(|| ("thor couldn't separate these two.".to_string(), Vec::new()));
+            rag.review_assessments = assessments;
+            rag.fell_back_reason = None;
+            rag.push_feed(
+                None,
+                format!("thor names finalists {a} and {b}; awaiting your pick"),
+            );
             rag.finalists = Some((a, b, reasoning));
             rag.phase = RagnarokPhase::AwaitingUserPick;
             rag.decision_cursor = 0;
@@ -895,6 +904,12 @@ fn apply_judging_outcome(rag: &mut RagnarokState, verdict: ragnarok::event::Judg
             reason,
             finalist_slots: [a, b],
         } => {
+            rag.review_assessments.clear();
+            rag.fell_back_reason = Some(reason.clone());
+            rag.push_feed(
+                None,
+                format!("thor's verdict was unusable; showing finalists {a} and {b}"),
+            );
             rag.finalists = Some((
                 a,
                 b,
@@ -1031,6 +1046,10 @@ impl AppState {
         };
         match event {
             RagnarokEvent::EligibilityScanned { eligible_count } => {
+                rag.push_feed(
+                    None,
+                    format!("thor found {eligible_count} eligible (agent, model) pair(s)"),
+                );
                 self.record_status_message(
                     StatusKind::Info,
                     format!(
@@ -1039,6 +1058,7 @@ impl AppState {
                 );
             }
             RagnarokEvent::Aborted { reason } => {
+                rag.push_feed(None, format!("tournament aborted: {reason}"));
                 rag.verdict_summary = Some(reason);
                 rag.phase = RagnarokPhase::Cancelled;
             }
@@ -1049,6 +1069,10 @@ impl AppState {
                 elo,
             } => {
                 rag.phase = RagnarokPhase::Implementing;
+                rag.push_feed(
+                    Some(slot.clone()),
+                    format!("{slot} enters with {agent_label}/{model_name} ({elo} elo)"),
+                );
                 rag.combatants.push(ragnarok::Combatant {
                     slot,
                     agent_label,
@@ -1073,17 +1097,35 @@ impl AppState {
                     // competitor is now actually implementing."
                     c.status = CombatantStatus::Implementing;
                 }
+                rag.push_feed(
+                    Some(slot.clone()),
+                    format!("{slot} arms model selection ({elo} elo)"),
+                );
             }
             RagnarokEvent::CompetitorActivity { slot, summary } => {
                 if let Some(c) = rag.combatant_mut(&slot) {
-                    c.activity = Some(summary);
+                    c.activity = Some(summary.clone());
                 }
+                rag.push_feed(Some(slot), summary);
             }
             RagnarokEvent::PermissionDecision {
                 slot,
                 approved,
                 summary,
             } => {
+                if let Some(c) = rag.combatant_mut(&slot) {
+                    c.activity = Some(format!(
+                        "permission {}: {summary}",
+                        if approved { "approved" } else { "denied" }
+                    ));
+                }
+                rag.push_feed(
+                    Some(slot.clone()),
+                    format!(
+                        "thor {} request: {summary}",
+                        if approved { "approved" } else { "denied" }
+                    ),
+                );
                 self.record_status_message(
                     StatusKind::Info,
                     format!(
@@ -1099,6 +1141,12 @@ impl AppState {
             } => {
                 // Send the status message first: `rag`/the combatant
                 // borrow below must not overlap a `&mut self` call.
+                let feed_status = match &outcome {
+                    ragnarok::event::TurnOutcome::Completed => "finished".to_string(),
+                    ragnarok::event::TurnOutcome::Failed { message } => {
+                        format!("failed: {message}")
+                    }
+                };
                 match &outcome {
                     ragnarok::event::TurnOutcome::Completed => {
                         self.record_status_message(
@@ -1127,9 +1175,17 @@ impl AppState {
                         }
                     };
                 }
+                rag.push_feed(
+                    Some(slot.clone()),
+                    format!(
+                        "{slot} {feed_status} in {}",
+                        format_duration_compact(duration)
+                    ),
+                );
             }
             RagnarokEvent::ReviewPhaseStarted => {
                 rag.phase = RagnarokPhase::Reviewing;
+                rag.push_feed(None, "adversarial review begins");
             }
             RagnarokEvent::TournamentDone { verdict } => {
                 rag.phase = RagnarokPhase::Judging;
