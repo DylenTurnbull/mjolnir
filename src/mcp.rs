@@ -81,6 +81,10 @@ const MAX_CONNECTIONS: usize = 32;
 /// cannot pin a request open indefinitely.
 const MAX_GET_RESULT_WAIT: Duration = Duration::from_secs(300);
 
+/// Managed callers apply config overrides synchronously before submitting the
+/// prompt so the runtime never receives a prompt while an update is in flight.
+const MANAGED_CONFIG_UPDATE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// How long to wait for an agent's runtime task to exit (running
 /// `kill_agent_tree`) during teardown before aborting it.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -603,6 +607,21 @@ impl ManagedAcpConnection {
         text: String,
         config_overrides: HashMap<String, String>,
     ) -> std::result::Result<u64, String> {
+        self.ensure_ready_for_prompt().await?;
+
+        for (config_id, value) in config_overrides {
+            self.inner
+                .cmd_tx
+                .send(UiCommand::SetSessionConfigOption {
+                    target: SessionConfigTarget::ConfigOption {
+                        config_id: SessionConfigId::new(config_id.clone()),
+                    },
+                    value: SessionConfigValueId::new(value.clone()),
+                })
+                .map_err(|_| "connection is closed".to_string())?;
+            self.wait_for_config_value(&config_id, &value).await?;
+        }
+
         let turn_id = {
             let mut st = self.inner.state.lock().await;
             if st.status != ConnStatus::Ready {
@@ -620,18 +639,6 @@ impl ManagedAcpConnection {
             st.turn.id
         };
 
-        for (config_id, value) in config_overrides {
-            self.inner
-                .cmd_tx
-                .send(UiCommand::SetSessionConfigOption {
-                    target: SessionConfigTarget::ConfigOption {
-                        config_id: SessionConfigId::new(config_id),
-                    },
-                    value: SessionConfigValueId::new(value),
-                })
-                .map_err(|_| "connection is closed".to_string())?;
-        }
-
         self.inner
             .cmd_tx
             .send(UiCommand::SendPrompt {
@@ -640,6 +647,50 @@ impl ManagedAcpConnection {
             })
             .map_err(|_| "connection is closed".to_string())?;
         Ok(turn_id)
+    }
+
+    async fn ensure_ready_for_prompt(&self) -> std::result::Result<(), String> {
+        let st = self.inner.state.lock().await;
+        if st.status != ConnStatus::Ready {
+            return Err(format!(
+                "connection not ready (status: {})",
+                st.status.label()
+            ));
+        }
+        if st.turn.status.is_active() {
+            return Err("a prompt turn is already in progress".to_string());
+        }
+        Ok(())
+    }
+
+    async fn wait_for_config_value(
+        &self,
+        config_id: &str,
+        value: &str,
+    ) -> std::result::Result<(), String> {
+        let ready = wait_for(&self.inner.state, MANAGED_CONFIG_UPDATE_TIMEOUT, |st| {
+            st.status == ConnStatus::Failed
+                || config_option_value_matches(&st.config_options, config_id, value)
+        })
+        .await;
+        let st = self.inner.state.lock().await;
+        if config_option_value_matches(&st.config_options, config_id, value) {
+            return Ok(());
+        }
+        if st.status == ConnStatus::Failed {
+            return Err(st.status_message.clone().unwrap_or_else(|| {
+                "connection failed while applying config override".to_string()
+            }));
+        }
+        if ready {
+            Err(format!(
+                "config override {config_id}={value} did not become active"
+            ))
+        } else {
+            Err(format!(
+                "timed out applying config override {config_id}={value}"
+            ))
+        }
     }
 
     pub(crate) async fn wait_result_rejecting_permissions(
@@ -685,6 +736,18 @@ impl ManagedAcpConnection {
     pub(crate) async fn disconnect(&self) {
         teardown_connection(&self.inner).await;
     }
+}
+
+fn config_option_value_matches(
+    options: &[SessionConfigOption],
+    config_id: &str,
+    value: &str,
+) -> bool {
+    options.iter().any(|option| {
+        option.id.to_string() == config_id
+            && config_option_current_value_id(option)
+                .is_some_and(|current| current.to_string() == value)
+    })
 }
 
 // --- the MCP server ---
@@ -1023,6 +1086,7 @@ impl McpServer {
             env: resolved.env,
             agent_stderr: self.config.agent_stderr.clone(),
             fs_max_text_bytes: self.config.fs_max_text_bytes,
+            client_capabilities: acp::AcpClientCapabilities::Full,
         })
     }
 
@@ -1632,6 +1696,23 @@ mod tests {
         });
         assert_eq!(st.config_options.len(), 1);
         assert_eq!(st.config_options[0].name, "Session Mode");
+    }
+
+    #[test]
+    fn config_option_value_match_requires_matching_id_and_current_value() {
+        let options = vec![SessionConfigOption::select(
+            "model",
+            "Model",
+            "fast",
+            vec![
+                agent_client_protocol::schema::v1::SessionConfigSelectOption::new("fast", "Fast"),
+                agent_client_protocol::schema::v1::SessionConfigSelectOption::new("smart", "Smart"),
+            ],
+        )];
+
+        assert!(config_option_value_matches(&options, "model", "fast"));
+        assert!(!config_option_value_matches(&options, "model", "smart"));
+        assert!(!config_option_value_matches(&options, "mode", "fast"));
     }
 
     #[test]

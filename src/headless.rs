@@ -140,6 +140,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         env: agent.env,
         agent_stderr: cfg.agent_stderr,
         fs_max_text_bytes: cfg.fs_max_text_bytes,
+        client_capabilities: acp::AcpClientCapabilities::Full,
     };
 
     let runtime = tokio::spawn(async move { acp::run(runtime_cfg, event_tx, cmd_rx).await });

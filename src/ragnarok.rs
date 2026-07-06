@@ -13,7 +13,7 @@ use agent_client_protocol::schema::v1::{SessionConfigOption, StopReason};
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::acp::AcpRuntimeConfig;
+use crate::acp::{AcpClientCapabilities, AcpRuntimeConfig};
 use crate::app::{config_option_choices, config_option_current_value_id, is_model_config_option};
 use crate::config::{self, Config, SelectedAgent};
 use crate::event::UiEvent;
@@ -476,6 +476,7 @@ fn runtime_config(candidate: &LaunchCandidate, cfg: &RagnarokConfig) -> AcpRunti
         // user-specified stderr capture file.
         agent_stderr: None,
         fs_max_text_bytes: cfg.fs_max_text_bytes,
+        client_capabilities: AcpClientCapabilities::ReadOnly,
     }
 }
 

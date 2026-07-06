@@ -1546,6 +1546,7 @@ async fn run_session(
         env: agent.env.clone(),
         agent_stderr: runtime_options.agent_stderr.clone(),
         fs_max_text_bytes: runtime_options.fs_max_text_bytes,
+        client_capabilities: acp::AcpClientCapabilities::Full,
     };
 
     // Drive the ACP runtime on its own task so the UI can own the

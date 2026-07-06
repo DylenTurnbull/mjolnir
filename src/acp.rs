@@ -61,6 +61,28 @@ pub struct AcpRuntimeConfig {
     /// Maximum text bytes returned by ACP filesystem reads or accepted by
     /// ACP filesystem writes.
     pub fs_max_text_bytes: u64,
+    /// ACP client-side capabilities exposed to this agent runtime.
+    pub client_capabilities: AcpClientCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcpClientCapabilities {
+    /// Normal interactive/headless behavior: expose filesystem reads/writes and
+    /// managed terminals.
+    Full,
+    /// Review-only behavior for supervised secondary agents: allow reads, but
+    /// do not allow writes or terminal process execution.
+    ReadOnly,
+}
+
+impl AcpClientCapabilities {
+    fn write_text_file(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    fn terminal(self) -> bool {
+        matches!(self, Self::Full)
+    }
 }
 
 #[derive(Clone)]
@@ -586,6 +608,7 @@ pub async fn run(
             ui_rx,
             fatal_emitted.clone(),
             cfg.fs_max_text_bytes,
+            cfg.client_capabilities,
         );
         tokio::pin!(drive);
         tokio::select! {
@@ -1100,6 +1123,7 @@ where
         ui_rx,
         fatal_emitted,
         DEFAULT_FS_TEXT_BYTES,
+        AcpClientCapabilities::Full,
     )
     .await
 }
@@ -1126,6 +1150,7 @@ where
         ui_rx,
         fatal_emitted,
         DEFAULT_FS_TEXT_BYTES,
+        AcpClientCapabilities::Full,
     )
     .await
 }
@@ -1140,6 +1165,7 @@ async fn drive_client_with_fs_limit<T>(
     mut ui_rx: mpsc::UnboundedReceiver<UiCommand>,
     fatal_emitted: Arc<AtomicBool>,
     fs_max_text_bytes: u64,
+    client_capabilities: AcpClientCapabilities,
 ) -> Result<()>
 where
     T: ConnectTo<Client>,
@@ -1164,6 +1190,8 @@ where
     let notif_session_state = session_state.clone();
     let read_filesystem = filesystem.clone();
     let write_filesystem = filesystem.clone();
+    let allow_write_filesystem = client_capabilities.write_text_file();
+    let allow_terminal = client_capabilities.terminal();
     let create_terminals = terminals.clone();
     let output_terminals = terminals.clone();
     let release_terminals = terminals.clone();
@@ -1275,37 +1303,73 @@ where
         )
         .on_receive_request(
             async move |request: WriteTextFileRequest, responder, _cx| {
-                responder.respond_with_result(write_filesystem.write_text_file(request).await)
+                if allow_write_filesystem {
+                    responder.respond_with_result(write_filesystem.write_text_file(request).await)
+                } else {
+                    responder.respond_with_result(Err(fs_invalid_params(
+                        "filesystem write is disabled for this session",
+                    )))
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             async move |request: CreateTerminalRequest, responder, _cx| {
-                responder.respond_with_result(create_terminals.create(request).await)
+                if allow_terminal {
+                    responder.respond_with_result(create_terminals.create(request).await)
+                } else {
+                    responder.respond_with_result(Err(terminal_invalid_params(
+                        "terminal capability is disabled for this session",
+                    )))
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             async move |request: TerminalOutputRequest, responder, _cx| {
-                responder.respond_with_result(output_terminals.output(request).await)
+                if allow_terminal {
+                    responder.respond_with_result(output_terminals.output(request).await)
+                } else {
+                    responder.respond_with_result(Err(terminal_invalid_params(
+                        "terminal capability is disabled for this session",
+                    )))
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             async move |request: ReleaseTerminalRequest, responder, _cx| {
-                responder.respond_with_result(release_terminals.release(request).await)
+                if allow_terminal {
+                    responder.respond_with_result(release_terminals.release(request).await)
+                } else {
+                    responder.respond_with_result(Err(terminal_invalid_params(
+                        "terminal capability is disabled for this session",
+                    )))
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             async move |request: WaitForTerminalExitRequest, responder, _cx| {
-                responder.respond_with_result(wait_terminals.wait_for_exit(request).await)
+                if allow_terminal {
+                    responder.respond_with_result(wait_terminals.wait_for_exit(request).await)
+                } else {
+                    responder.respond_with_result(Err(terminal_invalid_params(
+                        "terminal capability is disabled for this session",
+                    )))
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             async move |request: KillTerminalRequest, responder, _cx| {
-                responder.respond_with_result(kill_terminals.kill(request).await)
+                if allow_terminal {
+                    responder.respond_with_result(kill_terminals.kill(request).await)
+                } else {
+                    responder.respond_with_result(Err(terminal_invalid_params(
+                        "terminal capability is disabled for this session",
+                    )))
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -1320,6 +1384,7 @@ where
                 fatal_emitted,
                 session_state,
                 drive_terminals,
+                client_capabilities,
             )
             .await
             {
@@ -1350,6 +1415,7 @@ async fn drive_session(
     fatal_emitted: Arc<AtomicBool>,
     session_state: RuntimeSessionState,
     terminals: Arc<ManagedTerminals>,
+    client_capabilities: AcpClientCapabilities,
 ) -> Result<()> {
     // Advertise the client capabilities backed by handlers registered in
     // `drive_client` above.
@@ -1359,8 +1425,8 @@ async fn drive_session(
             ClientCapabilities::new()
                 .fs(FileSystemCapabilities::new()
                     .read_text_file(true)
-                    .write_text_file(true))
-                .terminal(true)
+                    .write_text_file(client_capabilities.write_text_file()))
+                .terminal(client_capabilities.terminal())
                 // Advertise both elicitation modes. `form` covers single-select
                 // `/setup` menus and `url` covers OAuth-login steps. v1 fully
                 // implements single-select forms and URL/QR; any richer form
@@ -6110,6 +6176,7 @@ mod tests {
             env: HashMap::new(),
             agent_stderr: None,
             fs_max_text_bytes: DEFAULT_FS_TEXT_BYTES,
+            client_capabilities: AcpClientCapabilities::Full,
         };
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
@@ -6162,6 +6229,7 @@ mod tests {
             env: HashMap::new(),
             agent_stderr: Some(bad_stderr),
             fs_max_text_bytes: DEFAULT_FS_TEXT_BYTES,
+            client_capabilities: AcpClientCapabilities::Full,
         };
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
@@ -6293,6 +6361,7 @@ mod tests {
             env: HashMap::new(),
             agent_stderr: None,
             fs_max_text_bytes: DEFAULT_FS_TEXT_BYTES,
+            client_capabilities: AcpClientCapabilities::Full,
         };
         assert_run_reports_agent_exited(cfg).await;
     }
@@ -6314,6 +6383,7 @@ mod tests {
             env: HashMap::new(),
             agent_stderr: None,
             fs_max_text_bytes: DEFAULT_FS_TEXT_BYTES,
+            client_capabilities: AcpClientCapabilities::Full,
         };
         assert_run_reports_agent_exited(cfg).await;
     }
@@ -6423,6 +6493,14 @@ mod tests {
             }
             other => panic!("expected UnsupportedProtocolVersion, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn read_only_client_capabilities_disable_writes_and_terminals() {
+        assert!(AcpClientCapabilities::Full.write_text_file());
+        assert!(AcpClientCapabilities::Full.terminal());
+        assert!(!AcpClientCapabilities::ReadOnly.write_text_file());
+        assert!(!AcpClientCapabilities::ReadOnly.terminal());
     }
 
     #[test]
