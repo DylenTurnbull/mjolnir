@@ -605,6 +605,7 @@ dependencies = [
  "rmcp",
  "rusqlite",
  "rustls",
+ "rustls-pemfile",
  "schemars 1.2.1",
  "semver",
  "serde",
