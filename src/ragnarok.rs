@@ -742,7 +742,7 @@ async fn run_one_competitor(
             cwd: session_cwd,
             model_value: Some(model_value),
             prompt,
-            permission: PermPolicy::AcceptAll,
+            permission: PermPolicy::AcceptEdits,
             agent_stderr,
             cancel: cancel.clone(),
             on_progress,
@@ -964,7 +964,7 @@ async fn run_one_review(
             cwd,
             model_value: Some(model_value),
             prompt,
-            permission: PermPolicy::AcceptAll,
+            permission: PermPolicy::AcceptEdits,
             agent_stderr,
             cancel: cancel.clone(),
             on_progress: noop,
@@ -1026,7 +1026,7 @@ async fn thor_route(
             cwd: council_cwd.to_path_buf(),
             model_value: Some(judge.model_value.clone()),
             prompt,
-            permission: PermPolicy::AcceptAll,
+            permission: PermPolicy::AcceptEdits,
             agent_stderr: cfg.agent_stderr.clone(),
             cancel: cancel.clone(),
             on_progress: noop,
@@ -1058,7 +1058,7 @@ async fn thor_judge(
             cwd: council_cwd.to_path_buf(),
             model_value: Some(judge.model_value.clone()),
             prompt,
-            permission: PermPolicy::AcceptAll,
+            permission: PermPolicy::AcceptEdits,
             agent_stderr: cfg.agent_stderr.clone(),
             cancel: cancel.clone(),
             on_progress: noop,
@@ -1227,10 +1227,8 @@ fn apply_progress(st: &mut RagnarokState, idx: usize, progress: TurnProgress) {
 
 #[derive(Debug, Clone, Copy)]
 enum PermPolicy {
-    /// Accept every permission request — champions run fully unattended.
-    AcceptAll,
-    /// Accept only edit/delete/move (kept for completeness / future use).
-    #[allow(dead_code)]
+    /// Accept only edit/delete/move so tournament agents can patch their
+    /// isolated worktrees without also approving arbitrary shell execution.
     AcceptEdits,
 }
 
@@ -1471,7 +1469,6 @@ fn decide_permission(
     options: &[PermissionOption],
 ) -> Option<String> {
     let allow = match policy {
-        PermPolicy::AcceptAll => true,
         PermPolicy::AcceptEdits => matches!(
             tool_call.fields.kind,
             Some(ToolKind::Edit | ToolKind::Delete | ToolKind::Move)
@@ -1488,7 +1485,6 @@ fn decide_permission(
                 .iter()
                 .find(|o| o.kind == PermissionOptionKind::AllowOnce)
         })
-        .or_else(|| options.first())
         .map(|o| o.option_id.to_string())
 }
 
@@ -2557,6 +2553,13 @@ mod tests {
         }
     }
 
+    fn permission_tool(kind: ToolKind) -> agent_client_protocol::schema::v1::ToolCallUpdate {
+        agent_client_protocol::schema::v1::ToolCallUpdate::new(
+            "call-1",
+            agent_client_protocol::schema::v1::ToolCallUpdateFields::new().kind(kind),
+        )
+    }
+
     #[test]
     fn clamp_keeps_count_within_two_and_available() {
         assert_eq!(clamp_competitor_count(1, 8), 2);
@@ -2613,6 +2616,49 @@ mod tests {
         assert_eq!(chosen.len(), 1);
         // And distinct_model_count agrees it is a single model.
         assert_eq!(distinct_model_count(&pool), 1);
+    }
+
+    #[test]
+    fn accept_edits_policy_rejects_shell_execution() {
+        let options = vec![
+            PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
+            PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectOnce),
+        ];
+
+        assert_eq!(
+            decide_permission(
+                PermPolicy::AcceptEdits,
+                &permission_tool(ToolKind::Edit),
+                &options
+            ),
+            Some("allow".to_string())
+        );
+        assert_eq!(
+            decide_permission(
+                PermPolicy::AcceptEdits,
+                &permission_tool(ToolKind::Execute),
+                &options
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn permission_decision_never_selects_non_allow_option() {
+        let options = vec![PermissionOption::new(
+            "reject",
+            "Reject",
+            PermissionOptionKind::RejectOnce,
+        )];
+
+        assert_eq!(
+            decide_permission(
+                PermPolicy::AcceptEdits,
+                &permission_tool(ToolKind::Edit),
+                &options
+            ),
+            None
+        );
     }
 
     #[test]
