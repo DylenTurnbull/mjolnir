@@ -7,6 +7,7 @@
 //! though the machine is unreachable from the public internet — and the
 //! resulting certificate produces no browser warning on any device.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -76,22 +77,45 @@ impl Tailscale {
 }
 
 fn find_binary() -> Option<PathBuf> {
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("tailscale");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    // The macOS app (App Store and standalone) does not put the CLI on PATH.
-    #[cfg(target_os = "macos")]
+    if let Some(path_var) = std::env::var_os("PATH")
+        && let Some(binary) = find_binary_in_path(&path_var)
     {
-        let app = PathBuf::from("/Applications/Tailscale.app/Contents/MacOS/Tailscale");
-        if app.is_file() {
-            return Some(app);
-        }
+        return Some(binary);
     }
+    find_bundled_binary()
+}
+
+fn find_binary_in_path(path_var: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path_var).find_map(|dir| {
+        tailscale_binary_names()
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+#[cfg(windows)]
+fn tailscale_binary_names() -> &'static [&'static str] {
+    &["tailscale.exe", "tailscale"]
+}
+
+#[cfg(not(windows))]
+fn tailscale_binary_names() -> &'static [&'static str] {
+    &["tailscale"]
+}
+
+#[cfg(target_os = "macos")]
+fn find_bundled_binary() -> Option<PathBuf> {
+    // The macOS app (App Store and standalone) does not put the CLI on PATH.
+    let app = PathBuf::from("/Applications/Tailscale.app/Contents/MacOS/Tailscale");
+    if app.is_file() {
+        return Some(app);
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn find_bundled_binary() -> Option<PathBuf> {
     None
 }
 
@@ -187,5 +211,24 @@ mod tests {
         let json = r#"{"BackendState": "NeedsLogin"}"#;
         let status: Status = serde_json::from_str(json).expect("parse");
         assert!(cert_domain(&status).is_err());
+    }
+
+    #[test]
+    fn find_binary_in_path_finds_tailscale_without_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = dir.path().join("tailscale");
+        std::fs::write(&binary, "").expect("write binary");
+        let path = std::env::join_paths([dir.path()]).expect("join path");
+        assert_eq!(find_binary_in_path(&path), Some(binary));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn find_binary_in_path_finds_windows_exe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = dir.path().join("tailscale.exe");
+        std::fs::write(&binary, "").expect("write binary");
+        let path = std::env::join_paths([dir.path()]).expect("join path");
+        assert_eq!(find_binary_in_path(&path), Some(binary));
     }
 }

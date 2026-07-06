@@ -2119,13 +2119,22 @@ fn prepare_tailscale_tls(root: &Path) -> Result<TailscaleTls> {
         "obtaining https certificate for {} via tailscale (first issuance can take ~30s)…",
         tailscale.cert_domain
     );
-    tailscale.mint_cert(&cert_path, &key_path)?;
-    restrict_permissions(&key_path)?;
+    mint_tailscale_cert(&tailscale, &cert_path, &key_path)?;
     Ok(TailscaleTls {
         tailscale,
         cert_path,
         key_path,
     })
+}
+
+fn mint_tailscale_cert(
+    tailscale: &crate::tailscale::Tailscale,
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<()> {
+    tailscale.mint_cert(cert_path, key_path)?;
+    restrict_permissions(key_path)?;
+    Ok(())
 }
 
 /// In tailscale mode the server must accept connections from tailnet peers
@@ -2222,7 +2231,7 @@ fn spawn_tailscale_cert_renewer(ts: TailscaleTls, resolver: Arc<SniCertResolver>
             interval.tick().await;
             let mint = ts.clone();
             let renewed = tokio::task::spawn_blocking(move || {
-                mint.tailscale.mint_cert(&mint.cert_path, &mint.key_path)?;
+                mint_tailscale_cert(&mint.tailscale, &mint.cert_path, &mint.key_path)?;
                 load_certified_key(&mint.cert_path, &mint.key_path)
             })
             .await;
