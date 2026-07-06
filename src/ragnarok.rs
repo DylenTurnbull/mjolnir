@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
     PermissionOption, PermissionOptionKind, SessionConfigOption, SessionUpdate, StopReason,
-    ToolCallStatus, ToolKind,
+    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
@@ -41,7 +41,7 @@ use crate::event::{
     content_block_text,
 };
 use crate::headless::choose_allow_option;
-use crate::labels::stop_reason_label;
+use crate::labels::{permission_option_kind_label, stop_reason_label, tool_kind_label};
 use crate::scores::{ScoreCatalog, ScoreStore};
 use crate::{install, model_resolve, picker, probe, registry, scores, worktree};
 
@@ -68,6 +68,8 @@ const FIGHT_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// Budget for each of Thor's pronouncements (route / assign / judge).
 const THOR_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Budget for Thor to rule on one participant permission request.
+const PERMISSION_RULING_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 /// How long to wait for the session config options needed to arm a model.
 const CONFIG_OPTIONS_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long to wait for the runtime to confirm a model selection. The
@@ -105,6 +107,8 @@ const REVIEW_FOR_JUDGMENT_LIMIT: usize = 8 * 1024;
 const SUMMARY_LIMIT: usize = 4 * 1024;
 /// Cap on accumulated agent text per turn (mirrors `mj mcp`).
 const FINAL_TEXT_LIMIT: usize = 1024 * 1024;
+/// Per-field budget inside Thor's permission court prompt.
+const PERMISSION_CONTEXT_LIMIT: usize = 6 * 1024;
 
 // ---------------------------------------------------------------------------
 // Events consumed by the arena UI
@@ -534,6 +538,7 @@ async fn battle(
     emit(tx, RagnarokEvent::Phase(Phase::Combat))?;
     let forge_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let (ping_tx, mut ping_rx) = mpsc::unbounded_channel::<WatchdogPing>();
+    let (permission_tx, mut permission_rx) = mpsc::unbounded_channel::<PermissionCourtRequest>();
     let mut kills: HashMap<FighterId, KillSwitch> = HashMap::new();
     let mut joinset = tokio::task::JoinSet::new();
     for fighter in chosen.clone() {
@@ -553,6 +558,7 @@ async fn battle(
             kill: kill_rx,
             kill_reason,
             ping: ping_tx.clone(),
+            permission_tx: permission_tx.clone(),
             tx: tx.clone(),
             abort: abort.clone(),
         };
@@ -593,6 +599,11 @@ async fn battle(
             maybe_ping = ping_rx.recv() => {
                 if let Some(ping) = maybe_ping {
                     watchdog.note_action(ping.id, ping.title);
+                }
+            }
+            maybe_permission = permission_rx.recv() => {
+                if let Some(request) = maybe_permission {
+                    handle_permission_request(&mut thor, &cfg.task, request, tx).await?;
                 }
             }
             _ = ticker.tick() => {
@@ -658,6 +669,7 @@ async fn battle(
     // ---- Phase: adversarial reviews (parallel) -------------------------------
     let by_id: HashMap<FighterId, &FighterReport> = reports.iter().map(|r| (r.id, r)).collect();
     let mut review_set = tokio::task::JoinSet::new();
+    let mut spawned_reviews = 0usize;
     for a in assignments.clone() {
         let reviewer = chosen.iter().find(|c| c.card.id == a.reviewer).cloned();
         let Some(reviewer) = reviewer else { continue };
@@ -678,13 +690,35 @@ async fn battle(
             .unwrap_or_else(|| cfg.cwd.clone());
         let tx = tx.clone();
         let abort = abort.clone();
-        review_set.spawn(async move { review(reviewer, a, prompt, defender_cwd, tx, abort).await });
+        let permission_tx = permission_tx.clone();
+        spawned_reviews += 1;
+        review_set.spawn(async move {
+            review(reviewer, a, prompt, defender_cwd, tx, abort, permission_tx).await
+        });
     }
     let mut reviews: Vec<ReviewReport> = Vec::new();
-    while let Some(joined) = review_set.join_next().await {
-        match joined {
-            Ok(report) => reviews.push(report),
-            Err(e) => feed(tx, None, format!("☠ a reviewer's thread was severed: {e}"))?,
+    let mut pending_reviews = spawned_reviews;
+    while pending_reviews > 0 {
+        tokio::select! {
+            joined = review_set.join_next() => {
+                match joined {
+                    Some(Ok(report)) => {
+                        pending_reviews = pending_reviews.saturating_sub(1);
+                        reviews.push(report);
+                    }
+                    Some(Err(e)) => {
+                        pending_reviews = pending_reviews.saturating_sub(1);
+                        feed(tx, None, format!("☠ a reviewer's thread was severed: {e}"))?;
+                    }
+                    None => break,
+                }
+            }
+            maybe_permission = permission_rx.recv() => {
+                if let Some(request) = maybe_permission {
+                    handle_permission_request(&mut thor, &cfg.task, request, tx).await?;
+                }
+            }
+            _ = wait_abort(abort.clone()) => bail!("the battle was called off"),
         }
     }
     if *abort.borrow() {
@@ -1136,6 +1170,69 @@ struct TurnOutcome {
     stop: StopReason,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CourtActorRole {
+    Champion,
+    Reviewer,
+}
+
+impl CourtActorRole {
+    fn label(self) -> &'static str {
+        match self {
+            CourtActorRole::Champion => "champion",
+            CourtActorRole::Reviewer => "reviewer",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PermissionRuling {
+    option_id: Option<String>,
+    reason: String,
+}
+
+#[derive(Debug)]
+struct PermissionCourtRequest {
+    actor_id: FighterId,
+    actor_tag: String,
+    role: CourtActorRole,
+    access_mode: acp::RuntimeAccessMode,
+    tool_call: ToolCallUpdate,
+    options: Vec<PermissionOption>,
+    respond: tokio::sync::oneshot::Sender<PermissionRuling>,
+}
+
+#[derive(Clone)]
+struct PermissionCourtClient {
+    tx: mpsc::UnboundedSender<PermissionCourtRequest>,
+    actor_id: FighterId,
+    actor_tag: String,
+    role: CourtActorRole,
+}
+
+impl PermissionCourtClient {
+    async fn rule(
+        &self,
+        prompt: &crate::event::PermissionPrompt,
+        access_mode: acp::RuntimeAccessMode,
+    ) -> Result<PermissionRuling> {
+        let (respond, receive) = tokio::sync::oneshot::channel();
+        let request = PermissionCourtRequest {
+            actor_id: self.actor_id,
+            actor_tag: self.actor_tag.clone(),
+            role: self.role,
+            access_mode,
+            tool_call: prompt.tool_call.clone(),
+            options: prompt.options.clone(),
+            respond,
+        };
+        self.tx
+            .send(request)
+            .map_err(|_| anyhow!("permission court is closed"))?;
+        receive.await.context("permission court dropped the ruling")
+    }
+}
+
 /// A live agent subprocess + session, driven over the same channel pair the
 /// TUI uses.
 struct AgentHandle {
@@ -1224,7 +1321,7 @@ impl AgentHandle {
 
     fn answer_permission(&self, prompt: crate::event::PermissionPrompt) -> String {
         let selected = self.select_permission_option(&prompt);
-        let note = permission_answer_note(&prompt, selected.as_deref());
+        let note = permission_answer_note("permission auto-answered", &prompt, selected.as_deref());
         let decision = selected
             .map(PermissionDecision::Selected)
             .unwrap_or(PermissionDecision::Cancelled);
@@ -1232,12 +1329,25 @@ impl AgentHandle {
         note
     }
 
+    async fn answer_permission_through_court(
+        &self,
+        prompt: crate::event::PermissionPrompt,
+        court: &PermissionCourtClient,
+    ) -> String {
+        let ruling = match court.rule(&prompt, self.access_mode).await {
+            Ok(ruling) => normalize_permission_ruling(&prompt, self.access_mode, ruling),
+            Err(e) => deny_permission_ruling(&prompt, format!("Thor could not rule: {e:#}")),
+        };
+        let note = permission_ruling_note(&prompt, &ruling);
+        let decision = ruling
+            .option_id
+            .map(PermissionDecision::Selected)
+            .unwrap_or(PermissionDecision::Cancelled);
+        let _ = prompt.responder.send(decision);
+        note
+    }
+
     fn select_permission_option(&self, prompt: &crate::event::PermissionPrompt) -> Option<String> {
-        if is_plan_approval_prompt(prompt)
-            && let Some(option) = choose_allow_option_by_id(&prompt.options, "accept_plan")
-        {
-            return Some(option);
-        }
         let allow = self.access_mode == acp::RuntimeAccessMode::Full
             || matches!(
                 prompt.tool_call.fields.kind,
@@ -1371,6 +1481,7 @@ impl AgentHandle {
         &mut self,
         text: String,
         budget: Duration,
+        permission_court: Option<&PermissionCourtClient>,
         mut on_event: impl FnMut(TurnEvent),
     ) -> Result<TurnOutcome> {
         let resend_text = text.clone();
@@ -1444,7 +1555,11 @@ impl AgentHandle {
                     self.store_config(options, targets)
                 }
                 UiEvent::PermissionRequest(p) => {
-                    let note = self.answer_permission(p);
+                    let note = if let Some(court) = permission_court {
+                        self.answer_permission_through_court(p, court).await
+                    } else {
+                        self.answer_permission(p)
+                    };
                     on_event(TurnEvent::Note(note));
                 }
                 UiEvent::ElicitationRequest(e) => {
@@ -1511,34 +1626,8 @@ fn choose_reject_option(options: &[PermissionOption]) -> Option<String> {
         .map(|option| option.option_id.to_string())
 }
 
-fn choose_allow_option_by_id(options: &[PermissionOption], option_id: &str) -> Option<String> {
-    options
-        .iter()
-        .find(|option| {
-            option.option_id.0.as_ref() == option_id
-                && matches!(
-                    option.kind,
-                    PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
-                )
-        })
-        .map(|option| option.option_id.to_string())
-}
-
-fn is_plan_approval_prompt(prompt: &crate::event::PermissionPrompt) -> bool {
-    prompt.tool_call.tool_call_id.to_string() == "planning-gate-approval"
-        || prompt
-            .tool_call
-            .fields
-            .title
-            .as_deref()
-            .is_some_and(|title| title.to_ascii_lowercase().contains("approve plan"))
-        || prompt
-            .options
-            .iter()
-            .any(|option| option.option_id.0.as_ref() == "accept_plan")
-}
-
 fn permission_answer_note(
+    prefix: &str,
     prompt: &crate::event::PermissionPrompt,
     selected: Option<&str>,
 ) -> String {
@@ -1556,10 +1645,304 @@ fn permission_answer_note(
                 .find(|option| option.option_id.0.as_ref() == option_id)
                 .map(|option| option.name.as_str())
                 .unwrap_or("unnamed option");
-            format!("permission auto-answered: {title} -> {option_id} ({option_name})")
+            format!("{prefix}: {title} -> {option_id} ({option_name})")
         }
-        None => format!("permission auto-cancelled: {title}"),
+        None => format!("{prefix}: {title} -> cancelled"),
     }
+}
+
+fn permission_ruling_note(
+    prompt: &crate::event::PermissionPrompt,
+    ruling: &PermissionRuling,
+) -> String {
+    let mut note = permission_answer_note(
+        "Thor ruled on permission",
+        prompt,
+        ruling.option_id.as_deref(),
+    );
+    if !ruling.reason.trim().is_empty() {
+        note.push_str(": ");
+        note.push_str(ruling.reason.trim());
+    }
+    note
+}
+
+fn normalize_permission_ruling(
+    prompt: &crate::event::PermissionPrompt,
+    access_mode: acp::RuntimeAccessMode,
+    ruling: PermissionRuling,
+) -> PermissionRuling {
+    normalize_permission_ruling_parts(&prompt.tool_call, &prompt.options, access_mode, ruling)
+}
+
+fn normalize_permission_ruling_parts(
+    tool_call: &ToolCallUpdate,
+    options: &[PermissionOption],
+    access_mode: acp::RuntimeAccessMode,
+    ruling: PermissionRuling,
+) -> PermissionRuling {
+    let Some(option_id) = ruling.option_id.as_deref() else {
+        return deny_permission_ruling_parts(options, ruling.reason);
+    };
+    let Some(option) = options
+        .iter()
+        .find(|option| option.option_id.0.as_ref() == option_id)
+    else {
+        return deny_permission_ruling_parts(
+            options,
+            format!("Thor selected unavailable option `{option_id}`; request denied by default."),
+        );
+    };
+    if !permission_option_allowed_by_access_mode(tool_call, option, access_mode) {
+        return deny_permission_ruling_parts(
+            options,
+            format!(
+                "Thor selected `{option_id}`, but that would exceed {} access; request denied.",
+                runtime_access_mode_label(access_mode)
+            ),
+        );
+    }
+    ruling
+}
+
+fn permission_option_allowed_by_access_mode(
+    tool_call: &ToolCallUpdate,
+    option: &PermissionOption,
+    access_mode: acp::RuntimeAccessMode,
+) -> bool {
+    if !matches!(
+        option.kind,
+        PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
+    ) {
+        return true;
+    }
+    access_mode == acp::RuntimeAccessMode::Full
+        || matches!(
+            tool_call.fields.kind,
+            Some(ToolKind::Read | ToolKind::Search | ToolKind::Think)
+        )
+}
+
+fn deny_permission_ruling(
+    prompt: &crate::event::PermissionPrompt,
+    reason: impl Into<String>,
+) -> PermissionRuling {
+    deny_permission_ruling_parts(&prompt.options, reason)
+}
+
+fn deny_permission_ruling_parts(
+    options: &[PermissionOption],
+    reason: impl Into<String>,
+) -> PermissionRuling {
+    PermissionRuling {
+        option_id: choose_reject_option(options),
+        reason: reason.into(),
+    }
+}
+
+fn runtime_access_mode_label(mode: acp::RuntimeAccessMode) -> &'static str {
+    match mode {
+        acp::RuntimeAccessMode::Full => "full",
+        acp::RuntimeAccessMode::ReadOnly => "read-only",
+    }
+}
+
+async fn handle_permission_request(
+    thor: &mut Thor,
+    task: &str,
+    request: PermissionCourtRequest,
+    tx: &mpsc::UnboundedSender<RagnarokEvent>,
+) -> Result<()> {
+    let title = request
+        .tool_call
+        .fields
+        .title
+        .as_deref()
+        .unwrap_or("permission request");
+    emit(tx, RagnarokEvent::ThorAction(ThorAction::Judging))?;
+    feed(
+        tx,
+        Some(request.actor_id),
+        format!(
+            "⚖ {} asks the court for permission: {}",
+            request.actor_tag,
+            first_line(title, 90)
+        ),
+    )?;
+    let ruling = thor.rule_permission(task, &request, tx).await;
+    let verdict = permission_ruling_verdict(&request.options, &ruling);
+    feed(
+        tx,
+        Some(request.actor_id),
+        format!(
+            "⚖ THOR {verdict} {}: {}",
+            request.actor_tag,
+            first_line(&ruling.reason, 120)
+        ),
+    )?;
+    let _ = request.respond.send(ruling);
+    Ok(())
+}
+
+fn permission_ruling_verdict(
+    options: &[PermissionOption],
+    ruling: &PermissionRuling,
+) -> &'static str {
+    let Some(option_id) = ruling.option_id.as_deref() else {
+        return "cancels the request from";
+    };
+    match options
+        .iter()
+        .find(|option| option.option_id.0.as_ref() == option_id)
+        .map(|option| option.kind)
+    {
+        Some(PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways) => "permits",
+        Some(PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways) => "denies",
+        _ => "denies",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPermissionRuling {
+    option_id: Option<String>,
+    reason: Option<String>,
+}
+
+fn parse_permission_ruling(text: &str, options: &[PermissionOption]) -> Option<PermissionRuling> {
+    let value = extract_json_object(text)?;
+    let raw: RawPermissionRuling = serde_json::from_value(value).ok()?;
+    let option_id = raw.option_id?;
+    if !options
+        .iter()
+        .any(|option| option.option_id.0.as_ref() == option_id)
+    {
+        return None;
+    }
+    Some(PermissionRuling {
+        option_id: Some(option_id),
+        reason: raw
+            .reason
+            .unwrap_or_else(|| "Thor issued no reason.".to_string()),
+    })
+}
+
+fn permission_ruling_prompt(task: &str, request: &PermissionCourtRequest) -> String {
+    let tool = permission_tool_summary(&request.tool_call);
+    let options = permission_options_summary(&request.options);
+    format!(
+        "You are THOR, judge of Ragnarok. A participant is asking for one ACP permission \
+         during the tournament procedure. Rule on this request only.\n\n\
+         Denying this permission is NOT a death sentence and does NOT eliminate the participant; \
+         it simply sends the chosen reject option back to the ACP agent. Approve only if the \
+         request is safe, relevant to the task, inside the participant's role, and consistent \
+         with the current access mode. Deny requests that are unrelated, insecure, destructive \
+         beyond the task, outside the worktree, credential/secrets related, or role-forbidden.\n\n\
+         ORIGINAL TASK:\n{task}\n\n\
+         PARTICIPANT:\n\
+         - id: {id}\n\
+         - actor: {actor}\n\
+         - role: {role}\n\
+         - access_mode: {access_mode}\n\n\
+         REQUESTED PERMISSION:\n{tool}\n\n\
+         ACP OPTIONS:\n{options}\n\n\
+         Choose exactly one option_id from ACP OPTIONS. If denying, choose a reject option if one \
+         exists. Respond with ONLY this JSON object, no prose and no code fences:\n\
+         {{\"option_id\":\"<exact option_id>\",\"reason\":\"<one short sentence>\"}}",
+        id = request.actor_id,
+        actor = request.actor_tag,
+        role = request.role.label(),
+        access_mode = runtime_access_mode_label(request.access_mode),
+    )
+}
+
+fn permission_options_summary(options: &[PermissionOption]) -> String {
+    if options.is_empty() {
+        return "(no ACP options were offered; Ragnarok can only cancel)".to_string();
+    }
+    options
+        .iter()
+        .map(|option| {
+            format!(
+                "- option_id: {}\n  label: {}\n  kind: {}",
+                option.option_id,
+                option.name,
+                permission_option_kind_label(option.kind)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn permission_tool_summary(tool_call: &ToolCallUpdate) -> String {
+    let title = tool_call.fields.title.as_deref().unwrap_or("(untitled)");
+    let kind = tool_call
+        .fields
+        .kind
+        .map(tool_kind_label)
+        .unwrap_or("unknown");
+    let status = tool_call
+        .fields
+        .status
+        .map(crate::labels::tool_status_label)
+        .unwrap_or("unknown");
+    let content = tool_call
+        .fields
+        .content
+        .as_deref()
+        .map(permission_tool_content_summary)
+        .unwrap_or_else(|| "(no content)".to_string());
+    let raw_input = tool_call
+        .fields
+        .raw_input
+        .as_ref()
+        .map(permission_json_summary)
+        .unwrap_or_else(|| "(no raw input)".to_string());
+    format!(
+        "- tool_call_id: {}\n\
+         - title: {}\n\
+         - kind: {}\n\
+         - status: {}\n\
+         - content:\n{}\n\
+         - raw_input:\n{}",
+        tool_call.tool_call_id,
+        title,
+        kind,
+        status,
+        indent_block(&truncate_middle(&content, PERMISSION_CONTEXT_LIMIT), "  "),
+        indent_block(&truncate_middle(&raw_input, PERMISSION_CONTEXT_LIMIT), "  "),
+    )
+}
+
+fn permission_tool_content_summary(content: &[ToolCallContent]) -> String {
+    if content.is_empty() {
+        return "(empty content)".to_string();
+    }
+    content
+        .iter()
+        .map(|item| match item {
+            ToolCallContent::Content(block) => content_block_text(&block.content),
+            ToolCallContent::Diff(diff) => format!("diff: {}", diff.path.display()),
+            ToolCallContent::Terminal(terminal) => {
+                format!("terminal: {}", terminal.terminal_id)
+            }
+            _ => "(unknown tool-call content)".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn permission_json_summary(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn indent_block(text: &str, prefix: &str) -> String {
+    if text.is_empty() {
+        return prefix.to_string();
+    }
+    text.lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -1833,6 +2216,7 @@ struct FightOrders {
     kill: watch::Receiver<bool>,
     kill_reason: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     ping: mpsc::UnboundedSender<WatchdogPing>,
+    permission_tx: mpsc::UnboundedSender<PermissionCourtRequest>,
     tx: mpsc::UnboundedSender<RagnarokEvent>,
     abort: watch::Receiver<bool>,
 }
@@ -1845,6 +2229,7 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
         kill,
         kill_reason,
         ping,
+        permission_tx,
         tx,
         abort,
     } = orders;
@@ -1949,30 +2334,41 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
     let mut cry_roll = id.wrapping_mul(7);
     let mut chunk_count = 0usize;
     let fighter_name = fighter.card.model_name.clone();
+    let permission_court = PermissionCourtClient {
+        tx: permission_tx,
+        actor_id: id,
+        actor_tag: fighter.card.tag(),
+        role: CourtActorRole::Champion,
+    };
     let tx_events = tx.clone();
     let outcome = handle
-        .prompt(fight_prompt(&task), FIGHT_TIMEOUT, |ev| {
-            if let TurnEvent::Tool {
-                title,
-                started: true,
-                ..
-            } = &ev
-            {
-                let _ = ping.send(WatchdogPing {
+        .prompt(
+            fight_prompt(&task),
+            FIGHT_TIMEOUT,
+            Some(&permission_court),
+            |ev| {
+                if let TurnEvent::Tool {
+                    title,
+                    started: true,
+                    ..
+                } = &ev
+                {
+                    let _ = ping.send(WatchdogPing {
+                        id,
+                        title: title.clone(),
+                    });
+                }
+                forward_turn_event(
+                    &tx_events,
                     id,
-                    title: title.clone(),
-                });
-            }
-            forward_turn_event(
-                &tx_events,
-                id,
-                &fighter_name,
-                ev,
-                TextLane::Message,
-                &mut cry_roll,
-                &mut chunk_count,
-            );
-        })
+                    &fighter_name,
+                    ev,
+                    TextLane::Message,
+                    &mut cry_roll,
+                    &mut chunk_count,
+                );
+            },
+        )
         .await;
     handle.dismiss().await;
     let outcome = match outcome {
@@ -2335,6 +2731,7 @@ async fn review(
     defender_cwd: PathBuf,
     tx: mpsc::UnboundedSender<RagnarokEvent>,
     abort: watch::Receiver<bool>,
+    permission_tx: mpsc::UnboundedSender<PermissionCourtRequest>,
 ) -> ReviewReport {
     let set_progress = |progress: ReviewProgress| {
         let _ = tx.send(RagnarokEvent::ReviewState {
@@ -2375,9 +2772,15 @@ async fn review(
     let name = reviewer.card.model_name.clone();
     let mut cry_roll = id.wrapping_mul(13);
     let mut chunk_count = 0usize;
+    let permission_court = PermissionCourtClient {
+        tx: permission_tx,
+        actor_id: id,
+        actor_tag: reviewer.card.tag(),
+        role: CourtActorRole::Reviewer,
+    };
     let tx_events = tx.clone();
     let outcome = handle
-        .prompt(prompt, REVIEW_TIMEOUT, |ev| {
+        .prompt(prompt, REVIEW_TIMEOUT, Some(&permission_court), |ev| {
             forward_turn_event(
                 &tx_events,
                 id,
@@ -2524,16 +2927,74 @@ impl Thor {
         let tx = tx.clone();
         let outcome = self
             .handle
-            .prompt(prompt, budget, |ev| {
-                if let TurnEvent::Message(chunk) = ev {
+            .prompt(prompt, budget, None, |ev| match ev {
+                TurnEvent::Message(chunk) => {
                     let _ = tx.send(RagnarokEvent::ThorSpeaks(chunk));
                 }
+                TurnEvent::Note(note) => {
+                    let _ = tx.send(RagnarokEvent::Log {
+                        fighter: None,
+                        text: first_line(&note, 140),
+                    });
+                    let _ = tx.send(RagnarokEvent::ThorSpeaks(format!(
+                        "\n{}\n",
+                        first_line(&note, 240)
+                    )));
+                }
+                TurnEvent::Thought(_) | TurnEvent::Tool { .. } => {}
             })
             .await?;
         if !turn_succeeded(outcome.stop) {
             bail!("Thor fell silent ({})", stop_reason_label(outcome.stop));
         }
         Ok(outcome.text)
+    }
+
+    async fn rule_permission(
+        &mut self,
+        task: &str,
+        request: &PermissionCourtRequest,
+        tx: &mpsc::UnboundedSender<RagnarokEvent>,
+    ) -> PermissionRuling {
+        let prompt = permission_ruling_prompt(task, request);
+        for attempt in 0..2 {
+            let text = if attempt == 0 {
+                self.speak_budget(prompt.clone(), PERMISSION_RULING_TIMEOUT, tx)
+                    .await
+            } else {
+                self.speak_budget(
+                    "Your previous permission ruling could not be used. Choose exactly one \
+                     option_id from the ACP OPTIONS and respond with ONLY \
+                     {\"option_id\":\"<exact option_id>\",\"reason\":\"<one short sentence>\"}."
+                        .to_string(),
+                    PERMISSION_RULING_TIMEOUT,
+                    tx,
+                )
+                .await
+            };
+            match text {
+                Ok(text) => {
+                    if let Some(ruling) = parse_permission_ruling(&text, &request.options) {
+                        return normalize_permission_ruling_parts(
+                            &request.tool_call,
+                            &request.options,
+                            request.access_mode,
+                            ruling,
+                        );
+                    }
+                }
+                Err(e) => {
+                    return deny_permission_ruling_parts(
+                        &request.options,
+                        format!("Thor could not rule on the permission request: {e:#}"),
+                    );
+                }
+            }
+        }
+        deny_permission_ruling_parts(
+            &request.options,
+            "Thor's permission ruling was invalid twice; request denied by default.",
+        )
     }
 
     /// Mid-combat straggler ruling: `(cut_down, reason)`. Never fails the
@@ -3855,7 +4316,7 @@ mod tests {
 
         let outcome = rig
             .handle
-            .prompt("go".to_string(), Duration::from_secs(5), |_| {})
+            .prompt("go".to_string(), Duration::from_secs(5), None, |_| {})
             .await
             .expect("prompt survives the rejection");
         assert_eq!(outcome.stop, StopReason::EndTurn);
@@ -3915,47 +4376,123 @@ mod tests {
         assert!(matches!(prx.await, Ok(PermissionDecision::Cancelled)));
     }
 
+    #[test]
+    fn parse_permission_ruling_accepts_only_available_option_ids() {
+        use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionKind};
+
+        let options = vec![
+            PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
+            PermissionOption::new("deny", "Deny", PermissionOptionKind::RejectOnce),
+        ];
+        let ruling = parse_permission_ruling(
+            r#"{"option_id":"deny","reason":"outside the task"}"#,
+            &options,
+        )
+        .expect("valid ruling");
+        assert_eq!(ruling.option_id.as_deref(), Some("deny"));
+        assert_eq!(ruling.reason, "outside the task");
+
+        assert!(
+            parse_permission_ruling(
+                r#"{"option_id":"missing","reason":"no such option"}"#,
+                &options,
+            )
+            .is_none()
+        );
+    }
+
     #[tokio::test]
-    async fn anvil_plan_approval_prefers_accept_plan_and_reports_choice() {
+    async fn prompt_routes_permission_requests_to_thor_court() {
         use agent_client_protocol::schema::v1::{
             PermissionOption, PermissionOptionKind, ToolCallUpdate, ToolCallUpdateFields,
         };
-        let rig = test_rig();
-        let mut fields = ToolCallUpdateFields::default();
-        fields.kind = Some(ToolKind::Think);
-        fields.title = Some("Approve plan before execution".to_string());
-        let (ptx, prx) = tokio::sync::oneshot::channel();
 
-        let note = rig
-            .handle
-            .answer_permission(crate::event::PermissionPrompt {
-                tool_call: ToolCallUpdate::new("planning-gate-approval", fields),
+        let TestRig {
+            mut handle,
+            event_tx,
+            cmd_rx: _cmd_rx,
+            _abort_tx,
+        } = test_rig();
+        let (court_tx, mut court_rx) = mpsc::unbounded_channel();
+        let court = PermissionCourtClient {
+            tx: court_tx,
+            actor_id: 7,
+            actor_tag: "Freyja [agent] ⚡1200".to_string(),
+            role: CourtActorRole::Champion,
+        };
+        let mut fields = ToolCallUpdateFields::default();
+        fields.kind = Some(ToolKind::Execute);
+        fields.title = Some("run risky command".to_string());
+        let (ptx, prx) = tokio::sync::oneshot::channel();
+        event_tx
+            .send(UiEvent::PermissionRequest(crate::event::PermissionPrompt {
+                tool_call: ToolCallUpdate::new("tool-1", fields),
                 options: vec![
-                    PermissionOption::new(
-                        "allow_all",
-                        "Allow all",
-                        PermissionOptionKind::AllowAlways,
-                    ),
-                    PermissionOption::new(
-                        "accept_plan",
-                        "Accept plan",
-                        PermissionOptionKind::AllowOnce,
-                    ),
-                    PermissionOption::new(
-                        "reject_plan",
-                        "Cancel",
-                        PermissionOptionKind::RejectOnce,
-                    ),
+                    PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
+                    PermissionOption::new("deny", "Deny", PermissionOptionKind::RejectOnce),
                 ],
                 responder: ptx,
-            });
+            }))
+            .unwrap();
+        event_tx
+            .send(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+            .unwrap();
 
-        assert!(matches!(prx.await, Ok(PermissionDecision::Selected(id)) if id == "accept_plan"));
-        assert!(note.contains("accept_plan"), "note: {note}");
-        assert!(
-            note.contains("Approve plan before execution"),
-            "note: {note}"
+        let prompt = tokio::spawn(async move {
+            handle
+                .prompt(
+                    "go".to_string(),
+                    Duration::from_secs(5),
+                    Some(&court),
+                    |_| {},
+                )
+                .await
+        });
+        let request = court_rx.recv().await.expect("court request");
+        assert_eq!(request.actor_id, 7);
+        assert_eq!(request.role, CourtActorRole::Champion);
+        assert_eq!(
+            request.tool_call.fields.title.as_deref(),
+            Some("run risky command")
         );
+        request
+            .respond
+            .send(PermissionRuling {
+                option_id: Some("deny".to_string()),
+                reason: "not needed for the task".to_string(),
+            })
+            .unwrap();
+        let outcome = prompt.await.expect("prompt task").expect("prompt succeeds");
+
+        assert_eq!(outcome.stop, StopReason::EndTurn);
+        assert!(matches!(prx.await, Ok(PermissionDecision::Selected(id)) if id == "deny"));
+    }
+
+    #[test]
+    fn read_only_access_overrides_unsafe_allow_ruling_to_denial() {
+        use agent_client_protocol::schema::v1::{
+            PermissionOption, PermissionOptionKind, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let mut fields = ToolCallUpdateFields::default();
+        fields.kind = Some(ToolKind::Edit);
+        let options = vec![
+            PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
+            PermissionOption::new("deny", "Deny", PermissionOptionKind::RejectOnce),
+        ];
+        let ruling = normalize_permission_ruling_parts(
+            &ToolCallUpdate::new("edit", fields),
+            &options,
+            acp::RuntimeAccessMode::ReadOnly,
+            PermissionRuling {
+                option_id: Some("allow".to_string()),
+                reason: "mistaken approval".to_string(),
+            },
+        );
+        assert_eq!(ruling.option_id.as_deref(), Some("deny"));
+        assert!(ruling.reason.contains("read-only"));
     }
 
     #[tokio::test]
@@ -4018,7 +4555,7 @@ mod tests {
             .unwrap();
         let err = rig
             .handle
-            .prompt("go".to_string(), Duration::from_secs(5), |_| {})
+            .prompt("go".to_string(), Duration::from_secs(5), None, |_| {})
             .await
             .expect_err("unrelated failures still fail");
         assert!(format!("{err:#}").contains("agent exploded"));
