@@ -242,12 +242,6 @@ struct ServerArgs {
     /// QR/bearer token is preserved, so devices can re-authenticate as usual.
     #[arg(long)]
     logout_all: bool,
-    /// Let signed-in viewers spawn new agent tasks through the web UI.
-    /// Spawned sessions run the configured agents with a working directory
-    /// constrained to --cwd / --additional-directory. Off by default because
-    /// it grants remote process launch to anyone holding viewer credentials.
-    #[arg(long)]
-    allow_spawn: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -392,7 +386,6 @@ async fn main() -> Result<()> {
                     history_days: args.history_days,
                     session_ttl_days: args.session_ttl_days,
                     logout_all: args.logout_all,
-                    allow_spawn: args.allow_spawn,
                     cwd,
                     additional_directories: workspace_roots.additional_directories().to_vec(),
                     fs_max_text_bytes,
