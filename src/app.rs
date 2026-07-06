@@ -2358,8 +2358,8 @@ pub struct RagnarokUi {
     pub show_review_lane: bool,
     /// The finalist chosen by the user at a split decision.
     pub chosen_finalist: Option<ragnarok::FighterId>,
-    /// First Esc arms fleeing; the second Esc aborts the battle.
-    pub esc_armed: bool,
+    /// First `q` arms quitting; the second `q` aborts the battle.
+    pub quit_armed: bool,
     pub started_at: Instant,
     abort_tx: tokio::sync::watch::Sender<bool>,
     proceed_tx: tokio::sync::watch::Sender<bool>,
@@ -2388,7 +2388,7 @@ impl RagnarokUi {
             selected_fighter: 0,
             show_review_lane: false,
             chosen_finalist: None,
-            esc_armed: false,
+            quit_armed: false,
             started_at: Instant::now(),
             abort_tx,
             proceed_tx,
@@ -2507,7 +2507,7 @@ impl AppState {
         match ev {
             E::Phase(phase) => {
                 arena.phase = phase;
-                arena.esc_armed = false;
+                arena.quit_armed = false;
                 arena.push_feed(None, format!("━━ {} ━━", phase.banner()));
             }
             E::Log { fighter, text } => arena.push_feed(fighter, text),

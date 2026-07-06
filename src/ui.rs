@@ -3044,7 +3044,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         if state.ragnarok.is_some() {
             state.record_status_message(
                 StatusKind::Warning,
-                "a Ragnarok is already raging (press Esc twice in the arena to flee)",
+                "a Ragnarok is already raging (press q twice in the arena to quit)",
             );
         } else if task.is_empty() {
             state
@@ -7598,24 +7598,35 @@ fn handle_ragnarok_key(
     };
     let over = arena.battle_over();
 
-    // Ctrl-C always flees, raging battle or not.
+    // Ctrl-C always aborts, raging battle or not.
     if modifiers == KeyModifiers::CONTROL && matches!(code, KeyCode::Char('c')) {
         state.close_ragnarok();
         return inline_repair_request(mode);
     }
 
-    let disarm = !matches!(code, KeyCode::Esc);
+    let disarm_quit = !matches!(code, KeyCode::Char('q') | KeyCode::Char('Q'));
     match code {
         KeyCode::Esc => {
+            arena.quit_armed = false;
+            if arena.pane == ArenaPane::Transcript {
+                arena.pane = ArenaPane::Arena;
+                return inline_repair_request(mode);
+            }
             if over {
                 state.close_ragnarok();
                 return inline_repair_request(mode);
             }
-            if arena.esc_armed {
+        }
+        KeyCode::Char('q') | KeyCode::Char('Q') if over => {
+            state.close_ragnarok();
+            return inline_repair_request(mode);
+        }
+        KeyCode::Char('q') | KeyCode::Char('Q') => {
+            if arena.quit_armed {
                 arena.abort();
-                arena.esc_armed = false;
+                arena.quit_armed = false;
             } else {
-                arena.esc_armed = true;
+                arena.quit_armed = true;
             }
         }
         KeyCode::Up | KeyCode::Char('k') => arena.scroll_feed(1),
@@ -7639,7 +7650,7 @@ fn handle_ragnarok_key(
                 arena.selected_fighter = picked;
             }
         }
-        KeyCode::Enter | KeyCode::Char('q') if over => {
+        KeyCode::Enter if over => {
             state.close_ragnarok();
             return inline_repair_request(mode);
         }
@@ -7647,14 +7658,14 @@ fn handle_ragnarok_key(
             arena.unleash();
         }
         KeyCode::Enter | KeyCode::Tab | KeyCode::Char('t') | KeyCode::Char('T') => {
-            arena.esc_armed = false;
+            arena.quit_armed = false;
             toggle_ragnarok_pane(arena);
             return inline_repair_request(mode);
         }
         _ => {}
     }
-    if disarm && let Some(arena) = state.ragnarok.as_mut() {
-        arena.esc_armed = false;
+    if disarm_quit && let Some(arena) = state.ragnarok.as_mut() {
+        arena.quit_armed = false;
     }
     TerminalRequest::None
 }
@@ -7750,35 +7761,35 @@ fn ragnarok_banner_line(arena: &RagnarokUi, theme: TerminalTheme, width: u16) ->
 
 fn ragnarok_footer_line(arena: &RagnarokUi, theme: TerminalTheme, width: u16) -> Line<'static> {
     let over = arena.battle_over();
-    let hints = if arena.esc_armed {
-        "⚠ Esc again to FLEE RAGNAROK (any other key stays) ⚠".to_string()
-    } else if over {
-        match arena.verdict.as_ref().and_then(|v| v.finalists) {
-            Some(_) => "1/2 choose finalist · Enter accept & close · t transcripts · ←/→ fighter"
-                .to_string(),
-            None => {
-                "Enter/q close · t transcripts · ↑/↓ feed · ←/→ fighter · r review lane".to_string()
+    let hints =
+        if arena.quit_armed {
+            "⚠ q again to quit Ragnarok (Esc cancels) ⚠".to_string()
+        } else if over {
+            match arena.verdict.as_ref().and_then(|v| v.finalists) {
+                Some(_) => "1/2 choose finalist · Enter accept & close · t transcripts · q close"
+                    .to_string(),
+                None => "Enter/q close · t transcripts · ↑/↓ feed · ←/→ fighter · r review lane"
+                    .to_string(),
             }
-        }
-    } else if arena.awaiting_approval() {
-        "⚔ Enter to UNLEASH RAGNAROK (no combat spend yet) · ↑/↓ feed · Esc Esc flee".to_string()
-    } else {
-        match arena.pane {
-            ArenaPane::Arena => {
-                "Enter transcript · ↑/↓ feed · ←/→ fighter · 1-9 select · Esc Esc flee".to_string()
+        } else if arena.awaiting_approval() {
+            "⚔ Enter to UNLEASH RAGNAROK (no combat spend yet) · ↑/↓ feed · q quit".to_string()
+        } else {
+            match arena.pane {
+                ArenaPane::Arena => {
+                    "Enter transcript · ↑/↓ feed · ←/→ fighter · 1-9 select · q quit".to_string()
+                }
+                ArenaPane::Transcript => {
+                    "Esc arena · Enter arena · ←/→ fighter · r review lane · q quit".to_string()
+                }
             }
-            ArenaPane::Transcript => {
-                "Enter arena · ←/→ fighter · r review lane · Esc Esc flee".to_string()
-            }
-        }
-    };
-    if arena.awaiting_approval() && !arena.esc_armed {
+        };
+    if arena.awaiting_approval() && !arena.quit_armed {
         let style = Style::default()
             .fg(theme.warning)
             .add_modifier(Modifier::BOLD);
         return Line::from(Span::styled(fit_width(&hints, width as usize), style)).centered();
     }
-    let style = if arena.esc_armed {
+    let style = if arena.quit_armed {
         Style::default()
             .fg(theme.error)
             .add_modifier(Modifier::BOLD)
@@ -13943,7 +13954,7 @@ mod tests {
             UiMode::InlineChat,
         );
         assert_eq!(state.ragnarok.as_ref().unwrap().pane, ArenaPane::Transcript);
-        state.ragnarok.as_mut().unwrap().esc_armed = true;
+        state.ragnarok.as_mut().unwrap().quit_armed = true;
         handle_ragnarok_key(
             &mut state,
             KeyModifiers::NONE,
@@ -13952,8 +13963,26 @@ mod tests {
         );
         assert_eq!(state.ragnarok.as_ref().unwrap().pane, ArenaPane::Arena);
         assert!(
-            !state.ragnarok.as_ref().unwrap().esc_armed,
-            "pane toggles disarm the flee confirmation"
+            !state.ragnarok.as_ref().unwrap().quit_armed,
+            "pane toggles disarm the quit confirmation"
+        );
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Enter,
+            UiMode::InlineChat,
+        );
+        assert_eq!(state.ragnarok.as_ref().unwrap().pane, ArenaPane::Transcript);
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Esc,
+            UiMode::InlineChat,
+        );
+        assert_eq!(
+            state.ragnarok.as_ref().unwrap().pane,
+            ArenaPane::Arena,
+            "Esc exits the transcript pane"
         );
         // Arrows cycle fighters.
         handle_ragnarok_key(
@@ -13997,14 +14026,14 @@ mod tests {
         assert!(*proceed_rx.borrow(), "gate Enter fires the proceed watch");
         state.apply_ragnarok_event(ragnarok::RagnarokEvent::Phase(ragnarok::Phase::Combat));
 
-        // Esc arms, second Esc fires the abort watch.
+        // q arms, second q fires the abort watch.
         handle_ragnarok_key(
             &mut state,
             KeyModifiers::NONE,
-            KeyCode::Esc,
+            KeyCode::Char('q'),
             UiMode::InlineChat,
         );
-        assert!(state.ragnarok.as_ref().unwrap().esc_armed);
+        assert!(state.ragnarok.as_ref().unwrap().quit_armed);
         assert!(!*abort_rx.borrow());
         handle_ragnarok_key(
             &mut state,
@@ -14012,7 +14041,24 @@ mod tests {
             KeyCode::Esc,
             UiMode::InlineChat,
         );
-        assert!(*abort_rx.borrow(), "second Esc flees the battle");
+        assert!(
+            !state.ragnarok.as_ref().unwrap().quit_armed,
+            "Esc cancels quit confirmation"
+        );
+        assert!(!*abort_rx.borrow());
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Char('q'),
+            UiMode::InlineChat,
+        );
+        handle_ragnarok_key(
+            &mut state,
+            KeyModifiers::NONE,
+            KeyCode::Char('q'),
+            UiMode::InlineChat,
+        );
+        assert!(*abort_rx.borrow(), "second q quits the battle");
         // The arena stays up until the battle task reports Failed/Done.
         assert!(state.ragnarok.is_some());
     }
