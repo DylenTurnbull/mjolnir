@@ -7,7 +7,7 @@
 
 use std::ffi::OsStr;
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -100,6 +100,7 @@ fn create_for_project_cwd(project_root: &Path, cwd: &Path) -> Result<CreatedWork
 /// predictable path and a branch the winner can be pushed from directly.
 /// Returns the absolute path of the created worktree.
 pub fn create_on_new_branch(project_root: &Path, branch_name: &str) -> Result<PathBuf> {
+    validate_programmatic_branch_name(branch_name)?;
     let worktree_root = worktrees_dir(project_root).join(branch_name);
     if let Some(parent) = worktree_root.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -117,6 +118,45 @@ pub fn create_on_new_branch(project_root: &Path, branch_name: &str) -> Result<Pa
     )
     .with_context(|| format!("create git worktree on branch {branch_name}"))?;
     Ok(worktree_root)
+}
+
+fn validate_programmatic_branch_name(branch_name: &str) -> Result<()> {
+    if branch_name.is_empty() {
+        bail!("branch name must not be empty");
+    }
+    if branch_name.len() > 200 {
+        bail!("branch name is too long");
+    }
+    if branch_name.starts_with('-') {
+        bail!("branch name must not start with '-'");
+    }
+    if branch_name.starts_with('/')
+        || branch_name.ends_with('/')
+        || branch_name.contains("//")
+        || branch_name.contains('\\')
+        || branch_name.contains("..")
+        || branch_name.contains("@{")
+    {
+        bail!("branch name must be a relative path under .mjolnir/worktrees");
+    }
+    if !branch_name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '-' | '_' | '.'))
+    {
+        bail!("branch name contains unsupported characters");
+    }
+    for component in Path::new(branch_name).components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part.to_string_lossy();
+                if part.is_empty() || part.starts_with('.') || part.ends_with(".lock") {
+                    bail!("branch name contains an unsafe path component");
+                }
+            }
+            _ => bail!("branch name must be a relative path under .mjolnir/worktrees"),
+        }
+    }
+    Ok(())
 }
 
 /// Open an existing worktree by name (short name under
@@ -797,6 +837,33 @@ mod tests {
             second.is_err(),
             "creating the same branch/worktree twice should fail, not silently succeed"
         );
+    }
+
+    #[test]
+    fn create_on_new_branch_rejects_path_traversal_branch_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("file.txt"), "hello").expect("write file");
+        run_git(dir.path(), [OsStr::new("add"), OsStr::new(".")]).expect("git add");
+        commit_all(dir.path());
+
+        let result = create_on_new_branch(dir.path(), "ragnarok/../../outside/c1");
+
+        assert!(result.is_err());
+        assert!(!dir.path().join("outside").exists());
+    }
+
+    #[test]
+    fn create_on_new_branch_rejects_absolute_branch_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("file.txt"), "hello").expect("write file");
+        run_git(dir.path(), [OsStr::new("add"), OsStr::new(".")]).expect("git add");
+        commit_all(dir.path());
+
+        let result = create_on_new_branch(dir.path(), "/tmp/ragnarok/c1");
+
+        assert!(result.is_err());
     }
 
     fn init_git_repo(path: &Path) {

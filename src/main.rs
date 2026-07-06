@@ -186,6 +186,11 @@ struct McpArgs {
     /// default, unrestricted behavior.
     #[arg(long, value_delimiter = ',')]
     allowed_agents: Vec<String>,
+    /// Require every `connect` cwd to live under `<cwd>/.mjolnir/worktrees/`.
+    /// Used by Ragnarok so nested agents can only operate in isolated linked
+    /// worktrees, never the supervising checkout.
+    #[arg(long)]
+    require_worktree_cwd: bool,
 }
 
 #[derive(Debug, clap::Args, Default)]
@@ -392,6 +397,7 @@ async fn main() -> Result<()> {
                     fs_max_text_bytes,
                     allowed_agents: (!args.allowed_agents.is_empty())
                         .then_some(args.allowed_agents),
+                    require_worktree_cwd: args.require_worktree_cwd,
                 })
                 .await
             }

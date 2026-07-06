@@ -126,6 +126,11 @@ pub struct McpConfig {
     /// unrestricted behavior. Used to give a supervising agent tool access
     /// to this server without letting it spawn arbitrary executables.
     pub allowed_agents: Option<Vec<String>>,
+    /// When true, `connect` rejects cwd values outside
+    /// `<default_cwd>/.mjolnir/worktrees/`. Ragnarok enables this on its
+    /// nested MCP server so worker/reviewer agents cannot run in the
+    /// supervising checkout.
+    pub require_worktree_cwd: bool,
 }
 
 // Enum→label mappers live in `crate::labels`, shared with the headless runner.
@@ -929,6 +934,9 @@ impl McpServer {
             Some(c) => check("cwd", c)?,
             None => self.config.default_cwd.clone(),
         };
+        if self.config.require_worktree_cwd {
+            self.ensure_required_worktree_cwd(&cwd)?;
+        }
         let additional_directories = if args.additional_directories.is_empty() {
             self.config.additional_directories.clone()
         } else {
@@ -938,6 +946,27 @@ impl McpServer {
                 .collect::<Result<Vec<_>, _>>()?
         };
         Ok((cwd, additional_directories))
+    }
+
+    fn ensure_required_worktree_cwd(&self, cwd: &Path) -> Result<(), String> {
+        let worktrees_root = std::fs::canonicalize(
+            self.config.default_cwd.join(".mjolnir/worktrees"),
+        )
+        .map_err(|e| {
+            format!(
+                "worktree cwd restriction is enabled, but {} is not usable: {e}",
+                self.config.default_cwd.join(".mjolnir/worktrees").display()
+            )
+        })?;
+        if cwd.starts_with(&worktrees_root) {
+            Ok(())
+        } else {
+            Err(format!(
+                "cwd {:?} is outside the required worktree root {}; use create_worktree first",
+                cwd,
+                worktrees_root.display()
+            ))
+        }
     }
 
     /// Canonicalized roots the operator allowed at launch.
@@ -1511,6 +1540,7 @@ mod tests {
             agent_stderr: None,
             fs_max_text_bytes: 1_000_000,
             allowed_agents,
+            require_worktree_cwd: false,
         }
     }
 
@@ -1579,6 +1609,52 @@ mod tests {
                 .check_allowed_agent(&connect_args(None, None))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn require_worktree_cwd_rejects_project_root_cwd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".mjolnir/worktrees")).expect("worktrees dir");
+        let server = McpServer::new(McpConfig {
+            default_cwd: dir.path().to_path_buf(),
+            additional_directories: Vec::new(),
+            agent_stderr: None,
+            fs_max_text_bytes: 1_000_000,
+            allowed_agents: None,
+            require_worktree_cwd: true,
+        });
+        let mut args = connect_args(Some("claude-acp"), None);
+        args.cwd = Some(dir.path().display().to_string());
+
+        let err = server
+            .resolve_workspace_roots(&args)
+            .expect_err("reject cwd");
+
+        assert!(err.contains("outside the required worktree root"), "{err}");
+    }
+
+    #[test]
+    fn require_worktree_cwd_accepts_nested_worktree_cwd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let worktree = dir.path().join(".mjolnir/worktrees/ragnarok/run/c1");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        let server = McpServer::new(McpConfig {
+            default_cwd: dir.path().to_path_buf(),
+            additional_directories: Vec::new(),
+            agent_stderr: None,
+            fs_max_text_bytes: 1_000_000,
+            allowed_agents: None,
+            require_worktree_cwd: true,
+        });
+        let mut args = connect_args(Some("claude-acp"), None);
+        args.cwd = Some(worktree.display().to_string());
+
+        let (cwd, additional) = server
+            .resolve_workspace_roots(&args)
+            .expect("accept worktree cwd");
+
+        assert_eq!(cwd, std::fs::canonicalize(&worktree).expect("canonical"));
+        assert!(additional.is_empty());
     }
 
     #[test]

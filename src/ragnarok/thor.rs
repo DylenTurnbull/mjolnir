@@ -19,7 +19,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
-    McpServer, McpServerStdio, PermissionOptionKind, SessionUpdate, StopReason, ToolCallStatus,
+    McpServer, McpServerStdio, PermissionOption, PermissionOptionKind, SessionUpdate, StopReason,
+    ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use tokio::sync::mpsc;
 
@@ -96,6 +97,7 @@ async fn run_tournament(
             return;
         }
     };
+    ensure_score_catalog_ready(&loaded_cfg, &cfg.score_store).await;
 
     let candidates = eligibility::candidates_from_config(&loaded_cfg);
     let scan = eligibility::scan(
@@ -106,11 +108,12 @@ async fn run_tournament(
     )
     .await;
 
-    if scan.eligible.len() < super::MIN_COMPETITORS {
+    if scan.eligible.len().saturating_sub(1) < super::MIN_COMPETITORS {
         let mut reason = format!(
-            "found {} eligible (agent, model) pair(s) with an Elo score; need at least {}. \
+            "found {} eligible (agent, model) pair(s) with an Elo score; need at least {} total ({} competitors plus one Thor judge). \
              Configure another ACP agent, or wait for a model to appear on the LMArena leaderboard.",
             scan.eligible.len(),
+            super::MIN_COMPETITORS + 1,
             super::MIN_COMPETITORS,
         );
         if !scan.skipped.is_empty() {
@@ -124,16 +127,14 @@ async fn run_tournament(
         let _ = event_tx.send(RagnarokEvent::Aborted { reason });
         return;
     }
-    let _ = event_tx.send(RagnarokEvent::EligibilityScanned {
-        eligible_count: scan.eligible.len(),
-    });
-
     // Thor is voiced by the single highest-Elo eligible entry and never
     // competes -- judging its own work would be exactly the conflict of
     // interest constraint #6 rules out between competitors.
-    let thor_voice = scan.eligible[0].clone();
-    let mut allowed_ids: Vec<String> = scan
-        .eligible
+    let (thor_voice, competitor_pool) = split_thor_voice_and_competitors(&scan.eligible);
+    let _ = event_tx.send(RagnarokEvent::EligibilityScanned {
+        eligible_count: competitor_pool.len(),
+    });
+    let mut allowed_ids: Vec<String> = competitor_pool
         .iter()
         .map(|c| c.agent_source_id.clone())
         .collect();
@@ -169,6 +170,7 @@ async fn run_tournament(
                 "mcp".to_string(),
                 "--allowed-agents".to_string(),
                 allowed_ids.join(","),
+                "--require-worktree-cwd".to_string(),
             ],
         ))],
     };
@@ -178,8 +180,8 @@ async fn run_tournament(
     let thor_runtime =
         tokio::spawn(async move { acp::run(runtime_cfg, thor_event_tx, thor_cmd_rx).await });
 
-    let prompt = build_prompt(&cfg.task, &scan.eligible);
-    let mut driver = ThorDriver::new(&scan.eligible, &event_tx);
+    let prompt = build_prompt(&cfg.task, &competitor_pool);
+    let mut driver = ThorDriver::new(&competitor_pool, &event_tx);
     let mut prompt_sent = false;
     let mut final_text = String::new();
     let mut aborted_reason: Option<String> = None;
@@ -213,25 +215,16 @@ async fn run_tournament(
                             driver.observe(update);
                         }
                         UiEvent::PermissionRequest(prompt) => {
-                            // Thor's own tool calls (connect/submit_prompt/
-                            // poll_progress/respond_permission/get_result/
-                            // create_worktree) are scoped orchestration that
-                            // never itself mutates the user's filesystem
-                            // beyond an isolated worktree -- auto-trust
-                            // them. What Thor must actively gate is
-                            // *competitors'* actions, via its own
-                            // respond_permission calls (observed, not
-                            // answered, by `driver`).
-                            let option = prompt.options.iter().find(|o| {
-                                matches!(
-                                    o.kind,
-                                    PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
-                                )
-                            });
-                            let decision = match option {
-                                Some(o) => PermissionDecision::Selected(o.option_id.to_string()),
-                                None => PermissionDecision::Cancelled,
-                            };
+                            // Thor can still ask for its own ACP tool
+                            // permissions while supervising. Auto-allow only
+                            // non-mutating/MCP-shaped requests; reject
+                            // execute/edit/delete/move so the judge cannot
+                            // silently mutate the user's real checkout.
+                            // Competitor permissions are handled separately
+                            // through Thor's respond_permission MCP calls
+                            // (observed, not answered, by `driver`).
+                            let decision =
+                                thor_permission_decision(&prompt.tool_call, &prompt.options);
                             let _ = prompt.responder.send(decision);
                         }
                         UiEvent::PromptDone { stop_reason, .. } => {
@@ -272,6 +265,84 @@ async fn run_tournament(
     }
 }
 
+fn split_thor_voice_and_competitors(
+    eligible: &[EligibleCompetitor],
+) -> (EligibleCompetitor, Vec<EligibleCompetitor>) {
+    let thor_voice = eligible
+        .first()
+        .expect("caller checks at least one eligible entry")
+        .clone();
+    let competitor_pool = eligible
+        .iter()
+        .skip(1)
+        .cloned()
+        .collect::<Vec<EligibleCompetitor>>();
+    (thor_voice, competitor_pool)
+}
+
+async fn ensure_score_catalog_ready(
+    loaded_cfg: &crate::config::Config,
+    score_store: &crate::scores::ScoreStore,
+) {
+    if score_store.is_active() || !loaded_cfg.scores.enabled {
+        return;
+    }
+    let cache_path = crate::scores::default_cache_path();
+    let url = loaded_cfg
+        .scores
+        .url
+        .as_deref()
+        .unwrap_or(crate::scores::DEFAULT_SCORES_URL);
+    let file = crate::scores::load_scores_file(&cache_path, crate::scores::CACHE_TTL, url).await;
+    score_store.install(crate::scores::ScoreCatalog::build(
+        &file,
+        loaded_cfg.scores.overrides.clone(),
+        loaded_cfg.scores.enabled,
+    ));
+}
+
+fn thor_permission_decision(
+    tool_call: &ToolCallUpdate,
+    options: &[PermissionOption],
+) -> PermissionDecision {
+    let allow = matches!(
+        tool_call.fields.kind.unwrap_or(ToolKind::Other),
+        ToolKind::Read | ToolKind::Search | ToolKind::Think | ToolKind::Fetch | ToolKind::Other
+    );
+    if allow {
+        return choose_permission_option(
+            options,
+            &[
+                PermissionOptionKind::AllowOnce,
+                PermissionOptionKind::AllowAlways,
+            ],
+        )
+        .map(PermissionDecision::Selected)
+        .unwrap_or(PermissionDecision::Cancelled);
+    }
+    choose_permission_option(
+        options,
+        &[
+            PermissionOptionKind::RejectOnce,
+            PermissionOptionKind::RejectAlways,
+        ],
+    )
+    .map(PermissionDecision::Selected)
+    .unwrap_or(PermissionDecision::Cancelled)
+}
+
+fn choose_permission_option(
+    options: &[PermissionOption],
+    kinds: &[PermissionOptionKind],
+) -> Option<String> {
+    kinds.iter().find_map(|kind| {
+        options
+            .iter()
+            .find(|option| option.kind == *kind)
+            .map(|option| option.option_id.to_string())
+    })
+}
+
 /// Builds Thor's one and only prompt: the task, the pool it must pick from,
 /// and the full protocol. Long by necessity -- this *is* the orchestration
 /// logic for everything past the eligibility scan, expressed as
@@ -294,14 +365,14 @@ fn build_prompt(task: &str, eligible: &[EligibleCompetitor]) -> String {
         .join("\n");
 
     format!(
-        r#"You are Thor, running a competitive multi-agent implementation tournament ("Ragnarok"). You have the `mj` MCP server available as a tool, exposing: create_worktree, connect, set_config_option, submit_prompt, poll_progress, respond_permission, get_result, cancel_prompt, disconnect, list_connections. You also have your own normal file-read and terminal tools.
+        r#"You are Thor, running a competitive multi-agent implementation tournament ("Ragnarok"). You have the `mj` MCP server available as a tool, exposing: create_worktree, connect, set_config_option, submit_prompt, poll_progress, respond_permission, get_result, cancel_prompt, disconnect, list_connections. You may use your own read/search tools for inspection, but do not use terminal or editing tools; those permission requests are denied by the supervisor.
 
 TASK (send this exact text, verbatim, to every competitor -- do not edit, summarize, or add your own commentary to it):
 ---
 {task}
 ---
 
-ELIGIBLE POOL (you may only pick agents/models from this list -- the server enforces this):
+ELIGIBLE POOL (you may only pick agents/models from this list -- the server enforces allowed agent ids and worktree cwd; you must enforce the listed model choices):
 {pool}
 
 PROTOCOL -- follow these steps in order:
@@ -321,7 +392,7 @@ PROTOCOL -- follow these steps in order:
 
 5. Once every competitor has a result, assign reviews using EXACTLY this rule (do not invent your own pairing): competitor c<i> reviews competitor c<((i mod K)+1)>'s work. For example, at K=4: c1 reviews c2, c2 reviews c3, c3 reviews c4, c4 reviews c1. At K=5: c1 reviews c2, c2 reviews c3, c3 reviews c4, c4 reviews c5, c5 reviews c1. This guarantees nobody reviews their own work and every implementation gets exactly one review.
 
-6. For each review pairing, connect the REVIEWER's own agent/model again (a fresh connection, cwd can be the project root -- do not give a reviewer filesystem access to the reviewee's worktree). Prompt it with the original task plus the reviewee's actual diff or changed files (get this yourself using your own file/terminal tools against the reviewee's worktree, e.g. `git diff` there) and ask it to adversarially critique correctness, completeness, and quality against the original task. Same respond_permission obligation applies to reviewer connections.
+6. For each review pairing, connect the REVIEWER's own agent/model again in its own isolated review worktree: call create_worktree with branch_name "ragnarok/<the same slug>/review-c<N>" for the reviewer slot, then connect with cwd set to that review worktree path. Never connect a reviewer to the project root or to the reviewee's worktree. Prompt it with the original task plus the reviewee's actual changed files or implementation summary gathered through safe read/search inspection, and ask it to adversarially critique correctness, completeness, and quality against the original task. Same respond_permission obligation applies to reviewer connections.
 
 7. Once all reviews are back, judge. Read every competitor's actual diff yourself (not just their own summary) and read every review. Fact-check each review's specific claims against the real diff -- do not take a review's word for it; note if a review is exaggerated, wrong, or dishonest. Pick a winner based on which implementation best satisfies the original task. If you are genuinely torn between two, say so rather than forcing a pick.
 
@@ -452,12 +523,10 @@ struct ThorDriver<'a> {
     /// Absent for reviewer connections (see `on_connect`) — only
     /// competitors get a roster slot.
     connection_slots: HashMap<String, (String, Instant)>,
-    /// Worktree paths seen from completed `create_worktree` calls. A
-    /// `connect` whose `cwd` matches one of these is a competitor; a
-    /// `connect` whose `cwd` doesn't (and at least one competitor already
-    /// exists) is a reviewer, per the prompt's own instruction that
-    /// reviewers connect against the project root, never a worktree.
-    known_worktrees: std::collections::HashSet<String>,
+    /// Competitor worktree paths seen from completed `create_worktree` calls.
+    /// Review worktrees are deliberately excluded so their follow-up
+    /// `connect` calls are treated as the review phase, not new roster rows.
+    competitor_worktrees: std::collections::HashSet<String>,
     /// Set once the first reviewer-shaped `connect` fires, so
     /// `ReviewPhaseStarted` is sent exactly once.
     review_phase_announced: bool,
@@ -482,7 +551,7 @@ impl<'a> ThorDriver<'a> {
             pending_input: HashMap::new(),
             last_activity: HashMap::new(),
             connection_slots: HashMap::new(),
-            known_worktrees: std::collections::HashSet::new(),
+            competitor_worktrees: std::collections::HashSet::new(),
             review_phase_announced: false,
             settled: std::collections::HashSet::new(),
         }
@@ -563,11 +632,18 @@ impl<'a> ThorDriver<'a> {
     }
 
     fn on_create_worktree(&mut self, raw_output: Option<&serde_json::Value>) {
-        if let Some(path) = raw_output
-            .and_then(|o| o.get("worktree_path"))
+        let Some(output) = raw_output else {
+            return;
+        };
+        let branch_name = output
+            .get("branch_name")
             .and_then(|v| v.as_str())
-        {
-            self.known_worktrees.insert(path.to_string());
+            .unwrap_or_default();
+        let Some(path) = output.get("worktree_path").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if is_competitor_branch_name(branch_name) {
+            self.competitor_worktrees.insert(path.to_string());
         }
     }
 
@@ -584,7 +660,7 @@ impl<'a> ThorDriver<'a> {
             return;
         };
         let cwd = raw_input.get("cwd").and_then(|v| v.as_str());
-        let is_competitor = cwd.is_some_and(|c| self.known_worktrees.contains(c));
+        let is_competitor = cwd.is_some_and(|c| self.competitor_worktrees.contains(c));
 
         if !is_competitor {
             // A reviewer connection: no roster slot (see the struct doc for
@@ -728,6 +804,14 @@ impl<'a> ThorDriver<'a> {
     }
 }
 
+fn is_competitor_branch_name(branch_name: &str) -> bool {
+    branch_name
+        .rsplit('/')
+        .next()
+        .and_then(|last| last.strip_prefix('c'))
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
+}
+
 /// One-line, honest summary of a `ProgressItem` (see mcp.rs), truncated for
 /// a roster row. `None` for item kinds that don't have anything worth
 /// showing as ongoing activity (permission requests/warnings surface
@@ -821,6 +905,7 @@ fn classify(raw_input: &serde_json::Value) -> ClassifiedCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::ToolCallUpdateFields;
     use serde_json::json;
 
     fn competitor(agent: &str, model: &str, elo: u32) -> EligibleCompetitor {
@@ -834,6 +919,95 @@ mod tests {
             model_name: model.to_string(),
             elo,
         }
+    }
+
+    fn permission_option(id: &str, kind: PermissionOptionKind) -> PermissionOption {
+        PermissionOption::new(id.to_string(), id.to_string(), kind)
+    }
+
+    fn permission_tool_call(kind: ToolKind) -> ToolCallUpdate {
+        let mut fields = ToolCallUpdateFields::new();
+        fields.kind = Some(kind);
+        ToolCallUpdate::new("permission-test", fields)
+    }
+
+    #[test]
+    fn split_thor_voice_removes_highest_ranked_pair_from_competitors() {
+        let ranked = vec![
+            competitor("thor-agent", "best", 3000),
+            competitor("agent-a", "model-a", 2500),
+            competitor("agent-b", "model-b", 2400),
+        ];
+
+        let (thor_voice, pool) = split_thor_voice_and_competitors(&ranked);
+
+        assert_eq!(thor_voice.agent_source_id, "thor-agent");
+        assert_eq!(thor_voice.model_value, "best");
+        let pairs: Vec<(String, String)> = pool
+            .into_iter()
+            .map(|c| (c.agent_source_id, c.model_value))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("agent-a".to_string(), "model-a".to_string()),
+                ("agent-b".to_string(), "model-b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn thor_permission_allows_other_tool_with_allow_once() {
+        let decision = thor_permission_decision(
+            &permission_tool_call(ToolKind::Other),
+            &[
+                permission_option("allow-always", PermissionOptionKind::AllowAlways),
+                permission_option("allow-once", PermissionOptionKind::AllowOnce),
+            ],
+        );
+
+        match decision {
+            PermissionDecision::Selected(id) => assert_eq!(id, "allow-once"),
+            PermissionDecision::Cancelled => panic!("expected allow decision"),
+        }
+    }
+
+    #[test]
+    fn thor_permission_rejects_execute_tool_even_when_allow_is_available() {
+        let decision = thor_permission_decision(
+            &permission_tool_call(ToolKind::Execute),
+            &[
+                permission_option("allow-once", PermissionOptionKind::AllowOnce),
+                permission_option("reject-once", PermissionOptionKind::RejectOnce),
+            ],
+        );
+
+        match decision {
+            PermissionDecision::Selected(id) => assert_eq!(id, "reject-once"),
+            PermissionDecision::Cancelled => panic!("expected explicit reject decision"),
+        }
+    }
+
+    #[test]
+    fn thor_permission_cancels_unsafe_tool_when_no_reject_option_exists() {
+        let decision = thor_permission_decision(
+            &permission_tool_call(ToolKind::Edit),
+            &[permission_option(
+                "allow-once",
+                PermissionOptionKind::AllowOnce,
+            )],
+        );
+
+        assert!(matches!(decision, PermissionDecision::Cancelled));
+    }
+
+    #[test]
+    fn competitor_branch_names_are_c_number_slots_only() {
+        assert!(is_competitor_branch_name("ragnarok/run/c1"));
+        assert!(is_competitor_branch_name("ragnarok/run/c10"));
+        assert!(!is_competitor_branch_name("ragnarok/run/review-c1"));
+        assert!(!is_competitor_branch_name("ragnarok/run/c"));
+        assert!(!is_competitor_branch_name("ragnarok/run/c1-review"));
     }
 
     // -- extract_json_block --
