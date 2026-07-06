@@ -8122,6 +8122,7 @@ fn compact_fighter_line(
         .as_ref()
         .filter(|(_, _, at)| at.elapsed() < RAGNAROK_ACTION_TTL)
         .map(|(kind, detail, _)| format!(" {} {detail}", action_glyph(*kind)))
+        .or_else(|| ambient_combat_caption(fighter).map(|caption| format!(" {caption}")))
         .unwrap_or_default();
     let text = format!(
         "{marker}{} {} — {state_word}{action}",
@@ -8158,23 +8159,73 @@ fn action_glyph(kind: ragnarok::ActionKind) -> &'static str {
     }
 }
 
+fn live_action_kind(fighter: &RagnarokFighterUi) -> Option<ragnarok::ActionKind> {
+    fighter
+        .action
+        .as_ref()
+        .filter(|(_, _, at)| at.elapsed() < RAGNAROK_ACTION_TTL)
+        .map(|(kind, _, _)| *kind)
+}
+
+fn ambient_combat_action(fighter: &RagnarokFighterUi) -> Option<ragnarok::ActionKind> {
+    if !matches!(
+        fighter.state,
+        ragnarok::FighterState::Fighting | ragnarok::FighterState::Capturing
+    ) || live_action_kind(fighter).is_some()
+    {
+        return None;
+    }
+    let beat = (arena_frame() / 2)
+        .wrapping_add(fighter.card.id * 2)
+        .wrapping_add(fighter.actions_seen as usize);
+    Some(match beat % 6 {
+        0 | 3 => ragnarok::ActionKind::Strike,
+        1 | 4 => ragnarok::ActionKind::Forge,
+        2 => ragnarok::ActionKind::Scry,
+        _ => ragnarok::ActionKind::Chant,
+    })
+}
+
+fn animated_action_kind(fighter: &RagnarokFighterUi) -> Option<ragnarok::ActionKind> {
+    live_action_kind(fighter).or_else(|| ambient_combat_action(fighter))
+}
+
+fn ambient_combat_caption(fighter: &RagnarokFighterUi) -> Option<&'static str> {
+    let action = ambient_combat_action(fighter)?;
+    Some(match action {
+        ragnarok::ActionKind::Strike => "⚡ leaping strike",
+        ragnarok::ActionKind::Forge => "🔨 hammer feint",
+        ragnarok::ActionKind::Scry => "🔮 reading the field",
+        ragnarok::ActionKind::Chant => "🎵 rallying cry",
+        _ => "⚔ pressing the attack",
+    })
+}
+
+fn fighter_bounce_offset(fighter: &RagnarokFighterUi) -> usize {
+    if !matches!(
+        fighter.state,
+        ragnarok::FighterState::Fighting | ragnarok::FighterState::Capturing
+    ) {
+        return 0;
+    }
+    let beat = arena_frame()
+        .wrapping_add(fighter.card.id)
+        .wrapping_add(fighter.actions_seen as usize);
+    usize::from(beat % 4 == 1)
+}
+
 /// Which pixel-art animation a fighter plays right now, plus the accent color
 /// for its `M` pixels (sparks, lightning, orb, notes, blood).
 fn sprite_for(fighter: &RagnarokFighterUi, theme: TerminalTheme) -> (SpriteKind, Color) {
     const GOLD: Color = Color::Rgb(240, 196, 60);
     const BLOOD: Color = Color::Rgb(202, 44, 44);
-    let live_action = fighter
-        .action
-        .as_ref()
-        .filter(|(_, _, at)| at.elapsed() < RAGNAROK_ACTION_TTL)
-        .map(|(kind, _, _)| *kind);
     match &fighter.state {
         ragnarok::FighterState::Slain(_) => (SpriteKind::Slain, BLOOD),
         ragnarok::FighterState::Standing => (SpriteKind::Victor, GOLD),
         ragnarok::FighterState::Summoned
         | ragnarok::FighterState::Forging
         | ragnarok::FighterState::Connecting => (SpriteKind::March, theme.muted),
-        _ => match live_action {
+        _ => match animated_action_kind(fighter) {
             Some(ragnarok::ActionKind::Forge) => (SpriteKind::Swing, Color::Rgb(255, 150, 60)),
             Some(ragnarok::ActionKind::Strike) => (SpriteKind::Swing, Color::Rgb(250, 224, 84)),
             Some(ragnarok::ActionKind::Scry) => (SpriteKind::Cast, Color::Rgb(196, 112, 240)),
@@ -8219,23 +8270,16 @@ fn pose_for(fighter: &RagnarokFighterUi) -> [&'static str; 3] {
         ragnarok::FighterState::Summoned
         | ragnarok::FighterState::Forging
         | ragnarok::FighterState::Connecting => pick(&MARCH),
-        _ => {
-            let live_action = fighter
-                .action
-                .as_ref()
-                .filter(|(_, _, at)| at.elapsed() < RAGNAROK_ACTION_TTL)
-                .map(|(kind, _, _)| *kind);
-            match live_action {
-                Some(ragnarok::ActionKind::Forge) => pick(&FORGE),
-                Some(ragnarok::ActionKind::Strike) => pick(&STRIKE),
-                Some(ragnarok::ActionKind::Scry) => pick(&SCRY),
-                Some(ragnarok::ActionKind::Chant) => pick(&CHANT),
-                Some(ragnarok::ActionKind::Ponder) => pick(&PONDER),
-                Some(ragnarok::ActionKind::Wound) => pick(&WOUND),
-                Some(ragnarok::ActionKind::Guard) => pick(&IDLE),
-                None => pick(&IDLE),
-            }
-        }
+        _ => match animated_action_kind(fighter) {
+            Some(ragnarok::ActionKind::Forge) => pick(&FORGE),
+            Some(ragnarok::ActionKind::Strike) => pick(&STRIKE),
+            Some(ragnarok::ActionKind::Scry) => pick(&SCRY),
+            Some(ragnarok::ActionKind::Chant) => pick(&CHANT),
+            Some(ragnarok::ActionKind::Ponder) => pick(&PONDER),
+            Some(ragnarok::ActionKind::Wound) => pick(&WOUND),
+            Some(ragnarok::ActionKind::Guard) => pick(&IDLE),
+            None => pick(&IDLE),
+        },
     }
 }
 
@@ -8319,7 +8363,16 @@ fn draw_fighter_card(
     // march in eerie unison.
     let frame = &frame_set[arena_frame().wrapping_add(fighter.card.id) % frame_set.len()];
     let pad = " ".repeat(inner_width.saturating_sub(ragnarok_sprites::SPRITE_W) / 2);
-    for sprite_line in ragnarok_sprites::render(frame, color, accent) {
+    let sprite_lines = ragnarok_sprites::render(frame, color, accent);
+    let bounce = fighter_bounce_offset(fighter);
+    let sprite_rows = sprite_lines.len();
+    if bounce > 0 {
+        lines.push(Line::default());
+    }
+    for sprite_line in sprite_lines
+        .into_iter()
+        .take(sprite_rows.saturating_sub(bounce))
+    {
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(sprite_line.spans.len() + 1);
         spans.push(Span::raw(pad.clone()));
         spans.extend(sprite_line.spans);
@@ -8359,6 +8412,7 @@ fn draw_fighter_card(
                     .to_string()
                 })
             })
+            .or_else(|| ambient_combat_caption(fighter).map(str::to_string))
             .unwrap_or_default(),
     };
     lines.push(Line::from(Span::styled(
@@ -13980,6 +14034,34 @@ mod tests {
         assert!(scene.contains("ᛏ"), "scene:\n{scene}");
         assert!(scene.contains("__==#"), "scene:\n{scene}");
         assert!(!scene.contains("MJÖLNIR"), "scene:\n{scene}");
+    }
+
+    #[test]
+    fn ragnarok_fighters_use_ambient_combat_animation_without_events() {
+        let mut state = AppState::new();
+        let (abort_tx, _abort_rx) = tokio::sync::watch::channel(false);
+        let (proceed_tx, _proceed_rx) = tokio::sync::watch::channel(false);
+        state.ragnarok = Some(RagnarokUi::new("task".into(), abort_tx, proceed_tx));
+        state.apply_ragnarok_event(ragnarok::RagnarokEvent::Roster(vec![
+            crate::ragnarok::FighterCard {
+                id: 0,
+                agent_source_id: "a".into(),
+                model_value: "m0".into(),
+                model_name: "M0".into(),
+                elo: 1400,
+                provisional: false,
+            },
+        ]));
+        state.apply_ragnarok_event(ragnarok::RagnarokEvent::FighterState {
+            id: 0,
+            state: ragnarok::FighterState::Fighting,
+        });
+        let arena = state.ragnarok.as_ref().unwrap();
+        let fighter = &arena.fighters[0];
+
+        let (sprite, _) = sprite_for(fighter, state.theme);
+        assert!(matches!(sprite, SpriteKind::Swing | SpriteKind::Cast));
+        assert!(ambient_combat_caption(fighter).is_some());
     }
 
     #[test]
