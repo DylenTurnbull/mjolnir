@@ -2315,6 +2315,12 @@ pub struct RagnarokFighterUi {
     pub transcript: String,
     /// What this fighter wrote while reviewing a rival.
     pub review_transcript: String,
+    /// Last lane appended to `transcript` / `review_transcript`. Streaming
+    /// chunks arrive as tiny deltas, so we only know a new message, thought,
+    /// or tool segment has started when the lane changes — that's where a
+    /// separator goes so the panes don't fuse into one solid block.
+    last_transcript_lane: Option<ragnarok::TextLane>,
+    last_review_lane: Option<ragnarok::TextLane>,
     pub diffstat: Option<String>,
     pub worktree_name: Option<String>,
     pub worktree_path: Option<PathBuf>,
@@ -2331,12 +2337,62 @@ impl RagnarokFighterUi {
             actions_seen: 0,
             transcript: String::new(),
             review_transcript: String::new(),
+            last_transcript_lane: None,
+            last_review_lane: None,
             diffstat: None,
             worktree_name: None,
             worktree_path: None,
             worktree_base_sha: None,
             review_progress: None,
         }
+    }
+
+    /// Append a streaming transcript delta, inserting a blank-line break — and,
+    /// for messages and thoughts, a short header — whenever the lane changes.
+    ///
+    /// The runtime streams a fighter's message, thought, and tool output as
+    /// many tiny deltas into a single string buffer. Appended raw, they fuse
+    /// into one solid block where a thought bleeds straight into the next
+    /// sentence. We can't separate every delta (that would split a message
+    /// mid-word), so we break only at lane changes — the real boundaries
+    /// between distinct outputs — and keep consecutive same-lane deltas glued.
+    fn push_transcript_chunk(&mut self, lane: ragnarok::TextLane, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        let review = lane == ragnarok::TextLane::Review;
+        let (buf, last): (&mut String, &mut Option<ragnarok::TextLane>) = if review {
+            (&mut self.review_transcript, &mut self.last_review_lane)
+        } else {
+            (&mut self.transcript, &mut self.last_transcript_lane)
+        };
+        let lane_changed = *last != Some(lane);
+        let chunk = if lane_changed {
+            if !buf.is_empty() {
+                // Normalize whatever trailing whitespace the previous segment
+                // left to exactly one blank line before the new segment.
+                let trimmed = buf.trim_end_matches(['\n', ' ']).len();
+                buf.truncate(trimmed);
+                buf.push_str("\n\n");
+                // Message and thought deltas carry no marker of their own;
+                // label them so speech and reasoning read as separate blocks.
+                // Tool and prompt chunks already open with their own header.
+                match lane {
+                    ragnarok::TextLane::Message | ragnarok::TextLane::Review => {
+                        buf.push_str("💬 message\n")
+                    }
+                    ragnarok::TextLane::Thought => buf.push_str("🧠 thinking\n"),
+                    ragnarok::TextLane::Tool => {}
+                }
+            }
+            // Drop a leading newline the new segment brought so the break we
+            // just inserted stays a single blank line rather than doubling up.
+            chunk.trim_start_matches('\n')
+        } else {
+            chunk
+        };
+        *last = Some(lane);
+        push_capped(buf, chunk, RAGNAROK_TRANSCRIPT_CAP);
     }
 }
 
@@ -2634,12 +2690,7 @@ impl AppState {
             }
             E::FighterText { id, lane, chunk } => {
                 if let Some(f) = arena.fighter_mut(id) {
-                    let buf = if lane == ragnarok::TextLane::Review {
-                        &mut f.review_transcript
-                    } else {
-                        &mut f.transcript
-                    };
-                    push_capped(buf, &chunk, RAGNAROK_TRANSCRIPT_CAP);
+                    f.push_transcript_chunk(lane, &chunk);
                 }
             }
             E::FighterDiffStat { id, stat } => {
@@ -5198,6 +5249,53 @@ mod tests {
         let arena = s.ragnarok.as_ref().expect("arena");
         assert!(arena.battle_over());
         assert_eq!(arena.verdict.as_ref().and_then(|v| v.clear_winner), Some(1));
+    }
+
+    #[test]
+    fn fighter_transcript_separates_message_thought_and_tool_segments() {
+        use crate::ragnarok::{RagnarokEvent, TextLane};
+        let mut s = arena_state();
+        s.apply_ragnarok_event(RagnarokEvent::Roster(vec![ragnarok_card(0, "Opus")]));
+
+        // A turn streams as tiny deltas: a message split across two chunks,
+        // then a thought, then a message again — the exact interleaving that
+        // used to fuse into one solid block.
+        for (lane, chunk) in [
+            (TextLane::Message, "I will forge "),
+            (TextLane::Message, "the hammer."),
+            (TextLane::Thought, "but first I must read"),
+            (TextLane::Message, "Reading the file now."),
+        ] {
+            s.apply_ragnarok_event(RagnarokEvent::FighterText {
+                id: 0,
+                lane,
+                chunk: chunk.into(),
+            });
+        }
+
+        let arena = s.ragnarok.as_ref().expect("arena");
+        let body = &arena.fighter(0).expect("fighter 0").transcript;
+
+        // Same-lane deltas stay glued into one sentence.
+        assert!(
+            body.contains("I will forge the hammer."),
+            "message deltas should not be broken mid-sentence: {body:?}"
+        );
+        // The thought is labeled and set off by a blank line from the message.
+        assert!(
+            body.contains("the hammer.\n\n🧠 thinking\nbut first I must read"),
+            "thought should start a new labeled block: {body:?}"
+        );
+        // Returning to a message opens a fresh labeled block, not a fused run.
+        assert!(
+            body.contains("but first I must read\n\n💬 message\nReading the file now."),
+            "message after a thought should start a new labeled block: {body:?}"
+        );
+        // No segment should ever fuse directly into the next.
+        assert!(
+            !body.contains("readReading"),
+            "thought must not bleed into the following message: {body:?}"
+        );
     }
 
     #[test]
