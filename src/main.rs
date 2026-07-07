@@ -23,6 +23,8 @@ mod paths;
 mod picker;
 mod probe;
 mod qr;
+mod ragnarok;
+mod ragnarok_sprites;
 mod registry;
 mod remote;
 mod scores;
@@ -1590,6 +1592,7 @@ async fn run_session(
         env: agent.env.clone(),
         agent_stderr: runtime_options.agent_stderr.clone(),
         fs_max_text_bytes: runtime_options.fs_max_text_bytes,
+        access_mode: acp::RuntimeAccessMode::Full,
         agent_source_id: Some(agent.source_id.clone()),
         config_path: Some(config::default_config_path()),
         saved_session_config: config::Config::load(&config::default_config_path())
@@ -1675,7 +1678,13 @@ async fn run_session(
                 theme_kind,
                 spinner_style,
                 score_store: score_store.clone(),
+                active_agent_launch: Some(ragnarok::Launch {
+                    program: agent.program.clone(),
+                    args: agent.args.clone(),
+                    env: agent.env.clone(),
+                }),
                 session_boundary: session_boundary.take(),
+                session_cwd: cwd.clone(),
             },
         )
         .await;
@@ -2088,6 +2097,7 @@ mod tests {
                 custom_agents: Vec::new(),
                 session_config: Default::default(),
                 scores: config::ScoresConfig::default(),
+                ragnarok: config::RagnarokConfig::default(),
             },
             None
         ));
@@ -2113,6 +2123,7 @@ mod tests {
                 custom_agents: Vec::new(),
                 session_config: Default::default(),
                 scores: config::ScoresConfig::default(),
+                ragnarok: config::RagnarokConfig::default(),
             },
             None
         ));
@@ -2145,6 +2156,7 @@ mod tests {
                 custom_agents: Vec::new(),
                 session_config: Default::default(),
                 scores: config::ScoresConfig::default(),
+                ragnarok: config::RagnarokConfig::default(),
             },
             None
         ));
@@ -2223,6 +2235,7 @@ mod tests {
             }],
             session_config: Default::default(),
             scores: config::ScoresConfig::default(),
+            ragnarok: config::RagnarokConfig::default(),
         };
         let prefs = picker_preferences_from_config(&cfg);
         assert_eq!(prefs.custom_agents.len(), 1);
@@ -2268,6 +2281,7 @@ mod tests {
                 ),
             ]),
             scores: config::ScoresConfig::default(),
+            ragnarok: config::RagnarokConfig::default(),
         };
 
         apply_picker_preferences(

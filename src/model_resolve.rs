@@ -155,6 +155,31 @@ fn provider_norm(p: &str) -> String {
     canonical_provider(p).unwrap_or_else(|| alnum_lower(p))
 }
 
+/// Canonical provider token for external callers that need to make decisions
+/// using the same vendor normalization as score matching.
+pub fn canonical_provider_id(provider: &str) -> Option<String> {
+    canonical_provider(provider)
+}
+
+/// Best-effort provider for one agent-selectable model option.
+pub fn agent_provider(
+    agent_id: &str,
+    value: &str,
+    name: &str,
+    _description: &str,
+) -> Option<String> {
+    for raw in [value, name] {
+        if raw.is_empty() {
+            continue;
+        }
+        let (provider, _) = parse_id(agent_id, raw);
+        if provider.is_some() {
+            return provider;
+        }
+    }
+    single_vendor_provider(agent_id).map(str::to_string)
+}
+
 /// Drop a context/variant decoration: a bracketed suffix like `[1m]`, a
 /// parenthetical like `(latest)`/`(Fast)`, and anything after a `:` (e.g.
 /// `:thinking`, the AWS `:0`, an ollama `:4b` tag).

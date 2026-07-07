@@ -1503,6 +1503,7 @@ fn start_server_agent_session(
         env: agent.env,
         agent_stderr: None,
         fs_max_text_bytes,
+        access_mode: crate::acp::RuntimeAccessMode::Full,
         agent_source_id: Some(agent_source_id),
         config_path: Some(config_path),
         saved_session_config,

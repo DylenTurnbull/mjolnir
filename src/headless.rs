@@ -146,6 +146,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         env: agent.env,
         agent_stderr: cfg.agent_stderr,
         fs_max_text_bytes: cfg.fs_max_text_bytes,
+        access_mode: acp::RuntimeAccessMode::Full,
         agent_source_id: Some(agent_source_id),
         config_path: Some(config_path),
         saved_session_config,
@@ -438,7 +439,9 @@ fn permission_decision(
     choose_allow_option(options)
 }
 
-fn choose_allow_option(
+/// First `AllowAlways` option, else first `AllowOnce`. Shared with Ragnarok's
+/// unattended fighters, which bypass permissions inside their own worktrees.
+pub(crate) fn choose_allow_option(
     options: &[agent_client_protocol::schema::v1::PermissionOption],
 ) -> Option<String> {
     options
