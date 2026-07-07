@@ -25,7 +25,8 @@ use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
-    SessionConfigOption, SessionUpdate, StopReason, ToolCallStatus, ToolKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigValueId, SessionUpdate,
+    StopReason, ToolCallStatus, ToolKind,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
@@ -76,6 +77,18 @@ const CONFIG_OPTIONS_TIMEOUT: Duration = Duration::from_secs(15);
 /// runtime rejects prompts while a config update is in flight, so arming
 /// must not return before the confirmation lands.
 const CONFIG_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Execution mode values used by known ACP agents. Ragnarok owns the whole
+/// agent turn, so plan/ask-only behavior is never useful for its workers.
+const EXECUTION_MODE_PREFERENCE: &[&str] = &[
+    "lutz",
+    "code",
+    "execute",
+    "execution",
+    "implement",
+    "implementation",
+    "edit",
+    "write",
+];
 /// Defense in depth: how many times one turn re-sends a prompt the runtime
 /// rejected with "config update already in flight" (250ms apart).
 const PROMPT_RESEND_LIMIT: usize = 20;
@@ -451,7 +464,7 @@ async fn battle(
             .context("thor camp task failed")?
             .context("could not forge Thor's camp")?
     };
-    let mut thor = Thor::summon(thor_host, thor_camp, abort.clone()).await?;
+    let mut thor = Thor::summon(thor_host, thor_camp, abort.clone(), tx).await?;
     emit(tx, RagnarokEvent::ThorAction(ThorAction::Deciding))?;
     let route = thor.route(&cfg.task, tx).await?;
     let cap = user_cfg.ragnarok.max_competitors;
@@ -1140,6 +1153,26 @@ struct TurnOutcome {
     stop: StopReason,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExecutionModeArm {
+    NotOffered,
+    AlreadyReady,
+    Changed { from: String, to: String },
+}
+
+struct ExecutionModeUpdate {
+    target: SessionConfigTarget,
+    value: SessionConfigValueId,
+    from: String,
+    to: String,
+}
+
+enum ExecutionModePlan {
+    NotOffered,
+    AlreadyReady,
+    Change(ExecutionModeUpdate),
+}
+
 /// A live agent subprocess + session, driven over the same channel pair the
 /// TUI uses.
 struct AgentHandle {
@@ -1313,6 +1346,195 @@ impl AgentHandle {
                 None => bail!("agent runtime closed"),
             }
         }
+    }
+
+    /// Select an execution/code behavior mode when the agent exposes one.
+    /// Planning-only modes can respond with a plan gate forever; Ragnarok's
+    /// workers need the agent's normal task execution behavior before the
+    /// first prompt is sent.
+    async fn arm_execution_mode(&mut self) -> Result<ExecutionModeArm> {
+        let update = match self.plan_execution_mode()? {
+            ExecutionModePlan::NotOffered => return Ok(ExecutionModeArm::NotOffered),
+            ExecutionModePlan::AlreadyReady => return Ok(ExecutionModeArm::AlreadyReady),
+            ExecutionModePlan::Change(update) => update,
+        };
+
+        let requested_value = update.value.to_string();
+        let requested_target = update.target.clone();
+        let _ = self.cmd_tx.send(UiCommand::SetSessionConfigOption {
+            target: update.target,
+            value: update.value,
+        });
+
+        let deadline = tokio::time::Instant::now() + CONFIG_UPDATE_TIMEOUT;
+        loop {
+            let ev = tokio::select! {
+                ev = self.events.recv() => ev,
+                _ = wait_abort(self.abort.clone()) => bail!("battle aborted"),
+                _ = tokio::time::sleep_until(deadline) => {
+                    bail!("execution mode select for '{}' was not confirmed in time", update.to)
+                }
+            };
+            match ev {
+                Some(UiEvent::SessionConfigOptions { options, targets }) => {
+                    self.store_config(options, targets);
+                    if self.config_target_is_current(&requested_target, &requested_value) {
+                        return Ok(ExecutionModeArm::Changed {
+                            from: update.from,
+                            to: update.to,
+                        });
+                    }
+                }
+                Some(UiEvent::Warning(w)) if w.contains("session config update failed") => {
+                    bail!("agent refused execution mode '{}': {w}", update.to)
+                }
+                Some(UiEvent::PermissionRequest(p)) => self.answer_permission(p),
+                Some(UiEvent::ElicitationRequest(e)) => {
+                    let _ = e.responder.send(ElicitationOutcome::Decline);
+                }
+                Some(UiEvent::Fatal(m)) => bail!("agent failed: {m}"),
+                Some(_) => {}
+                None => bail!("agent runtime closed"),
+            }
+        }
+    }
+
+    fn plan_execution_mode(&self) -> Result<ExecutionModePlan> {
+        let mut saw_execution_mode = false;
+        let mut plan_without_execution_choice = None;
+
+        for (option, target) in self.config_options.iter().zip(&self.config_targets) {
+            if !Self::is_session_mode_option(option) {
+                continue;
+            }
+
+            let Some(current) = crate::app::config_option_current_value_id(option) else {
+                continue;
+            };
+            if self.current_mode_is_execution(option, current) {
+                saw_execution_mode = true;
+                continue;
+            }
+
+            if let Some(choice) = Self::preferred_execution_mode_choice(option) {
+                return Ok(ExecutionModePlan::Change(ExecutionModeUpdate {
+                    target: target.clone(),
+                    value: choice.value.clone(),
+                    from: Self::mode_value_label(option, current),
+                    to: Self::mode_choice_label(&choice),
+                }));
+            }
+
+            if Self::mode_value_is_plan(option, current) {
+                plan_without_execution_choice = Some(Self::mode_value_label(option, current));
+            }
+        }
+
+        if let Some(current) = plan_without_execution_choice {
+            bail!(
+                "agent is in planning mode ({current}) but did not offer a known execution/code mode"
+            );
+        }
+
+        if saw_execution_mode {
+            Ok(ExecutionModePlan::AlreadyReady)
+        } else {
+            Ok(ExecutionModePlan::NotOffered)
+        }
+    }
+
+    fn is_session_mode_option(option: &SessionConfigOption) -> bool {
+        matches!(option.category, Some(SessionConfigOptionCategory::Mode))
+            || Self::looks_like_mode_option(&option.id.to_string())
+            || Self::looks_like_mode_option(&option.name)
+    }
+
+    fn looks_like_mode_option(text: &str) -> bool {
+        let text = text.to_ascii_lowercase();
+        text == "mode"
+            || text.ends_with("_mode")
+            || text.ends_with("-mode")
+            || text.ends_with(".mode")
+            || text.ends_with(" mode")
+    }
+
+    fn current_mode_is_execution(
+        &self,
+        option: &SessionConfigOption,
+        current: &SessionConfigValueId,
+    ) -> bool {
+        crate::app::config_option_choices(option)
+            .unwrap_or_default()
+            .iter()
+            .any(|choice| &choice.value == current && Self::execution_mode_rank(choice).is_some())
+    }
+
+    fn preferred_execution_mode_choice(
+        option: &SessionConfigOption,
+    ) -> Option<crate::app::ConfigValueChoice> {
+        crate::app::config_option_choices(option)?
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, choice)| {
+                Self::execution_mode_rank(&choice).map(|rank| (rank, idx, choice))
+            })
+            .min_by_key(|(rank, idx, _)| (*rank, *idx))
+            .map(|(_, _, choice)| choice)
+    }
+
+    fn execution_mode_rank(choice: &crate::app::ConfigValueChoice) -> Option<usize> {
+        let value = choice.value.to_string();
+        EXECUTION_MODE_PREFERENCE.iter().position(|preferred| {
+            Self::mode_text_matches(&value, preferred)
+                || Self::mode_text_matches(&choice.name, preferred)
+        })
+    }
+
+    fn mode_value_is_plan(option: &SessionConfigOption, value: &SessionConfigValueId) -> bool {
+        let value_text = value.to_string();
+        Self::mode_text_matches(&value_text, "plan")
+            || crate::app::config_option_choices(option)
+                .unwrap_or_default()
+                .iter()
+                .find(|choice| &choice.value == value)
+                .is_some_and(|choice| Self::mode_text_matches(&choice.name, "plan"))
+    }
+
+    fn mode_text_matches(text: &str, expected: &str) -> bool {
+        let text = text.to_ascii_lowercase();
+        text == expected
+            || text
+                .split(|ch: char| !ch.is_ascii_alphanumeric())
+                .any(|part| part == expected)
+    }
+
+    fn mode_value_label(option: &SessionConfigOption, value: &SessionConfigValueId) -> String {
+        crate::app::config_option_choices(option)
+            .unwrap_or_default()
+            .iter()
+            .find(|choice| &choice.value == value)
+            .map(Self::mode_choice_label)
+            .unwrap_or_else(|| value.to_string())
+    }
+
+    fn mode_choice_label(choice: &crate::app::ConfigValueChoice) -> String {
+        let value = choice.value.to_string();
+        if choice.name == value {
+            value
+        } else {
+            format!("{} ({value})", choice.name)
+        }
+    }
+
+    fn config_target_is_current(&self, target: &SessionConfigTarget, value: &str) -> bool {
+        self.config_options
+            .iter()
+            .zip(&self.config_targets)
+            .any(|(option, option_target)| {
+                option_target == target
+                    && crate::app::config_option_current_value_id(option)
+                        .is_some_and(|current| current.to_string() == value)
+            })
     }
 
     /// True when a Model-category option's current value already equals
@@ -1912,6 +2134,26 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
             kill_note(format!("could not arm their model: {e:#}")),
         );
     }
+    match handle.arm_execution_mode().await {
+        Ok(ExecutionModeArm::Changed { from, to }) => {
+            let _ = tx.send(RagnarokEvent::Log {
+                fighter: Some(id),
+                text: format!(
+                    "🧭 THOR switches {} into execution mode before combat ({from} -> {to}).",
+                    fighter.card.model_name
+                ),
+            });
+        }
+        Ok(ExecutionModeArm::AlreadyReady | ExecutionModeArm::NotOffered) => {}
+        Err(e) => {
+            handle.dismiss().await;
+            return slain(
+                report,
+                set_state,
+                kill_note(format!("could not arm execution mode: {e:#}")),
+            );
+        }
+    }
 
     let mut cry_roll = id.wrapping_mul(7);
     let mut chunk_count = 0usize;
@@ -2456,6 +2698,27 @@ async fn review(
             delivered: false,
         };
     }
+    match handle.arm_execution_mode().await {
+        Ok(ExecutionModeArm::Changed { from, to }) => {
+            let _ = tx.send(RagnarokEvent::Log {
+                fighter: Some(assignment.reviewer),
+                text: format!(
+                    "🧭 THOR switches {} into execution mode before review ({from} -> {to}).",
+                    reviewer.card.model_name
+                ),
+            });
+        }
+        Ok(ExecutionModeArm::AlreadyReady | ExecutionModeArm::NotOffered) => {}
+        Err(e) => {
+            handle.dismiss().await;
+            set_progress(ReviewProgress::Failed);
+            return ReviewReport {
+                assignment,
+                text: format!("(review not delivered: could not arm execution mode: {e:#})"),
+                delivered: false,
+            };
+        }
+    }
     set_progress(ReviewProgress::Reviewing);
     let id = assignment.reviewer;
     let name = reviewer.card.model_name.clone();
@@ -2574,6 +2837,7 @@ impl Thor {
         host: ThorHost,
         camp: worktree::CreatedWorktree,
         abort: watch::Receiver<bool>,
+        tx: &mpsc::UnboundedSender<RagnarokEvent>,
     ) -> Result<Self> {
         let mut handle = AgentHandle::connect(
             &host.launch,
@@ -2588,6 +2852,20 @@ impl Thor {
                 .arm_model(model_value)
                 .await
                 .context("Thor could not take form (model select failed)")?;
+        }
+        match handle
+            .arm_execution_mode()
+            .await
+            .context("Thor could not ready execution mode")?
+        {
+            ExecutionModeArm::Changed { from, to } => {
+                feed(
+                    tx,
+                    None,
+                    format!("🧭 THOR switches himself into execution mode ({from} -> {to})."),
+                )?;
+            }
+            ExecutionModeArm::AlreadyReady | ExecutionModeArm::NotOffered => {}
         }
         Ok(Self { handle, camp })
     }
@@ -3931,6 +4209,65 @@ mod tests {
         (vec![option], vec![target])
     }
 
+    fn anvil_mode_options(current: &str) -> (Vec<SessionConfigOption>, Vec<SessionConfigTarget>) {
+        mode_options(
+            "behavior_mode",
+            "Behavior Mode",
+            current,
+            vec![
+                SessionConfigSelectOption::new("PLAN", "Plan"),
+                SessionConfigSelectOption::new("LUTZ", "Lutz"),
+            ],
+        )
+    }
+
+    fn ask_code_mode_options(
+        current: &str,
+    ) -> (Vec<SessionConfigOption>, Vec<SessionConfigTarget>) {
+        mode_options(
+            "mode",
+            "Mode",
+            current,
+            vec![
+                SessionConfigSelectOption::new("ask", "Ask"),
+                SessionConfigSelectOption::new("code", "Code"),
+            ],
+        )
+    }
+
+    fn plan_only_mode_options(
+        current: &str,
+    ) -> (Vec<SessionConfigOption>, Vec<SessionConfigTarget>) {
+        mode_options(
+            "mode",
+            "Mode",
+            current,
+            vec![
+                SessionConfigSelectOption::new("plan", "Plan"),
+                SessionConfigSelectOption::new("read", "Read"),
+            ],
+        )
+    }
+
+    fn mode_options(
+        id: &str,
+        name: &str,
+        current: &str,
+        choices: Vec<SessionConfigSelectOption>,
+    ) -> (Vec<SessionConfigOption>, Vec<SessionConfigTarget>) {
+        let option = SessionConfigOption::select(
+            id.to_string(),
+            name.to_string(),
+            current.to_string(),
+            choices,
+        )
+        .category(Some(SessionConfigOptionCategory::Mode));
+        let target = SessionConfigTarget::ConfigOption {
+            config_id: option.id.clone(),
+        };
+        (vec![option], vec![target])
+    }
+
     #[tokio::test]
     async fn arm_model_skips_round_trip_when_already_current() {
         let mut rig = test_rig();
@@ -3992,6 +4329,102 @@ mod tests {
             .await
             .expect_err("failure must surface");
         assert!(format!("{err:#}").contains("refused"), "err: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn arm_execution_mode_sets_anvil_lutz_when_plan_current() {
+        let mut rig = test_rig();
+        let (options, targets) = anvil_mode_options("PLAN");
+        rig.handle.store_config(options, targets);
+        let (confirmed_options, confirmed_targets) = anvil_mode_options("LUTZ");
+        rig.event_tx
+            .send(UiEvent::SessionConfigOptions {
+                options: confirmed_options,
+                targets: confirmed_targets,
+            })
+            .unwrap();
+
+        let armed = rig.handle.arm_execution_mode().await.expect("armed");
+
+        assert_eq!(
+            armed,
+            ExecutionModeArm::Changed {
+                from: "Plan (PLAN)".to_string(),
+                to: "Lutz (LUTZ)".to_string()
+            }
+        );
+        assert!(
+            matches!(
+                rig.cmd_rx.try_recv(),
+                Ok(UiCommand::SetSessionConfigOption { value, .. }) if value.to_string() == "LUTZ"
+            ),
+            "the set command must have selected LUTZ"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_execution_mode_sets_code_for_generic_agent_mode() {
+        let mut rig = test_rig();
+        let (options, targets) = ask_code_mode_options("ask");
+        rig.handle.store_config(options, targets);
+        let (confirmed_options, confirmed_targets) = ask_code_mode_options("code");
+        rig.event_tx
+            .send(UiEvent::SessionConfigOptions {
+                options: confirmed_options,
+                targets: confirmed_targets,
+            })
+            .unwrap();
+
+        let armed = rig.handle.arm_execution_mode().await.expect("armed");
+
+        assert_eq!(
+            armed,
+            ExecutionModeArm::Changed {
+                from: "Ask (ask)".to_string(),
+                to: "Code (code)".to_string()
+            }
+        );
+        assert!(
+            matches!(
+                rig.cmd_rx.try_recv(),
+                Ok(UiCommand::SetSessionConfigOption { value, .. }) if value.to_string() == "code"
+            ),
+            "the set command must have selected code"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_execution_mode_skips_when_mode_option_absent() {
+        let mut rig = test_rig();
+        let (options, targets) = model_options("opus");
+        rig.handle.store_config(options, targets);
+
+        let armed = rig.handle.arm_execution_mode().await.expect("checked");
+
+        assert_eq!(armed, ExecutionModeArm::NotOffered);
+        assert!(
+            rig.cmd_rx.try_recv().is_err(),
+            "no command should be sent when no mode selector exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_execution_mode_rejects_plan_without_execution_choice() {
+        let mut rig = test_rig();
+        let (options, targets) = plan_only_mode_options("plan");
+        rig.handle.store_config(options, targets);
+
+        let err = rig
+            .handle
+            .arm_execution_mode()
+            .await
+            .expect_err("plan mode without execution must fail");
+
+        assert!(format!("{err:#}").contains("planning mode"), "err: {err:#}");
+        assert!(
+            rig.cmd_rx.try_recv().is_err(),
+            "no command should be sent without a known execution choice"
+        );
     }
 
     #[tokio::test]
