@@ -2315,6 +2315,11 @@ pub struct RagnarokFighterUi {
     pub transcript: String,
     /// What this fighter wrote while reviewing a rival.
     pub review_transcript: String,
+    /// Last lane appended to `transcript` / `review_transcript`. Streaming
+    /// chunks arrive as tiny deltas, so a separator belongs at lane changes,
+    /// not between every chunk.
+    last_transcript_lane: Option<ragnarok::TextLane>,
+    last_review_lane: Option<ragnarok::TextLane>,
     pub diffstat: Option<String>,
     pub worktree_name: Option<String>,
     pub worktree_path: Option<PathBuf>,
@@ -2331,12 +2336,50 @@ impl RagnarokFighterUi {
             actions_seen: 0,
             transcript: String::new(),
             review_transcript: String::new(),
+            last_transcript_lane: None,
+            last_review_lane: None,
             diffstat: None,
             worktree_name: None,
             worktree_path: None,
             worktree_base_sha: None,
             review_progress: None,
         }
+    }
+
+    /// Append a streaming transcript delta, inserting a blank-line break and
+    /// a small header when a new lane starts.
+    fn push_transcript_chunk(&mut self, lane: ragnarok::TextLane, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+
+        let review = lane == ragnarok::TextLane::Review;
+        let (buf, last): (&mut String, &mut Option<ragnarok::TextLane>) = if review {
+            (&mut self.review_transcript, &mut self.last_review_lane)
+        } else {
+            (&mut self.transcript, &mut self.last_transcript_lane)
+        };
+
+        let chunk = if *last != Some(lane) {
+            if !buf.is_empty() {
+                let trimmed = buf.trim_end_matches(['\n', ' ']).len();
+                buf.truncate(trimmed);
+                buf.push_str("\n\n");
+                match lane {
+                    ragnarok::TextLane::Message | ragnarok::TextLane::Review => {
+                        buf.push_str("💬 message\n");
+                    }
+                    ragnarok::TextLane::Thought => buf.push_str("🧠 thinking\n"),
+                    ragnarok::TextLane::Tool => {}
+                }
+            }
+            chunk.trim_start_matches('\n')
+        } else {
+            chunk
+        };
+
+        *last = Some(lane);
+        push_capped(buf, chunk, RAGNAROK_TRANSCRIPT_CAP);
     }
 }
 
@@ -2634,12 +2677,7 @@ impl AppState {
             }
             E::FighterText { id, lane, chunk } => {
                 if let Some(f) = arena.fighter_mut(id) {
-                    let buf = if lane == ragnarok::TextLane::Review {
-                        &mut f.review_transcript
-                    } else {
-                        &mut f.transcript
-                    };
-                    push_capped(buf, &chunk, RAGNAROK_TRANSCRIPT_CAP);
+                    f.push_transcript_chunk(lane, &chunk);
                 }
             }
             E::FighterDiffStat { id, stat } => {
@@ -5198,6 +5236,51 @@ mod tests {
         let arena = s.ragnarok.as_ref().expect("arena");
         assert!(arena.battle_over());
         assert_eq!(arena.verdict.as_ref().and_then(|v| v.clear_winner), Some(1));
+    }
+
+    #[test]
+    fn fighter_transcript_separates_message_thought_and_tool_segments() {
+        use crate::ragnarok::{RagnarokEvent, TextLane};
+        let mut s = arena_state();
+        s.apply_ragnarok_event(RagnarokEvent::Roster(vec![ragnarok_card(0, "Opus")]));
+
+        for (lane, chunk) in [
+            (TextLane::Message, "I will forge "),
+            (TextLane::Message, "the hammer."),
+            (TextLane::Thought, "but first I must read"),
+            (TextLane::Tool, "\n⚙ [read] src/main.rs\n"),
+            (TextLane::Message, "Reading the file now."),
+        ] {
+            s.apply_ragnarok_event(RagnarokEvent::FighterText {
+                id: 0,
+                lane,
+                chunk: chunk.into(),
+            });
+        }
+
+        let arena = s.ragnarok.as_ref().expect("arena");
+        let body = &arena.fighter(0).expect("fighter 0").transcript;
+
+        assert!(
+            body.contains("I will forge the hammer."),
+            "message deltas should not be broken mid-sentence: {body:?}"
+        );
+        assert!(
+            body.contains("the hammer.\n\n🧠 thinking\nbut first I must read"),
+            "thought should start a new labeled block: {body:?}"
+        );
+        assert!(
+            body.contains("but first I must read\n\n⚙ [read] src/main.rs"),
+            "tool header should be preserved after a clean break: {body:?}"
+        );
+        assert!(
+            body.contains("src/main.rs\n\n💬 message\nReading the file now."),
+            "message after a thought should start a new labeled block: {body:?}"
+        );
+        assert!(
+            !body.contains("readReading"),
+            "thought must not bleed into the following message: {body:?}"
+        );
     }
 
     #[test]
