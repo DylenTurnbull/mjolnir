@@ -63,6 +63,9 @@ const SELECTION_RANDOM_TOP_N: usize = 4;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(180);
 /// Budget for one champion to implement the task.
 const FIGHT_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+/// A no-diff champion gets one explicit second chance before the tournament
+/// accepts that it still produced no artifact.
+const EMPTY_DIFF_CONTINUATION_LIMIT: usize = 1;
 /// Budget for one adversarial review.
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// Budget for each of Thor's pronouncements (route / assign / judge).
@@ -1748,6 +1751,12 @@ struct CapturedArtifact {
     truncated: bool,
 }
 
+impl CapturedArtifact {
+    fn is_empty(&self) -> bool {
+        self.diff.trim().is_empty()
+    }
+}
+
 #[derive(Debug)]
 struct FighterReport {
     id: FighterId,
@@ -1879,73 +1888,93 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
         );
     }
 
-    set_state(FighterState::Fighting);
     let mut cry_roll = id.wrapping_mul(7);
     let mut chunk_count = 0usize;
     let fighter_name = fighter.card.model_name.clone();
     let tx_events = tx.clone();
-    let outcome = handle
-        .prompt(fight_prompt(&task), FIGHT_TIMEOUT, |ev| {
-            if let TurnEvent::Tool {
-                title,
-                started: true,
-                ..
-            } = &ev
-            {
-                let _ = ping.send(WatchdogPing {
+    let mut prompt = fight_prompt(&task);
+    let mut continuation_count = 0usize;
+    loop {
+        set_state(FighterState::Fighting);
+        let outcome = handle
+            .prompt(prompt, FIGHT_TIMEOUT, |ev| {
+                if let TurnEvent::Tool {
+                    title,
+                    started: true,
+                    ..
+                } = &ev
+                {
+                    let _ = ping.send(WatchdogPing {
+                        id,
+                        title: title.clone(),
+                    });
+                }
+                forward_turn_event(
+                    &tx_events,
                     id,
-                    title: title.clone(),
-                });
+                    &fighter_name,
+                    ev,
+                    TextLane::Message,
+                    &mut cry_roll,
+                    &mut chunk_count,
+                );
+            })
+            .await;
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                handle.dismiss().await;
+                return slain(
+                    report,
+                    set_state,
+                    kill_note(format!("fell in battle: {e:#}")),
+                );
             }
-            forward_turn_event(
-                &tx_events,
-                id,
-                &fighter_name,
-                ev,
-                TextLane::Message,
-                &mut cry_roll,
-                &mut chunk_count,
-            );
-        })
-        .await;
-    handle.dismiss().await;
-    let outcome = match outcome {
-        Ok(o) => o,
-        Err(e) => {
+        };
+        if !turn_succeeded(outcome.stop) {
+            handle.dismiss().await;
             return slain(
                 report,
                 set_state,
-                kill_note(format!("fell in battle: {e:#}")),
+                kill_note(format!("yielded ({})", stop_reason_label(outcome.stop))),
             );
         }
-    };
-    if !turn_succeeded(outcome.stop) {
-        return slain(
-            report,
-            set_state,
-            kill_note(format!("yielded ({})", stop_reason_label(outcome.stop))),
-        );
-    }
-    report.final_text = outcome.text;
+        append_turn_text(&mut report.final_text, &outcome.text);
 
-    set_state(FighterState::Capturing);
-    let root = created.worktree_root.clone();
-    let artifact = capture_artifact(&root, &base_sha).await;
-    match artifact {
-        Ok(a) => {
-            let _ = tx.send(RagnarokEvent::FighterDiffStat {
-                id,
-                stat: a.diffstat.clone(),
-            });
-            report.artifact = Some(a);
+        set_state(FighterState::Capturing);
+        let root = created.worktree_root.clone();
+        let artifact = capture_artifact(&root, &base_sha).await;
+        match artifact {
+            Ok(a) => {
+                let empty = a.is_empty();
+                let _ = tx.send(RagnarokEvent::FighterDiffStat {
+                    id,
+                    stat: a.diffstat.clone(),
+                });
+                if empty && continuation_count < EMPTY_DIFF_CONTINUATION_LIMIT {
+                    continuation_count += 1;
+                    let _ = tx.send(RagnarokEvent::Log {
+                        fighter: Some(id),
+                        text: format!(
+                            "⚡ THOR finds no changed files from {}; continue the work!",
+                            fighter.card.model_name
+                        ),
+                    });
+                    prompt = empty_diff_continue_prompt(&task);
+                    continue;
+                }
+                report.artifact = Some(a);
+            }
+            Err(e) => {
+                let _ = tx.send(RagnarokEvent::Log {
+                    fighter: Some(id),
+                    text: format!("⚠ artifact capture faltered: {e:#}"),
+                });
+            }
         }
-        Err(e) => {
-            let _ = tx.send(RagnarokEvent::Log {
-                fighter: Some(id),
-                text: format!("⚠ artifact capture faltered: {e:#}"),
-            });
-        }
+        break;
     }
+    handle.dismiss().await;
     set_state(FighterState::Standing);
     let _ = tx.send(RagnarokEvent::Log {
         fighter: Some(id),
@@ -1955,6 +1984,16 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
         ),
     });
     report
+}
+
+fn append_turn_text(acc: &mut String, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if !acc.is_empty() {
+        acc.push_str("\n\n--- continuation turn ---\n");
+    }
+    acc.push_str(text);
 }
 
 fn slain(
@@ -2082,6 +2121,22 @@ fn fight_prompt(task: &str) -> String {
          - Verify your work (build/tests) when the project allows it.\n\
          - Finish with a concise summary of what you built and how you verified it. \
            Overclaiming will be found out in review.\n\n\
+         THE TASK:\n{task}"
+    )
+}
+
+fn empty_diff_continue_prompt(task: &str) -> String {
+    format!(
+        "⚡ THOR INSPECTION. Your previous turn ended, but Thor checked `git diff` \
+         against the starting commit and found no changes. You have not produced an \
+         implementation artifact for Ragnarok.\n\n\
+         Continue in this same worktree now.\n\n\
+         Rules:\n\
+         - Implement the task below in the current working directory.\n\
+         - Do NOT create git commits. Leave every change in the working tree.\n\
+         - Do NOT push, and do NOT touch anything outside this worktree.\n\
+         - Verify your work when the project allows it.\n\
+         - Finish with a concise summary of the changes and verification.\n\n\
          THE TASK:\n{task}"
     )
 }
@@ -3572,6 +3627,45 @@ mod tests {
         assert!(out.contains("excised"));
         // Must not panic and must remain valid UTF-8 (guaranteed by String).
         assert!(out.chars().count() > 0);
+    }
+
+    #[test]
+    fn captured_artifact_empty_tracks_diff_body() {
+        let empty = CapturedArtifact {
+            diffstat: "1 file changed".to_string(),
+            diff: "\n".to_string(),
+            truncated: false,
+        };
+        assert!(empty.is_empty());
+
+        let changed = CapturedArtifact {
+            diffstat: String::new(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\n".to_string(),
+            truncated: false,
+        };
+        assert!(!changed.is_empty());
+    }
+
+    #[test]
+    fn empty_diff_continue_prompt_orders_same_worktree_changes() {
+        let prompt = empty_diff_continue_prompt("fix empty output");
+        assert!(prompt.contains("THOR INSPECTION"));
+        assert!(prompt.contains("git diff"));
+        assert!(prompt.contains("Continue in this same worktree"));
+        assert!(prompt.contains("Do NOT create git commits"));
+        assert!(prompt.contains("fix empty output"));
+    }
+
+    #[test]
+    fn append_turn_text_preserves_continuation_summary() {
+        let mut text = String::new();
+        append_turn_text(&mut text, "first summary");
+        append_turn_text(&mut text, "second summary");
+        append_turn_text(&mut text, "  ");
+
+        assert!(text.contains("first summary"));
+        assert!(text.contains("--- continuation turn ---"));
+        assert!(text.ends_with("second summary"));
     }
 
     #[tokio::test]
