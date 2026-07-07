@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::net::TcpListener;
+use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1521,7 +1521,13 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
             ts.tailscale.cert_domain
         );
     }
-    println!("{}", crate::qr::render_qr(&viewer_url)?);
+    if should_render_login_qr(&listen.viewer_host) {
+        println!("{}", crate::qr::render_qr(&viewer_url)?);
+    } else {
+        println!(
+            "QR code hidden because localhost is only reachable from this machine; use --hostname or --tailscale for a device-login QR."
+        );
+    }
     println!("viewer code: {viewer_code}");
     if logout_all {
         println!("logged out all devices (rotated cookie signing key)");
@@ -1588,6 +1594,7 @@ fn start_server_agent_session(
         env: agent.env,
         agent_stderr: None,
         fs_max_text_bytes,
+        access_mode: crate::acp::RuntimeAccessMode::Full,
         agent_source_id: Some(agent_source_id),
         config_path: Some(config_path),
         saved_session_config,
@@ -1770,6 +1777,11 @@ fn remote_qr_login_url(host: &str, token: &str) -> String {
     // sets the session cookie, and redirects to a clean `/`. This keeps the
     // long-lived token out of the browser history and out of later requests.
     format!("https://{host}:11921/auth/login?token={encoded}")
+}
+
+fn should_render_login_qr(host: &str) -> bool {
+    !host.eq_ignore_ascii_case("localhost")
+        && !host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Install the ring CryptoProvider so we do not depend on aws-lc-rs (which needs
@@ -3566,7 +3578,7 @@ fn format_tool_body(
             ToolCallContent::Diff(diff) => parts.push(format!("diff: {}", diff.path.display())),
             ToolCallContent::Terminal(terminal) => {
                 let terminal_id = terminal.terminal_id.to_string();
-                let mut text = "background terminal".to_string();
+                let mut text = "terminal output".to_string();
                 if let Some(snapshot) = terminal_outputs.get(&terminal_id) {
                     let snapshot = format_terminal_snapshot(snapshot, tool_status);
                     if !snapshot.is_empty() {
@@ -3611,6 +3623,9 @@ fn format_terminal_snapshot(
         parts.push(snapshot.output.clone());
     }
     if let Some(status) = &snapshot.exit_status {
+        if snapshot.output.trim().is_empty() {
+            parts.push("no stdout/stderr captured".to_string());
+        }
         parts.push(format!("exit {}", terminal_exit_status_label(status)));
     } else if parts.is_empty() {
         parts.push(terminal_empty_state_label(tool_status).to_string());
@@ -3837,7 +3852,7 @@ mod tests {
         let snapshot = state.snapshot().expect("snapshot");
         assert_eq!(snapshot.transcript.len(), 1);
         assert_eq!(snapshot.transcript[0].kind, "tool");
-        assert!(snapshot.transcript[0].text.contains("background terminal"));
+        assert!(snapshot.transcript[0].text.contains("terminal output"));
         assert!(!snapshot.transcript[0].text.contains("term-1"));
         assert!(snapshot.transcript[0].text.contains("[output truncated]"));
         assert!(snapshot.transcript[0].text.contains("hello\n"));
@@ -3983,7 +3998,7 @@ mod tests {
         state.observe_session_update(&SessionUpdate::ToolCall(tool_call));
 
         let snapshot = state.snapshot().expect("snapshot");
-        assert!(snapshot.transcript[0].text.contains("background terminal"));
+        assert!(snapshot.transcript[0].text.contains("terminal output"));
         assert!(snapshot.transcript[0].text.contains("waiting for output"));
         assert!(
             !snapshot.transcript[0]
@@ -5528,6 +5543,16 @@ mod tests {
             remote_qr_login_url("example.com", "a+b/c=="),
             "https://example.com:11921/auth/login?token=a%2Bb%2Fc%3D%3D"
         );
+    }
+
+    #[test]
+    fn login_qr_is_hidden_for_loopback_hosts() {
+        assert!(!should_render_login_qr("localhost"));
+        assert!(!should_render_login_qr("LOCALHOST"));
+        assert!(!should_render_login_qr("127.0.0.1"));
+        assert!(!should_render_login_qr("::1"));
+        assert!(should_render_login_qr("example.com"));
+        assert!(should_render_login_qr("mybox.tail1234.ts.net"));
     }
 
     #[test]

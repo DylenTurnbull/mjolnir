@@ -64,12 +64,34 @@ pub struct AcpRuntimeConfig {
     /// Maximum text bytes returned by ACP filesystem reads or accepted by
     /// ACP filesystem writes.
     pub fs_max_text_bytes: u64,
+    /// Host capabilities exposed to the agent for this runtime.
+    pub access_mode: RuntimeAccessMode,
     /// Stable configured agent id used for per-agent session-config memory.
     pub agent_source_id: Option<String>,
     /// Config file to update when a prompt snapshots current session options.
     pub config_path: Option<PathBuf>,
     /// Values remembered from the last prompt submitted for this agent.
     pub saved_session_config: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeAccessMode {
+    /// Normal interactive/fighter sessions: expose read/write filesystem and
+    /// terminal execution.
+    Full,
+    /// Analysis-only sessions: allow reads, but deny writes and terminal
+    /// execution even if the agent asks directly.
+    ReadOnly,
+}
+
+impl RuntimeAccessMode {
+    fn allows_filesystem_writes(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    fn allows_terminals(self) -> bool {
+        matches!(self, Self::Full)
+    }
 }
 
 #[derive(Clone)]
@@ -595,6 +617,7 @@ pub async fn run(
             ui_rx,
             fatal_emitted.clone(),
             cfg.fs_max_text_bytes,
+            cfg.access_mode,
             cfg.agent_source_id.clone(),
             cfg.config_path.clone(),
             cfg.saved_session_config.clone(),
@@ -1112,6 +1135,7 @@ where
         ui_rx,
         fatal_emitted,
         DEFAULT_FS_TEXT_BYTES,
+        RuntimeAccessMode::Full,
         None,
         None,
         HashMap::new(),
@@ -1141,6 +1165,7 @@ where
         ui_rx,
         fatal_emitted,
         DEFAULT_FS_TEXT_BYTES,
+        RuntimeAccessMode::Full,
         None,
         None,
         HashMap::new(),
@@ -1158,6 +1183,7 @@ async fn drive_client_with_fs_limit<T>(
     mut ui_rx: mpsc::UnboundedReceiver<UiCommand>,
     fatal_emitted: Arc<AtomicBool>,
     fs_max_text_bytes: u64,
+    access_mode: RuntimeAccessMode,
     agent_source_id: Option<String>,
     config_path: Option<PathBuf>,
     saved_session_config: HashMap<String, String>,
@@ -1172,11 +1198,13 @@ where
     let terminals = Arc::new(ManagedTerminals::with_session_state(
         ui_tx.clone(),
         session_state.clone(),
+        access_mode,
     ));
     let filesystem = Arc::new(LocalFileSystem::new(
         session_state.clone(),
         ui_tx.clone(),
         fs_max_text_bytes,
+        access_mode,
     ));
     let perm_ui_tx = ui_tx.clone();
     let elicit_ui_tx = ui_tx.clone();
@@ -1341,6 +1369,7 @@ where
                 fatal_emitted,
                 session_state,
                 drive_terminals,
+                access_mode,
                 fs_max_text_bytes,
                 agent_source_id,
                 config_path,
@@ -1375,6 +1404,7 @@ async fn drive_session(
     fatal_emitted: Arc<AtomicBool>,
     session_state: RuntimeSessionState,
     terminals: Arc<ManagedTerminals>,
+    access_mode: RuntimeAccessMode,
     fs_max_text_bytes: u64,
     agent_source_id: Option<String>,
     config_path: Option<PathBuf>,
@@ -1388,8 +1418,8 @@ async fn drive_session(
             ClientCapabilities::new()
                 .fs(FileSystemCapabilities::new()
                     .read_text_file(true)
-                    .write_text_file(true))
-                .terminal(true)
+                    .write_text_file(access_mode.allows_filesystem_writes()))
+                .terminal(access_mode.allows_terminals())
                 // Advertise both elicitation modes. `form` covers single-select
                 // `/setup` menus and `url` covers OAuth-login steps. v1 fully
                 // implements single-select forms and URL/QR; any richer form
@@ -2125,6 +2155,7 @@ struct LocalFileSystem {
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     next_permission_id: AtomicU64,
     max_text_bytes: u64,
+    access_mode: RuntimeAccessMode,
 }
 
 impl LocalFileSystem {
@@ -2132,12 +2163,14 @@ impl LocalFileSystem {
         session_state: RuntimeSessionState,
         ui_tx: mpsc::UnboundedSender<UiEvent>,
         max_text_bytes: u64,
+        access_mode: RuntimeAccessMode,
     ) -> Self {
         Self {
             session_state,
             ui_tx,
             next_permission_id: AtomicU64::new(1),
             max_text_bytes,
+            access_mode,
         }
     }
 
@@ -2167,6 +2200,11 @@ impl LocalFileSystem {
         &self,
         request: WriteTextFileRequest,
     ) -> std::result::Result<WriteTextFileResponse, agent_client_protocol::Error> {
+        if !self.access_mode.allows_filesystem_writes() {
+            return Err(fs_invalid_params(
+                "filesystem writes are disabled for this session",
+            ));
+        }
         let roots = self
             .session_state
             .active_root_set(&request.session_id, "filesystem")
@@ -2627,6 +2665,7 @@ struct ManagedTerminals {
     next_id: AtomicU64,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     session_state: Option<RuntimeSessionState>,
+    access_mode: RuntimeAccessMode,
 }
 
 #[derive(Debug)]
@@ -2685,18 +2724,21 @@ impl ManagedTerminals {
             next_id: AtomicU64::new(1),
             ui_tx,
             session_state: None,
+            access_mode: RuntimeAccessMode::Full,
         }
     }
 
     fn with_session_state(
         ui_tx: mpsc::UnboundedSender<UiEvent>,
         session_state: RuntimeSessionState,
+        access_mode: RuntimeAccessMode,
     ) -> Self {
         Self {
             terminals: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             ui_tx,
             session_state: Some(session_state),
+            access_mode,
         }
     }
 
@@ -2704,6 +2746,11 @@ impl ManagedTerminals {
         &self,
         request: CreateTerminalRequest,
     ) -> std::result::Result<CreateTerminalResponse, agent_client_protocol::Error> {
+        if !self.access_mode.allows_terminals() {
+            return Err(terminal_invalid_params(
+                "terminal execution is disabled for this session",
+            ));
+        }
         self.validate_active_session(&request.session_id).await?;
         if request.command.trim().is_empty() {
             return Err(terminal_invalid_params("terminal command cannot be empty"));
@@ -4027,7 +4074,12 @@ mod tests {
             .expect("active session");
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
         (
-            LocalFileSystem::new(state.clone(), ui_tx, max_text_bytes),
+            LocalFileSystem::new(
+                state.clone(),
+                ui_tx,
+                max_text_bytes,
+                RuntimeAccessMode::Full,
+            ),
             ui_rx,
             state,
         )
@@ -4157,7 +4209,8 @@ mod tests {
             .await
             .expect("active roots");
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
-        let filesystem = LocalFileSystem::new(state, ui_tx, DEFAULT_FS_TEXT_BYTES);
+        let filesystem =
+            LocalFileSystem::new(state, ui_tx, DEFAULT_FS_TEXT_BYTES, RuntimeAccessMode::Full);
         let read_path = additional.path().join("notes.txt");
         tokio::fs::write(&read_path, "extra").await.expect("seed");
 
@@ -4215,6 +4268,41 @@ mod tests {
         );
         expect_next_fs_write_diff(&mut ui_rx, &path, Some("old contents\n"), "new contents\n")
             .await;
+    }
+
+    #[tokio::test]
+    async fn local_filesystem_read_only_mode_denies_writes_without_prompting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionId::new("session-1");
+        let state = RuntimeSessionState::new();
+        state
+            .set_active_session(session_id.clone(), temp.path())
+            .await
+            .expect("active session");
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let filesystem = LocalFileSystem::new(
+            state,
+            ui_tx,
+            DEFAULT_FS_TEXT_BYTES,
+            RuntimeAccessMode::ReadOnly,
+        );
+
+        let err = filesystem
+            .write_text_file(WriteTextFileRequest::new(
+                session_id,
+                temp.path().join("created.txt"),
+                "created",
+            ))
+            .await
+            .expect_err("read-only writes are denied");
+        assert!(
+            format!("{err}").contains("filesystem writes are disabled"),
+            "err: {err}"
+        );
+        assert!(
+            ui_rx.try_recv().is_err(),
+            "read-only denial should not ask the UI for permission"
+        );
     }
 
     #[tokio::test]
@@ -4502,7 +4590,8 @@ mod tests {
             )
             .await
             .expect("active roots");
-        let terminals = ManagedTerminals::with_session_state(ui_tx, session_state);
+        let terminals =
+            ManagedTerminals::with_session_state(ui_tx, session_state, RuntimeAccessMode::Full);
 
         let default_cwd = terminals
             .resolve_terminal_cwd(&CreateTerminalRequest::new(session_id.clone(), "pwd"))
@@ -4535,6 +4624,29 @@ mod tests {
                 )
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_terminal_read_only_mode_denies_create() {
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        let session_id = SessionId::new("session-1");
+        let root = tempfile::tempdir().expect("root");
+        let session_state = RuntimeSessionState::new();
+        session_state
+            .set_active_session(session_id.clone(), root.path())
+            .await
+            .expect("active session");
+        let terminals =
+            ManagedTerminals::with_session_state(ui_tx, session_state, RuntimeAccessMode::ReadOnly);
+
+        let err = terminals
+            .create(CreateTerminalRequest::new(session_id, "echo"))
+            .await
+            .expect_err("read-only terminal creation is denied");
+        assert!(
+            format!("{err}").contains("terminal execution is disabled"),
+            "err: {err}"
         );
     }
 
@@ -4602,7 +4714,11 @@ mod tests {
             .set_active_session(session_id.clone(), root.path())
             .await
             .expect("active session");
-        let terminals = ManagedTerminals::with_session_state(ui_tx, session_state.clone());
+        let terminals = ManagedTerminals::with_session_state(
+            ui_tx,
+            session_state.clone(),
+            RuntimeAccessMode::Full,
+        );
         #[cfg(windows)]
         let script = "ping -n 30 127.0.0.1 >NUL";
         #[cfg(not(windows))]
@@ -7024,6 +7140,7 @@ mod tests {
             env: HashMap::new(),
             agent_stderr: None,
             fs_max_text_bytes: DEFAULT_FS_TEXT_BYTES,
+            access_mode: RuntimeAccessMode::Full,
             agent_source_id: None,
             config_path: None,
             saved_session_config: HashMap::new(),
@@ -7079,6 +7196,7 @@ mod tests {
             env: HashMap::new(),
             agent_stderr: Some(bad_stderr),
             fs_max_text_bytes: DEFAULT_FS_TEXT_BYTES,
+            access_mode: RuntimeAccessMode::Full,
             agent_source_id: None,
             config_path: None,
             saved_session_config: HashMap::new(),
@@ -7213,6 +7331,7 @@ mod tests {
             env: HashMap::new(),
             agent_stderr: None,
             fs_max_text_bytes: DEFAULT_FS_TEXT_BYTES,
+            access_mode: RuntimeAccessMode::Full,
             agent_source_id: None,
             config_path: None,
             saved_session_config: HashMap::new(),
@@ -7237,6 +7356,7 @@ mod tests {
             env: HashMap::new(),
             agent_stderr: None,
             fs_max_text_bytes: DEFAULT_FS_TEXT_BYTES,
+            access_mode: RuntimeAccessMode::Full,
             agent_source_id: None,
             config_path: None,
             saved_session_config: HashMap::new(),
