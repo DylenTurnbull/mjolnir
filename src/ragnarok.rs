@@ -355,23 +355,6 @@ fn feed(
     )
 }
 
-fn feed_agent_config(
-    tx: &mpsc::UnboundedSender<RagnarokEvent>,
-    fighter: Option<FighterId>,
-    name: &str,
-    context: &str,
-    handle: &AgentHandle,
-) -> Result<()> {
-    feed(
-        tx,
-        fighter,
-        format!(
-            "🧾 THOR reads {name} session config {context}: {}",
-            handle.session_config_summary()
-        ),
-    )
-}
-
 /// Resolves when the battle should stop: the abort flag flipped, or the abort
 /// sender vanished (the UI is gone).
 async fn wait_abort(mut abort: watch::Receiver<bool>) {
@@ -1274,83 +1257,6 @@ impl AgentHandle {
         }
     }
 
-    fn session_config_summary(&self) -> String {
-        if self.config_options.is_empty() {
-            return "no session config options received".to_string();
-        }
-
-        let mut saw_mode = false;
-        let mut parts = Vec::new();
-        for option in &self.config_options {
-            saw_mode |= Self::is_session_mode_option(option);
-            parts.push(Self::format_config_option(option));
-        }
-        if !saw_mode {
-            parts.push("mode: not offered".to_string());
-        }
-        parts.join(" | ")
-    }
-
-    fn format_config_option(option: &SessionConfigOption) -> String {
-        let category = Self::config_category_label(option);
-        let current = crate::app::config_option_current_value_id(option)
-            .map(|value| Self::mode_value_label(option, value))
-            .unwrap_or_else(|| "unsupported".to_string());
-        let choices = Self::format_config_choices(option);
-        format!(
-            "{category} {} [{}] current={current}{choices}",
-            option.name, option.id
-        )
-    }
-
-    fn config_category_label(option: &SessionConfigOption) -> String {
-        match option.category.as_ref() {
-            Some(SessionConfigOptionCategory::Mode) => "mode".to_string(),
-            Some(SessionConfigOptionCategory::Model) => "model".to_string(),
-            Some(SessionConfigOptionCategory::ThoughtLevel) => "thought".to_string(),
-            Some(SessionConfigOptionCategory::Other(category)) => format!("other:{category}"),
-            Some(_) => "other".to_string(),
-            None => "uncategorized".to_string(),
-        }
-    }
-
-    fn format_config_choices(option: &SessionConfigOption) -> String {
-        let Some(choices) = crate::app::config_option_choices(option) else {
-            return String::new();
-        };
-        if choices.is_empty() {
-            return " choices=0".to_string();
-        }
-
-        let show_all = Self::is_session_mode_option(option) || choices.len() <= 8;
-        let interesting: Vec<_> = if show_all {
-            choices.iter().collect()
-        } else {
-            let current = crate::app::config_option_current_value_id(option);
-            choices
-                .iter()
-                .filter(|choice| {
-                    current.is_some_and(|value| &choice.value == value)
-                        || Self::execution_mode_rank(choice).is_some()
-                })
-                .take(8)
-                .collect()
-        };
-
-        if interesting.is_empty() {
-            return format!(" choices={}", choices.len());
-        }
-
-        let mut labels: Vec<_> = interesting
-            .iter()
-            .map(|choice| Self::mode_choice_label(choice))
-            .collect();
-        if labels.len() < choices.len() {
-            labels.push(format!("+{} more", choices.len() - labels.len()));
-        }
-        format!(" choices={} [{}]", choices.len(), labels.join(", "))
-    }
-
     fn answer_permission(&self, prompt: crate::event::PermissionPrompt) {
         let allow = self.access_mode == acp::RuntimeAccessMode::Full
             || matches!(
@@ -2240,13 +2146,6 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
         }
         Ok(ExecutionModeArm::AlreadyReady | ExecutionModeArm::NotOffered) => {}
         Err(e) => {
-            let _ = feed_agent_config(
-                &tx,
-                Some(id),
-                &fighter.card.model_name,
-                "before execution-mode failure",
-                &handle,
-            );
             handle.dismiss().await;
             return slain(
                 report,
@@ -2255,13 +2154,6 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
             );
         }
     }
-    let _ = feed_agent_config(
-        &tx,
-        Some(id),
-        &fighter.card.model_name,
-        "after arming",
-        &handle,
-    );
 
     let mut cry_roll = id.wrapping_mul(7);
     let mut chunk_count = 0usize;
@@ -2818,13 +2710,6 @@ async fn review(
         }
         Ok(ExecutionModeArm::AlreadyReady | ExecutionModeArm::NotOffered) => {}
         Err(e) => {
-            let _ = feed_agent_config(
-                &tx,
-                Some(assignment.reviewer),
-                &reviewer.card.model_name,
-                "before execution-mode failure",
-                &handle,
-            );
             handle.dismiss().await;
             set_progress(ReviewProgress::Failed);
             return ReviewReport {
@@ -2834,13 +2719,6 @@ async fn review(
             };
         }
     }
-    let _ = feed_agent_config(
-        &tx,
-        Some(assignment.reviewer),
-        &reviewer.card.model_name,
-        "after arming",
-        &handle,
-    );
     set_progress(ReviewProgress::Reviewing);
     let id = assignment.reviewer;
     let name = reviewer.card.model_name.clone();
@@ -2975,16 +2853,11 @@ impl Thor {
                 .await
                 .context("Thor could not take form (model select failed)")?;
         }
-        let execution_mode = handle.arm_execution_mode().await;
-        let execution_mode = match execution_mode.context("Thor could not ready execution mode") {
-            Ok(mode) => mode,
-            Err(e) => {
-                let _ =
-                    feed_agent_config(tx, None, "Thor", "before execution-mode failure", &handle);
-                return Err(e);
-            }
-        };
-        match execution_mode {
+        match handle
+            .arm_execution_mode()
+            .await
+            .context("Thor could not ready execution mode")?
+        {
             ExecutionModeArm::Changed { from, to } => {
                 feed(
                     tx,
@@ -2994,7 +2867,6 @@ impl Thor {
             }
             ExecutionModeArm::AlreadyReady | ExecutionModeArm::NotOffered => {}
         }
-        feed_agent_config(tx, None, "Thor", "after arming", &handle)?;
         Ok(Self { handle, camp })
     }
 
@@ -4553,39 +4425,6 @@ mod tests {
             rig.cmd_rx.try_recv().is_err(),
             "no command should be sent without a known execution choice"
         );
-    }
-
-    #[tokio::test]
-    async fn session_config_summary_lists_anvil_behavior_mode() {
-        let mut rig = test_rig();
-        let (options, targets) = anvil_mode_options("PLAN");
-        rig.handle.store_config(options, targets);
-
-        let summary = rig.handle.session_config_summary();
-
-        assert!(
-            summary.contains("mode Behavior Mode [behavior_mode] current=Plan (PLAN)"),
-            "summary: {summary}"
-        );
-        assert!(
-            summary.contains("choices=2 [Plan (PLAN), Lutz (LUTZ)]"),
-            "summary: {summary}"
-        );
-    }
-
-    #[tokio::test]
-    async fn session_config_summary_notes_when_mode_is_not_offered() {
-        let mut rig = test_rig();
-        let (options, targets) = model_options("opus");
-        rig.handle.store_config(options, targets);
-
-        let summary = rig.handle.session_config_summary();
-
-        assert!(
-            summary.contains("model Model [model] current=Opus (opus)"),
-            "summary: {summary}"
-        );
-        assert!(summary.contains("mode: not offered"), "summary: {summary}");
     }
 
     #[tokio::test]
