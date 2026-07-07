@@ -61,8 +61,12 @@ const NEW_AGENT_SELECTION_BONUS: i32 = 50;
 const SELECTION_RANDOM_TOP_N: usize = 4;
 /// Budget for an agent to reach `SessionStarted` (covers cold npx/uvx runs).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(180);
-/// Budget for one champion to implement the task.
+/// Budget for one champion's first attempt to implement the task.
 const FIGHT_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+/// How many times Thor may shove a no-op champion back into combat.
+const FIGHT_NUDGE_LIMIT: usize = 2;
+/// Budget for each follow-up after a champion claims victory with no diff.
+const FIGHT_NUDGE_TIMEOUT: Duration = Duration::from_secs(12 * 60);
 /// Budget for one adversarial review.
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// Budget for each of Thor's pronouncements (route / assign / judge).
@@ -1883,69 +1887,120 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
     let mut cry_roll = id.wrapping_mul(7);
     let mut chunk_count = 0usize;
     let fighter_name = fighter.card.model_name.clone();
-    let tx_events = tx.clone();
-    let outcome = handle
-        .prompt(fight_prompt(&task), FIGHT_TIMEOUT, |ev| {
-            if let TurnEvent::Tool {
-                title,
-                started: true,
-                ..
-            } = &ev
-            {
-                let _ = ping.send(WatchdogPing {
+    let mut prompt_text = fight_prompt(&task);
+    let mut nudges = 0usize;
+    loop {
+        let budget = if nudges == 0 {
+            FIGHT_TIMEOUT
+        } else {
+            FIGHT_NUDGE_TIMEOUT
+        };
+        let tx_events = tx.clone();
+        let current_prompt = std::mem::take(&mut prompt_text);
+        let outcome = handle
+            .prompt(current_prompt, budget, |ev| {
+                if let TurnEvent::Tool {
+                    title,
+                    started: true,
+                    ..
+                } = &ev
+                {
+                    let _ = ping.send(WatchdogPing {
+                        id,
+                        title: title.clone(),
+                    });
+                }
+                forward_turn_event(
+                    &tx_events,
                     id,
-                    title: title.clone(),
-                });
+                    &fighter_name,
+                    ev,
+                    TextLane::Message,
+                    &mut cry_roll,
+                    &mut chunk_count,
+                );
+            })
+            .await;
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                handle.dismiss().await;
+                return slain(
+                    report,
+                    set_state,
+                    kill_note(format!("fell in battle: {e:#}")),
+                );
             }
-            forward_turn_event(
-                &tx_events,
-                id,
-                &fighter_name,
-                ev,
-                TextLane::Message,
-                &mut cry_roll,
-                &mut chunk_count,
-            );
-        })
-        .await;
-    handle.dismiss().await;
-    let outcome = match outcome {
-        Ok(o) => o,
-        Err(e) => {
+        };
+        if !turn_succeeded(outcome.stop) {
+            handle.dismiss().await;
             return slain(
                 report,
                 set_state,
-                kill_note(format!("fell in battle: {e:#}")),
+                kill_note(format!("yielded ({})", stop_reason_label(outcome.stop))),
             );
         }
-    };
-    if !turn_succeeded(outcome.stop) {
-        return slain(
-            report,
-            set_state,
-            kill_note(format!("yielded ({})", stop_reason_label(outcome.stop))),
-        );
-    }
-    report.final_text = outcome.text;
+        record_fighter_summary(&mut report.final_text, nudges, &outcome.text);
 
-    set_state(FighterState::Capturing);
-    let root = created.worktree_root.clone();
-    let artifact = capture_artifact(&root, &base_sha).await;
-    match artifact {
-        Ok(a) => {
-            let _ = tx.send(RagnarokEvent::FighterDiffStat {
-                id,
-                stat: a.diffstat.clone(),
-            });
-            report.artifact = Some(a);
-        }
-        Err(e) => {
-            let _ = tx.send(RagnarokEvent::Log {
-                fighter: Some(id),
-                text: format!("⚠ artifact capture faltered: {e:#}"),
-            });
+        set_state(FighterState::Capturing);
+        let root = created.worktree_root.clone();
+        let artifact = capture_artifact(&root, &base_sha).await;
+        match artifact {
+            Ok(a) => {
+                let has_changes = artifact_has_changes(&a);
+                let summary = artifact_diff_summary(&a);
+                let _ = tx.send(RagnarokEvent::FighterDiffStat {
+                    id,
+                    stat: a.diffstat.clone(),
+                });
+                let _ = tx.send(RagnarokEvent::Log {
+                    fighter: Some(id),
+                    text: format!(
+                        "📜 Ragnarok captured {}'s diff: {summary}",
+                        fighter.card.model_name
+                    ),
+                });
+                if has_changes || nudges >= FIGHT_NUDGE_LIMIT {
+                    if !has_changes {
+                        let _ = tx.send(RagnarokEvent::Log {
+                            fighter: Some(id),
+                            text: format!(
+                                "⚠ THOR finds no diff from {} after {} nudge(s); the empty banner will face review.",
+                                fighter.card.model_name, nudges
+                            ),
+                        });
+                    }
+                    report.artifact = Some(a);
+                    break;
+                }
+
+                nudges += 1;
+                let _ = tx.send(RagnarokEvent::Log {
+                    fighter: Some(id),
+                    text: format!(
+                        "⚡ THOR sees no diff from {}; nudge {nudges}/{FIGHT_NUDGE_LIMIT} drives them back into the fray.",
+                        fighter.card.model_name
+                    ),
+                });
+                let _ = tx.send(RagnarokEvent::FighterAction {
+                    id,
+                    action: ActionKind::Guard,
+                    detail: "Thor demands visible progress".to_string(),
+                });
+                prompt_text =
+                    no_diff_nudge_prompt(&task, nudges, FIGHT_NUDGE_LIMIT, &report.final_text);
+                set_state(FighterState::Fighting);
+            }
+            Err(e) => {
+                let _ = tx.send(RagnarokEvent::Log {
+                    fighter: Some(id),
+                    text: format!("⚠ artifact capture faltered: {e:#}"),
+                });
+                break;
+            }
         }
     }
+    handle.dismiss().await;
     set_state(FighterState::Standing);
     let _ = tx.send(RagnarokEvent::Log {
         fighter: Some(id),
@@ -1965,6 +2020,79 @@ fn slain(
     set_state(FighterState::Slain(reason.clone()));
     report.slain_reason = Some(reason);
     report
+}
+
+fn artifact_has_changes(artifact: &CapturedArtifact) -> bool {
+    !artifact.diff.trim().is_empty() || !artifact.diffstat.trim().is_empty()
+}
+
+fn artifact_diff_summary(artifact: &CapturedArtifact) -> String {
+    if !artifact_has_changes(artifact) {
+        return "no changed lines".to_string();
+    }
+    if let Some((files, insertions, deletions)) = parse_diffstat_totals(&artifact.diffstat) {
+        let mut parts = vec![format!("{files} file{}", if files == 1 { "" } else { "s" })];
+        if insertions > 0 {
+            parts.push(format!(
+                "{insertions} insertion{}",
+                if insertions == 1 { "" } else { "s" }
+            ));
+        }
+        if deletions > 0 {
+            parts.push(format!(
+                "{deletions} deletion{}",
+                if deletions == 1 { "" } else { "s" }
+            ));
+        }
+        return parts.join(", ");
+    }
+    let files = artifact
+        .diff
+        .lines()
+        .filter(|line| line.starts_with("diff --git "))
+        .count();
+    format!("{files} changed file{}", if files == 1 { "" } else { "s" })
+}
+
+fn parse_diffstat_totals(diffstat: &str) -> Option<(usize, usize, usize)> {
+    let summary = diffstat
+        .lines()
+        .rev()
+        .find(|line| line.contains("changed"))?;
+    let mut files = 0usize;
+    let mut insertions = 0usize;
+    let mut deletions = 0usize;
+    let mut saw_files = false;
+    for part in summary.split(',').map(str::trim) {
+        let mut fields = part.split_whitespace();
+        let Some(n) = fields.next().and_then(|s| s.parse::<usize>().ok()) else {
+            continue;
+        };
+        let Some(label) = fields.next() else { continue };
+        if label.starts_with("file") {
+            files = n;
+            saw_files = true;
+        } else if label.starts_with("insertion") {
+            insertions = n;
+        } else if label.starts_with("deletion") {
+            deletions = n;
+        }
+    }
+    saw_files.then_some((files, insertions, deletions))
+}
+
+fn record_fighter_summary(buf: &mut String, attempt: usize, text: &str) {
+    if attempt == 0 {
+        *buf = text.to_string();
+    } else {
+        if !buf.is_empty() {
+            buf.push_str("\n\n");
+        }
+        buf.push_str(&format!("AFTER THOR NUDGE {attempt}:\n{text}"));
+    }
+    if buf.len() > FINAL_TEXT_LIMIT {
+        *buf = truncate_middle(buf, FINAL_TEXT_LIMIT);
+    }
 }
 
 /// Fold a digested turn event into arena events: transcript text, an action
@@ -2083,6 +2211,26 @@ fn fight_prompt(task: &str) -> String {
          - Finish with a concise summary of what you built and how you verified it. \
            Overclaiming will be found out in review.\n\n\
          THE TASK:\n{task}"
+    )
+}
+
+fn no_diff_nudge_prompt(
+    task: &str,
+    attempt: usize,
+    limit: usize,
+    previous_summary: &str,
+) -> String {
+    format!(
+        "⚡ THOR'S NUDGE {attempt}/{limit}. Your previous turn ended, but your worktree \
+         still has NO git diff against the starting commit. Ragnarok cannot review an \
+         implementation with no changed files.\n\n\
+         Continue from your current worktree and handle whatever blocked you. Do not \
+         merely explain the problem. Make the smallest safe, task-relevant code or test \
+         change that moves the task forward, then verify what you can. Leave changes \
+         uncommitted.\n\n\
+         THE ORIGINAL TASK:\n{task}\n\n\
+         YOUR PREVIOUS SUMMARY:\n{summary}",
+        summary = truncate_middle(previous_summary, SUMMARY_LIMIT),
     )
 }
 
@@ -3507,6 +3655,73 @@ mod tests {
         assert!(tally.contains("run tests ×1"));
         assert!(tally.contains("of the last 4"));
         assert_eq!(action_tally(&[]), "(no recorded actions)");
+    }
+
+    #[test]
+    fn empty_artifact_is_not_progress() {
+        let empty = CapturedArtifact {
+            diffstat: "".to_string(),
+            diff: "\n".to_string(),
+            truncated: false,
+        };
+        assert!(!artifact_has_changes(&empty));
+
+        let changed = CapturedArtifact {
+            diffstat: " src/main.rs | 1 +".to_string(),
+            diff: "".to_string(),
+            truncated: false,
+        };
+        assert!(artifact_has_changes(&changed));
+    }
+
+    #[test]
+    fn artifact_diff_summary_reports_line_counts() {
+        let artifact = CapturedArtifact {
+            diffstat: " src/main.rs | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-)"
+                .to_string(),
+            diff: String::new(),
+            truncated: false,
+        };
+
+        assert_eq!(
+            artifact_diff_summary(&artifact),
+            "1 file, 2 insertions, 1 deletion"
+        );
+    }
+
+    #[test]
+    fn artifact_diff_summary_reports_no_changed_lines() {
+        let artifact = CapturedArtifact {
+            diffstat: String::new(),
+            diff: String::new(),
+            truncated: false,
+        };
+
+        assert_eq!(artifact_diff_summary(&artifact), "no changed lines");
+    }
+
+    #[test]
+    fn fighter_summary_records_thor_nudges() {
+        let mut summary = String::new();
+        record_fighter_summary(&mut summary, 0, "first pass");
+        record_fighter_summary(&mut summary, 1, "made the change");
+
+        assert_eq!(
+            summary,
+            "first pass\n\nAFTER THOR NUDGE 1:\nmade the change"
+        );
+    }
+
+    #[test]
+    fn no_diff_nudge_prompt_pushes_for_visible_changes() {
+        let prompt = no_diff_nudge_prompt("fix the bug", 2, 3, "I got blocked");
+
+        assert!(prompt.contains("THOR'S NUDGE 2/3"));
+        assert!(prompt.contains("NO git diff"));
+        assert!(prompt.contains("Do not merely explain"));
+        assert!(prompt.contains("code or test change"));
+        assert!(prompt.contains("fix the bug"));
+        assert!(prompt.contains("I got blocked"));
     }
 
     #[test]
