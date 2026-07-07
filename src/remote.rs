@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::net::TcpListener;
+use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1430,7 +1430,13 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
             ts.tailscale.cert_domain
         );
     }
-    println!("{}", crate::qr::render_qr(&viewer_url)?);
+    if should_render_login_qr(&listen.viewer_host) {
+        println!("{}", crate::qr::render_qr(&viewer_url)?);
+    } else {
+        println!(
+            "QR code hidden because localhost is only reachable from this machine; use --hostname or --tailscale for a device-login QR."
+        );
+    }
     println!("viewer code: {viewer_code}");
     if logout_all {
         println!("logged out all devices (rotated cookie signing key)");
@@ -1686,6 +1692,11 @@ fn remote_qr_login_url(host: &str, token: &str) -> String {
     // sets the session cookie, and redirects to a clean `/`. This keeps the
     // long-lived token out of the browser history and out of later requests.
     format!("https://{host}:11921/auth/login?token={encoded}")
+}
+
+fn should_render_login_qr(host: &str) -> bool {
+    !host.eq_ignore_ascii_case("localhost")
+        && !host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Install the ring CryptoProvider so we do not depend on aws-lc-rs (which needs
@@ -5218,6 +5229,16 @@ mod tests {
             remote_qr_login_url("example.com", "a+b/c=="),
             "https://example.com:11921/auth/login?token=a%2Bb%2Fc%3D%3D"
         );
+    }
+
+    #[test]
+    fn login_qr_is_hidden_for_loopback_hosts() {
+        assert!(!should_render_login_qr("localhost"));
+        assert!(!should_render_login_qr("LOCALHOST"));
+        assert!(!should_render_login_qr("127.0.0.1"));
+        assert!(!should_render_login_qr("::1"));
+        assert!(should_render_login_qr("example.com"));
+        assert!(should_render_login_qr("mybox.tail1234.ts.net"));
     }
 
     #[test]
