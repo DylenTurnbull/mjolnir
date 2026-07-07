@@ -1321,12 +1321,11 @@ impl AgentHandle {
 
     fn answer_permission(&self, prompt: crate::event::PermissionPrompt) -> String {
         let selected = self.select_permission_option(&prompt);
-        let mut note =
-            permission_answer_note("permission auto-answered", &prompt, selected.as_deref());
+        let note = permission_answer_note("permission auto-answered", &prompt, selected.as_deref());
         let decision = selected
             .map(PermissionDecision::Selected)
             .unwrap_or(PermissionDecision::Cancelled);
-        append_permission_delivery(&mut note, prompt.responder.send(decision).is_ok());
+        let _ = prompt.responder.send(decision);
         note
     }
 
@@ -1339,12 +1338,12 @@ impl AgentHandle {
             Ok(ruling) => normalize_permission_ruling(&prompt, self.access_mode, ruling),
             Err(e) => deny_permission_ruling(&prompt, format!("Thor could not rule: {e:#}")),
         };
-        let mut note = permission_ruling_note(&prompt, &ruling);
+        let note = permission_ruling_note(&prompt, &ruling);
         let decision = ruling
             .option_id
             .map(PermissionDecision::Selected)
             .unwrap_or(PermissionDecision::Cancelled);
-        append_permission_delivery(&mut note, prompt.responder.send(decision).is_ok());
+        let _ = prompt.responder.send(decision);
         note
     }
 
@@ -1666,14 +1665,6 @@ fn permission_ruling_note(
         note.push_str(ruling.reason.trim());
     }
     note
-}
-
-fn append_permission_delivery(note: &mut String, delivered: bool) {
-    if delivered {
-        note.push_str(" [queued to ACP runtime]");
-    } else {
-        note.push_str(" [not delivered: ACP runtime no longer waiting]");
-    }
 }
 
 fn normalize_permission_ruling(
@@ -4383,115 +4374,6 @@ mod tests {
                 responder: ptx,
             });
         assert!(matches!(prx.await, Ok(PermissionDecision::Cancelled)));
-    }
-
-    #[tokio::test]
-    async fn court_permission_note_reports_runtime_delivery() {
-        use agent_client_protocol::schema::v1::{
-            PermissionOption, PermissionOptionKind, ToolCallUpdate, ToolCallUpdateFields,
-        };
-
-        let rig = test_rig();
-        let (court_tx, mut court_rx) = mpsc::unbounded_channel();
-        let court = PermissionCourtClient {
-            tx: court_tx,
-            actor_id: 7,
-            actor_tag: "Freyja [agent] ⚡1200".to_string(),
-            role: CourtActorRole::Champion,
-        };
-        let (ptx, prx) = tokio::sync::oneshot::channel();
-        let answer = rig.handle.answer_permission_through_court(
-            crate::event::PermissionPrompt {
-                tool_call: ToolCallUpdate::new(
-                    "planning-gate-approval",
-                    ToolCallUpdateFields::default().title("Approve plan before execution"),
-                ),
-                options: vec![
-                    PermissionOption::new(
-                        "accept_plan",
-                        "Accept plan",
-                        PermissionOptionKind::AllowOnce,
-                    ),
-                    PermissionOption::new(
-                        "reject_plan",
-                        "Cancel",
-                        PermissionOptionKind::RejectOnce,
-                    ),
-                ],
-                responder: ptx,
-            },
-            &court,
-        );
-        let court_side = async {
-            let request = court_rx.recv().await.expect("court request");
-            request
-                .respond
-                .send(PermissionRuling {
-                    option_id: Some("accept_plan".to_string()),
-                    reason: "safe and on task".to_string(),
-                })
-                .expect("send ruling");
-        };
-        let (note, ()) = tokio::join!(answer, court_side);
-
-        assert!(note.contains("Thor ruled on permission"));
-        assert!(note.contains("-> accept_plan (Accept plan)"));
-        assert!(note.contains("[queued to ACP runtime]"));
-        assert!(matches!(prx.await, Ok(PermissionDecision::Selected(id)) if id == "accept_plan"));
-    }
-
-    #[tokio::test]
-    async fn court_permission_note_reports_dropped_runtime_receiver() {
-        use agent_client_protocol::schema::v1::{
-            PermissionOption, PermissionOptionKind, ToolCallUpdate, ToolCallUpdateFields,
-        };
-
-        let rig = test_rig();
-        let (court_tx, mut court_rx) = mpsc::unbounded_channel();
-        let court = PermissionCourtClient {
-            tx: court_tx,
-            actor_id: 7,
-            actor_tag: "Freyja [agent] ⚡1200".to_string(),
-            role: CourtActorRole::Champion,
-        };
-        let (ptx, prx) = tokio::sync::oneshot::channel();
-        drop(prx);
-        let answer = rig.handle.answer_permission_through_court(
-            crate::event::PermissionPrompt {
-                tool_call: ToolCallUpdate::new(
-                    "planning-gate-approval",
-                    ToolCallUpdateFields::default().title("Approve plan before execution"),
-                ),
-                options: vec![
-                    PermissionOption::new(
-                        "accept_plan",
-                        "Accept plan",
-                        PermissionOptionKind::AllowOnce,
-                    ),
-                    PermissionOption::new(
-                        "reject_plan",
-                        "Cancel",
-                        PermissionOptionKind::RejectOnce,
-                    ),
-                ],
-                responder: ptx,
-            },
-            &court,
-        );
-        let court_side = async {
-            let request = court_rx.recv().await.expect("court request");
-            request
-                .respond
-                .send(PermissionRuling {
-                    option_id: Some("accept_plan".to_string()),
-                    reason: "safe and on task".to_string(),
-                })
-                .expect("send ruling");
-        };
-        let (note, ()) = tokio::join!(answer, court_side);
-
-        assert!(note.contains("-> accept_plan (Accept plan)"));
-        assert!(note.contains("[not delivered: ACP runtime no longer waiting]"));
     }
 
     #[test]
