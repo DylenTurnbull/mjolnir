@@ -489,6 +489,20 @@
         }
       }
 
+      .sidebar-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex: 0 0 auto;
+      }
+
+      .sidebar-new-button {
+        height: 30px;
+        padding: 0 12px;
+        font-size: 10px;
+        letter-spacing: 0.08em;
+      }
+
       #status {
         margin: 7px 0 0;
         color: var(--dim);
@@ -508,6 +522,212 @@
         cursor: pointer;
 
         &:hover {
+          color: var(--red-hot);
+        }
+      }
+
+      /* ---- new session folder picker ---- */
+
+      .modal-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: calc(18px + env(safe-area-inset-top)) calc(18px + env(safe-area-inset-right)) calc(18px + env(safe-area-inset-bottom)) calc(18px + env(safe-area-inset-left));
+        background: rgb(0 0 0 / 0.58);
+        backdrop-filter: blur(7px);
+      }
+
+      .new-session-panel {
+        position: relative;
+        isolation: isolate;
+        width: min(720px, 100%);
+        max-height: min(760px, 100%);
+        display: flex;
+        flex-direction: column;
+        gap: 13px;
+        padding: 18px;
+        clip-path: var(--shape-console);
+        background: linear-gradient(135deg, rgb(255 255 255 / 0.2), rgb(255 255 255 / 0.09) 48%, rgb(235 63 51 / 0.34));
+
+        &::before {
+          content: "";
+          position: absolute;
+          inset: 1px;
+          z-index: -2;
+          background: var(--bg);
+          clip-path: var(--shape-console-inner);
+        }
+
+        &::after {
+          content: "";
+          position: absolute;
+          inset: 2px;
+          z-index: -1;
+          background: linear-gradient(180deg, rgb(255 255 255 / 0.03), transparent 42%), var(--surface-chrome);
+          clip-path: var(--shape-console-fill);
+        }
+      }
+
+      .new-session-head {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+
+        & h2 {
+          flex: 1;
+          margin: 0;
+          font: 400 20px/1 var(--font-display);
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+        }
+      }
+
+      .new-session-close,
+      .fs-parent-button,
+      .fs-root-button,
+      .fs-row {
+        border: 1px solid var(--line-row);
+        background: var(--surface-control);
+        color: var(--text-control);
+        cursor: pointer;
+        transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+
+        &:hover:not(:disabled) {
+          border-color: var(--line-strong);
+          background: var(--row-hover);
+          color: var(--button-hover-text);
+        }
+
+        &:disabled {
+          color: var(--dim);
+          cursor: default;
+          opacity: 0.65;
+        }
+      }
+
+      .new-session-close {
+        width: 34px;
+        height: 30px;
+        padding: 0;
+        font: 700 15px/1 var(--font-mono);
+      }
+
+      .fs-current {
+        display: grid;
+        gap: 5px;
+        padding: 11px 12px;
+        border: 1px solid var(--line-row);
+        background: var(--surface-terminal);
+      }
+
+      .fs-label {
+        color: var(--dim);
+        font: 700 9.5px/1 var(--font-mono);
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+      }
+
+      .fs-path {
+        min-width: 0;
+        color: var(--text-control);
+        font: 400 12px/1.5 var(--font-mono);
+        overflow-wrap: anywhere;
+      }
+
+      .fs-roots {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .fs-root-button {
+        padding: 7px 10px;
+        font: 700 10px/1 var(--font-mono);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+
+        &.active {
+          border-color: rgb(235 63 51 / 0.6);
+          color: var(--red-hot);
+          background: rgb(235 63 51 / 0.11);
+        }
+      }
+
+      .fs-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 9px;
+      }
+
+      .fs-parent-button {
+        min-height: 34px;
+        padding: 0 12px;
+        font: 700 10px/1 var(--font-mono);
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .fs-spacer {
+        flex: 1 1 auto;
+      }
+
+      .fs-list {
+        min-height: 180px;
+        max-height: min(42dvh, 360px);
+        overflow-y: auto;
+        border: 1px solid var(--line-row);
+        background: var(--surface-terminal);
+      }
+
+      .fs-row {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        min-height: 42px;
+        padding: 8px 12px;
+        border: 0;
+        border-bottom: 1px solid var(--line-row);
+        text-align: left;
+        background: transparent;
+
+        &:last-child {
+          border-bottom: 0;
+        }
+      }
+
+      .fs-row-icon {
+        flex: 0 0 auto;
+        color: var(--red);
+        font: 700 13px/1 var(--font-mono);
+      }
+
+      .fs-row-text {
+        min-width: 0;
+        display: grid;
+        gap: 3px;
+      }
+
+      .fs-row-name {
+        font: 600 14px/1.2 var(--font-body);
+      }
+
+      .fs-row-path {
+        color: var(--dim);
+        font: 400 10.5px/1.35 var(--font-mono);
+        overflow-wrap: anywhere;
+      }
+
+      .new-session-status {
+        min-height: 17px;
+        color: var(--dim);
+        font: 400 11px/1.5 var(--font-mono);
+
+        &.is-error {
           color: var(--red-hot);
         }
       }
@@ -1543,6 +1763,37 @@
           padding-right: calc(16px + var(--theme-toggle-reserve) + env(safe-area-inset-right));
         }
 
+        .sidebar-title-row {
+          gap: 8px;
+        }
+
+        .sidebar-actions {
+          gap: 7px;
+        }
+
+        .sidebar-new-button {
+          padding: 0 10px;
+        }
+
+        .modal-backdrop {
+          align-items: stretch;
+          padding: calc(12px + env(safe-area-inset-top)) calc(10px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));
+        }
+
+        .new-session-panel {
+          max-height: 100%;
+          padding: 14px;
+        }
+
+        .fs-list {
+          max-height: none;
+          flex: 1;
+        }
+
+        .fs-toolbar .primary {
+          flex: 1 1 160px;
+        }
+
         .entry {
           padding: 12px 14px 14px;
         }
@@ -1658,7 +1909,10 @@
         <div class="panel-header">
           <div class="sidebar-title-row">
             <h1>Mjolnir</h1>
-            <button id="logout-button" class="ghost-danger" type="button">Log out</button>
+            <div class="sidebar-actions">
+              <button id="new-session-button" class="primary sidebar-new-button" type="button">New</button>
+              <button id="logout-button" class="ghost-danger" type="button">Log out</button>
+            </div>
           </div>
           <p id="status">Loading…</p>
         </div>
@@ -1693,6 +1947,27 @@
         </section>
       </main>
     </div>
+
+    <section id="new-session-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="new-session-title" hidden>
+      <div class="new-session-panel">
+        <header class="new-session-head">
+          <h2 id="new-session-title">New session</h2>
+          <button id="new-session-close" class="new-session-close" type="button" aria-label="Close new session picker">×</button>
+        </header>
+        <div class="fs-current">
+          <span class="fs-label">Current folder</span>
+          <span id="fs-current-path" class="fs-path"></span>
+        </div>
+        <div id="fs-roots" class="fs-roots" aria-label="Workspace roots"></div>
+        <div class="fs-toolbar">
+          <button id="fs-parent-button" class="fs-parent-button" type="button">Up</button>
+          <span class="fs-spacer"></span>
+          <button id="new-session-start" class="primary" type="button">Start session</button>
+        </div>
+        <div id="fs-list" class="fs-list" aria-label="Folders"></div>
+        <div id="new-session-status" class="new-session-status" role="status"></div>
+      </div>
+    </section>
 
     <template id="tpl-session">
       <button type="button" class="session-item">
@@ -1761,6 +2036,15 @@
       const authSubmitEl = $("auth-submit");
       const authErrorEl = $("auth-error");
       const logoutButtonEl = $("logout-button");
+      const newSessionButtonEl = $("new-session-button");
+      const newSessionModalEl = $("new-session-modal");
+      const newSessionCloseEl = $("new-session-close");
+      const newSessionStartEl = $("new-session-start");
+      const newSessionStatusEl = $("new-session-status");
+      const fsCurrentPathEl = $("fs-current-path");
+      const fsRootsEl = $("fs-roots");
+      const fsParentButtonEl = $("fs-parent-button");
+      const fsListEl = $("fs-list");
       const statusEl = $("status");
       const sessionsEl = $("sessions");
       const transcriptEl = $("transcript");
@@ -1807,6 +2091,9 @@
       let shouldStickToBottom = true;
       let forceScrollToBottom = false;
       let pendingNewEntries = 0;
+      let filesystemState = null;
+      let filesystemLoading = false;
+      let creatingSession = false;
       const draftBySessionId = new Map();
       const activityBySessionId = new Map();
       const sessionCardById = new Map();
@@ -1902,6 +2189,10 @@
         sessions = [];
         queuedPrompts = [];
         selectedSessionId = null;
+        filesystemState = null;
+        filesystemLoading = false;
+        creatingSession = false;
+        newSessionModalEl.hidden = true;
         sessionCardById.clear();
         activityBySessionId.clear();
         sentDecisions.clear();
@@ -1942,6 +2233,178 @@
           throw new Error("HTTP 401");
         }
         return response;
+      }
+
+      function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      /* ---- new session folder picker ---- */
+
+      function setNewSessionStatus(text, isError = false) {
+        newSessionStatusEl.textContent = text;
+        newSessionStatusEl.classList.toggle("is-error", isError);
+      }
+
+      function setFilesystemBusy(busy) {
+        filesystemLoading = busy;
+        fsParentButtonEl.disabled = busy || !filesystemState?.parent || creatingSession;
+        newSessionStartEl.disabled = busy || !filesystemState?.current || creatingSession;
+        fsRootsEl.querySelectorAll("button").forEach((button) => {
+          button.disabled = busy || creatingSession;
+        });
+        fsListEl.querySelectorAll("button").forEach((button) => {
+          button.disabled = busy || creatingSession;
+        });
+      }
+
+      function openNewSessionPicker() {
+        if (!authenticated) {
+          return;
+        }
+        newSessionModalEl.hidden = false;
+        setNewSessionStatus("");
+        void loadFilesystem();
+      }
+
+      function closeNewSessionPicker() {
+        if (creatingSession) {
+          return;
+        }
+        newSessionModalEl.hidden = true;
+      }
+
+      function directoryButton(record, className, onClick) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = className;
+        button.addEventListener("click", onClick);
+        return button;
+      }
+
+      function renderFilesystemPicker() {
+        fsRootsEl.replaceChildren();
+        fsListEl.replaceChildren();
+        const current = filesystemState?.current || null;
+        fsCurrentPathEl.textContent = current?.display_path || "";
+
+        for (const root of filesystemState?.roots || []) {
+          const button = directoryButton(root, "fs-root-button", () => {
+            void loadFilesystem(root.path);
+          });
+          button.textContent = root.name || root.display_path || root.path;
+          button.title = root.display_path || root.path;
+          button.classList.toggle("active", current?.path === root.path);
+          fsRootsEl.appendChild(button);
+        }
+
+        fsParentButtonEl.onclick = () => {
+          if (filesystemState?.parent) {
+            void loadFilesystem(filesystemState.parent.path);
+          }
+        };
+
+        const entries = filesystemState?.entries || [];
+        if (!entries.length) {
+          fsListEl.appendChild(emptyNote("No folders"));
+        } else {
+          for (const entry of entries) {
+            const button = directoryButton(entry, "fs-row", () => {
+              void loadFilesystem(entry.path);
+            });
+            const icon = document.createElement("span");
+            icon.className = "fs-row-icon";
+            icon.textContent = ">";
+            const text = document.createElement("span");
+            text.className = "fs-row-text";
+            const name = document.createElement("span");
+            name.className = "fs-row-name";
+            name.textContent = entry.name || entry.path;
+            const path = document.createElement("span");
+            path.className = "fs-row-path";
+            path.textContent = entry.display_path || entry.path;
+            text.append(name, path);
+            button.append(icon, text);
+            fsListEl.appendChild(button);
+          }
+        }
+
+        setFilesystemBusy(filesystemLoading);
+      }
+
+      async function loadFilesystem(path = "") {
+        if (filesystemLoading || creatingSession) {
+          return;
+        }
+        setFilesystemBusy(true);
+        setNewSessionStatus("Loading folders…");
+        try {
+          const url = path ? `/api/filesystem?path=${encodeURIComponent(path)}` : "/api/filesystem";
+          const response = await apiFetch(url, { cache: "no-store" });
+          if (!response.ok) {
+            const message = await response.text();
+            throw new Error(message || `HTTP ${response.status}`);
+          }
+          filesystemState = await response.json();
+          setNewSessionStatus("");
+          renderFilesystemPicker();
+          newSessionStartEl.focus();
+        } catch (error) {
+          if (error.message !== "HTTP 401") {
+            setNewSessionStatus(`Folder load failed: ${error.message}`, true);
+          }
+        } finally {
+          setFilesystemBusy(false);
+        }
+      }
+
+      async function startNewSession() {
+        const current = filesystemState?.current;
+        if (!current || creatingSession) {
+          return;
+        }
+        creatingSession = true;
+        setFilesystemBusy(true);
+        setNewSessionStatus("Starting session…");
+        const knownSessionIds = new Set(sessions.map((session) => session.session_id));
+        try {
+          const response = await apiFetch("/api/server-sessions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ cwd: current.path }),
+          });
+          if (!response.ok) {
+            const message = await response.text();
+            throw new Error(message || `HTTP ${response.status}`);
+          }
+          newSessionModalEl.hidden = true;
+          statusEl.textContent = "Starting session…";
+          await selectNewlyStartedSession(knownSessionIds);
+        } catch (error) {
+          if (error.message !== "HTTP 401") {
+            setNewSessionStatus(`Start failed: ${error.message}`, true);
+          }
+        } finally {
+          creatingSession = false;
+          setFilesystemBusy(false);
+        }
+      }
+
+      async function selectNewlyStartedSession(knownSessionIds) {
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+          await sleep(attempt === 0 ? 300 : 1000);
+          await refreshSessions();
+          const created = sessions
+            .filter((session) => !knownSessionIds.has(session.session_id))
+            .sort((a, b) => new Date(b.start_time || 0) - new Date(a.start_time || 0))[0];
+          if (created) {
+            navigateToSession(created.session_id);
+            return;
+          }
+        }
+        statusEl.textContent = "Session is starting; refresh will pick it up.";
       }
 
       /* ---- timestamps ---- */
@@ -3916,6 +4379,20 @@
       });
       authFormEl.addEventListener("submit", submitAuth);
       logoutButtonEl.addEventListener("click", logout);
+      newSessionButtonEl.addEventListener("click", openNewSessionPicker);
+      newSessionCloseEl.addEventListener("click", closeNewSessionPicker);
+      newSessionStartEl.addEventListener("click", startNewSession);
+      newSessionModalEl.addEventListener("click", (event) => {
+        if (event.target === newSessionModalEl) {
+          closeNewSessionPicker();
+        }
+      });
+      window.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && !newSessionModalEl.hidden) {
+          event.preventDefault();
+          closeNewSessionPicker();
+        }
+      });
       backButtonEl.addEventListener("click", navigateToList);
       window.addEventListener("hashchange", applyRoute);
       narrowScreen.addEventListener("change", () => {

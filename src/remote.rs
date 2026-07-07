@@ -325,6 +325,38 @@ struct QueuePromptRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NewServerSessionRequest {
+    cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NewServerSessionResponse {
+    cwd: String,
+    display_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct BrowseFilesystemQuery {
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FilesystemDirectoryRecord {
+    path: String,
+    name: String,
+    display_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FilesystemBrowseResponse {
+    current: FilesystemDirectoryRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<FilesystemDirectoryRecord>,
+    roots: Vec<FilesystemDirectoryRecord>,
+    entries: Vec<FilesystemDirectoryRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ClaimQueuedPromptRequest {
     session_id: String,
 }
@@ -456,12 +488,62 @@ struct ServerState {
     /// no cookie `Max-Age`, so it dies when the browser/PWA closes.
     session_ttl: Duration,
     code_guard: Arc<Mutex<CodeAuthGuard>>,
+    workspace_roots: Arc<Vec<PathBuf>>,
+    session_manager: Arc<ServerSessionManager>,
 }
 
 #[derive(Debug)]
 struct ServerAgentSession {
     command_tx: mpsc::UnboundedSender<UiCommand>,
     task: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct ServerSessionManager {
+    agent: SelectedAgent,
+    additional_directories: Vec<PathBuf>,
+    fs_max_text_bytes: u64,
+    sessions: Mutex<Vec<ServerAgentSession>>,
+}
+
+impl ServerSessionManager {
+    fn new(
+        agent: SelectedAgent,
+        additional_directories: Vec<PathBuf>,
+        fs_max_text_bytes: u64,
+    ) -> Self {
+        Self {
+            agent,
+            additional_directories,
+            fs_max_text_bytes,
+            sessions: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn start_session(&self, cwd: PathBuf) {
+        let session = start_server_agent_session(
+            self.agent.clone(),
+            cwd,
+            self.additional_directories.clone(),
+            self.fs_max_text_bytes,
+        );
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.push(session);
+        } else {
+            session.task.abort();
+        }
+    }
+
+    async fn shutdown_all(&self) {
+        let sessions = self
+            .sessions
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default();
+        for session in sessions {
+            session.shutdown().await;
+        }
+    }
 }
 
 impl TrackerState {
@@ -1385,6 +1467,13 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     } else {
         ensure_cookie_key(&paths.cookie_key_path)?
     };
+    let workspace_roots =
+        crate::paths::WorkspaceRoots::new(&cwd, &additional_directories)?.active_roots();
+    let session_manager = Arc::new(ServerSessionManager::new(
+        agent,
+        additional_directories,
+        fs_max_text_bytes,
+    ));
     let session_ttl = session_ttl_from_days(session_ttl_days);
     let viewer_code = generate_viewer_code()?;
     let viewer_url = remote_qr_login_url(&listen.viewer_host, &token);
@@ -1395,6 +1484,8 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
         viewer_code: viewer_code.clone(),
         cookie_key,
         session_ttl,
+        workspace_roots,
+        session_manager: Arc::clone(&session_manager),
     });
 
     let tls_config = match &tailscale_tls {
@@ -1454,9 +1545,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     let server_task = tokio::spawn(server);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let agent_session =
-        start_server_agent_session(agent, cwd, additional_directories, fs_max_text_bytes);
-    let mut agent_session = Some(agent_session);
+    session_manager.start_session(cwd);
     let mut server_task = server_task;
     let result = tokio::select! {
         joined = &mut server_task => joined.context("remote-control server task join")?,
@@ -1464,16 +1553,12 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
             if let Err(error) = signal {
                 warn!("remote-control shutdown signal failed: {error}");
             }
-            if let Some(session) = agent_session.take() {
-                session.shutdown().await;
-            }
+            session_manager.shutdown_all().await;
             server_handle.graceful_shutdown(Some(Duration::from_secs(2)));
             server_task.await.context("remote-control server task join after shutdown")?
         }
     };
-    if let Some(session) = agent_session.take() {
-        session.shutdown().await;
-    }
+    session_manager.shutdown_all().await;
     result.with_context(|| format!("serve remote-control API on {}", listen.bind_addr))
 }
 
@@ -1863,6 +1948,8 @@ struct RouterConfig {
     viewer_code: String,
     cookie_key: String,
     session_ttl: Duration,
+    workspace_roots: Vec<PathBuf>,
+    session_manager: Arc<ServerSessionManager>,
 }
 
 fn build_router(config: RouterConfig) -> Router {
@@ -1873,11 +1960,15 @@ fn build_router(config: RouterConfig) -> Router {
         cookie_key: Arc::new(config.cookie_key),
         session_ttl: config.session_ttl,
         code_guard: Arc::new(Mutex::new(CodeAuthGuard::default())),
+        workspace_roots: Arc::new(config.workspace_roots),
+        session_manager: config.session_manager,
     };
 
     let protected = Router::new()
         .route("/live/sessions", get(list_live_sessions))
         .route("/sessions", get(list_sessions))
+        .route("/api/server-sessions", post(create_server_owned_session))
+        .route("/api/filesystem", get(browse_filesystem))
         .route("/api/sessions", post(upsert_session))
         .route(
             "/api/sessions/{session_id}",
@@ -2356,6 +2447,42 @@ async fn list_live_sessions(
     Ok(Json(sessions))
 }
 
+async fn browse_filesystem(
+    State(state): State<ServerState>,
+    Query(query): Query<BrowseFilesystemQuery>,
+) -> std::result::Result<Json<FilesystemBrowseResponse>, (StatusCode, String)> {
+    let roots = Arc::clone(&state.workspace_roots);
+    let requested_path = query.path;
+    let response = tokio::task::spawn_blocking(move || {
+        browse_filesystem_under_roots(roots.as_slice(), requested_path.as_deref())
+    })
+    .await
+    .map_err(internal_error)??;
+    Ok(Json(response))
+}
+
+async fn create_server_owned_session(
+    State(state): State<ServerState>,
+    Json(request): Json<NewServerSessionRequest>,
+) -> std::result::Result<(StatusCode, Json<NewServerSessionResponse>), (StatusCode, String)> {
+    let cwd = request.cwd.trim().to_string();
+    if cwd.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "cwd must not be empty".to_string()));
+    }
+    let roots = Arc::clone(&state.workspace_roots);
+    let cwd = tokio::task::spawn_blocking(move || directory_under_roots(roots.as_slice(), &cwd))
+        .await
+        .map_err(internal_error)??;
+    state.session_manager.start_session(cwd.clone());
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(NewServerSessionResponse {
+            display_path: crate::paths::display_path_with_tilde(&cwd),
+            cwd: cwd.display().to_string(),
+        }),
+    ))
+}
+
 async fn list_queued_prompts(
     State(state): State<ServerState>,
     Query(query): Query<SessionQueueQuery>,
@@ -2494,6 +2621,110 @@ async fn claim_config_change(
     .map_err(internal_error)?
     .map_err(internal_error)?;
     Ok(Json(change))
+}
+
+fn browse_filesystem_under_roots(
+    roots: &[PathBuf],
+    requested_path: Option<&str>,
+) -> std::result::Result<FilesystemBrowseResponse, (StatusCode, String)> {
+    if roots.is_empty() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no workspace roots configured".to_string(),
+        ));
+    }
+    let current = match requested_path {
+        Some(path) if !path.trim().is_empty() => directory_under_roots(roots, path.trim())?,
+        _ => roots[0].clone(),
+    };
+    let parent = current.parent().and_then(|path| {
+        let parent = std::fs::canonicalize(path).ok()?;
+        crate::paths::path_is_under_any_root(roots, &parent)
+            .then(|| filesystem_directory_record(&parent))
+    });
+    let mut entries = Vec::new();
+    let read_dir = std::fs::read_dir(&current).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("read {}: {error}", current.display()),
+        )
+    })?;
+    for entry in read_dir {
+        let entry = entry.map_err(internal_error)?;
+        let file_type = entry.file_type().map_err(internal_error)?;
+        if !file_type.is_dir() && !file_type.is_symlink() {
+            continue;
+        }
+        let path = match std::fs::canonicalize(entry.path()) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if !path.is_dir() || !crate::paths::path_is_under_any_root(roots, &path) {
+            continue;
+        }
+        entries.push(filesystem_directory_record(&path));
+    }
+    entries.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(FilesystemBrowseResponse {
+        current: filesystem_directory_record(&current),
+        parent,
+        roots: roots
+            .iter()
+            .map(|root| filesystem_directory_record(root))
+            .collect(),
+        entries,
+    })
+}
+
+fn directory_under_roots(
+    roots: &[PathBuf],
+    path: &str,
+) -> std::result::Result<PathBuf, (StatusCode, String)> {
+    let requested = PathBuf::from(path);
+    if !requested.is_absolute() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("path must be absolute: {}", requested.display()),
+        ));
+    }
+    let canonical = std::fs::canonicalize(&requested).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("resolve {}: {error}", requested.display()),
+        )
+    })?;
+    let metadata = std::fs::metadata(&canonical).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("inspect {}: {error}", canonical.display()),
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("path is not a directory: {}", canonical.display()),
+        ));
+    }
+    if !crate::paths::path_is_under_any_root(roots, &canonical) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "path is outside configured workspace roots".to_string(),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn filesystem_directory_record(path: &Path) -> FilesystemDirectoryRecord {
+    FilesystemDirectoryRecord {
+        path: path.display().to_string(),
+        name: crate::paths::folder_label(path),
+        display_path: crate::paths::display_path_with_tilde(path),
+    }
 }
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
@@ -3452,6 +3683,23 @@ mod tests {
     /// The default cookie lifetime as a `Duration`, derived from the public
     /// day-granularity default so tests stay in lockstep with the CLI default.
     const DEFAULT_SESSION_TTL: Duration = session_ttl_from_days(DEFAULT_SESSION_TTL_DAYS);
+
+    fn test_session_manager() -> Arc<ServerSessionManager> {
+        Arc::new(ServerSessionManager::new(
+            SelectedAgent {
+                source_id: "test-agent".to_string(),
+                program: PathBuf::from("false"),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+            Vec::new(),
+            crate::acp::DEFAULT_FS_TEXT_BYTES,
+        ))
+    }
+
+    fn test_workspace_roots(root: &Path) -> Vec<PathBuf> {
+        vec![std::fs::canonicalize(root).expect("canonical test root")]
+    }
 
     /// Build a `PermissionPrompt` and keep the original responder receiver
     /// so tests can assert what decision was forwarded to the runtime.
@@ -4525,6 +4773,8 @@ mod tests {
             viewer_code: "123456".to_string(),
             cookie_key: "test-cookie-key".to_string(),
             session_ttl: DEFAULT_SESSION_TTL,
+            workspace_roots: test_workspace_roots(dir.path()),
+            session_manager: test_session_manager(),
         });
 
         let decision_body = |request_id: &str, option_id: &str| {
@@ -4740,6 +4990,8 @@ mod tests {
             viewer_code: "123456".to_string(),
             cookie_key: "test-cookie-key".to_string(),
             session_ttl: DEFAULT_SESSION_TTL,
+            workspace_roots: test_workspace_roots(dir.path()),
+            session_manager: test_session_manager(),
         });
 
         let change_body = |target_kind: &str, config_id: Option<&str>, value: &str| {
@@ -4889,6 +5141,60 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_browse_lists_directories_under_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let child = dir.path().join("child");
+        let nested = child.join("nested");
+        std::fs::create_dir_all(&nested).expect("create nested dirs");
+        std::fs::write(dir.path().join("file.txt"), "not a dir").expect("write file");
+        let roots = test_workspace_roots(dir.path());
+
+        let root_listing = browse_filesystem_under_roots(&roots, None).expect("browse root");
+        assert_eq!(root_listing.current.path, roots[0].display().to_string());
+        assert_eq!(
+            root_listing
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child"]
+        );
+        assert!(root_listing.parent.is_none());
+
+        let child_listing =
+            browse_filesystem_under_roots(&roots, Some(&child.display().to_string()))
+                .expect("browse child");
+        let root_path = roots[0].display().to_string();
+        assert_eq!(
+            child_listing
+                .parent
+                .as_ref()
+                .map(|entry| entry.path.as_str()),
+            Some(root_path.as_str())
+        );
+        assert_eq!(
+            child_listing
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nested"]
+        );
+    }
+
+    #[test]
+    fn filesystem_browse_rejects_paths_outside_roots() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let roots = test_workspace_roots(root.path());
+
+        let err = directory_under_roots(&roots, &outside.path().display().to_string())
+            .expect_err("outside path should be rejected");
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
     fn token_matches_requires_exact_bearer() {
         assert!(token_matches("secret", Some("secret")));
         assert!(!token_matches("secret", Some("wrong")));
@@ -5023,6 +5329,8 @@ mod tests {
             cookie_key: Arc::new("test-cookie-signing-key".to_string()),
             session_ttl: DEFAULT_SESSION_TTL,
             code_guard: Arc::new(Mutex::new(CodeAuthGuard::default())),
+            workspace_roots: Arc::new(vec![std::env::temp_dir()]),
+            session_manager: test_session_manager(),
         }
     }
 
@@ -5111,12 +5419,15 @@ mod tests {
 
     #[tokio::test]
     async fn pwa_assets_are_served_publicly() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let app = build_router(RouterConfig {
             db_path: PathBuf::from("unused.sqlite3"),
             token: "integration-token".to_string(),
             viewer_code: "123456".to_string(),
             cookie_key: "integration-cookie-key".to_string(),
             session_ttl: DEFAULT_SESSION_TTL,
+            workspace_roots: test_workspace_roots(dir.path()),
+            session_manager: test_session_manager(),
         });
 
         // (path, expected content-type prefix). The shell assets must be reachable
@@ -5423,6 +5734,8 @@ mod tests {
             viewer_code: viewer_code.clone(),
             cookie_key: "integration-cookie-key".to_string(),
             session_ttl: DEFAULT_SESSION_TTL,
+            workspace_roots: test_workspace_roots(dir.path()),
+            session_manager: test_session_manager(),
         });
 
         let _client = build_client(&cert_path).expect("pinned client");
