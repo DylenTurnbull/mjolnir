@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::net::TcpListener;
+use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -11,14 +11,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use agent_client_protocol::schema::v1::{
     ContentBlock, PermissionOptionKind, SessionConfigId, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOptions, SessionConfigValueId, SessionUpdate,
-    ToolCallContent, ToolCallStatus,
+    ToolCallContent, ToolCallStatus, ToolCallUpdateFields, ToolKind,
 };
 use anyhow::{Context, Result, anyhow};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::StatusCode;
-use axum::http::header::{AUTHORIZATION, COOKIE, HeaderValue, SET_COOKIE};
+use axum::http::header::{
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, COOKIE, HeaderValue, SET_COOKIE,
+};
 use axum::middleware::Next;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
@@ -283,6 +285,19 @@ pub struct TranscriptEntry {
     pub text: String,
     #[serde(default)]
     pub timestamp: String,
+    /// Stable ACP tool-call kind label (`execute`, `read`, `edit`, ...) for
+    /// `tool` entries, so the viewer can highlight by semantics instead of
+    /// re-sniffing the command text. Absent for non-tool entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_kind: Option<String>,
+    /// Structured tool title preserved for viewers that need to distinguish
+    /// the command/title from formatted tool content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_title: Option<String>,
+    /// Formatted tool content without the title prefix. Kept separate so
+    /// execute commands containing blank lines do not get split incorrectly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_body: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -307,6 +322,38 @@ struct SessionAuthQuery {
 struct QueuePromptRequest {
     session_id: String,
     text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NewServerSessionRequest {
+    cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NewServerSessionResponse {
+    cwd: String,
+    display_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct BrowseFilesystemQuery {
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FilesystemDirectoryRecord {
+    path: String,
+    name: String,
+    display_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FilesystemBrowseResponse {
+    current: FilesystemDirectoryRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<FilesystemDirectoryRecord>,
+    roots: Vec<FilesystemDirectoryRecord>,
+    entries: Vec<FilesystemDirectoryRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -408,6 +455,7 @@ struct ToolTranscriptEntry {
     title: String,
     content: Vec<ToolCallContent>,
     status: ToolCallStatus,
+    kind: ToolKind,
 }
 
 #[derive(Debug, Clone)]
@@ -440,12 +488,62 @@ struct ServerState {
     /// no cookie `Max-Age`, so it dies when the browser/PWA closes.
     session_ttl: Duration,
     code_guard: Arc<Mutex<CodeAuthGuard>>,
+    workspace_roots: Arc<Vec<PathBuf>>,
+    session_manager: Arc<ServerSessionManager>,
 }
 
 #[derive(Debug)]
 struct ServerAgentSession {
     command_tx: mpsc::UnboundedSender<UiCommand>,
     task: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct ServerSessionManager {
+    agent: SelectedAgent,
+    additional_directories: Vec<PathBuf>,
+    fs_max_text_bytes: u64,
+    sessions: Mutex<Vec<ServerAgentSession>>,
+}
+
+impl ServerSessionManager {
+    fn new(
+        agent: SelectedAgent,
+        additional_directories: Vec<PathBuf>,
+        fs_max_text_bytes: u64,
+    ) -> Self {
+        Self {
+            agent,
+            additional_directories,
+            fs_max_text_bytes,
+            sessions: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn start_session(&self, cwd: PathBuf) {
+        let session = start_server_agent_session(
+            self.agent.clone(),
+            cwd,
+            self.additional_directories.clone(),
+            self.fs_max_text_bytes,
+        );
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.push(session);
+        } else {
+            session.task.abort();
+        }
+    }
+
+    async fn shutdown_all(&self) {
+        let sessions = self
+            .sessions
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default();
+        for session in sessions {
+            session.shutdown().await;
+        }
+    }
 }
 
 impl TrackerState {
@@ -578,25 +676,25 @@ impl TrackerState {
                     tool_call.title.clone(),
                     tool_call.content.clone(),
                     tool_call.status,
+                    tool_call.kind,
                 );
                 self.touch();
             }
             SessionUpdate::ToolCallUpdate(update) => {
                 self.agent_message_open = false;
-                if let Some(content) = &update.fields.content {
+                let tool_call_id = update.tool_call_id.to_string();
+                if !self.update_tool_transcript_entry(&tool_call_id, &update.fields) {
                     self.push_tool_transcript_entry(
-                        update.tool_call_id.to_string(),
+                        tool_call_id,
                         update
                             .fields
                             .title
                             .clone()
                             .unwrap_or_else(|| "tool".to_string()),
-                        content.clone(),
+                        update.fields.content.clone().unwrap_or_default(),
                         update.fields.status.unwrap_or(ToolCallStatus::Pending),
+                        update.fields.kind.unwrap_or(ToolKind::Other),
                     );
-                }
-                if let Some(status) = update.fields.status {
-                    self.update_tool_transcript_status(&update.tool_call_id.to_string(), status);
                 }
                 self.touch();
             }
@@ -624,12 +722,7 @@ impl TrackerState {
                 continue;
             }
             if let Some(entry) = self.transcript.get_mut(*index) {
-                entry.text = format_tool_call(
-                    &tool_entry.title,
-                    &tool_entry.content,
-                    tool_entry.status,
-                    &self.terminal_outputs,
-                );
+                Self::render_tool_transcript_entry(entry, tool_entry, &self.terminal_outputs);
                 changed = true;
             }
         }
@@ -654,6 +747,9 @@ impl TrackerState {
             kind: kind.to_string(),
             text,
             timestamp: now_rfc3339(),
+            tool_kind: None,
+            tool_title: None,
+            tool_body: None,
         });
         index
     }
@@ -664,37 +760,62 @@ impl TrackerState {
         title: String,
         content: Vec<ToolCallContent>,
         status: ToolCallStatus,
+        kind: ToolKind,
     ) {
-        let index = self.push_transcript_entry(
-            "tool",
-            format_tool_call(&title, &content, status, &self.terminal_outputs),
-        );
-        self.tool_transcript_entries.insert(
-            index,
-            ToolTranscriptEntry {
-                tool_call_id,
-                title,
-                content,
-                status,
-            },
-        );
+        let index = self.push_transcript_entry("tool", String::new());
+        let tool_entry = ToolTranscriptEntry {
+            tool_call_id,
+            title,
+            content,
+            status,
+            kind,
+        };
+        if let Some(entry) = self.transcript.get_mut(index) {
+            Self::render_tool_transcript_entry(entry, &tool_entry, &self.terminal_outputs);
+        }
+        self.tool_transcript_entries.insert(index, tool_entry);
     }
 
-    fn update_tool_transcript_status(&mut self, tool_call_id: &str, status: ToolCallStatus) {
+    fn update_tool_transcript_entry(
+        &mut self,
+        tool_call_id: &str,
+        fields: &ToolCallUpdateFields,
+    ) -> bool {
+        let mut updated = false;
         for (index, tool_entry) in &mut self.tool_transcript_entries {
-            if tool_entry.tool_call_id != tool_call_id || tool_entry.status == status {
+            if tool_entry.tool_call_id != tool_call_id {
                 continue;
             }
-            tool_entry.status = status;
-            if let Some(entry) = self.transcript.get_mut(*index) {
-                entry.text = format_tool_call(
-                    &tool_entry.title,
-                    &tool_entry.content,
-                    tool_entry.status,
-                    &self.terminal_outputs,
-                );
+            if let Some(title) = &fields.title {
+                tool_entry.title = title.clone();
             }
+            if let Some(content) = &fields.content {
+                tool_entry.content = content.clone();
+            }
+            if let Some(status) = fields.status {
+                tool_entry.status = status;
+            }
+            if let Some(kind) = fields.kind {
+                tool_entry.kind = kind;
+            }
+            if let Some(entry) = self.transcript.get_mut(*index) {
+                Self::render_tool_transcript_entry(entry, tool_entry, &self.terminal_outputs);
+            }
+            updated = true;
         }
+        updated
+    }
+
+    fn render_tool_transcript_entry(
+        entry: &mut TranscriptEntry,
+        tool_entry: &ToolTranscriptEntry,
+        terminal_outputs: &HashMap<String, TerminalOutputSnapshot>,
+    ) {
+        let tool_body = format_tool_body(&tool_entry.content, tool_entry.status, terminal_outputs);
+        entry.text = format_tool_call_from_body(&tool_entry.title, tool_body.as_deref());
+        entry.tool_kind = Some(crate::labels::tool_kind_label(tool_entry.kind).to_string());
+        entry.tool_title = Some(tool_entry.title.clone());
+        entry.tool_body = tool_body;
     }
 
     fn snapshot(&self) -> Option<SessionRecord> {
@@ -1346,6 +1467,13 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     } else {
         ensure_cookie_key(&paths.cookie_key_path)?
     };
+    let workspace_roots =
+        crate::paths::WorkspaceRoots::new(&cwd, &additional_directories)?.active_roots();
+    let session_manager = Arc::new(ServerSessionManager::new(
+        agent,
+        additional_directories,
+        fs_max_text_bytes,
+    ));
     let session_ttl = session_ttl_from_days(session_ttl_days);
     let viewer_code = generate_viewer_code()?;
     let viewer_url = remote_qr_login_url(&listen.viewer_host, &token);
@@ -1356,6 +1484,8 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
         viewer_code: viewer_code.clone(),
         cookie_key,
         session_ttl,
+        workspace_roots,
+        session_manager: Arc::clone(&session_manager),
     });
 
     let tls_config = match &tailscale_tls {
@@ -1391,7 +1521,13 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
             ts.tailscale.cert_domain
         );
     }
-    println!("{}", crate::qr::render_qr(&viewer_url)?);
+    if should_render_login_qr(&listen.viewer_host) {
+        println!("{}", crate::qr::render_qr(&viewer_url)?);
+    } else {
+        println!(
+            "QR code hidden because localhost is only reachable from this machine; use --hostname or --tailscale for a device-login QR."
+        );
+    }
     println!("viewer code: {viewer_code}");
     if logout_all {
         println!("logged out all devices (rotated cookie signing key)");
@@ -1409,9 +1545,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     let server_task = tokio::spawn(server);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let agent_session =
-        start_server_agent_session(agent, cwd, additional_directories, fs_max_text_bytes);
-    let mut agent_session = Some(agent_session);
+    session_manager.start_session(cwd);
     let mut server_task = server_task;
     let result = tokio::select! {
         joined = &mut server_task => joined.context("remote-control server task join")?,
@@ -1419,16 +1553,12 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
             if let Err(error) = signal {
                 warn!("remote-control shutdown signal failed: {error}");
             }
-            if let Some(session) = agent_session.take() {
-                session.shutdown().await;
-            }
+            session_manager.shutdown_all().await;
             server_handle.graceful_shutdown(Some(Duration::from_secs(2)));
             server_task.await.context("remote-control server task join after shutdown")?
         }
     };
-    if let Some(session) = agent_session.take() {
-        session.shutdown().await;
-    }
+    session_manager.shutdown_all().await;
     result.with_context(|| format!("serve remote-control API on {}", listen.bind_addr))
 }
 
@@ -1441,6 +1571,12 @@ fn start_server_agent_session(
     let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
     let (runtime_cmd_tx, runtime_cmd_rx) = mpsc::unbounded_channel();
     let (remote_event_tx, mut remote_event_rx) = mpsc::unbounded_channel();
+    let agent_source_id = agent.source_id.clone();
+    let config_path = config::default_config_path();
+    let saved_session_config = config::Config::load(&config_path)
+        .ok()
+        .and_then(|cfg| cfg.session_config.get(&agent_source_id).cloned())
+        .unwrap_or_default();
     let agent_label = agent_display_label(&agent);
     let project_label = crate::paths::project_label_from_cwd(&cwd);
     let tracker = RemoteSessionTracker::new(
@@ -1459,6 +1595,9 @@ fn start_server_agent_session(
         agent_stderr: None,
         fs_max_text_bytes,
         access_mode: crate::acp::RuntimeAccessMode::Full,
+        agent_source_id: Some(agent_source_id),
+        config_path: Some(config_path),
+        saved_session_config,
     };
     let command_tx = runtime_cmd_tx.clone();
     let shutdown_tx = runtime_cmd_tx;
@@ -1640,6 +1779,11 @@ fn remote_qr_login_url(host: &str, token: &str) -> String {
     format!("https://{host}:11921/auth/login?token={encoded}")
 }
 
+fn should_render_login_qr(host: &str) -> bool {
+    !host.eq_ignore_ascii_case("localhost")
+        && !host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Install the ring CryptoProvider so we do not depend on aws-lc-rs (which needs
 /// cmake + a C toolchain). reqwest and rcgen already pull ring in. Idempotent:
 /// a second call is a no-op.
@@ -1804,6 +1948,8 @@ struct RouterConfig {
     viewer_code: String,
     cookie_key: String,
     session_ttl: Duration,
+    workspace_roots: Vec<PathBuf>,
+    session_manager: Arc<ServerSessionManager>,
 }
 
 fn build_router(config: RouterConfig) -> Router {
@@ -1814,11 +1960,15 @@ fn build_router(config: RouterConfig) -> Router {
         cookie_key: Arc::new(config.cookie_key),
         session_ttl: config.session_ttl,
         code_guard: Arc::new(Mutex::new(CodeAuthGuard::default())),
+        workspace_roots: Arc::new(config.workspace_roots),
+        session_manager: config.session_manager,
     };
 
     let protected = Router::new()
         .route("/live/sessions", get(list_live_sessions))
         .route("/sessions", get(list_sessions))
+        .route("/api/server-sessions", post(create_server_owned_session))
+        .route("/api/filesystem", get(browse_filesystem))
         .route("/api/sessions", post(upsert_session))
         .route(
             "/api/sessions/{session_id}",
@@ -1852,6 +2002,14 @@ fn build_router(config: RouterConfig) -> Router {
         .route("/icons/icon-512.png", get(remote_icon_512))
         .route("/icons/maskable-512.png", get(remote_icon_maskable))
         .route("/icons/apple-touch-icon.png", get(remote_icon_apple_touch))
+        .route("/fonts/staatliches-400.woff2", get(remote_font_staatliches))
+        .route("/fonts/rajdhani-500.woff2", get(remote_font_rajdhani_500))
+        .route("/fonts/rajdhani-600.woff2", get(remote_font_rajdhani_600))
+        .route("/fonts/rajdhani-700.woff2", get(remote_font_rajdhani_700))
+        .route(
+            "/fonts/jetbrains-mono.woff2",
+            get(remote_font_jetbrains_mono),
+        )
         .route("/auth/login", get(create_viewer_session_from_query))
         .route(
             "/auth/session",
@@ -1980,8 +2138,21 @@ fn session_cookie_valid(cookie_key: &str, value: &str, now_unix: u64) -> bool {
     constant_time_eq(expected.as_bytes(), value.as_bytes())
 }
 
-async fn remote_viewer() -> Html<&'static str> {
-    Html(include_str!("remote_viewer.html"))
+async fn remote_viewer() -> Response {
+    (
+        [
+            (
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (
+                CACHE_CONTROL,
+                HeaderValue::from_static("no-store, max-age=0"),
+            ),
+        ],
+        include_str!("remote_viewer.html"),
+    )
+        .into_response()
 }
 
 /// Serve a compiled-in static asset with an explicit content type. Used for the
@@ -1998,10 +2169,20 @@ async fn remote_manifest() -> Response {
 }
 
 async fn remote_service_worker() -> Response {
-    static_asset(
-        "text/javascript; charset=utf-8",
+    (
+        [
+            (
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/javascript; charset=utf-8"),
+            ),
+            (
+                CACHE_CONTROL,
+                HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+            ),
+        ],
         include_bytes!("remote_service_worker.js"),
     )
+        .into_response()
 }
 
 async fn remote_icon_svg() -> Response {
@@ -2022,6 +2203,43 @@ async fn remote_icon_maskable() -> Response {
 
 async fn remote_icon_apple_touch() -> Response {
     static_asset("image/png", include_bytes!("icons/apple-touch-icon.png"))
+}
+
+/// Like `static_asset`, but marked immutable so browsers never refetch. Only
+/// the brand fonts use this: they are the heaviest shell assets and a change
+/// would ship under a new file name anyway.
+fn static_asset_immutable(content_type: &'static str, body: &'static [u8]) -> Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn remote_font_staatliches() -> Response {
+    static_asset_immutable("font/woff2", include_bytes!("fonts/staatliches-400.woff2"))
+}
+
+async fn remote_font_rajdhani_500() -> Response {
+    static_asset_immutable("font/woff2", include_bytes!("fonts/rajdhani-500.woff2"))
+}
+
+async fn remote_font_rajdhani_600() -> Response {
+    static_asset_immutable("font/woff2", include_bytes!("fonts/rajdhani-600.woff2"))
+}
+
+async fn remote_font_rajdhani_700() -> Response {
+    static_asset_immutable("font/woff2", include_bytes!("fonts/rajdhani-700.woff2"))
+}
+
+async fn remote_font_jetbrains_mono() -> Response {
+    static_asset_immutable("font/woff2", include_bytes!("fonts/jetbrains-mono.woff2"))
 }
 
 async fn create_viewer_session(
@@ -2229,6 +2447,42 @@ async fn list_live_sessions(
     Ok(Json(sessions))
 }
 
+async fn browse_filesystem(
+    State(state): State<ServerState>,
+    Query(query): Query<BrowseFilesystemQuery>,
+) -> std::result::Result<Json<FilesystemBrowseResponse>, (StatusCode, String)> {
+    let roots = Arc::clone(&state.workspace_roots);
+    let requested_path = query.path;
+    let response = tokio::task::spawn_blocking(move || {
+        browse_filesystem_under_roots(roots.as_slice(), requested_path.as_deref())
+    })
+    .await
+    .map_err(internal_error)??;
+    Ok(Json(response))
+}
+
+async fn create_server_owned_session(
+    State(state): State<ServerState>,
+    Json(request): Json<NewServerSessionRequest>,
+) -> std::result::Result<(StatusCode, Json<NewServerSessionResponse>), (StatusCode, String)> {
+    let cwd = request.cwd.trim().to_string();
+    if cwd.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "cwd must not be empty".to_string()));
+    }
+    let roots = Arc::clone(&state.workspace_roots);
+    let cwd = tokio::task::spawn_blocking(move || directory_under_roots(roots.as_slice(), &cwd))
+        .await
+        .map_err(internal_error)??;
+    state.session_manager.start_session(cwd.clone());
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(NewServerSessionResponse {
+            display_path: crate::paths::display_path_with_tilde(&cwd),
+            cwd: cwd.display().to_string(),
+        }),
+    ))
+}
+
 async fn list_queued_prompts(
     State(state): State<ServerState>,
     Query(query): Query<SessionQueueQuery>,
@@ -2367,6 +2621,110 @@ async fn claim_config_change(
     .map_err(internal_error)?
     .map_err(internal_error)?;
     Ok(Json(change))
+}
+
+fn browse_filesystem_under_roots(
+    roots: &[PathBuf],
+    requested_path: Option<&str>,
+) -> std::result::Result<FilesystemBrowseResponse, (StatusCode, String)> {
+    if roots.is_empty() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no workspace roots configured".to_string(),
+        ));
+    }
+    let current = match requested_path {
+        Some(path) if !path.trim().is_empty() => directory_under_roots(roots, path.trim())?,
+        _ => roots[0].clone(),
+    };
+    let parent = current.parent().and_then(|path| {
+        let parent = std::fs::canonicalize(path).ok()?;
+        crate::paths::path_is_under_any_root(roots, &parent)
+            .then(|| filesystem_directory_record(&parent))
+    });
+    let mut entries = Vec::new();
+    let read_dir = std::fs::read_dir(&current).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("read {}: {error}", current.display()),
+        )
+    })?;
+    for entry in read_dir {
+        let entry = entry.map_err(internal_error)?;
+        let file_type = entry.file_type().map_err(internal_error)?;
+        if !file_type.is_dir() && !file_type.is_symlink() {
+            continue;
+        }
+        let path = match std::fs::canonicalize(entry.path()) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if !path.is_dir() || !crate::paths::path_is_under_any_root(roots, &path) {
+            continue;
+        }
+        entries.push(filesystem_directory_record(&path));
+    }
+    entries.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(FilesystemBrowseResponse {
+        current: filesystem_directory_record(&current),
+        parent,
+        roots: roots
+            .iter()
+            .map(|root| filesystem_directory_record(root))
+            .collect(),
+        entries,
+    })
+}
+
+fn directory_under_roots(
+    roots: &[PathBuf],
+    path: &str,
+) -> std::result::Result<PathBuf, (StatusCode, String)> {
+    let requested = PathBuf::from(path);
+    if !requested.is_absolute() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("path must be absolute: {}", requested.display()),
+        ));
+    }
+    let canonical = std::fs::canonicalize(&requested).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("resolve {}: {error}", requested.display()),
+        )
+    })?;
+    let metadata = std::fs::metadata(&canonical).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("inspect {}: {error}", canonical.display()),
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("path is not a directory: {}", canonical.display()),
+        ));
+    }
+    if !crate::paths::path_is_under_any_root(roots, &canonical) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "path is outside configured workspace roots".to_string(),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn filesystem_directory_record(path: &Path) -> FilesystemDirectoryRecord {
+    FilesystemDirectoryRecord {
+        path: path.display().to_string(),
+        name: crate::paths::folder_label(path),
+        display_path: crate::paths::display_path_with_tilde(path),
+    }
 }
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
@@ -3201,12 +3559,18 @@ fn content_block_text(block: &ContentBlock) -> String {
     }
 }
 
-fn format_tool_call(
-    title: &str,
+fn format_tool_call_from_body(title: &str, body: Option<&str>) -> String {
+    match body {
+        Some(body) => format!("{title}\n\n{body}"),
+        None => title.to_string(),
+    }
+}
+
+fn format_tool_body(
     content: &[ToolCallContent],
     tool_status: ToolCallStatus,
     terminal_outputs: &HashMap<String, TerminalOutputSnapshot>,
-) -> String {
+) -> Option<String> {
     let mut parts = Vec::new();
     for item in content {
         match item {
@@ -3214,7 +3578,7 @@ fn format_tool_call(
             ToolCallContent::Diff(diff) => parts.push(format!("diff: {}", diff.path.display())),
             ToolCallContent::Terminal(terminal) => {
                 let terminal_id = terminal.terminal_id.to_string();
-                let mut text = "background terminal".to_string();
+                let mut text = "terminal output".to_string();
                 if let Some(snapshot) = terminal_outputs.get(&terminal_id) {
                     let snapshot = format_terminal_snapshot(snapshot, tool_status);
                     if !snapshot.is_empty() {
@@ -3232,9 +3596,9 @@ fn format_tool_call(
     }
 
     if parts.is_empty() {
-        title.to_string()
+        None
     } else {
-        format!("{}\n\n{}", title, parts.join("\n\n"))
+        Some(parts.join("\n\n"))
     }
 }
 
@@ -3259,6 +3623,9 @@ fn format_terminal_snapshot(
         parts.push(snapshot.output.clone());
     }
     if let Some(status) = &snapshot.exit_status {
+        if snapshot.output.trim().is_empty() {
+            parts.push("no stdout/stderr captured".to_string());
+        }
         parts.push(format!("exit {}", terminal_exit_status_label(status)));
     } else if parts.is_empty() {
         parts.push(terminal_empty_state_label(tool_status).to_string());
@@ -3316,6 +3683,23 @@ mod tests {
     /// The default cookie lifetime as a `Duration`, derived from the public
     /// day-granularity default so tests stay in lockstep with the CLI default.
     const DEFAULT_SESSION_TTL: Duration = session_ttl_from_days(DEFAULT_SESSION_TTL_DAYS);
+
+    fn test_session_manager() -> Arc<ServerSessionManager> {
+        Arc::new(ServerSessionManager::new(
+            SelectedAgent {
+                source_id: "test-agent".to_string(),
+                program: PathBuf::from("false"),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+            Vec::new(),
+            crate::acp::DEFAULT_FS_TEXT_BYTES,
+        ))
+    }
+
+    fn test_workspace_roots(root: &Path) -> Vec<PathBuf> {
+        vec![std::fs::canonicalize(root).expect("canonical test root")]
+    }
 
     /// Build a `PermissionPrompt` and keep the original responder receiver
     /// so tests can assert what decision was forwarded to the runtime.
@@ -3468,7 +3852,7 @@ mod tests {
         let snapshot = state.snapshot().expect("snapshot");
         assert_eq!(snapshot.transcript.len(), 1);
         assert_eq!(snapshot.transcript[0].kind, "tool");
-        assert!(snapshot.transcript[0].text.contains("background terminal"));
+        assert!(snapshot.transcript[0].text.contains("terminal output"));
         assert!(!snapshot.transcript[0].text.contains("term-1"));
         assert!(snapshot.transcript[0].text.contains("[output truncated]"));
         assert!(snapshot.transcript[0].text.contains("hello\n"));
@@ -3489,6 +3873,116 @@ mod tests {
     }
 
     #[test]
+    fn tool_transcript_entry_carries_execute_kind() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+
+        let mut tool_call = ToolCall::new("call-1", "rg --files | rg -n LICENSE");
+        tool_call.kind = ToolKind::Execute;
+        tool_call.content = vec![ToolCallContent::Terminal(Terminal::new(TerminalId::new(
+            "term-1",
+        )))];
+        state.observe_session_update(&SessionUpdate::ToolCall(tool_call));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.transcript.len(), 1);
+        assert_eq!(snapshot.transcript[0].kind, "tool");
+        // The ACP tool kind rides on the entry so the viewer can shell-highlight
+        // the command by semantics instead of guessing from a prompt prefix.
+        assert_eq!(snapshot.transcript[0].tool_kind.as_deref(), Some("execute"));
+
+        // A late terminal snapshot rebuilds the entry text in place; the kind
+        // must survive that rebuild.
+        state.observe_event(&UiEvent::TerminalOutput(TerminalOutputSnapshot {
+            terminal_id: "term-1".to_string(),
+            output: "match\n".to_string(),
+            truncated: false,
+            exit_status: Some(TerminalExitStatus::new().exit_code(0)),
+        }));
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.transcript[0].tool_kind.as_deref(), Some("execute"));
+    }
+
+    #[test]
+    fn tool_transcript_entry_defaults_non_execute_kind() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+
+        // ToolCall::new leaves kind at its default (Other), so a non-command
+        // tool is labelled accordingly and the viewer will not shell-highlight.
+        let tool_call = ToolCall::new("call-1", "read src/remote.rs");
+        state.observe_session_update(&SessionUpdate::ToolCall(tool_call));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.transcript[0].tool_kind.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn tool_transcript_kind_update_without_content_updates_existing_entry() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+
+        let tool_call = ToolCall::new("call-1", "cargo test");
+        state.observe_session_update(&SessionUpdate::ToolCall(tool_call));
+
+        let mut fields = ToolCallUpdateFields::default();
+        fields.kind = Some(ToolKind::Execute);
+        state.observe_session_update(&SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "call-1", fields,
+        )));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.transcript.len(), 1);
+        assert_eq!(snapshot.transcript[0].tool_kind.as_deref(), Some("execute"));
+        assert_eq!(
+            snapshot.transcript[0].tool_title.as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(snapshot.transcript[0].text, "cargo test");
+    }
+
+    #[test]
+    fn tool_transcript_preserves_multiline_execute_title_boundary() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+
+        let title = "cat <<'EOF'\nfirst\n\nsecond\nEOF";
+        let mut tool_call = ToolCall::new("call-1", title);
+        tool_call.kind = ToolKind::Execute;
+        tool_call.content = vec![ToolCallContent::Content(
+            agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new("terminal output"),
+            )),
+        )];
+        state.observe_session_update(&SessionUpdate::ToolCall(tool_call));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.transcript.len(), 1);
+        assert_eq!(snapshot.transcript[0].tool_kind.as_deref(), Some("execute"));
+        assert_eq!(snapshot.transcript[0].tool_title.as_deref(), Some(title));
+        assert_eq!(
+            snapshot.transcript[0].tool_body.as_deref(),
+            Some("terminal output")
+        );
+        assert_eq!(
+            snapshot.transcript[0].text,
+            format!("{title}\n\nterminal output")
+        );
+    }
+
+    #[test]
     fn tracker_renders_pending_terminal_without_snapshot_as_waiting() {
         let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
         state.observe_event(&UiEvent::SessionStarted {
@@ -3504,7 +3998,7 @@ mod tests {
         state.observe_session_update(&SessionUpdate::ToolCall(tool_call));
 
         let snapshot = state.snapshot().expect("snapshot");
-        assert!(snapshot.transcript[0].text.contains("background terminal"));
+        assert!(snapshot.transcript[0].text.contains("terminal output"));
         assert!(snapshot.transcript[0].text.contains("waiting for output"));
         assert!(
             !snapshot.transcript[0]
@@ -3624,11 +4118,17 @@ mod tests {
                     kind: "user".to_string(),
                     text: "hello".to_string(),
                     timestamp: "2026-06-03T10:00:05Z".to_string(),
+                    tool_kind: None,
+                    tool_title: None,
+                    tool_body: None,
                 },
                 TranscriptEntry {
                     kind: "agent".to_string(),
                     text: "hi".to_string(),
                     timestamp: "2026-06-03T10:00:06Z".to_string(),
+                    tool_kind: None,
+                    tool_title: None,
+                    tool_body: None,
                 },
             ],
             queued_prompt_count: 0,
@@ -3647,11 +4147,17 @@ mod tests {
                         kind: "user".to_string(),
                         text: "hello".to_string(),
                         timestamp: "2026-06-03T10:00:05Z".to_string(),
+                        tool_kind: None,
+                        tool_title: None,
+                        tool_body: None,
                     },
                     TranscriptEntry {
                         kind: "agent".to_string(),
                         text: "hi there".to_string(),
                         timestamp: "2026-06-03T10:00:06Z".to_string(),
+                        tool_kind: None,
+                        tool_title: None,
+                        tool_body: None,
                     },
                 ],
                 ..session.clone()
@@ -4267,6 +4773,8 @@ mod tests {
             viewer_code: "123456".to_string(),
             cookie_key: "test-cookie-key".to_string(),
             session_ttl: DEFAULT_SESSION_TTL,
+            workspace_roots: test_workspace_roots(dir.path()),
+            session_manager: test_session_manager(),
         });
 
         let decision_body = |request_id: &str, option_id: &str| {
@@ -4482,6 +4990,8 @@ mod tests {
             viewer_code: "123456".to_string(),
             cookie_key: "test-cookie-key".to_string(),
             session_ttl: DEFAULT_SESSION_TTL,
+            workspace_roots: test_workspace_roots(dir.path()),
+            session_manager: test_session_manager(),
         });
 
         let change_body = |target_kind: &str, config_id: Option<&str>, value: &str| {
@@ -4631,6 +5141,60 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_browse_lists_directories_under_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let child = dir.path().join("child");
+        let nested = child.join("nested");
+        std::fs::create_dir_all(&nested).expect("create nested dirs");
+        std::fs::write(dir.path().join("file.txt"), "not a dir").expect("write file");
+        let roots = test_workspace_roots(dir.path());
+
+        let root_listing = browse_filesystem_under_roots(&roots, None).expect("browse root");
+        assert_eq!(root_listing.current.path, roots[0].display().to_string());
+        assert_eq!(
+            root_listing
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child"]
+        );
+        assert!(root_listing.parent.is_none());
+
+        let child_listing =
+            browse_filesystem_under_roots(&roots, Some(&child.display().to_string()))
+                .expect("browse child");
+        let root_path = roots[0].display().to_string();
+        assert_eq!(
+            child_listing
+                .parent
+                .as_ref()
+                .map(|entry| entry.path.as_str()),
+            Some(root_path.as_str())
+        );
+        assert_eq!(
+            child_listing
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nested"]
+        );
+    }
+
+    #[test]
+    fn filesystem_browse_rejects_paths_outside_roots() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let roots = test_workspace_roots(root.path());
+
+        let err = directory_under_roots(&roots, &outside.path().display().to_string())
+            .expect_err("outside path should be rejected");
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
     fn token_matches_requires_exact_bearer() {
         assert!(token_matches("secret", Some("secret")));
         assert!(!token_matches("secret", Some("wrong")));
@@ -4765,6 +5329,8 @@ mod tests {
             cookie_key: Arc::new("test-cookie-signing-key".to_string()),
             session_ttl: DEFAULT_SESSION_TTL,
             code_guard: Arc::new(Mutex::new(CodeAuthGuard::default())),
+            workspace_roots: Arc::new(vec![std::env::temp_dir()]),
+            session_manager: test_session_manager(),
         }
     }
 
@@ -4853,12 +5419,15 @@ mod tests {
 
     #[tokio::test]
     async fn pwa_assets_are_served_publicly() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let app = build_router(RouterConfig {
             db_path: PathBuf::from("unused.sqlite3"),
             token: "integration-token".to_string(),
             viewer_code: "123456".to_string(),
             cookie_key: "integration-cookie-key".to_string(),
             session_ttl: DEFAULT_SESSION_TTL,
+            workspace_roots: test_workspace_roots(dir.path()),
+            session_manager: test_session_manager(),
         });
 
         // (path, expected content-type prefix). The shell assets must be reachable
@@ -4974,6 +5543,16 @@ mod tests {
             remote_qr_login_url("example.com", "a+b/c=="),
             "https://example.com:11921/auth/login?token=a%2Bb%2Fc%3D%3D"
         );
+    }
+
+    #[test]
+    fn login_qr_is_hidden_for_loopback_hosts() {
+        assert!(!should_render_login_qr("localhost"));
+        assert!(!should_render_login_qr("LOCALHOST"));
+        assert!(!should_render_login_qr("127.0.0.1"));
+        assert!(!should_render_login_qr("::1"));
+        assert!(should_render_login_qr("example.com"));
+        assert!(should_render_login_qr("mybox.tail1234.ts.net"));
     }
 
     #[test]
@@ -5155,6 +5734,8 @@ mod tests {
             viewer_code: viewer_code.clone(),
             cookie_key: "integration-cookie-key".to_string(),
             session_ttl: DEFAULT_SESSION_TTL,
+            workspace_roots: test_workspace_roots(dir.path()),
+            session_manager: test_session_manager(),
         });
 
         let _client = build_client(&cert_path).expect("pinned client");
@@ -5257,7 +5838,7 @@ mod tests {
         )
         .expect("viewer utf8");
         assert!(viewer.contains("Mjolnir Web"));
-        assert!(viewer.contains("Sign In"));
+        assert!(viewer.contains("Sign in"));
         assert!(!viewer.contains("Unlock Remote Sessions"));
         assert!(!viewer.contains(&token));
 
