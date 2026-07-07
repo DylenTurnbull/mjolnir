@@ -3347,7 +3347,7 @@ fn format_tool_body(
             ToolCallContent::Diff(diff) => parts.push(format!("diff: {}", diff.path.display())),
             ToolCallContent::Terminal(terminal) => {
                 let terminal_id = terminal.terminal_id.to_string();
-                let mut text = "background terminal".to_string();
+                let mut text = "terminal output".to_string();
                 if let Some(snapshot) = terminal_outputs.get(&terminal_id) {
                     let snapshot = format_terminal_snapshot(snapshot, tool_status);
                     if !snapshot.is_empty() {
@@ -3392,6 +3392,9 @@ fn format_terminal_snapshot(
         parts.push(snapshot.output.clone());
     }
     if let Some(status) = &snapshot.exit_status {
+        if snapshot.output.trim().is_empty() {
+            parts.push("no stdout/stderr captured".to_string());
+        }
         parts.push(format!("exit {}", terminal_exit_status_label(status)));
     } else if parts.is_empty() {
         parts.push(terminal_empty_state_label(tool_status).to_string());
@@ -3601,7 +3604,7 @@ mod tests {
         let snapshot = state.snapshot().expect("snapshot");
         assert_eq!(snapshot.transcript.len(), 1);
         assert_eq!(snapshot.transcript[0].kind, "tool");
-        assert!(snapshot.transcript[0].text.contains("background terminal"));
+        assert!(snapshot.transcript[0].text.contains("terminal output"));
         assert!(!snapshot.transcript[0].text.contains("term-1"));
         assert!(snapshot.transcript[0].text.contains("[output truncated]"));
         assert!(snapshot.transcript[0].text.contains("hello\n"));
@@ -3747,7 +3750,7 @@ mod tests {
         state.observe_session_update(&SessionUpdate::ToolCall(tool_call));
 
         let snapshot = state.snapshot().expect("snapshot");
-        assert!(snapshot.transcript[0].text.contains("background terminal"));
+        assert!(snapshot.transcript[0].text.contains("terminal output"));
         assert!(snapshot.transcript[0].text.contains("waiting for output"));
         assert!(
             !snapshot.transcript[0]

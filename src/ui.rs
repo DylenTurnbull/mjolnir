@@ -251,7 +251,15 @@ fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bo
             matches!(
                 view.status,
                 ToolCallStatus::Completed | ToolCallStatus::Failed
-            )
+            ) && view.body.iter().all(|output| {
+                !matches!(
+                    output,
+                    ToolCallOutput::Terminal {
+                        exit_status: None,
+                        ..
+                    }
+                )
+            })
         }),
     }
 }
@@ -3454,13 +3462,15 @@ fn push_export_tool_output(out: &mut String, output: &ToolCallOutput, tool_statu
             exit_status,
             ..
         } => {
-            out.push_str("### Background terminal\n\n");
+            out.push_str("### Terminal output\n\n");
             if *truncated {
                 out.push_str("_Output truncated._\n\n");
             }
             if !output.trim().is_empty() {
                 push_export_fence(out, output);
-            } else if exit_status.is_none() {
+            } else if exit_status.is_some() {
+                out.push_str("_No stdout/stderr captured._\n\n");
+            } else {
                 out.push_str(&format!(
                     "_{}._\n\n",
                     terminal_empty_state_label(tool_status)
@@ -5301,7 +5311,7 @@ fn push_tool_outputs(
                 ..
             } => {
                 out.push(Line::from(Span::styled(
-                    "  background terminal",
+                    "  terminal output",
                     Style::default()
                         .fg(theme.terminal)
                         .add_modifier(Modifier::BOLD),
@@ -5314,7 +5324,12 @@ fn push_tool_outputs(
                 }
                 if !output.trim().is_empty() {
                     push_tool_text_lines(out, output.clone(), 4, collapse_limit, theme);
-                } else if exit_status.is_none() {
+                } else if exit_status.is_some() {
+                    out.push(Line::from(Span::styled(
+                        "    no stdout/stderr captured",
+                        Style::default().fg(theme.muted),
+                    )));
+                } else {
                     let state = terminal_empty_state_label(tool_status);
                     out.push(Line::from(Span::styled(
                         format!("    {state}"),
@@ -8932,7 +8947,7 @@ mod tests {
 
     use crate::app::StatusKind;
     use crate::claude_usage::ClaudeUsageReport;
-    use crate::event::{ElicitationPrompt, SessionConfigTarget};
+    use crate::event::{ElicitationPrompt, SessionConfigTarget, TerminalOutputSnapshot};
 
     use super::*;
     use agent_client_protocol::schema::v1::{
@@ -10672,7 +10687,7 @@ mod tests {
         assert!(markdown.contains("- Kind: exec"));
         assert!(markdown.contains("- Status: done"));
         assert!(markdown.contains("````text\n```\nnot markdown\n````"));
-        assert!(markdown.contains("### Background terminal"));
+        assert!(markdown.contains("### Terminal output"));
         assert!(markdown.contains("_no terminal output received._"));
         assert!(
             !markdown.contains("call_q403"),
@@ -11099,6 +11114,64 @@ mod tests {
             .collect();
         assert_eq!(rendered, vec!["│ tool exec cargo test", "│   ok", ""]);
         assert!(sink.pending_lines(&state, 80).is_empty());
+    }
+
+    #[test]
+    fn transcript_sink_waits_for_completed_terminal_exit_snapshot() {
+        let mut state = AppState::new();
+        let mut sink = TranscriptSink::default();
+
+        state.record_user_prompt("run tests".to_string());
+        state.tool_calls.insert(
+            "call-1".to_string(),
+            crate::app::ToolCallView {
+                title: "cargo test".to_string(),
+                kind: ToolKind::Execute,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Terminal {
+                    terminal_id: "term-1".to_string(),
+                    output: String::new(),
+                    truncated: false,
+                    exit_status: None,
+                }],
+            },
+        );
+        state.transcript.push(Entry::ToolCall("call-1".to_string()));
+
+        let prompt: Vec<String> = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(prompt, vec!["you:", "run tests", ""]);
+        assert!(
+            sink.pending_lines(&state, 80).is_empty(),
+            "completed terminal tool call must not flush before terminal exit status arrives"
+        );
+
+        state.apply_event(UiEvent::TerminalOutput(TerminalOutputSnapshot {
+            terminal_id: "term-1".to_string(),
+            output: "ok\n".to_string(),
+            truncated: false,
+            exit_status: Some(TerminalExitStatus::new().exit_code(0)),
+        }));
+
+        let rendered: Vec<String> = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "│ tool exec cargo test",
+                "│   terminal output",
+                "│     ok",
+                "│     ",
+                "│     exit code 0",
+                ""
+            ]
+        );
     }
 
     #[test]
@@ -12221,11 +12294,7 @@ mod tests {
         assert!(rendered.iter().any(|line| line == "│   diff src/main.rs"));
         assert!(rendered.iter().any(|line| line == "│     - old"));
         assert!(rendered.iter().any(|line| line == "│     + new"));
-        assert!(
-            rendered
-                .iter()
-                .any(|line| line == "│   background terminal")
-        );
+        assert!(rendered.iter().any(|line| line == "│   terminal output"));
         assert!(
             rendered
                 .iter()
@@ -12268,11 +12337,7 @@ mod tests {
                 .iter()
                 .any(|line| line == "│ tool [failed] exec cargo test")
         );
-        assert!(
-            rendered
-                .iter()
-                .any(|line| line == "│   background terminal")
-        );
+        assert!(rendered.iter().any(|line| line == "│   terminal output"));
         assert!(
             rendered
                 .iter()
