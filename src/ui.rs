@@ -106,6 +106,10 @@ fn terminal_request_forces_inline_repair(request: TerminalRequest) -> bool {
     matches!(request, TerminalRequest::ForceInlineRepair)
 }
 
+fn inline_transcript_viewer_accepts_input(state: &AppState) -> bool {
+    state.transcript_viewer && !state.has_pending_permission() && !state.has_pending_elicitation()
+}
+
 #[derive(Debug)]
 enum DictationEvent {
     Partial(String),
@@ -591,7 +595,17 @@ async fn ui_loop(
                         if should_force_inline_repair_for_event(mode, &state, &ev) {
                             force_inline_repair = true;
                         }
+                        let inline_reader_was_active =
+                            mode == UiMode::InlineChat && inline_transcript_viewer_accepts_input(&state);
                         let request = handle_crossterm(&mut state, cmd_tx, ev, mode);
+                        if mode == UiMode::InlineChat
+                            && inline_reader_was_active != inline_transcript_viewer_accepts_input(&state)
+                        {
+                            set_mouse_capture(
+                                terminal,
+                                inline_transcript_viewer_accepts_input(&state),
+                            )?;
+                        }
                         if mode == UiMode::InlineChat
                             && terminal_request_forces_inline_repair(request)
                         {
@@ -645,12 +659,22 @@ async fn ui_loop(
             maybe_ev = event_rx.recv(), if !state.runtime_closed => {
                 match maybe_ev {
                     Some(ev) => {
+                        let inline_reader_was_active =
+                            mode == UiMode::InlineChat && inline_transcript_viewer_accepts_input(&state);
                         let redraw_cause = ui_event_redraw_cause(&ev);
                         let force_repair_for_event =
                             should_force_inline_repair_for_ui_event(mode, &ev);
                         let notification = notification_message_for_event(mode, &state, &ev);
                         state.apply_event(ev);
                         drain_queued_prompt(&mut state, cmd_tx);
+                        if mode == UiMode::InlineChat
+                            && inline_reader_was_active != inline_transcript_viewer_accepts_input(&state)
+                        {
+                            set_mouse_capture(
+                                terminal,
+                                inline_transcript_viewer_accepts_input(&state),
+                            )?;
+                        }
                         if force_repair_for_event {
                             force_inline_repair = true;
                             // Defer the repair while a resize reflow is pending:
@@ -1478,7 +1502,9 @@ fn handle_crossterm(
             return TerminalRequest::None;
         }
         CtEvent::Mouse(mouse) => {
-            if mode == UiMode::FullscreenTui {
+            if mode == UiMode::InlineChat && inline_transcript_viewer_accepts_input(state) {
+                handle_transcript_viewer_mouse(state, mouse);
+            } else if mode == UiMode::FullscreenTui {
                 handle_mouse(state, mouse);
             }
             return TerminalRequest::None;
@@ -1872,6 +1898,22 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) {
             state.scroll_offset = state
                 .scroll_offset
                 .saturating_sub(TRANSCRIPT_SCROLL_WHEEL_STEP);
+        }
+        _ => {}
+    }
+}
+
+fn handle_transcript_viewer_mouse(state: &mut AppState, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            state.scroll_offset = state
+                .scroll_offset
+                .saturating_sub(TRANSCRIPT_SCROLL_WHEEL_STEP);
+        }
+        MouseEventKind::ScrollDown => {
+            state.scroll_offset = state
+                .scroll_offset
+                .saturating_add(TRANSCRIPT_SCROLL_WHEEL_STEP);
         }
         _ => {}
     }
@@ -3853,7 +3895,11 @@ pub fn restore_inline_chat_terminal(terminal: &mut Terminal<TrackedBackend<Stdou
     } else if let Err(e) = Write::flush(terminal.backend_mut()) {
         tracing::warn!("skip inline exit cleanup flush: {e}");
     }
-    execute!(terminal.backend_mut(), DisableBracketedPaste)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     disable_raw_mode()?;
     terminal.show_cursor()?;
     Ok(())
@@ -9991,6 +10037,36 @@ mod tests {
             terminal_request_forces_inline_repair(request),
             "closing the reader must repair the shrunken inline viewport"
         );
+    }
+
+    #[test]
+    fn transcript_reader_scrolls_with_mouse_wheel() {
+        let mut state = AppState::new();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        state.open_transcript_viewer();
+        state.scroll_offset = 10;
+
+        handle_inline_crossterm(&mut state, &cmd_tx, mouse(MouseEventKind::ScrollUp));
+        assert_eq!(state.scroll_offset, 10 - TRANSCRIPT_SCROLL_WHEEL_STEP);
+
+        handle_inline_crossterm(&mut state, &cmd_tx, mouse(MouseEventKind::ScrollDown));
+        assert_eq!(state.scroll_offset, 10);
+    }
+
+    #[test]
+    fn transcript_reader_mouse_wheel_pauses_for_permission_modal() {
+        let mut state = AppState::new();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        state.open_transcript_viewer();
+        state.scroll_offset = 10;
+        let pending = permission_pending_with_options("run command", &["allow"], 0);
+        state.apply_event(UiEvent::PermissionRequest(pending.prompt));
+
+        handle_inline_crossterm(&mut state, &cmd_tx, mouse(MouseEventKind::ScrollUp));
+
+        assert_eq!(state.scroll_offset, 10);
     }
 
     #[test]
