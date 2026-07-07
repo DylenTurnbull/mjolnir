@@ -67,8 +67,6 @@ const FIGHT_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 /// A no-diff champion gets one explicit second chance before the tournament
 /// accepts that it still produced no artifact.
 const EMPTY_DIFF_CONTINUATION_LIMIT: usize = 1;
-/// Battle-feed excerpt budget for a fighter turn that produced no diff.
-const EMPTY_REPLY_LOG_LIMIT: usize = 1600;
 /// Budget for one adversarial review.
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// Budget for each of Thor's pronouncements (route / assign / judge).
@@ -1172,29 +1170,6 @@ struct TurnOutcome {
     stop: StopReason,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FighterPromptStage {
-    Combat,
-    EmptyDiffContinuation,
-    PlanRequest,
-    PlanApproval,
-}
-
-impl FighterPromptStage {
-    fn prompt_kind(self) -> &'static str {
-        match self {
-            Self::Combat => "combat",
-            Self::EmptyDiffContinuation => "continuation",
-            Self::PlanRequest => "plan request",
-            Self::PlanApproval => "plan approval",
-        }
-    }
-
-    fn is_followup(self) -> bool {
-        self != Self::Combat
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExecutionModeArm {
     NotOffered,
@@ -2294,16 +2269,19 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
     let tx_events = tx.clone();
     let mut prompt = fight_prompt(&task);
     let mut continuation_count = 0usize;
-    let mut prompt_stage = FighterPromptStage::Combat;
     loop {
         set_state(FighterState::Fighting);
-        let prompt_kind = prompt_stage.prompt_kind();
-        if prompt_stage.is_followup() {
+        let prompt_kind = if continuation_count > 0 {
+            "continuation"
+        } else {
+            "combat"
+        };
+        if continuation_count > 0 {
             let _ = tx.send(RagnarokEvent::Log {
                 fighter: Some(id),
                 text: format!(
-                    "📯 THOR's {prompt_kind} prompt is being sent to {}.",
-                    fighter.card.model_name,
+                    "📯 THOR's continuation prompt is being sent to {} ({continuation_count}/{EMPTY_DIFF_CONTINUATION_LIMIT}).",
+                    fighter.card.model_name
                 ),
             });
         }
@@ -2355,13 +2333,12 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
                 kill_note(format!("yielded ({})", stop_reason_label(outcome.stop))),
             );
         }
-        let last_turn_text = outcome.text.clone();
-        append_turn_text(&mut report.final_text, &last_turn_text);
-        if prompt_stage.is_followup() {
+        append_turn_text(&mut report.final_text, &outcome.text);
+        if continuation_count > 0 {
             let _ = tx.send(RagnarokEvent::Log {
                 fighter: Some(id),
                 text: format!(
-                    "🔎 {}'s {prompt_kind} turn ended; recapturing the diff.",
+                    "🔎 {}'s continuation turn ended; recapturing the diff.",
                     fighter.card.model_name
                 ),
             });
@@ -2377,75 +2354,44 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
                     id,
                     stat: a.diffstat.clone(),
                 });
+                if empty && continuation_count < EMPTY_DIFF_CONTINUATION_LIMIT {
+                    continuation_count += 1;
+                    let plan_gate = plan_required_response(&report.final_text);
+                    let _ = tx.send(RagnarokEvent::Log {
+                        fighter: Some(id),
+                        text: if plan_gate {
+                            format!(
+                                "⚡ THOR finds no changed files from {}; their response says a plan is required, so queueing a plan-aware continuation {continuation_count}/{EMPTY_DIFF_CONTINUATION_LIMIT}.",
+                                fighter.card.model_name,
+                            )
+                        } else {
+                            format!(
+                                "⚡ THOR finds no changed files from {}; queueing continuation {continuation_count}/{EMPTY_DIFF_CONTINUATION_LIMIT}.",
+                                fighter.card.model_name,
+                            )
+                        },
+                    });
+                    prompt = if plan_gate {
+                        plan_required_continue_prompt(&task)
+                    } else {
+                        empty_diff_continue_prompt(&task)
+                    };
+                    continue;
+                }
                 if empty {
-                    log_empty_reply(
-                        &tx,
-                        id,
-                        &fighter.card.model_name,
-                        prompt_stage,
-                        &last_turn_text,
-                    );
-                    match prompt_stage {
-                        FighterPromptStage::Combat | FighterPromptStage::EmptyDiffContinuation
-                            if plan_required_response(&last_turn_text) =>
-                        {
-                            let _ = tx.send(RagnarokEvent::Log {
-                                fighter: Some(id),
-                                text: format!(
-                                    "⚡ THOR finds no changed files from {}; their response asks for a plan, so requesting the plan first.",
-                                    fighter.card.model_name,
-                                ),
-                            });
-                            prompt = plan_request_prompt(&task);
-                            prompt_stage = FighterPromptStage::PlanRequest;
-                            continue;
-                        }
-                        FighterPromptStage::PlanRequest => {
-                            let _ = tx.send(RagnarokEvent::Log {
-                                fighter: Some(id),
-                                text: format!(
-                                    "✅ THOR received {}'s plan; sending approval so they execute it.",
-                                    fighter.card.model_name,
-                                ),
-                            });
-                            prompt = plan_approval_prompt();
-                            prompt_stage = FighterPromptStage::PlanApproval;
-                            continue;
-                        }
-                        FighterPromptStage::Combat
-                            if continuation_count < EMPTY_DIFF_CONTINUATION_LIMIT =>
-                        {
-                            continuation_count += 1;
-                            let _ = tx.send(RagnarokEvent::Log {
-                                fighter: Some(id),
-                                text: format!(
-                                    "⚡ THOR finds no changed files from {}; queueing continuation {continuation_count}/{EMPTY_DIFF_CONTINUATION_LIMIT}.",
-                                    fighter.card.model_name,
-                                ),
-                            });
-                            prompt = empty_diff_continue_prompt(&task);
-                            prompt_stage = FighterPromptStage::EmptyDiffContinuation;
-                            continue;
-                        }
-                        FighterPromptStage::Combat
-                        | FighterPromptStage::EmptyDiffContinuation
-                        | FighterPromptStage::PlanApproval => {}
-                    }
                     let _ = tx.send(RagnarokEvent::Log {
                         fighter: Some(id),
                         text: format!(
-                            "⚠ THOR still sees no changed files from {} after {}; carrying the empty artifact forward.",
-                            fighter.card.model_name,
-                            prompt_stage.prompt_kind(),
+                            "⚠ THOR still sees no changed files from {} after continuation; carrying the empty artifact forward.",
+                            fighter.card.model_name
                         ),
                     });
-                } else if prompt_stage.is_followup() {
+                } else if continuation_count > 0 {
                     let _ = tx.send(RagnarokEvent::Log {
                         fighter: Some(id),
                         text: format!(
-                            "✅ THOR sees a diff from {} after {}.",
-                            fighter.card.model_name,
-                            prompt_stage.prompt_kind(),
+                            "✅ THOR sees a diff from {} after continuation.",
+                            fighter.card.model_name
                         ),
                     });
                 }
@@ -2653,34 +2599,21 @@ fn empty_diff_continue_prompt(task: &str) -> String {
     )
 }
 
-fn plan_request_prompt(task: &str) -> String {
-    format!("make me a plan for this task\n\n{task}")
-}
-
-fn plan_approval_prompt() -> String {
-    "i approve this plan".to_string()
-}
-
-fn log_empty_reply(
-    tx: &mpsc::UnboundedSender<RagnarokEvent>,
-    id: FighterId,
-    fighter_name: &str,
-    stage: FighterPromptStage,
-    text: &str,
-) {
-    let reply = text.trim();
-    let reply = if reply.is_empty() {
-        "(empty response)".to_string()
-    } else {
-        truncate_middle(reply, EMPTY_REPLY_LOG_LIMIT)
-    };
-    let _ = tx.send(RagnarokEvent::Log {
-        fighter: Some(id),
-        text: format!(
-            "🗣 {fighter_name}'s {} reply produced no diff: {reply}",
-            stage.prompt_kind()
-        ),
-    });
+fn plan_required_continue_prompt(task: &str) -> String {
+    format!(
+        "⚡ THOR INSPECTION. Your previous turn ended without a git diff, and your \
+         response said this request needs a plan before execution.\n\n\
+         Create the required plan now, then execute that plan in this same turn. Do not \
+         stop after saying a plan is required. This is an automated Ragnarok worktree; \
+         leave the implementation changes in the working tree for `git diff`.\n\n\
+         Rules:\n\
+         - Work only in the current working directory.\n\
+         - Do NOT create git commits. Leave every change in the working tree.\n\
+         - Do NOT push, and do NOT touch anything outside this worktree.\n\
+         - Verify your work when the project allows it.\n\
+         - Finish with a concise summary of the plan, changes, and verification.\n\n\
+         THE TASK:\n{task}"
+    )
 }
 
 /// `git add -N` makes untracked files visible to `git diff`, then diff against
@@ -4256,12 +4189,12 @@ mod tests {
     }
 
     #[test]
-    fn plan_gate_followup_prompts_request_then_approve_plan() {
-        let prompt = plan_request_prompt("wire the hammer");
-        assert!(prompt.starts_with("make me a plan for this task"));
+    fn plan_required_continue_prompt_tells_agent_to_plan_then_execute() {
+        let prompt = plan_required_continue_prompt("wire the hammer");
+        assert!(prompt.contains("needs a plan before execution"));
+        assert!(prompt.contains("Create the required plan now"));
+        assert!(prompt.contains("execute that plan in this same turn"));
         assert!(prompt.contains("wire the hammer"));
-
-        assert_eq!(plan_approval_prompt(), "i approve this plan");
     }
 
     #[test]
