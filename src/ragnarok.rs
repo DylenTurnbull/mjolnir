@@ -1445,10 +1445,11 @@ impl AgentHandle {
                     });
                 }
                 UiEvent::PromptFailed { message } => {
-                    if message.contains("config update already in flight")
-                        && resends < PROMPT_RESEND_LIMIT
-                    {
+                    if prompt_rejected_transiently(&message) && resends < PROMPT_RESEND_LIMIT {
                         resends += 1;
+                        on_event(TurnEvent::Note(format!(
+                            "runtime rejected prompt ({message}); retrying {resends}/{PROMPT_RESEND_LIMIT}"
+                        )));
                         tokio::time::sleep(Duration::from_millis(250)).await;
                         let _ = self.cmd_tx.send(UiCommand::SendPrompt {
                             text: resend_text.clone(),
@@ -1459,7 +1460,24 @@ impl AgentHandle {
                     bail!("prompt failed: {message}")
                 }
                 UiEvent::Fatal(m) => bail!("agent failed: {m}"),
-                UiEvent::Warning(w) => on_event(TurnEvent::Note(w)),
+                UiEvent::Warning(w) => {
+                    if prompt_rejected_transiently(&w) {
+                        if resends < PROMPT_RESEND_LIMIT {
+                            resends += 1;
+                            on_event(TurnEvent::Note(format!(
+                                "runtime warning ({w}); retrying prompt {resends}/{PROMPT_RESEND_LIMIT}"
+                            )));
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            let _ = self.cmd_tx.send(UiCommand::SendPrompt {
+                                text: resend_text.clone(),
+                                images: Vec::new(),
+                            });
+                            continue;
+                        }
+                        bail!("prompt failed: {w}");
+                    }
+                    on_event(TurnEvent::Note(w));
+                }
                 _ => {}
             }
         }
@@ -1479,6 +1497,11 @@ fn turn_succeeded(stop: StopReason) -> bool {
         stop,
         StopReason::EndTurn | StopReason::MaxTokens | StopReason::MaxTurnRequests
     )
+}
+
+fn prompt_rejected_transiently(message: &str) -> bool {
+    message.contains("config update already in flight")
+        || message.contains("prompt already in flight")
 }
 
 /// First `RejectOnce` option, else first `RejectAlways`. Used only when an
@@ -1896,6 +1919,15 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
     let mut continuation_count = 0usize;
     loop {
         set_state(FighterState::Fighting);
+        if continuation_count > 0 {
+            let _ = tx.send(RagnarokEvent::Log {
+                fighter: Some(id),
+                text: format!(
+                    "📯 THOR's continuation prompt is being sent to {} ({continuation_count}/{EMPTY_DIFF_CONTINUATION_LIMIT}).",
+                    fighter.card.model_name
+                ),
+            });
+        }
         let outcome = handle
             .prompt(prompt, FIGHT_TIMEOUT, |ev| {
                 if let TurnEvent::Tool {
@@ -1940,6 +1972,15 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
             );
         }
         append_turn_text(&mut report.final_text, &outcome.text);
+        if continuation_count > 0 {
+            let _ = tx.send(RagnarokEvent::Log {
+                fighter: Some(id),
+                text: format!(
+                    "🔎 {}'s continuation turn ended; recapturing the diff.",
+                    fighter.card.model_name
+                ),
+            });
+        }
 
         set_state(FighterState::Capturing);
         let root = created.worktree_root.clone();
@@ -1956,12 +1997,29 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
                     let _ = tx.send(RagnarokEvent::Log {
                         fighter: Some(id),
                         text: format!(
-                            "⚡ THOR finds no changed files from {}; continue the work!",
-                            fighter.card.model_name
+                            "⚡ THOR finds no changed files from {}; queueing continuation {continuation_count}/{EMPTY_DIFF_CONTINUATION_LIMIT}.",
+                            fighter.card.model_name,
                         ),
                     });
                     prompt = empty_diff_continue_prompt(&task);
                     continue;
+                }
+                if empty {
+                    let _ = tx.send(RagnarokEvent::Log {
+                        fighter: Some(id),
+                        text: format!(
+                            "⚠ THOR still sees no changed files from {} after continuation; carrying the empty artifact forward.",
+                            fighter.card.model_name
+                        ),
+                    });
+                } else if continuation_count > 0 {
+                    let _ = tx.send(RagnarokEvent::Log {
+                        fighter: Some(id),
+                        text: format!(
+                            "✅ THOR sees a diff from {} after continuation.",
+                            fighter.card.model_name
+                        ),
+                    });
                 }
                 report.artifact = Some(a);
             }
@@ -2091,10 +2149,15 @@ fn forward_turn_event(
             }
         }
         TurnEvent::Note(note) => {
+            let shown = first_line(&note, 90);
             let _ = tx.send(RagnarokEvent::FighterAction {
                 id,
                 action: ActionKind::Guard,
                 detail: first_line(&note, 60),
+            });
+            let _ = tx.send(RagnarokEvent::Log {
+                fighter: Some(id),
+                text: format!("🛡 {fighter_name} runtime note: {shown}"),
             });
         }
     }
@@ -3867,6 +3930,44 @@ mod tests {
             }
         }
         assert_eq!(sends, 2, "the rejected prompt must be re-sent once");
+    }
+
+    #[tokio::test]
+    async fn prompt_resends_after_prompt_in_flight_warning() {
+        let mut rig = test_rig();
+        rig.event_tx
+            .send(UiEvent::Warning("prompt already in flight".to_string()))
+            .unwrap();
+        rig.event_tx
+            .send(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+            .unwrap();
+
+        let mut notes = Vec::new();
+        let outcome = rig
+            .handle
+            .prompt("go".to_string(), Duration::from_secs(5), |ev| {
+                if let TurnEvent::Note(note) = ev {
+                    notes.push(note);
+                }
+            })
+            .await
+            .expect("prompt survives transient in-flight warning");
+        assert_eq!(outcome.stop, StopReason::EndTurn);
+        assert!(
+            notes.iter().any(|note| note.contains("retrying prompt")),
+            "notes: {notes:?}"
+        );
+
+        let mut sends = 0;
+        while let Ok(cmd) = rig.cmd_rx.try_recv() {
+            if matches!(cmd, UiCommand::SendPrompt { .. }) {
+                sends += 1;
+            }
+        }
+        assert_eq!(sends, 2, "the bounced prompt must be re-sent once");
     }
 
     #[tokio::test]
