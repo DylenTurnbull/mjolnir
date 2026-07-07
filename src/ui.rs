@@ -7458,7 +7458,7 @@ fn model_choice_score(
 mod tests {
     use crate::app::StatusKind;
     use crate::claude_usage::ClaudeUsageReport;
-    use crate::event::{ElicitationPrompt, SessionConfigTarget};
+    use crate::event::{ElicitationPrompt, SessionConfigTarget, TerminalOutputSnapshot};
 
     use super::*;
     use agent_client_protocol::schema::v1::{
@@ -9678,6 +9678,7 @@ mod tests {
                 "│ tool exec cargo test",
                 "│   terminal output",
                 "│     ok",
+                "│     ",
                 "│     exit code 0",
                 ""
             ]
