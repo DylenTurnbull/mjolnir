@@ -42,9 +42,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::{
     AppState, ArenaPane, ConfigValueChoice, ConnectionState, ElicitationView, Entry,
     MjConfigSection, PastedAttachment, PastedImageAttachment, PendingElicitation,
-    PendingPermission, QUEUED_PROMPT_PREVIEW_WIDTH, QueuedPrompt, RagnarokFighterUi, RagnarokUi,
-    StatusKind, StatusMessage, ToolCallOutput, UiExitReason, classify_elicitation,
-    config_option_choices, config_option_current_value_label,
+    PendingPermission, QUEUED_PROMPT_PREVIEW_WIDTH, QueuedPrompt, RagnarokDraftPrStatus,
+    RagnarokFighterUi, RagnarokUi, StatusKind, StatusMessage, ToolCallOutput, UiExitReason,
+    classify_elicitation, config_option_choices, config_option_current_value_label,
 };
 use crate::clipboard::{
     ClipboardImage, copy_to_clipboard, load_image_path_as_png, read_clipboard_image_as_png,
@@ -623,6 +623,7 @@ async fn ui_loop(
                             start_ragnarok(&mut state, task, ragnarok_tx.clone());
                             force_soft_inline_repair = mode == UiMode::InlineChat;
                         }
+                        drain_ragnarok_draft_pr_publish(&mut state, &ragnarok_tx);
                     }
                     Some(Err(e)) => {
                         state.record_status_message(
@@ -667,6 +668,7 @@ async fn ui_loop(
                         _ => RedrawCause::Interactive,
                     };
                     state.apply_ragnarok_event(ev);
+                    drain_ragnarok_draft_pr_publish(&mut state, &ragnarok_tx);
                     pending_redraw.mark(cause);
                 }
             }
@@ -7592,6 +7594,33 @@ fn start_ragnarok(
     tokio::spawn(ragnarok::run_battle(cfg, tx, abort_rx, proceed_rx));
 }
 
+fn drain_ragnarok_draft_pr_publish(
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ragnarok::RagnarokEvent>,
+) {
+    while let Some(req) = state.take_ragnarok_draft_pr_publish_request() {
+        spawn_ragnarok_draft_pr_publish(req, tx.clone());
+    }
+}
+
+fn spawn_ragnarok_draft_pr_publish(
+    req: ragnarok::DraftPrRequest,
+    tx: mpsc::UnboundedSender<ragnarok::RagnarokEvent>,
+) {
+    let winner = req.winner;
+    let _ = tx.send(ragnarok::RagnarokEvent::DraftPrPublishing { winner });
+    tokio::spawn(async move {
+        let ev = match ragnarok::publish_draft_pr(req).await {
+            Ok(url) => ragnarok::RagnarokEvent::DraftPrPublished { winner, url },
+            Err(e) => ragnarok::RagnarokEvent::DraftPrFailed {
+                winner,
+                message: format!("{e:#}"),
+            },
+        };
+        let _ = tx.send(ev);
+    });
+}
+
 fn active_thor_host(state: &AppState) -> Option<ragnarok::ThorHost> {
     let launch = state.active_agent_launch.clone()?;
     let model = active_model_config(state);
@@ -7665,12 +7694,19 @@ fn handle_ragnarok_key(
         KeyCode::Char(c @ '1'..='9') => {
             let picked = (c as u8 - b'1') as usize;
             if over {
-                if let Some(verdict) = &arena.verdict
+                if arena.chosen_finalist.is_none()
+                    && let Some(verdict) = &arena.verdict
                     && let Some((a, b)) = verdict.finalists
                 {
                     match picked {
-                        0 => arena.chosen_finalist = Some(a),
-                        1 => arena.chosen_finalist = Some(b),
+                        0 => {
+                            arena.chosen_finalist = Some(a);
+                            arena.queue_draft_pr_publish(a);
+                        }
+                        1 => {
+                            arena.chosen_finalist = Some(b);
+                            arena.queue_draft_pr_publish(b);
+                        }
                         _ => {}
                     }
                 }
@@ -7789,28 +7825,32 @@ fn ragnarok_banner_line(arena: &RagnarokUi, theme: TerminalTheme, width: u16) ->
 
 fn ragnarok_footer_line(arena: &RagnarokUi, theme: TerminalTheme, width: u16) -> Line<'static> {
     let over = arena.battle_over();
-    let hints =
-        if arena.quit_armed {
-            "⚠ q again to quit Ragnarok (Esc cancels) ⚠".to_string()
-        } else if over {
-            match arena.verdict.as_ref().and_then(|v| v.finalists) {
-                Some(_) => "1/2 choose finalist · Enter accept & close · t transcripts · q close"
-                    .to_string(),
-                None => "Enter/q close · t transcripts · ↑/↓ feed · ←/→ fighter · r review lane"
-                    .to_string(),
+    let hints = if arena.quit_armed {
+        "⚠ q again to quit Ragnarok (Esc cancels) ⚠".to_string()
+    } else if over {
+        match arena.verdict.as_ref().and_then(|v| v.finalists) {
+            Some(_) if arena.chosen_finalist.is_none() => {
+                "1/2 choose finalist · Enter accept & close · t transcripts · q close".to_string()
             }
-        } else if arena.awaiting_approval() {
-            "⚔ Enter to UNLEASH RAGNAROK (no combat spend yet) · ↑/↓ feed · q quit".to_string()
-        } else {
-            match arena.pane {
-                ArenaPane::Arena => {
-                    "Enter transcript · ↑/↓ feed · ←/→ fighter · 1-9 select · q quit".to_string()
-                }
-                ArenaPane::Transcript => {
-                    "Esc arena · Enter arena · ←/→ fighter · r review lane · q quit".to_string()
-                }
+            None => {
+                "Enter/q close · t transcripts · ↑/↓ feed · ←/→ fighter · r review lane".to_string()
             }
-        };
+            Some(_) => {
+                "Enter/q close · t transcripts · ↑/↓ feed · ←/→ fighter · r review lane".to_string()
+            }
+        }
+    } else if arena.awaiting_approval() {
+        "⚔ Enter to UNLEASH RAGNAROK (no combat spend yet) · ↑/↓ feed · q quit".to_string()
+    } else {
+        match arena.pane {
+            ArenaPane::Arena => {
+                "Enter transcript · ↑/↓ feed · ←/→ fighter · 1-9 select · q quit".to_string()
+            }
+            ArenaPane::Transcript => {
+                "Esc arena · Enter arena · ←/→ fighter · r review lane · q quit".to_string()
+            }
+        }
+    };
     if arena.awaiting_approval() && !arena.quit_armed {
         let style = Style::default()
             .fg(theme.warning)
@@ -8632,6 +8672,14 @@ fn draw_ragnarok_verdict(
         (None, None) => {}
     }
 
+    if let Some(line) = ragnarok_draft_pr_status_line(arena, width) {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            line,
+            Style::default().fg(theme.accent),
+        )));
+    }
+
     if verdict.thor_fallback {
         lines.push(Line::from(Span::styled(
             fit_width(
@@ -8680,6 +8728,23 @@ fn draw_ragnarok_verdict(
     }
     lines.truncate(area.height as usize);
     f.render_widget(Paragraph::new(lines), area);
+}
+
+fn ragnarok_draft_pr_status_line(arena: &RagnarokUi, width: usize) -> Option<String> {
+    let status = arena.draft_pr_status.as_ref()?;
+    let line = match status {
+        RagnarokDraftPrStatus::Publishing { winner } => {
+            format!("Draft PR: publishing {}...", arena.fighter_name(*winner))
+        }
+        RagnarokDraftPrStatus::Published { winner, url } => {
+            format!("Draft PR for {}: {url}", arena.fighter_name(*winner))
+        }
+        RagnarokDraftPrStatus::Failed { winner, message } => format!(
+            "Draft PR for {} failed: {message}",
+            arena.fighter_name(*winner)
+        ),
+    };
+    Some(fit_width(line, width))
 }
 
 /// Transcript pane: live per-fighter output (combat work or their review).

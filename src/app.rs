@@ -2318,6 +2318,7 @@ pub struct RagnarokFighterUi {
     pub diffstat: Option<String>,
     pub worktree_name: Option<String>,
     pub worktree_path: Option<PathBuf>,
+    pub worktree_base_sha: Option<String>,
     pub review_progress: Option<ragnarok::ReviewProgress>,
 }
 
@@ -2333,9 +2334,25 @@ impl RagnarokFighterUi {
             diffstat: None,
             worktree_name: None,
             worktree_path: None,
+            worktree_base_sha: None,
             review_progress: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RagnarokDraftPrStatus {
+    Publishing {
+        winner: ragnarok::FighterId,
+    },
+    Published {
+        winner: ragnarok::FighterId,
+        url: String,
+    },
+    Failed {
+        winner: ragnarok::FighterId,
+        message: String,
+    },
 }
 
 /// All render state for one `/ragnarok` battle.
@@ -2363,6 +2380,9 @@ pub struct RagnarokUi {
     pub show_review_lane: bool,
     /// The finalist chosen by the user at a split decision.
     pub chosen_finalist: Option<ragnarok::FighterId>,
+    pub draft_pr_status: Option<RagnarokDraftPrStatus>,
+    draft_pr_requested_for: Option<ragnarok::FighterId>,
+    draft_pr_request: Option<ragnarok::DraftPrRequest>,
     /// First `q` arms quitting; the second `q` aborts the battle.
     pub quit_armed: bool,
     pub started_at: Instant,
@@ -2393,6 +2413,9 @@ impl RagnarokUi {
             selected_fighter: 0,
             show_review_lane: false,
             chosen_finalist: None,
+            draft_pr_status: None,
+            draft_pr_requested_for: None,
+            draft_pr_request: None,
             quit_armed: false,
             started_at: Instant::now(),
             abort_tx,
@@ -2418,6 +2441,48 @@ impl RagnarokUi {
     /// The battle reached a terminal state (verdict, failure, or done).
     pub fn battle_over(&self) -> bool {
         self.done || self.failed.is_some() || self.verdict.is_some()
+    }
+
+    pub fn queue_draft_pr_publish(&mut self, winner: ragnarok::FighterId) {
+        if self.draft_pr_requested_for.is_some() {
+            return;
+        }
+        if matches!(
+            self.draft_pr_status,
+            Some(RagnarokDraftPrStatus::Published { winner: published, .. }) if published == winner
+        ) {
+            return;
+        }
+        let Some(fighter) = self.fighter(winner) else {
+            return;
+        };
+        let Some(worktree_path) = fighter.worktree_path.clone() else {
+            self.draft_pr_status = Some(RagnarokDraftPrStatus::Failed {
+                winner,
+                message: "winner worktree path is unavailable".to_string(),
+            });
+            return;
+        };
+        let Some(base_sha) = fighter.worktree_base_sha.clone() else {
+            self.draft_pr_status = Some(RagnarokDraftPrStatus::Failed {
+                winner,
+                message: "winner worktree base SHA is unavailable".to_string(),
+            });
+            return;
+        };
+        let winner_tag = fighter.card.tag();
+        self.draft_pr_requested_for = Some(winner);
+        self.draft_pr_request = Some(ragnarok::DraftPrRequest {
+            winner,
+            winner_tag,
+            task: self.task.clone(),
+            worktree_path,
+            base_sha,
+        });
+    }
+
+    pub fn take_draft_pr_publish_request(&mut self) -> Option<ragnarok::DraftPrRequest> {
+        self.draft_pr_request.take()
     }
 
     pub fn fighter(&self, id: ragnarok::FighterId) -> Option<&RagnarokFighterUi> {
@@ -2525,6 +2590,15 @@ impl AppState {
                 arena.fighters = cards.into_iter().map(RagnarokFighterUi::new).collect();
                 arena.selected_fighter = 0;
             }
+            E::FighterJoined(card) => {
+                let id = card.id;
+                let tag = card.tag();
+                arena.fighters.push(RagnarokFighterUi::new(card));
+                arena.push_feed(
+                    Some(id),
+                    format!("⚖ {tag} enters only to judge the survivor."),
+                );
+            }
             E::FighterState { id, state } => {
                 let slain_line = if let ragnarok::FighterState::Slain(reason) = &state {
                     Some(format!("☠ {} is slain: {reason}", arena.fighter_name(id)))
@@ -2538,11 +2612,17 @@ impl AppState {
                     arena.push_feed(Some(id), line);
                 }
             }
-            E::FighterWorktree { id, name, path } => {
+            E::FighterWorktree {
+                id,
+                name,
+                path,
+                base_sha,
+            } => {
                 let line = format!("🏕 {} pitches camp in {name}", arena.fighter_name(id));
                 if let Some(f) = arena.fighter_mut(id) {
                     f.worktree_name = Some(name);
                     f.worktree_path = Some(path);
+                    f.worktree_base_sha = Some(base_sha);
                 }
                 arena.push_feed(Some(id), line);
             }
@@ -2581,6 +2661,42 @@ impl AppState {
             E::Verdict(verdict) => {
                 arena.verdict = Some(*verdict);
                 arena.phase = ragnarok::Phase::Verdict;
+                if let Some(winner) = arena.verdict.as_ref().and_then(|v| v.clear_winner) {
+                    arena.queue_draft_pr_publish(winner);
+                }
+            }
+            E::DraftPrPublishing { winner } => {
+                arena.draft_pr_status = Some(RagnarokDraftPrStatus::Publishing { winner });
+                arena.push_feed(
+                    Some(winner),
+                    format!(
+                        "🚀 publishing {} as a draft PR...",
+                        arena.fighter_name(winner)
+                    ),
+                );
+            }
+            E::DraftPrPublished { winner, url } => {
+                arena.draft_pr_status = Some(RagnarokDraftPrStatus::Published {
+                    winner,
+                    url: url.clone(),
+                });
+                arena.push_feed(
+                    Some(winner),
+                    format!("🔗 draft PR for {}: {url}", arena.fighter_name(winner)),
+                );
+            }
+            E::DraftPrFailed { winner, message } => {
+                arena.draft_pr_status = Some(RagnarokDraftPrStatus::Failed {
+                    winner,
+                    message: message.clone(),
+                });
+                arena.push_feed(
+                    Some(winner),
+                    format!(
+                        "⚠ draft PR for {} failed: {message}",
+                        arena.fighter_name(winner)
+                    ),
+                );
             }
             E::Failed(message) => {
                 arena.push_feed(None, format!("💀 RAGNAROK HAS FALLEN: {message}"));
@@ -2599,6 +2715,12 @@ impl AppState {
         arena.abort();
         let summary = ragnarok_summary(&arena);
         self.push_system_message(summary);
+    }
+
+    pub fn take_ragnarok_draft_pr_publish_request(&mut self) -> Option<ragnarok::DraftPrRequest> {
+        self.ragnarok
+            .as_mut()
+            .and_then(RagnarokUi::take_draft_pr_publish_request)
     }
 }
 
@@ -2653,6 +2775,28 @@ fn ragnarok_summary(arena: &RagnarokUi) -> String {
             }
         }
         out.push_str(&format!("Thor's reasoning: {}\n", verdict.reasoning));
+    }
+    if let Some(status) = &arena.draft_pr_status {
+        match status {
+            RagnarokDraftPrStatus::Publishing { winner } => {
+                out.push_str(&format!(
+                    "draft PR: publishing for {}\n",
+                    arena.fighter_name(*winner)
+                ));
+            }
+            RagnarokDraftPrStatus::Published { winner, url } => {
+                out.push_str(&format!(
+                    "draft PR for {}: {url}\n",
+                    arena.fighter_name(*winner)
+                ));
+            }
+            RagnarokDraftPrStatus::Failed { winner, message } => {
+                out.push_str(&format!(
+                    "draft PR for {} failed: {message}\n",
+                    arena.fighter_name(*winner)
+                ));
+            }
+        }
     }
     let with_worktrees: Vec<&RagnarokFighterUi> = arena
         .fighters
@@ -5013,7 +5157,9 @@ mod tests {
             id: 1,
             name: "ragnarok-gpt".into(),
             path: PathBuf::from("/tmp/ragnarok-gpt"),
+            base_sha: "base-gpt".into(),
         });
+        s.apply_ragnarok_event(RagnarokEvent::FighterJoined(ragnarok_card(2, "Judge")));
         s.apply_ragnarok_event(RagnarokEvent::FighterState {
             id: 0,
             state: FighterState::Slain("tripped on a rune".into()),
@@ -5021,13 +5167,17 @@ mod tests {
 
         let arena = s.ragnarok.as_ref().expect("arena");
         assert_eq!(arena.phase, Phase::Combat);
-        assert_eq!(arena.fighters.len(), 2);
+        assert_eq!(arena.fighters.len(), 3);
         let f1 = arena.fighter(1).expect("fighter 1");
         assert_eq!(f1.state, FighterState::Fighting);
         assert_eq!(f1.transcript, "I shall");
         assert_eq!(f1.review_transcript, "their code is bad");
         assert_eq!(f1.worktree_name.as_deref(), Some("ragnarok-gpt"));
         assert_eq!(f1.actions_seen, 1);
+        assert_eq!(
+            arena.fighter(2).expect("late judge").card.model_name,
+            "Judge"
+        );
         // The slain fighter's reason lands in the feed.
         assert!(
             arena
@@ -5062,6 +5212,7 @@ mod tests {
             id: 0,
             name: "ragnarok-opus".into(),
             path: PathBuf::from("/tmp/ragnarok-opus"),
+            base_sha: "base-opus".into(),
         });
         s.apply_ragnarok_event(RagnarokEvent::Verdict(Box::new(Verdict {
             clear_winner: Some(0),
@@ -5071,6 +5222,10 @@ mod tests {
             reasoning: "flawless".into(),
             thor_fallback: false,
         })));
+        s.apply_ragnarok_event(RagnarokEvent::DraftPrPublished {
+            winner: 0,
+            url: "https://github.com/example/repo/pull/123".into(),
+        });
         s.close_ragnarok();
         assert!(s.ragnarok.is_none());
         let Some(Entry::System(summary)) = s.transcript.last() else {
@@ -5080,6 +5235,10 @@ mod tests {
         assert!(summary.contains("Opus"), "summary: {summary}");
         assert!(summary.contains("ragnarok-opus"), "summary: {summary}");
         assert!(summary.contains("mj --worktree"), "summary: {summary}");
+        assert!(
+            summary.contains("https://github.com/example/repo/pull/123"),
+            "summary: {summary}"
+        );
         // Closing twice is harmless.
         s.close_ragnarok();
     }

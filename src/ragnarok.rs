@@ -57,6 +57,9 @@ const BEDROCK_SELECTION_PENALTY: i32 = 100;
 const NEW_VENDOR_SELECTION_BONUS: i32 = 50;
 /// Diversity bonus for an ACP agent not already represented in the roster.
 const NEW_AGENT_SELECTION_BONUS: i32 = 50;
+/// Judge-only replacements should be especially unlike the sole survivor.
+const JUDGE_ONLY_VENDOR_SELECTION_BONUS: i32 = NEW_VENDOR_SELECTION_BONUS * 2;
+const JUDGE_ONLY_AGENT_SELECTION_BONUS: i32 = NEW_AGENT_SELECTION_BONUS * 2;
 /// After scoring with penalties/bonuses, pick randomly from this many top rows.
 const SELECTION_RANDOM_TOP_N: usize = 4;
 /// Budget for an agent to reach `SessionStarted` (covers cold npx/uvx runs).
@@ -253,6 +256,8 @@ pub enum RagnarokEvent {
     ThorAction(ThorAction),
     /// The chosen roster, in fighter-id order.
     Roster(Vec<FighterCard>),
+    /// A late entrant that did not fight, but may adversarially review.
+    FighterJoined(FighterCard),
     FighterState {
         id: FighterId,
         state: FighterState,
@@ -262,6 +267,7 @@ pub enum RagnarokEvent {
         id: FighterId,
         name: String,
         path: PathBuf,
+        base_sha: String,
     },
     FighterAction {
         id: FighterId,
@@ -284,6 +290,17 @@ pub enum RagnarokEvent {
         progress: ReviewProgress,
     },
     Verdict(Box<Verdict>),
+    DraftPrPublishing {
+        winner: FighterId,
+    },
+    DraftPrPublished {
+        winner: FighterId,
+        url: String,
+    },
+    DraftPrFailed {
+        winner: FighterId,
+        message: String,
+    },
     Failed(String),
     Done,
 }
@@ -321,6 +338,15 @@ pub async fn run_battle(
         let _ = tx.send(RagnarokEvent::Failed(format!("{e:#}")));
     }
     let _ = tx.send(RagnarokEvent::Done);
+}
+
+#[derive(Debug, Clone)]
+pub struct DraftPrRequest {
+    pub winner: FighterId,
+    pub winner_tag: String,
+    pub task: String,
+    pub worktree_path: PathBuf,
+    pub base_sha: String,
 }
 
 fn emit(tx: &mpsc::UnboundedSender<RagnarokEvent>, ev: RagnarokEvent) -> Result<()> {
@@ -503,7 +529,7 @@ async fn battle(
     for (id, fighter) in chosen.iter_mut().enumerate() {
         fighter.card.id = id;
     }
-    let cards: Vec<FighterCard> = chosen.iter().map(|c| c.card.clone()).collect();
+    let mut cards: Vec<FighterCard> = chosen.iter().map(|c| c.card.clone()).collect();
     emit(tx, RagnarokEvent::Roster(cards.clone()))?;
     for card in &cards {
         feed(
@@ -627,11 +653,8 @@ async fn battle(
         .iter()
         .filter(|r| r.slain_reason.is_none())
         .collect();
-    if survivors.len() < MIN_FIGHTERS {
-        bail!(
-            "only {} champion(s) survived combat — not enough for adversarial review",
-            survivors.len()
-        );
+    if survivors.is_empty() {
+        bail!("no champions survived combat — not enough for adversarial review");
     }
     feed(
         tx,
@@ -641,11 +664,42 @@ async fn battle(
 
     // ---- Phase: Thor assigns adversarial reviews ----------------------------
     let survivor_ids: Vec<FighterId> = survivors.iter().map(|r| r.id).collect();
+    let mut review_assignments = None;
+    if survivor_ids.len() == 1 {
+        let survivor = survivor_ids[0];
+        let mut judge = select_judge_only_reviewer(&pool, &chosen, survivor).ok_or_else(|| {
+            anyhow!(
+                "only one champion survived combat and no distinct judge-only competitor was available"
+            )
+        })?;
+        let judge_id = cards.len();
+        judge.card.id = judge_id;
+        feed(
+            tx,
+            Some(survivor),
+            format!(
+                "⚖ Only {} still stands; THOR summons {} only to judge the surviving work.",
+                cards[survivor].model_name,
+                judge.card.tag()
+            ),
+        )?;
+        emit(tx, RagnarokEvent::FighterJoined(judge.card.clone()))?;
+        cards.push(judge.card.clone());
+        chosen.push(judge);
+        review_assignments = Some(vec![Assignment {
+            reviewer: judge_id,
+            defender: survivor,
+        }]);
+    }
     emit(tx, RagnarokEvent::ThorAction(ThorAction::Assigning))?;
-    let assignments = thor
-        .assign(&survivor_ids, &cards, tx)
-        .await
-        .unwrap_or_else(|_| assignments_rotation(&survivor_ids));
+    let assignments = if let Some(assignments) = review_assignments {
+        assignments
+    } else {
+        thor.assign(&survivor_ids, &cards, tx)
+            .await
+            .unwrap_or_else(|_| assignments_rotation(&survivor_ids))
+    };
+    let review_judges: Vec<FighterId> = assignments.iter().map(|a| a.reviewer).collect();
     emit(tx, RagnarokEvent::Phase(Phase::Review))?;
     emit(tx, RagnarokEvent::Assignments(assignments.clone()))?;
     for a in &assignments {
@@ -701,7 +755,9 @@ async fn battle(
     emit(tx, RagnarokEvent::Phase(Phase::Judgment))?;
     emit(tx, RagnarokEvent::ThorAction(ThorAction::Judging))?;
     let dossier = judgment_dossier(&cfg.task, &cards, &survivor_ids, &by_id, &reviews);
-    let verdict = thor.judge(&dossier, &survivor_ids, tx).await;
+    let verdict = thor
+        .judge(&dossier, &survivor_ids, &review_judges, tx)
+        .await;
     thor.dismiss().await;
     let verdict = match verdict {
         Ok(v) => v,
@@ -745,9 +801,10 @@ async fn battle(
 fn elo_fallback_verdict(survivors: &[FighterId], cards: &[FighterCard]) -> Verdict {
     let mut ranking: Vec<FighterId> = survivors.to_vec();
     ranking.sort_by_key(|id| std::cmp::Reverse(cards[*id].elo));
+    let clear_winner = (ranking.len() == 1).then(|| ranking[0]);
     let finalists = (ranking.len() >= 2).then(|| (ranking[0], ranking[1]));
     Verdict {
-        clear_winner: None,
+        clear_winner,
         finalists,
         ranking,
         review_verdicts: Vec::new(),
@@ -993,6 +1050,22 @@ fn adjusted_selection_score(
     used_agents: &HashSet<String>,
     used_vendors: &HashSet<String>,
 ) -> i32 {
+    adjusted_selection_score_with_bonuses(
+        candidate,
+        used_agents,
+        used_vendors,
+        NEW_VENDOR_SELECTION_BONUS,
+        NEW_AGENT_SELECTION_BONUS,
+    )
+}
+
+fn adjusted_selection_score_with_bonuses(
+    candidate: &Candidate,
+    used_agents: &HashSet<String>,
+    used_vendors: &HashSet<String>,
+    vendor_bonus: i32,
+    agent_bonus: i32,
+) -> i32 {
     let mut score = candidate.card.elo as i32;
     if candidate.bedrock {
         score -= BEDROCK_SELECTION_PENALTY;
@@ -1004,12 +1077,80 @@ fn adjusted_selection_score(
             .as_deref()
             .is_some_and(|vendor| !used_vendors.contains(vendor))
     {
-        score += NEW_VENDOR_SELECTION_BONUS;
+        score += vendor_bonus;
     }
     if diversity_applies && !used_agents.contains(&candidate.card.agent_source_id) {
-        score += NEW_AGENT_SELECTION_BONUS;
+        score += agent_bonus;
     }
     score
+}
+
+fn select_judge_only_reviewer_with_picker<F>(
+    pool: &[Candidate],
+    current_roster: &[Candidate],
+    survivor: FighterId,
+    mut pick_index: F,
+) -> Option<Candidate>
+where
+    F: FnMut(usize) -> usize,
+{
+    let survivor = current_roster.iter().find(|c| c.card.id == survivor)?;
+    let roster_keys: HashSet<&str> = current_roster
+        .iter()
+        .map(|c| c.match_key.as_str())
+        .collect();
+    let mut used_agents = HashSet::new();
+    used_agents.insert(survivor.card.agent_source_id.clone());
+    let mut used_vendors = HashSet::new();
+    if let Some(vendor) = &survivor.vendor {
+        used_vendors.insert(vendor.clone());
+    }
+
+    let mut ranked: Vec<(usize, i32)> = pool
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| !roster_keys.contains(candidate.match_key.as_str()))
+        .map(|(idx, candidate)| {
+            (
+                idx,
+                adjusted_selection_score_with_bonuses(
+                    candidate,
+                    &used_agents,
+                    &used_vendors,
+                    JUDGE_ONLY_VENDOR_SELECTION_BONUS,
+                    JUDGE_ONLY_AGENT_SELECTION_BONUS,
+                ),
+            )
+        })
+        .collect();
+    if ranked.is_empty() {
+        return None;
+    }
+    ranked.sort_by(|(a_idx, a_score), (b_idx, b_score)| {
+        let a = &pool[*a_idx];
+        let b = &pool[*b_idx];
+        b_score
+            .cmp(a_score)
+            .then_with(|| b.card.elo.cmp(&a.card.elo))
+            .then_with(|| a.card.model_name.cmp(&b.card.model_name))
+            .then_with(|| a.card.agent_source_id.cmp(&b.card.agent_source_id))
+    });
+    let base_window = ranked.len().min(SELECTION_RANDOM_TOP_N.max(1));
+    let cutoff = ranked[base_window - 1].1;
+    let top_len = ranked
+        .iter()
+        .take_while(|(_, score)| *score >= cutoff)
+        .count();
+    let choice = pick_index(top_len).min(top_len.saturating_sub(1));
+    Some(pool[ranked[choice].0].clone())
+}
+
+fn select_judge_only_reviewer(
+    pool: &[Candidate],
+    current_roster: &[Candidate],
+    survivor: FighterId,
+) -> Option<Candidate> {
+    select_judge_only_reviewer_with_picker(pool, current_roster, survivor, selection_random_index)
 }
 
 fn selection_random_index(upper: usize) -> usize {
@@ -1875,15 +2016,16 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| created.worktree_root.display().to_string());
-    let _ = tx.send(RagnarokEvent::FighterWorktree {
-        id,
-        name: worktree_name,
-        path: created.worktree_root.clone(),
-    });
     let base_sha = match git_capture(&created.worktree_root, &["rev-parse", "HEAD"]).await {
         Ok(sha) => sha.trim().to_string(),
         Err(e) => return slain(report, set_state, format!("could not read base sha: {e:#}")),
     };
+    let _ = tx.send(RagnarokEvent::FighterWorktree {
+        id,
+        name: worktree_name,
+        path: created.worktree_root.clone(),
+        base_sha: base_sha.clone(),
+    });
     report.worktree = Some(created.clone());
 
     set_state(FighterState::Connecting);
@@ -2266,6 +2408,144 @@ async fn git_capture(dir: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn gh_capture(dir: &Path, args: &[&str]) -> Result<String> {
+    let dir = dir.to_path_buf();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let joined = args.join(" ");
+    let output = tokio::process::Command::new("gh")
+        .current_dir(&dir)
+        .args(&args)
+        .output()
+        .await
+        .with_context(|| format!("run gh {joined} in {}", dir.display()))?;
+    if !output.status.success() {
+        bail!(
+            "gh {joined} failed in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+pub async fn publish_draft_pr(req: DraftPrRequest) -> Result<String> {
+    let status = git_capture(
+        &req.worktree_path,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )
+    .await?;
+    let has_worktree_changes = !status.trim().is_empty();
+    let head = git_capture(&req.worktree_path, &["rev-parse", "HEAD"]).await?;
+    let has_committed_changes = head.trim() != req.base_sha.trim();
+    if !has_worktree_changes && !has_committed_changes {
+        bail!("winner worktree has no changes to publish");
+    }
+
+    let base = origin_default_branch(&req.worktree_path).await?;
+    let branch = draft_pr_branch_name(req.winner, &req.task);
+    let title = format!("Ragnarok: {}", first_line(&req.task, 72));
+    let commit_subject = format!("ragnarok winner: {}", first_line(&req.task, 60));
+    let body = format!(
+        "Draft PR generated from Ragnarok's winning pick.\n\n\
+         Winner: {}\n\n\
+         Task:\n{}\n\n\
+         Source worktree: `{}`\n",
+        req.winner_tag,
+        req.task,
+        req.worktree_path.display(),
+    );
+
+    git_capture(&req.worktree_path, &["switch", "-c", &branch]).await?;
+    if has_worktree_changes {
+        git_capture(&req.worktree_path, &["add", "-A"]).await?;
+        git_capture(&req.worktree_path, &["commit", "-m", &commit_subject]).await?;
+    }
+    git_capture(&req.worktree_path, &["push", "-u", "origin", &branch]).await?;
+    let out = gh_capture(
+        &req.worktree_path,
+        &[
+            "pr", "create", "--draft", "--base", &base, "--head", &branch, "--title", &title,
+            "--body", &body,
+        ],
+    )
+    .await?;
+    let url = out
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("http://") || line.starts_with("https://"))
+        .unwrap_or(out.trim());
+    if url.is_empty() {
+        bail!("gh created a draft PR but did not return its URL");
+    }
+    Ok(url.to_string())
+}
+
+async fn origin_default_branch(dir: &Path) -> Result<String> {
+    match git_capture(
+        dir,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    )
+    .await
+    {
+        Ok(head) => {
+            let head = head.trim();
+            if let Some(branch) = head.strip_prefix("origin/")
+                && !branch.is_empty()
+            {
+                return Ok(branch.to_string());
+            }
+        }
+        Err(e) => tracing::debug!("origin/HEAD lookup failed: {e:#}"),
+    }
+
+    let remote = git_capture(dir, &["remote", "show", "-n", "origin"]).await?;
+    remote
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("HEAD branch: "))
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty() && *branch != "(unknown)")
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow!("could not determine origin default branch; set origin/HEAD before publishing")
+        })
+}
+
+fn draft_pr_branch_name(winner: FighterId, task: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = true;
+    for ch in task.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if mapped == '-' {
+            if last_dash {
+                continue;
+            }
+            last_dash = true;
+        } else {
+            last_dash = false;
+            slug.push(mapped);
+        }
+        if slug.len() >= 36 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() { "winner" } else { slug };
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("ragnarok/{slug}-{winner}-{millis}")
 }
 
 struct CappedOutput {
@@ -2709,6 +2989,7 @@ impl Thor {
         &mut self,
         dossier: &str,
         survivors: &[FighterId],
+        allowed_reviewers: &[FighterId],
         tx: &mpsc::UnboundedSender<RagnarokEvent>,
     ) -> Result<Verdict> {
         let prompt = judge_prompt(dossier);
@@ -2724,7 +3005,9 @@ impl Thor {
                 )
                 .await?
             };
-            if let Some(verdict) = parse_judgment(&text, survivors) {
+            if let Some(verdict) =
+                parse_judgment_with_reviewers(&text, survivors, allowed_reviewers)
+            {
                 return Ok(verdict);
             }
         }
@@ -3025,18 +3308,27 @@ struct RawReviewVerdict {
     notes: Option<String>,
 }
 
-pub fn parse_judgment(text: &str, survivors: &[FighterId]) -> Option<Verdict> {
+fn parse_judgment_with_reviewers(
+    text: &str,
+    survivors: &[FighterId],
+    allowed_reviewers: &[FighterId],
+) -> Option<Verdict> {
     let value = extract_json_object(text)?;
     let raw: RawJudgment = serde_json::from_value(value).ok()?;
-    let valid: HashSet<FighterId> = survivors.iter().copied().collect();
-    let to_id = |v: i64| -> Option<FighterId> {
+    let valid_survivors: HashSet<FighterId> = survivors.iter().copied().collect();
+    let valid_reviewers: HashSet<FighterId> = allowed_reviewers.iter().copied().collect();
+    let to_survivor_id = |v: i64| -> Option<FighterId> {
         let id = usize::try_from(v).ok()?;
-        valid.contains(&id).then_some(id)
+        valid_survivors.contains(&id).then_some(id)
+    };
+    let to_reviewer_id = |v: i64| -> Option<FighterId> {
+        let id = usize::try_from(v).ok()?;
+        valid_reviewers.contains(&id).then_some(id)
     };
 
     let mut ranking: Vec<FighterId> = Vec::new();
     for v in raw.ranking.unwrap_or_default() {
-        let id = to_id(v)?;
+        let id = to_survivor_id(v)?;
         if !ranking.contains(&id) {
             ranking.push(id);
         }
@@ -3048,13 +3340,13 @@ pub fn parse_judgment(text: &str, survivors: &[FighterId]) -> Option<Verdict> {
     }
 
     let clear_winner = match raw.clear_winner {
-        Some(v) => Some(to_id(v)?),
+        Some(v) => Some(to_survivor_id(v)?),
         None => None,
     };
     let finalists = match raw.finalists {
         Some(pair) if pair.len() == 2 => {
-            let a = to_id(pair[0])?;
-            let b = to_id(pair[1])?;
+            let a = to_survivor_id(pair[0])?;
+            let b = to_survivor_id(pair[1])?;
             if a == b {
                 return None;
             }
@@ -3081,8 +3373,8 @@ pub fn parse_judgment(text: &str, survivors: &[FighterId]) -> Option<Verdict> {
         .into_iter()
         .filter_map(|rv| {
             Some(ReviewVerdict {
-                reviewer: to_id(rv.reviewer)?,
-                defender: to_id(rv.defender)?,
+                reviewer: to_reviewer_id(rv.reviewer)?,
+                defender: to_survivor_id(rv.defender)?,
                 honesty: rv.honesty.unwrap_or(0).clamp(0, 10) as u8,
                 validity: rv.validity.unwrap_or(0).clamp(0, 10) as u8,
                 notes: rv.notes.unwrap_or_default(),
@@ -3385,6 +3677,27 @@ mod tests {
     }
 
     #[test]
+    fn judge_only_reviewer_uses_double_diversity_and_skips_roster_models() {
+        let mut survivor = candidate("agent-a", "alpha", 1500, "openai/alpha");
+        survivor.card.id = 0;
+        let mut original_rival = candidate("agent-c", "delta", 1700, "google/delta");
+        original_rival.card.id = 1;
+        let pool = sorted(vec![
+            survivor.clone(),
+            original_rival.clone(),
+            candidate("agent-a", "beta", 1490, "openai/beta"),
+            candidate("agent-b", "gamma", 1375, "anthropic/gamma"),
+        ]);
+
+        let picked =
+            select_judge_only_reviewer_with_picker(&pool, &[survivor, original_rival], 0, |_| 0)
+                .expect("judge-only reviewer");
+
+        assert_eq!(picked.card.model_name, "gamma");
+        assert_eq!(picked.card.agent_source_id, "agent-b");
+    }
+
+    #[test]
     fn rotation_is_a_derangement_for_all_sizes() {
         for n in 2..=10 {
             let ids: Vec<FighterId> = (0..n).collect();
@@ -3512,36 +3825,50 @@ mod tests {
         let survivors = vec![0, 1, 2];
         let win =
             "{\"ranking\":[1,0,2],\"clear_winner\":1,\"finalists\":null,\"reasoning\":\"strong\"}";
-        let v = parse_judgment(win, &survivors).expect("verdict");
+        let v = parse_judgment_with_reviewers(win, &survivors, &survivors).expect("verdict");
         assert_eq!(v.clear_winner, Some(1));
         assert!(v.finalists.is_none());
         assert_eq!(v.ranking, vec![1, 0, 2]);
 
         let split =
             "{\"ranking\":[2,0],\"clear_winner\":null,\"finalists\":[2,0],\"reasoning\":\"close\"}";
-        let v = parse_judgment(split, &survivors).expect("verdict");
+        let v = parse_judgment_with_reviewers(split, &survivors, &survivors).expect("verdict");
         assert_eq!(v.finalists, Some((2, 0)));
         // Missing survivors are appended to the ranking.
         assert_eq!(v.ranking, vec![2, 0, 1]);
 
         // Neither winner nor finalists: derive finalists from ranking.
         let neither = "{\"ranking\":[0,2,1],\"reasoning\":\"meh\"}";
-        let v = parse_judgment(neither, &survivors).expect("verdict");
+        let v = parse_judgment_with_reviewers(neither, &survivors, &survivors).expect("verdict");
         assert_eq!(v.finalists, Some((0, 2)));
         assert!(v.clear_winner.is_none());
 
         // Bogus ids fail the parse entirely.
-        assert!(parse_judgment("{\"clear_winner\":9}", &survivors).is_none());
+        assert!(
+            parse_judgment_with_reviewers("{\"clear_winner\":9}", &survivors, &survivors).is_none()
+        );
     }
 
     #[test]
     fn parse_judgment_collects_review_verdicts() {
         let survivors = vec![0, 1];
         let text = "{\"review_verdicts\":[{\"reviewer\":0,\"defender\":1,\"honesty\":9,\"validity\":22,\"notes\":\"fair\"}],\"clear_winner\":0,\"reasoning\":\"ok\"}";
-        let v = parse_judgment(text, &survivors).expect("verdict");
+        let v = parse_judgment_with_reviewers(text, &survivors, &survivors).expect("verdict");
         assert_eq!(v.review_verdicts.len(), 1);
         assert_eq!(v.review_verdicts[0].honesty, 9);
         assert_eq!(v.review_verdicts[0].validity, 10, "clamped to 10");
+    }
+
+    #[test]
+    fn parse_judgment_allows_judge_only_reviewer_without_making_them_a_finalist() {
+        let text = "{\"review_verdicts\":[{\"reviewer\":2,\"defender\":0,\"honesty\":8,\"validity\":7,\"notes\":\"sound\"}],\"ranking\":[0],\"clear_winner\":0,\"reasoning\":\"only implementation left\"}";
+        let v = parse_judgment_with_reviewers(text, &[0], &[2]).expect("verdict");
+
+        assert_eq!(v.clear_winner, Some(0));
+        assert_eq!(v.ranking, vec![0]);
+        assert_eq!(v.review_verdicts.len(), 1);
+        assert_eq!(v.review_verdicts[0].reviewer, 2);
+        assert_eq!(v.review_verdicts[0].defender, 0);
     }
 
     #[test]
@@ -3576,6 +3903,24 @@ mod tests {
         assert!(v.thor_fallback);
         assert_eq!(v.finalists, Some((1, 2)));
         assert_eq!(v.ranking, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn elo_fallback_crowns_the_only_survivor() {
+        let cards = vec![FighterCard {
+            id: 0,
+            agent_source_id: "a".into(),
+            model_value: "m".into(),
+            model_name: "Solo".into(),
+            elo: 1400,
+            provisional: false,
+        }];
+        let v = elo_fallback_verdict(&[0], &cards);
+
+        assert!(v.thor_fallback);
+        assert_eq!(v.clear_winner, Some(0));
+        assert!(v.finalists.is_none());
+        assert_eq!(v.ranking, vec![0]);
     }
 
     // ---- Straggler watchdog -----------------------------------------------
