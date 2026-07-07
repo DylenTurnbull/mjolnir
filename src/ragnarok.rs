@@ -107,6 +107,8 @@ const REVIEW_FOR_JUDGMENT_LIMIT: usize = 8 * 1024;
 const SUMMARY_LIMIT: usize = 4 * 1024;
 /// Cap on accumulated agent text per turn (mirrors `mj mcp`).
 const FINAL_TEXT_LIMIT: usize = 1024 * 1024;
+/// Keep synthetic outbound prompt markers readable in fighter transcripts.
+const PROMPT_MARKER_TASK_LIMIT: usize = 800;
 
 // ---------------------------------------------------------------------------
 // Events consumed by the arena UI
@@ -1919,6 +1921,11 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
     let mut continuation_count = 0usize;
     loop {
         set_state(FighterState::Fighting);
+        let prompt_kind = if continuation_count > 0 {
+            "continuation"
+        } else {
+            "combat"
+        };
         if continuation_count > 0 {
             let _ = tx.send(RagnarokEvent::Log {
                 fighter: Some(id),
@@ -1928,6 +1935,11 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
                 ),
             });
         }
+        let _ = tx.send(RagnarokEvent::FighterText {
+            id,
+            lane: TextLane::Tool,
+            chunk: prompt_marker(prompt_kind, &prompt),
+        });
         let outcome = handle
             .prompt(prompt, FIGHT_TIMEOUT, |ev| {
                 if let TurnEvent::Tool {
@@ -1994,14 +2006,26 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
                 });
                 if empty && continuation_count < EMPTY_DIFF_CONTINUATION_LIMIT {
                     continuation_count += 1;
+                    let plan_gate = plan_required_response(&report.final_text);
                     let _ = tx.send(RagnarokEvent::Log {
                         fighter: Some(id),
-                        text: format!(
-                            "⚡ THOR finds no changed files from {}; queueing continuation {continuation_count}/{EMPTY_DIFF_CONTINUATION_LIMIT}.",
-                            fighter.card.model_name,
-                        ),
+                        text: if plan_gate {
+                            format!(
+                                "⚡ THOR finds no changed files from {}; their response says a plan is required, so queueing a plan-aware continuation {continuation_count}/{EMPTY_DIFF_CONTINUATION_LIMIT}.",
+                                fighter.card.model_name,
+                            )
+                        } else {
+                            format!(
+                                "⚡ THOR finds no changed files from {}; queueing continuation {continuation_count}/{EMPTY_DIFF_CONTINUATION_LIMIT}.",
+                                fighter.card.model_name,
+                            )
+                        },
                     });
-                    prompt = empty_diff_continue_prompt(&task);
+                    prompt = if plan_gate {
+                        plan_required_continue_prompt(&task)
+                    } else {
+                        empty_diff_continue_prompt(&task)
+                    };
                     continue;
                 }
                 if empty {
@@ -2052,6 +2076,23 @@ fn append_turn_text(acc: &mut String, text: &str) {
         acc.push_str("\n\n--- continuation turn ---\n");
     }
     acc.push_str(text);
+}
+
+fn prompt_marker(kind: &str, prompt: &str) -> String {
+    let task = prompt
+        .split("THE TASK:\n")
+        .nth(1)
+        .map(str::trim)
+        .filter(|task| !task.is_empty())
+        .map(|task| truncate_middle(task, PROMPT_MARKER_TASK_LIMIT))
+        .unwrap_or_else(|| first_line(prompt, PROMPT_MARKER_TASK_LIMIT));
+    format!("\n▶ mj sent {kind} prompt to this fighter\nTASK:\n{task}\n\n")
+}
+
+fn plan_required_response(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    lowered.contains("needs a plan before execution")
+        || lowered.contains("requires a plan before execution")
 }
 
 fn slain(
@@ -2179,6 +2220,8 @@ fn fight_prompt(task: &str) -> String {
          one can win.\n\n\
          Rules of combat:\n\
          - Implement the task below in the current working directory (your private worktree).\n\
+         - If your agent/runtime requires a plan before execution, create the required plan \
+           first in this same turn, then execute it. Do not stop after only saying a plan is required.\n\
          - Do NOT create git commits. Leave every change in the working tree.\n\
          - Do NOT push, and do NOT touch anything outside this worktree.\n\
          - Verify your work (build/tests) when the project allows it.\n\
@@ -2196,10 +2239,29 @@ fn empty_diff_continue_prompt(task: &str) -> String {
          Continue in this same worktree now.\n\n\
          Rules:\n\
          - Implement the task below in the current working directory.\n\
+         - If your agent/runtime requires a plan before execution, create the required plan \
+           first in this same turn, then execute it. Do not stop after only saying a plan is required.\n\
          - Do NOT create git commits. Leave every change in the working tree.\n\
          - Do NOT push, and do NOT touch anything outside this worktree.\n\
          - Verify your work when the project allows it.\n\
          - Finish with a concise summary of the changes and verification.\n\n\
+         THE TASK:\n{task}"
+    )
+}
+
+fn plan_required_continue_prompt(task: &str) -> String {
+    format!(
+        "⚡ THOR INSPECTION. Your previous turn ended without a git diff, and your \
+         response said this request needs a plan before execution.\n\n\
+         Create the required plan now, then execute that plan in this same turn. Do not \
+         stop after saying a plan is required. This is an automated Ragnarok worktree; \
+         leave the implementation changes in the working tree for `git diff`.\n\n\
+         Rules:\n\
+         - Work only in the current working directory.\n\
+         - Do NOT create git commits. Leave every change in the working tree.\n\
+         - Do NOT push, and do NOT touch anything outside this worktree.\n\
+         - Verify your work when the project allows it.\n\
+         - Finish with a concise summary of the plan, changes, and verification.\n\n\
          THE TASK:\n{task}"
     )
 }
@@ -3715,8 +3777,41 @@ mod tests {
         assert!(prompt.contains("THOR INSPECTION"));
         assert!(prompt.contains("git diff"));
         assert!(prompt.contains("Continue in this same worktree"));
+        assert!(prompt.contains("requires a plan before execution"));
         assert!(prompt.contains("Do NOT create git commits"));
         assert!(prompt.contains("fix empty output"));
+    }
+
+    #[test]
+    fn plan_required_continue_prompt_tells_agent_to_plan_then_execute() {
+        let prompt = plan_required_continue_prompt("wire the hammer");
+        assert!(prompt.contains("needs a plan before execution"));
+        assert!(prompt.contains("Create the required plan now"));
+        assert!(prompt.contains("execute that plan in this same turn"));
+        assert!(prompt.contains("wire the hammer"));
+    }
+
+    #[test]
+    fn plan_required_response_detects_plan_gate_text() {
+        assert!(plan_required_response(
+            "This request needs a plan before execution."
+        ));
+        assert!(plan_required_response(
+            "The task requires a plan before execution."
+        ));
+        assert!(!plan_required_response("I wrote a plan and changed files."));
+    }
+
+    #[test]
+    fn prompt_marker_shows_outbound_prompt_without_full_wrapper() {
+        let prompt = fight_prompt("change the thing");
+        let marker = prompt_marker("combat", &prompt);
+        assert!(marker.contains("mj sent combat prompt"));
+        assert!(marker.contains("TASK:\nchange the thing"));
+        assert!(
+            !marker.contains("RAGNAROK. You are one of several"),
+            "marker should not dump the full wrapper: {marker}"
+        );
     }
 
     #[test]
