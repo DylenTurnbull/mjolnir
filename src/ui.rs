@@ -3763,7 +3763,7 @@ fn handle_elicitation_key(state: &mut AppState, code: KeyCode, mode: UiMode) -> 
                 pending.scroll_offset = Some(usize::MAX);
             }
         }
-        KeyCode::Char('c') if matches!(view, ElicitationView::Url { .. }) => {
+        KeyCode::Char('c' | 'C') if matches!(view, ElicitationView::Url { .. }) => {
             if let ElicitationView::Url { url } = view {
                 return TerminalRequest::CopyText(url);
             }
@@ -9512,6 +9512,9 @@ mod tests {
             state.has_pending_elicitation(),
             "copy must not dismiss login prompt"
         );
+
+        let request = handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('C')));
+        assert_eq!(request, TerminalRequest::CopyText(url.to_string()));
     }
 
     #[test]
