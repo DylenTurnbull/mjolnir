@@ -2584,7 +2584,7 @@
         card.agent.textContent = session.agent || "-";
         const queued = session.queued_prompt_count ?? 0;
         card.counts.textContent = `${session.total_messages ?? 0} messages${queued ? ` · ${queued} queued` : ""}`;
-        setTimestamp(card.updated, session.last_prompt_at || session.last_update || "");
+        setTimestamp(card.updated, session.last_prompt_at || session.start_time || "");
         const needsApproval = sessionPendingPermissions(session).length > 0;
         card.root.classList.toggle("needs-approval", needsApproval);
         card.approval.hidden = !needsApproval;

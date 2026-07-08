@@ -764,7 +764,13 @@ impl TrackerState {
         self.total_messages = self.total_messages.saturating_add(1);
         self.agent_message_open = false;
         self.prompt_in_flight = true;
-        self.last_prompt_at = Some(prompt_at.clone());
+        if self
+            .last_prompt_at
+            .as_deref()
+            .is_none_or(|current| prompt_at.as_str() >= current)
+        {
+            self.last_prompt_at = Some(prompt_at.clone());
+        }
         self.push_transcript_entry_at("user", text, prompt_at);
         self.touch();
     }
@@ -3255,6 +3261,7 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
     let session_config = serde_json::from_str(&session_config_json).unwrap_or_default();
     let last_prompt_at: Option<String> = row
         .get::<_, Option<String>>(4)?
+        .filter(|value| !value.is_empty())
         .or_else(|| last_prompt_at_from_transcript(&transcript));
     Ok(SessionRecord {
         session_id: row.get(0)?,
@@ -3274,11 +3281,8 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
 
 fn sort_session_records(sessions: &mut [SessionRecord]) {
     sessions.sort_by(|a, b| {
-        let a_needs_approval = !a.pending_permissions.is_empty();
-        let b_needs_approval = !b.pending_permissions.is_empty();
         session_prompt_sort_time(b)
             .cmp(session_prompt_sort_time(a))
-            .then_with(|| b_needs_approval.cmp(&a_needs_approval))
             .then_with(|| a.session_id.cmp(&b.session_id))
     });
 }
@@ -3334,15 +3338,18 @@ fn load_queued_prompts(db_path: &Path, session_id: &str) -> Result<Vec<QueuedPro
 
 fn queue_prompt_record(db_path: &Path, session_id: &str, text: &str) -> Result<()> {
     init_db(db_path)?;
-    let conn = open_db(db_path)?;
+    let mut conn = open_db(db_path)?;
     let created_at = now_rfc3339();
-    conn.execute(
+    let tx = conn
+        .transaction()
+        .context("begin queued-prompt transaction")?;
+    tx.execute(
         "insert into queued_prompts (session_id, text, created_at)
         values (?1, ?2, ?3)",
         params![session_id, text, &created_at],
     )
     .context("insert queued prompt")?;
-    conn.execute(
+    tx.execute(
         "update sessions
         set last_prompt_at = ?2
         where session_id = ?1
@@ -3350,6 +3357,7 @@ fn queue_prompt_record(db_path: &Path, session_id: &str, text: &str) -> Result<(
         params![session_id, &created_at],
     )
     .context("touch session prompt recency")?;
+    tx.commit().context("commit queued-prompt transaction")?;
     Ok(())
 }
 
@@ -4389,6 +4397,84 @@ mod tests {
             "queued prompt should update prompt recency: {:?}",
             sessions[0].last_prompt_at
         );
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_clobber_queued_prompt_recency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sessions.sqlite3");
+
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                last_prompt_at: Some("2026-06-10T10:00:00Z".to_string()),
+                ..session_named("sess-race", "2026-06-10T10:00:01Z")
+            },
+        )
+        .expect("insert session");
+
+        queue_prompt_record(&db_path, "sess-race", "remote prompt").expect("queue prompt");
+        let queued_prompt_at = load_session_records(&db_path).expect("load after queue")[0]
+            .last_prompt_at
+            .clone();
+        assert!(queued_prompt_at.as_deref() > Some("2026-06-10T10:00:00Z"));
+
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                last_update: "2026-06-10T10:00:02Z".to_string(),
+                last_prompt_at: Some("2026-06-10T09:59:00Z".to_string()),
+                ..session_named("sess-race", "2026-06-10T10:00:02Z")
+            },
+        )
+        .expect("stale prompted heartbeat");
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                last_update: "2026-06-10T10:00:03Z".to_string(),
+                last_prompt_at: None,
+                ..session_named("sess-race", "2026-06-10T10:00:03Z")
+            },
+        )
+        .expect("absent prompted heartbeat");
+
+        let loaded = load_session_records(&db_path).expect("reload");
+        assert_eq!(loaded[0].last_prompt_at, queued_prompt_at);
+    }
+
+    #[test]
+    fn session_listing_falls_back_to_start_time_when_never_prompted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sessions.sqlite3");
+
+        let older_started_recent_heartbeat = SessionRecord {
+            start_time: "2026-06-10T10:00:00Z".to_string(),
+            last_update: "2026-06-10T10:05:00Z".to_string(),
+            ..session_named("sess-older", "2026-06-10T10:05:00Z")
+        };
+        let newer_started_old_heartbeat = SessionRecord {
+            start_time: "2026-06-10T10:02:00Z".to_string(),
+            last_update: "2026-06-10T10:03:00Z".to_string(),
+            ..session_named("sess-newer", "2026-06-10T10:03:00Z")
+        };
+
+        upsert_session_record(&db_path, &older_started_recent_heartbeat).expect("older");
+        upsert_session_record(&db_path, &newer_started_old_heartbeat).expect("newer");
+
+        let sessions = load_session_records(&db_path).expect("load");
+        let ids: Vec<_> = sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["sess-newer", "sess-older"]);
+
+        let connected = load_connected_session_records(&db_path, "1970-01-01T00:00:00Z")
+            .expect("load connected");
+        let connected_ids: Vec<_> = connected
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(connected_ids, ids);
     }
 
     #[test]
