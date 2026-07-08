@@ -1631,10 +1631,11 @@ async fn drive_session(
             }
             UiCommand::ForkSession => {
                 if !connected_fields.session_fork_supported {
-                    let _ = ui_tx.send(UiEvent::Warning(
+                    let message =
                         "session fork is not supported by this agent (unstable ACP extension not advertised)"
-                            .to_string(),
-                    ));
+                            .to_string();
+                    let _ = ui_tx.send(UiEvent::Warning(message.clone()));
+                    let _ = ui_tx.send(UiEvent::SessionForkFailed { message });
                     continue;
                 }
 
@@ -6494,7 +6495,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fork_session_without_capability_emits_warning() {
+    async fn fork_session_without_capability_emits_warning_and_failure() {
         let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
         let (cr, cw) = split(client_side);
         let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
@@ -6537,6 +6538,20 @@ mod tests {
             .expect("channel closed");
         match ev {
             UiEvent::Warning(message) => {
+                assert_eq!(
+                    message,
+                    "session fork is not supported by this agent (unstable ACP extension not advertised)"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+            .await
+            .expect("timeout waiting for fork failure")
+            .expect("channel closed");
+        match ev {
+            UiEvent::SessionForkFailed { message } => {
                 assert_eq!(
                     message,
                     "session fork is not supported by this agent (unstable ACP extension not advertised)"

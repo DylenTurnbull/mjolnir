@@ -1,6 +1,6 @@
 //! Simple remote-control server and local session registration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -9,9 +9,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, PermissionOptionKind, SessionConfigId, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionConfigValueId, SessionUpdate,
-    ToolCallContent, ToolCallStatus, ToolCallUpdateFields, ToolKind,
+    AvailableCommand, AvailableCommandInput, ContentBlock, PermissionOptionKind, SessionConfigId,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOptions, SessionConfigValueId, SessionUpdate, ToolCallContent,
+    ToolCallStatus, ToolCallUpdateFields, ToolKind,
 };
 use anyhow::{Context, Result, anyhow};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
@@ -68,6 +69,13 @@ const QUEUED_PROMPT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// old unclaimed decision is unambiguously dead.
 const PERMISSION_DECISION_TTL: Duration = Duration::from_secs(60 * 60);
 const SESSION_COOKIE_NAME: &str = "mj_remote_session";
+const REMOTE_BUILTIN_NEW_COMMAND: &str = "new";
+const REMOTE_BUILTIN_CLEAR_COMMAND: &str = "clear";
+const REMOTE_BUILTIN_LOAD_COMMAND: &str = "load";
+const REMOTE_BUILTIN_FORK_COMMAND: &str = "fork";
+const REMOTE_BUILTIN_EXPORT_COMMAND: &str = "export";
+const REMOTE_BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
+const REMOTE_BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 /// Default lifetime of a viewer session cookie, in days. Long enough that an
 /// installed phone PWA stays signed in across app evictions for weeks, short
 /// enough to bound the exposure window if a device is lost. This is the default
@@ -107,6 +115,8 @@ pub struct SessionRecord {
     pub name: String,
     pub start_time: String,
     pub last_update: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt_at: Option<String>,
     pub total_messages: u64,
     pub project: String,
     pub agent: String,
@@ -122,6 +132,122 @@ pub struct SessionRecord {
     /// the active value and queue a change.
     #[serde(default)]
     pub session_config: Vec<SessionConfigOptionRecord>,
+    /// Slash commands available in the web composer. This includes agent
+    /// commands from ACP plus the subset of Mjolnir-local commands that have a
+    /// web equivalent.
+    #[serde(default)]
+    pub available_commands: Vec<CommandRecord>,
+}
+
+/// A slash command projected for the remote viewer. Kept separate from ACP's
+/// `AvailableCommand` so the browser contract stays stable and only exposes
+/// command input shapes the web composer can render.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandRecord {
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
+    /// `mjolnir` for Mjolnir-owned commands, `agent` for ACP-advertised
+    /// commands that are sent as slash prompt text.
+    pub source: String,
+}
+
+fn command_record(
+    name: impl Into<String>,
+    description: impl Into<String>,
+    input_hint: Option<String>,
+    source: &'static str,
+) -> CommandRecord {
+    CommandRecord {
+        name: name.into(),
+        description: description.into(),
+        input_hint,
+        source: source.to_string(),
+    }
+}
+
+fn remote_builtin_command_records(include_fork: bool) -> Vec<CommandRecord> {
+    let mut commands = vec![
+        command_record(
+            REMOTE_BUILTIN_NEW_COMMAND,
+            "start a new web session",
+            None,
+            "mjolnir",
+        ),
+        command_record(
+            REMOTE_BUILTIN_EXPORT_COMMAND,
+            "download this transcript as markdown",
+            None,
+            "mjolnir",
+        ),
+        command_record(
+            REMOTE_BUILTIN_MJCONFIG_COMMAND,
+            "focus session configuration controls",
+            None,
+            "mjolnir",
+        ),
+    ];
+    if include_fork {
+        commands.push(command_record(
+            REMOTE_BUILTIN_FORK_COMMAND,
+            "fork the current session",
+            None,
+            "mjolnir",
+        ));
+    }
+    commands
+}
+
+fn is_remote_reserved_command(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        REMOTE_BUILTIN_NEW_COMMAND
+            | REMOTE_BUILTIN_CLEAR_COMMAND
+            | REMOTE_BUILTIN_LOAD_COMMAND
+            | REMOTE_BUILTIN_FORK_COMMAND
+            | REMOTE_BUILTIN_EXPORT_COMMAND
+            | REMOTE_BUILTIN_MJCONFIG_COMMAND
+            | REMOTE_BUILTIN_RAGNAROK_COMMAND
+    )
+}
+
+fn available_command_records(
+    commands: &[AvailableCommand],
+    include_fork: bool,
+) -> Vec<CommandRecord> {
+    let mut records = remote_builtin_command_records(include_fork);
+    let mut seen: HashSet<String> = records
+        .iter()
+        .map(|command| command.name.to_ascii_lowercase())
+        .collect();
+    for command in commands {
+        let name = command.name.trim();
+        if name.is_empty()
+            || name.chars().any(char::is_whitespace)
+            || is_remote_reserved_command(name)
+        {
+            continue;
+        }
+        if !seen.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        records.push(command_record(
+            name.to_string(),
+            command.description.clone(),
+            available_command_input_hint(command.input.as_ref()),
+            "agent",
+        ));
+    }
+    records
+}
+
+fn available_command_input_hint(input: Option<&AvailableCommandInput>) -> Option<String> {
+    match input {
+        Some(AvailableCommandInput::Unstructured(unstructured)) => Some(unstructured.hint.clone()),
+        _ => None,
+    }
 }
 
 /// A session configuration option projected for the remote viewer. Carries
@@ -308,6 +434,27 @@ pub struct QueuedPrompt {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteQueuedPromptAction {
+    SendPrompt(String),
+    ForkSession,
+    RejectUnsupportedFork,
+}
+
+fn remote_queued_prompt_action(
+    text: String,
+    session_fork_supported: bool,
+) -> RemoteQueuedPromptAction {
+    if text.trim() != "/fork" {
+        return RemoteQueuedPromptAction::SendPrompt(text);
+    }
+    if session_fork_supported {
+        RemoteQueuedPromptAction::ForkSession
+    } else {
+        RemoteQueuedPromptAction::RejectUnsupportedFork
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SessionAuthRequest {
     code: String,
@@ -436,6 +583,7 @@ struct TrackerState {
     name: Option<String>,
     start_time: Option<String>,
     last_update: Option<String>,
+    last_prompt_at: Option<String>,
     total_messages: u64,
     project: String,
     agent: String,
@@ -446,6 +594,8 @@ struct TrackerState {
     tool_transcript_entries: HashMap<usize, ToolTranscriptEntry>,
     pending_permissions: Vec<PendingPermissionRecord>,
     session_config: Vec<SessionConfigOptionRecord>,
+    available_commands: Vec<CommandRecord>,
+    session_fork_supported: bool,
     sessions_to_disconnect: Vec<String>,
 }
 
@@ -553,6 +703,7 @@ impl TrackerState {
             name: None,
             start_time: None,
             last_update: None,
+            last_prompt_at: None,
             total_messages: 0,
             project,
             agent,
@@ -563,17 +714,15 @@ impl TrackerState {
             tool_transcript_entries: HashMap::new(),
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
+            available_commands: remote_builtin_command_records(false),
+            session_fork_supported: false,
             sessions_to_disconnect: Vec::new(),
         }
     }
 
     fn observe_command(&mut self, command: &UiCommand) {
         if let UiCommand::SendPrompt { text, .. } = command {
-            self.total_messages = self.total_messages.saturating_add(1);
-            self.agent_message_open = false;
-            self.prompt_in_flight = true;
-            self.push_transcript_entry("user", text.clone());
-            self.touch();
+            self.observe_prompt_text(text.clone(), None);
         }
     }
 
@@ -581,6 +730,7 @@ impl TrackerState {
         self.session_id = Some(new_session_id.to_string());
         self.name = Some(new_session_id.to_string());
         self.start_time = Some(now.to_string());
+        self.last_prompt_at = None;
         self.total_messages = 0;
         self.agent_message_open = false;
         self.prompt_in_flight = false;
@@ -589,10 +739,20 @@ impl TrackerState {
         self.tool_transcript_entries.clear();
         self.pending_permissions.clear();
         self.session_config.clear();
+        self.available_commands = available_command_records(&[], self.session_fork_supported);
     }
 
     fn observe_event(&mut self, event: &UiEvent) {
         match event {
+            UiEvent::Connected {
+                session_fork_supported,
+                ..
+            } => {
+                self.session_fork_supported = *session_fork_supported;
+                self.available_commands =
+                    available_command_records(&[], self.session_fork_supported);
+                self.touch();
+            }
             UiEvent::SessionStarted { session_id, .. } => {
                 let now = now_rfc3339();
                 if let Some(previous) = self.session_id.as_ref()
@@ -612,6 +772,8 @@ impl TrackerState {
                     self.prompt_in_flight = false;
                     self.pending_permissions.clear();
                     self.session_config.clear();
+                    self.available_commands =
+                        available_command_records(&[], self.session_fork_supported);
                 }
                 self.last_update = Some(now);
             }
@@ -633,19 +795,21 @@ impl TrackerState {
                 self.pending_permissions.clear();
                 self.touch();
             }
+            UiEvent::SessionForkFailed { .. } => {
+                self.prompt_in_flight = false;
+                self.touch();
+            }
             UiEvent::ClaudeUsage(_) => {}
             UiEvent::CancelPendingPermissions => {
                 self.pending_permissions.clear();
                 self.touch();
             }
-            UiEvent::Connected { .. }
-            | UiEvent::PermissionRequest(_)
+            UiEvent::PermissionRequest(_)
             // Elicitation modals are answered locally in the host TUI; the
             // remote viewer is a read-only mirror and has nothing to track.
             | UiEvent::ElicitationRequest(_)
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::Info(_)
-            | UiEvent::SessionForkFailed { .. }
             | UiEvent::Warning(_) => {}
         }
     }
@@ -705,6 +869,14 @@ impl TrackerState {
                 self.agent_message_open = false;
                 self.touch();
             }
+            SessionUpdate::AvailableCommandsUpdate(update) => {
+                self.available_commands = available_command_records(
+                    &update.available_commands,
+                    self.session_fork_supported,
+                );
+                self.agent_message_open = false;
+                self.touch();
+            }
             _ => {
                 self.agent_message_open = false;
                 self.touch();
@@ -742,16 +914,43 @@ impl TrackerState {
     }
 
     fn push_transcript_entry(&mut self, kind: &str, text: String) -> usize {
+        self.push_transcript_entry_at(kind, text, now_rfc3339())
+    }
+
+    fn push_transcript_entry_at(&mut self, kind: &str, text: String, timestamp: String) -> usize {
         let index = self.transcript.len();
         self.transcript.push(TranscriptEntry {
             kind: kind.to_string(),
             text,
-            timestamp: now_rfc3339(),
+            timestamp,
             tool_kind: None,
             tool_title: None,
             tool_body: None,
         });
         index
+    }
+
+    fn push_system_notice(&mut self, text: impl Into<String>) {
+        self.agent_message_open = false;
+        self.prompt_in_flight = false;
+        self.push_transcript_entry("system", text.into());
+        self.touch();
+    }
+
+    fn observe_prompt_text(&mut self, text: String, submitted_at: Option<String>) {
+        let prompt_at = submitted_at.unwrap_or_else(now_rfc3339);
+        self.total_messages = self.total_messages.saturating_add(1);
+        self.agent_message_open = false;
+        self.prompt_in_flight = true;
+        if self
+            .last_prompt_at
+            .as_deref()
+            .is_none_or(|current| prompt_at.as_str() >= current)
+        {
+            self.last_prompt_at = Some(prompt_at.clone());
+        }
+        self.push_transcript_entry_at("user", text, prompt_at);
+        self.touch();
     }
 
     fn push_tool_transcript_entry(
@@ -827,6 +1026,7 @@ impl TrackerState {
             session_id,
             start_time,
             last_update,
+            last_prompt_at: self.last_prompt_at.clone(),
             total_messages: self.total_messages,
             project: self.project.clone(),
             agent: self.agent.clone(),
@@ -834,6 +1034,7 @@ impl TrackerState {
             queued_prompt_count: 0,
             pending_permissions: self.pending_permissions.clone(),
             session_config: self.session_config.clone(),
+            available_commands: self.available_commands.clone(),
         })
     }
 
@@ -1343,15 +1544,39 @@ impl RemoteSessionTracker {
                 let queued = claim_remote_prompt(connection.clone(), &session_id).await;
                 match queued {
                     Ok(Some(prompt)) => {
-                        let command = UiCommand::SendPrompt {
-                            text: prompt.text,
-                            images: Vec::new(),
-                        };
-                        if let Ok(mut guard) = state.lock() {
-                            guard.observe_command(&command);
-                        }
-                        if command_tx.send(command).is_err() {
-                            break;
+                        let can_fork = state
+                            .lock()
+                            .map(|guard| guard.session_fork_supported)
+                            .unwrap_or(false);
+                        let created_at = prompt.created_at;
+                        match remote_queued_prompt_action(prompt.text, can_fork) {
+                            RemoteQueuedPromptAction::ForkSession => {
+                                if command_tx.send(UiCommand::ForkSession).is_err() {
+                                    break;
+                                }
+                            }
+                            RemoteQueuedPromptAction::RejectUnsupportedFork => {
+                                let message =
+                                    "session fork is not supported by this agent".to_string();
+                                if let Some(ui_event_tx) = ui_event_tx.as_ref() {
+                                    let _ = ui_event_tx.send(UiEvent::Warning(message.clone()));
+                                }
+                                if let Ok(mut guard) = state.lock() {
+                                    guard.push_system_notice(message);
+                                }
+                            }
+                            RemoteQueuedPromptAction::SendPrompt(text) => {
+                                let command = UiCommand::SendPrompt {
+                                    text: text.clone(),
+                                    images: Vec::new(),
+                                };
+                                if let Ok(mut guard) = state.lock() {
+                                    guard.observe_prompt_text(text, Some(created_at));
+                                }
+                                if command_tx.send(command).is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
                     Ok(None) => {
@@ -2902,6 +3127,7 @@ fn init_db(db_path: &Path) -> Result<()> {
             name text not null,
             start_time text not null,
             last_update text not null,
+            last_prompt_at text,
             total_messages integer not null,
             project text not null,
             agent text not null,
@@ -2933,12 +3159,18 @@ fn init_db(db_path: &Path) -> Result<()> {
     .context("create remote-control schema")?;
     ensure_sessions_column(&conn, "transcript_json", "text not null default '[]'")?;
     ensure_sessions_column(&conn, "connected", "integer not null default 0")?;
+    ensure_sessions_column(&conn, "last_prompt_at", "text")?;
     ensure_sessions_column(
         &conn,
         "pending_permissions_json",
         "text not null default '[]'",
     )?;
     ensure_sessions_column(&conn, "session_config_json", "text not null default '[]'")?;
+    ensure_sessions_column(
+        &conn,
+        "available_commands_json",
+        "text not null default '[]'",
+    )?;
     Ok(())
 }
 
@@ -2980,6 +3212,9 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
         .context("serialize remote-control pending permissions")?;
     let session_config_json = serde_json::to_string(&session.session_config)
         .context("serialize remote-control session config")?;
+    let available_commands_json = serde_json::to_string(&session.available_commands)
+        .context("serialize remote-control available commands")?;
+    let last_prompt_at = session_last_prompt_at(session);
     // The conflict arm refuses to move `last_update` backwards: every state
     // change touches the timestamp before the snapshot is taken, so a
     // delayed or replayed upload can never overwrite newer session state
@@ -2990,24 +3225,33 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             name,
             start_time,
             last_update,
+            last_prompt_at,
             total_messages,
             project,
             agent,
             transcript_json,
             pending_permissions_json,
             session_config_json,
+            available_commands_json,
             connected
-        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)
         on conflict(session_id) do update set
             name = excluded.name,
             start_time = sessions.start_time,
             last_update = excluded.last_update,
+            last_prompt_at = case
+                when excluded.last_prompt_at is null then sessions.last_prompt_at
+                when sessions.last_prompt_at is null then excluded.last_prompt_at
+                when excluded.last_prompt_at >= sessions.last_prompt_at then excluded.last_prompt_at
+                else sessions.last_prompt_at
+            end,
             total_messages = excluded.total_messages,
             project = excluded.project,
             agent = excluded.agent,
             transcript_json = excluded.transcript_json,
             pending_permissions_json = excluded.pending_permissions_json,
             session_config_json = excluded.session_config_json,
+            available_commands_json = excluded.available_commands_json,
             connected = 1
         where excluded.last_update >= sessions.last_update",
         params![
@@ -3015,12 +3259,14 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             session.name,
             session.start_time,
             session.last_update,
+            last_prompt_at,
             total_messages,
             session.project,
             session.agent,
             transcript_json,
             pending_permissions_json,
             session_config_json,
+            available_commands_json,
         ],
     )
     .context("upsert remote-control session")?;
@@ -3149,27 +3395,32 @@ fn load_session_records(db_path: &Path) -> Result<Vec<SessionRecord>> {
                 name,
                 start_time,
                 last_update,
+                last_prompt_at,
                 total_messages,
                 project,
                 agent,
                 transcript_json,
                 pending_permissions_json,
                 session_config_json,
+                available_commands_json,
                 (
                     select count(*)
                     from queued_prompts
                     where queued_prompts.session_id = sessions.session_id
                 ) as queued_prompt_count
             from sessions
-            order by last_update desc, session_id asc",
+            order by session_id asc",
         )
         .context("prepare session query")?;
     let rows = stmt
         .query_map([], session_record_from_row)
         .context("query sessions")?;
 
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("collect sessions")
+    let mut sessions = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("collect sessions")?;
+    sort_session_records(&mut sessions);
+    Ok(sessions)
 }
 
 fn load_connected_session_records(db_path: &Path, cutoff: &str) -> Result<Vec<SessionRecord>> {
@@ -3182,12 +3433,14 @@ fn load_connected_session_records(db_path: &Path, cutoff: &str) -> Result<Vec<Se
                 name,
                 start_time,
                 last_update,
+                last_prompt_at,
                 total_messages,
                 project,
                 agent,
                 transcript_json,
                 pending_permissions_json,
                 session_config_json,
+                available_commands_json,
                 (
                     select count(*)
                     from queued_prompts
@@ -3195,39 +3448,83 @@ fn load_connected_session_records(db_path: &Path, cutoff: &str) -> Result<Vec<Se
                 ) as queued_prompt_count
             from sessions
             where connected = 1 and last_update >= ?1
-            order by last_update desc, session_id asc",
+            order by session_id asc",
         )
         .context("prepare connected session query")?;
     let rows = stmt
         .query_map(params![cutoff], session_record_from_row)
         .context("query connected sessions")?;
 
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("collect connected sessions")
+    let mut sessions = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("collect connected sessions")?;
+    sort_session_records(&mut sessions);
+    Ok(sessions)
 }
 
 fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
-    let total_messages: i64 = row.get(4)?;
-    let transcript_json: String = row.get(7)?;
-    let pending_permissions_json: String = row.get(8)?;
-    let session_config_json: String = row.get(9)?;
-    let queued_prompt_count: i64 = row.get(10)?;
-    let transcript = serde_json::from_str(&transcript_json).unwrap_or_default();
+    let total_messages: i64 = row.get(5)?;
+    let transcript_json: String = row.get(8)?;
+    let pending_permissions_json: String = row.get(9)?;
+    let session_config_json: String = row.get(10)?;
+    let available_commands_json: String = row.get(11)?;
+    let queued_prompt_count: i64 = row.get(12)?;
+    let transcript: Vec<TranscriptEntry> =
+        serde_json::from_str(&transcript_json).unwrap_or_default();
     let pending_permissions = serde_json::from_str(&pending_permissions_json).unwrap_or_default();
     let session_config = serde_json::from_str(&session_config_json).unwrap_or_default();
+    let available_commands = serde_json::from_str(&available_commands_json).unwrap_or_default();
+    let last_prompt_at: Option<String> = row
+        .get::<_, Option<String>>(4)?
+        .filter(|value| !value.is_empty())
+        .or_else(|| last_prompt_at_from_transcript(&transcript));
     Ok(SessionRecord {
         session_id: row.get(0)?,
         name: row.get(1)?,
         start_time: row.get(2)?,
         last_update: row.get(3)?,
+        last_prompt_at,
         total_messages: u64::try_from(total_messages).unwrap_or(0),
-        project: row.get(5)?,
-        agent: row.get(6)?,
+        project: row.get(6)?,
+        agent: row.get(7)?,
         transcript,
         queued_prompt_count: u64::try_from(queued_prompt_count).unwrap_or(0),
         pending_permissions,
         session_config,
+        available_commands,
     })
+}
+
+fn sort_session_records(sessions: &mut [SessionRecord]) {
+    sessions.sort_by(|a, b| {
+        session_prompt_sort_time(b)
+            .cmp(session_prompt_sort_time(a))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+}
+
+fn session_prompt_sort_time(session: &SessionRecord) -> &str {
+    session
+        .last_prompt_at
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&session.start_time)
+}
+
+fn session_last_prompt_at(session: &SessionRecord) -> Option<String> {
+    session
+        .last_prompt_at
+        .clone()
+        .filter(|value| !value.is_empty())
+        .or_else(|| last_prompt_at_from_transcript(&session.transcript))
+}
+
+fn last_prompt_at_from_transcript(transcript: &[TranscriptEntry]) -> Option<String> {
+    transcript
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == "user" && !entry.timestamp.is_empty())
+        .map(|entry| entry.timestamp.clone())
 }
 
 fn load_queued_prompts(db_path: &Path, session_id: &str) -> Result<Vec<QueuedPrompt>> {
@@ -3257,13 +3554,26 @@ fn load_queued_prompts(db_path: &Path, session_id: &str) -> Result<Vec<QueuedPro
 
 fn queue_prompt_record(db_path: &Path, session_id: &str, text: &str) -> Result<()> {
     init_db(db_path)?;
-    let conn = open_db(db_path)?;
-    conn.execute(
+    let mut conn = open_db(db_path)?;
+    let created_at = now_rfc3339();
+    let tx = conn
+        .transaction()
+        .context("begin queued-prompt transaction")?;
+    tx.execute(
         "insert into queued_prompts (session_id, text, created_at)
         values (?1, ?2, ?3)",
-        params![session_id, text, now_rfc3339()],
+        params![session_id, text, &created_at],
     )
     .context("insert queued prompt")?;
+    tx.execute(
+        "update sessions
+        set last_prompt_at = ?2
+        where session_id = ?1
+            and (last_prompt_at is null or ?2 >= last_prompt_at)",
+        params![session_id, &created_at],
+    )
+    .context("touch session prompt recency")?;
+    tx.commit().context("commit queued-prompt transaction")?;
     Ok(())
 }
 
@@ -3671,9 +3981,10 @@ fn rfc3339_before(age: Duration) -> String {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        PermissionOption, SessionConfigSelect, SessionConfigSelectOption, Terminal,
-        TerminalExitStatus, TerminalId, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
-        ToolCallUpdateFields,
+        AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, PermissionOption,
+        SessionConfigSelect, SessionConfigSelectOption, Terminal, TerminalExitStatus, TerminalId,
+        ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        UnstructuredCommandInput,
     };
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
@@ -4110,6 +4421,7 @@ mod tests {
             name: "demo".to_string(),
             start_time: "2026-06-03T10:00:00Z".to_string(),
             last_update: "2026-06-03T10:00:20Z".to_string(),
+            last_prompt_at: None,
             total_messages: 4,
             project: "mjolnir".to_string(),
             agent: "anvil".to_string(),
@@ -4134,6 +4446,12 @@ mod tests {
             queued_prompt_count: 0,
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
+            available_commands: vec![command_record(
+                "review",
+                "review the workspace",
+                Some("scope".to_string()),
+                "agent",
+            )],
         };
 
         upsert_session_record(&db_path, &session).expect("insert");
@@ -4171,11 +4489,16 @@ mod tests {
         assert_eq!(sessions[0].total_messages, 6);
         assert_eq!(sessions[0].start_time, "2026-06-03T10:00:00Z");
         assert_eq!(sessions[0].last_update, "2026-06-03T10:00:40Z");
+        assert_eq!(
+            sessions[0].last_prompt_at.as_deref(),
+            Some("2026-06-03T10:00:05Z")
+        );
         assert_eq!(sessions[0].transcript.len(), 2);
         assert_eq!(sessions[0].transcript[0].kind, "user");
         assert_eq!(sessions[0].transcript[0].text, "hello");
         assert_eq!(sessions[0].transcript[1].kind, "agent");
         assert_eq!(sessions[0].transcript[1].text, "hi there");
+        assert_eq!(sessions[0].available_commands, session.available_commands);
     }
 
     #[test]
@@ -4188,6 +4511,7 @@ mod tests {
             name: "active".to_string(),
             start_time: fresh.clone(),
             last_update: fresh.clone(),
+            last_prompt_at: None,
             total_messages: 1,
             project: "mjolnir".to_string(),
             agent: "agent".to_string(),
@@ -4195,6 +4519,7 @@ mod tests {
             queued_prompt_count: 0,
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
+            available_commands: Vec::new(),
         };
         let disconnected = SessionRecord {
             session_id: "sess-disconnected".to_string(),
@@ -4222,6 +4547,159 @@ mod tests {
 
         let all = load_session_records(&db_path).expect("load all");
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn session_listing_orders_by_prompt_recency_not_heartbeat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sessions.sqlite3");
+
+        let heartbeat_recent = SessionRecord {
+            last_update: "2026-06-10T10:03:00Z".to_string(),
+            last_prompt_at: Some("2026-06-10T10:00:00Z".to_string()),
+            ..session_named("sess-heartbeat", "2026-06-10T10:03:00Z")
+        };
+        let prompted_recent = SessionRecord {
+            last_update: "2026-06-10T10:01:00Z".to_string(),
+            last_prompt_at: Some("2026-06-10T10:02:00Z".to_string()),
+            ..session_named("sess-prompted", "2026-06-10T10:01:00Z")
+        };
+        let needs_approval = SessionRecord {
+            last_update: "2026-06-10T09:59:00Z".to_string(),
+            last_prompt_at: Some("2026-06-10T09:59:00Z".to_string()),
+            pending_permissions: vec![PendingPermissionRecord {
+                request_id: "call-1".to_string(),
+                title: "run command".to_string(),
+                options: Vec::new(),
+                requested_at: "2026-06-10T09:59:30Z".to_string(),
+            }],
+            ..session_named("sess-approval", "2026-06-10T09:59:00Z")
+        };
+
+        upsert_session_record(&db_path, &heartbeat_recent).expect("heartbeat recent");
+        upsert_session_record(&db_path, &prompted_recent).expect("prompted recent");
+        upsert_session_record(&db_path, &needs_approval).expect("approval");
+
+        let sessions = load_session_records(&db_path).expect("load");
+        let ids: Vec<_> = sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["sess-prompted", "sess-heartbeat", "sess-approval"]
+        );
+    }
+
+    #[test]
+    fn queued_prompt_updates_session_prompt_recency_for_ordering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sessions.sqlite3");
+
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                last_prompt_at: Some("2026-06-10T10:00:00Z".to_string()),
+                ..session_named("sess-first", "2026-06-10T10:05:00Z")
+            },
+        )
+        .expect("first");
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                last_prompt_at: Some("2026-06-10T10:04:00Z".to_string()),
+                ..session_named("sess-second", "2026-06-10T10:04:00Z")
+            },
+        )
+        .expect("second");
+
+        queue_prompt_record(&db_path, "sess-first", "new work").expect("queue prompt");
+
+        let sessions = load_session_records(&db_path).expect("load");
+        assert_eq!(sessions[0].session_id, "sess-first");
+        assert!(
+            sessions[0].last_prompt_at.as_deref() > Some("2026-06-10T10:04:00Z"),
+            "queued prompt should update prompt recency: {:?}",
+            sessions[0].last_prompt_at
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_clobber_queued_prompt_recency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sessions.sqlite3");
+
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                last_prompt_at: Some("2026-06-10T10:00:00Z".to_string()),
+                ..session_named("sess-race", "2026-06-10T10:00:01Z")
+            },
+        )
+        .expect("insert session");
+
+        queue_prompt_record(&db_path, "sess-race", "remote prompt").expect("queue prompt");
+        let queued_prompt_at = load_session_records(&db_path).expect("load after queue")[0]
+            .last_prompt_at
+            .clone();
+        assert!(queued_prompt_at.as_deref() > Some("2026-06-10T10:00:00Z"));
+
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                last_update: "2026-06-10T10:00:02Z".to_string(),
+                last_prompt_at: Some("2026-06-10T09:59:00Z".to_string()),
+                ..session_named("sess-race", "2026-06-10T10:00:02Z")
+            },
+        )
+        .expect("stale prompted heartbeat");
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                last_update: "2026-06-10T10:00:03Z".to_string(),
+                last_prompt_at: None,
+                ..session_named("sess-race", "2026-06-10T10:00:03Z")
+            },
+        )
+        .expect("absent prompted heartbeat");
+
+        let loaded = load_session_records(&db_path).expect("reload");
+        assert_eq!(loaded[0].last_prompt_at, queued_prompt_at);
+    }
+
+    #[test]
+    fn session_listing_falls_back_to_start_time_when_never_prompted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sessions.sqlite3");
+
+        let older_started_recent_heartbeat = SessionRecord {
+            start_time: "2026-06-10T10:00:00Z".to_string(),
+            last_update: "2026-06-10T10:05:00Z".to_string(),
+            ..session_named("sess-older", "2026-06-10T10:05:00Z")
+        };
+        let newer_started_old_heartbeat = SessionRecord {
+            start_time: "2026-06-10T10:02:00Z".to_string(),
+            last_update: "2026-06-10T10:03:00Z".to_string(),
+            ..session_named("sess-newer", "2026-06-10T10:03:00Z")
+        };
+
+        upsert_session_record(&db_path, &older_started_recent_heartbeat).expect("older");
+        upsert_session_record(&db_path, &newer_started_old_heartbeat).expect("newer");
+
+        let sessions = load_session_records(&db_path).expect("load");
+        let ids: Vec<_> = sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["sess-newer", "sess-older"]);
+
+        let connected = load_connected_session_records(&db_path, "1970-01-01T00:00:00Z")
+            .expect("load connected");
+        let connected_ids: Vec<_> = connected
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(connected_ids, ids);
     }
 
     #[test]
@@ -4262,6 +4740,26 @@ mod tests {
         assert_eq!(other[0].text, "other");
     }
 
+    #[test]
+    fn remote_queued_prompt_action_routes_fork_commands() {
+        assert_eq!(
+            remote_queued_prompt_action("/fork".to_string(), true),
+            RemoteQueuedPromptAction::ForkSession
+        );
+        assert_eq!(
+            remote_queued_prompt_action(" /fork ".to_string(), false),
+            RemoteQueuedPromptAction::RejectUnsupportedFork
+        );
+        assert_eq!(
+            remote_queued_prompt_action("/fork later".to_string(), true),
+            RemoteQueuedPromptAction::SendPrompt("/fork later".to_string())
+        );
+        assert_eq!(
+            remote_queued_prompt_action("hello".to_string(), true),
+            RemoteQueuedPromptAction::SendPrompt("hello".to_string())
+        );
+    }
+
     /// Insert a queue row with an explicit `created_at`, bypassing the
     /// public helpers that always stamp "now".
     fn insert_decision_at(db_path: &Path, session_id: &str, created_at: &str) {
@@ -4280,6 +4778,7 @@ mod tests {
             name: session_id.to_string(),
             start_time: "2026-06-10T08:00:00Z".to_string(),
             last_update: last_update.to_string(),
+            last_prompt_at: None,
             total_messages: 1,
             project: "proj".to_string(),
             agent: "agent".to_string(),
@@ -4287,6 +4786,7 @@ mod tests {
             queued_prompt_count: 0,
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
+            available_commands: Vec::new(),
         }
     }
 
@@ -4521,6 +5021,130 @@ mod tests {
     }
 
     #[test]
+    fn tracker_publishes_remote_command_catalog() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::Connected {
+            agent_name: Some("agent".to_string()),
+            agent_version: None,
+            prompt_images_supported: false,
+            session_fork_supported: true,
+        });
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.observe_event(&UiEvent::SessionUpdate(
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                AvailableCommand::new("new", "agent new should be hidden"),
+                AvailableCommand::new("fork ", "agent fork should be hidden"),
+                AvailableCommand::new("New", "agent case variant should be hidden"),
+                AvailableCommand::new("", "empty should be hidden"),
+                AvailableCommand::new("review", "review the workspace").input(
+                    AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("scope")),
+                ),
+                AvailableCommand::new(" review ", "duplicate review should be hidden"),
+            ])),
+        ));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        let names: Vec<&str> = snapshot
+            .available_commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["new", "export", "mjconfig", "fork", "review"]);
+        assert_eq!(snapshot.available_commands[0].source, "mjolnir");
+        assert_eq!(snapshot.available_commands[4].source, "agent");
+        assert_eq!(
+            snapshot.available_commands[4].input_hint.as_deref(),
+            Some("scope")
+        );
+    }
+
+    #[test]
+    fn tracker_resets_remote_command_catalog_on_session_start() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::Connected {
+            agent_name: Some("agent".to_string()),
+            agent_version: None,
+            prompt_images_supported: false,
+            session_fork_supported: true,
+        });
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.observe_event(&UiEvent::SessionUpdate(
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                AvailableCommand::new("review", "review the workspace"),
+            ])),
+        ));
+        assert!(
+            state
+                .snapshot()
+                .expect("snapshot")
+                .available_commands
+                .iter()
+                .any(|command| command.name == "review")
+        );
+
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: true,
+        });
+        let same_session_names: Vec<String> = state
+            .snapshot()
+            .expect("same session snapshot")
+            .available_commands
+            .iter()
+            .map(|command| command.name.clone())
+            .collect();
+        assert_eq!(
+            same_session_names,
+            vec!["new", "export", "mjconfig", "fork"]
+        );
+
+        state.observe_event(&UiEvent::SessionUpdate(
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                AvailableCommand::new("review", "review the workspace"),
+            ])),
+        ));
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-2".to_string(),
+            resumed: false,
+        });
+        let new_session_names: Vec<String> = state
+            .snapshot()
+            .expect("new session snapshot")
+            .available_commands
+            .iter()
+            .map(|command| command.name.clone())
+            .collect();
+        assert_eq!(new_session_names, vec!["new", "export", "mjconfig", "fork"]);
+    }
+
+    #[test]
+    fn tracker_records_unsupported_remote_fork_notice() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.prompt_in_flight = true;
+
+        state.push_system_notice("session fork is not supported by this agent");
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert!(!state.prompt_in_flight);
+        assert_eq!(snapshot.transcript.len(), 1);
+        assert_eq!(snapshot.transcript[0].kind, "system");
+        assert_eq!(
+            snapshot.transcript[0].text,
+            "session fork is not supported by this agent"
+        );
+    }
+
+    #[test]
     fn tracker_queues_previous_session_for_disconnect_on_session_change() {
         let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
 
@@ -4698,6 +5322,7 @@ mod tests {
             name: "demo".to_string(),
             start_time: "2026-06-10T10:00:00Z".to_string(),
             last_update: "2026-06-10T10:00:20Z".to_string(),
+            last_prompt_at: None,
             total_messages: 1,
             project: "mjolnir".to_string(),
             agent: "anvil".to_string(),
@@ -4705,6 +5330,7 @@ mod tests {
             queued_prompt_count: 0,
             pending_permissions: vec![pending.clone()],
             session_config: Vec::new(),
+            available_commands: Vec::new(),
         };
 
         upsert_session_record(&db_path, &session).expect("insert");
@@ -5746,6 +6372,7 @@ mod tests {
             name: "demo".to_string(),
             start_time: record_time.clone(),
             last_update: record_time,
+            last_prompt_at: None,
             total_messages: 1,
             project: "proj".to_string(),
             agent: "agent".to_string(),
@@ -5753,6 +6380,7 @@ mod tests {
             queued_prompt_count: 0,
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
+            available_commands: Vec::new(),
         };
 
         // Without the bearer token the write is rejected.
