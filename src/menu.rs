@@ -64,7 +64,11 @@ pub fn select_inline(
     // Erase the menu block whether selection succeeded or failed, so the
     // scrollback is left clean for the caller's outcome line.
     let height = options.len() as u16 + 2;
-    let _ = queue!(out, cursor::MoveUp(height), Clear(ClearType::FromCursorDown));
+    let _ = queue!(
+        out,
+        cursor::MoveUp(height),
+        Clear(ClearType::FromCursorDown)
+    );
     let _ = out.flush();
 
     result.map(Some)
