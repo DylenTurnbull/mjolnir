@@ -1624,7 +1624,7 @@
         overflow-wrap: anywhere;
       }
 
-      /* control strip: inline settings · queue status · Queue key */
+      /* control strip: inline settings · queue status · Stop/Queue keys */
       .console-strip {
         display: flex;
         flex-wrap: wrap;
@@ -2021,7 +2021,6 @@
           </div>
           <span id="approval-badge" class="approval-badge" hidden>needs approval</span>
           <span id="working-badge" class="working-badge" hidden>working</span>
-          <button id="stop-turn" class="stop-turn" type="button" hidden>Stop</button>
         </header>
         <div class="transcript-wrap">
           <div id="transcript" role="log" aria-label="Session transcript"></div>
@@ -2037,6 +2036,7 @@
             <div class="console-strip">
               <div id="session-config" class="config-strip"></div>
               <span id="queue-status" class="queue-meta">Select a session.</span>
+              <button id="stop-turn" class="stop-turn" type="button" hidden>Stop</button>
               <button id="queue-submit" class="primary" type="button">Queue</button>
             </div>
           </div>
