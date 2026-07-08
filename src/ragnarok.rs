@@ -515,6 +515,7 @@ async fn battle(
     };
     register_camp(&camps, &thor_camp);
     let mut thor = Thor::summon(thor_host, thor_camp, abort.clone()).await?;
+    let battle_result: Result<()> = async {
     emit(tx, RagnarokEvent::ThorAction(ThorAction::Deciding))?;
     let route = thor.route(&cfg.task, tx).await?;
     let cap = user_cfg.ragnarok.max_competitors;
@@ -796,7 +797,6 @@ async fn battle(
     let verdict = thor
         .judge(&dossier, &survivor_ids, &review_judges, tx)
         .await;
-    thor.dismiss().await;
     let verdict = match verdict {
         Ok(v) => v,
         Err(e) => {
@@ -831,6 +831,10 @@ async fn battle(
     }
     emit(tx, RagnarokEvent::Verdict(Box::new(verdict)))?;
     Ok(())
+    }
+    .await;
+    thor.dismiss().await;
+    battle_result
 }
 
 /// Deterministic fallback when Thor cannot deliver a parseable judgment:
