@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use qrcode::QrCode;
-use qrcode::types::Color;
+use qrcode::types::{Color, EcLevel};
 
 /// Render `data` as a half-block QR code string. Each line is terminated by
 /// `\n`; callers that need individual rows can split on it. The four-module
@@ -12,7 +12,8 @@ use qrcode::types::Color;
 pub fn render_qr(data: &str) -> Result<String> {
     const QUIET_ZONE_MODULES: usize = 4;
 
-    let qr = QrCode::new(data.as_bytes()).context("encode QR code")?;
+    let qr = QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L)
+        .context("encode QR code")?;
     let mut output = String::new();
     let qr_width = qr.width();
     let total_width = qr_width + QUIET_ZONE_MODULES * 2;

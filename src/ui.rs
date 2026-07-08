@@ -96,16 +96,17 @@ pub struct HeaderLabels {
     pub session_title: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TerminalRequest {
     None,
     ToggleTextSelectionMode,
     StartDictation,
     StopDictation,
     ForceInlineRepair,
+    CopyText(String),
 }
 
-fn terminal_request_forces_inline_repair(request: TerminalRequest) -> bool {
+fn terminal_request_forces_inline_repair(request: &TerminalRequest) -> bool {
     matches!(request, TerminalRequest::ForceInlineRepair)
 }
 
@@ -630,7 +631,7 @@ async fn ui_loop(
                             )?;
                         }
                         if mode == UiMode::InlineChat
-                            && terminal_request_forces_inline_repair(request)
+                            && terminal_request_forces_inline_repair(&request)
                         {
                             force_soft_inline_repair = true;
                         }
@@ -1473,6 +1474,15 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
             .saturating_sub(1)
             .max(INLINE_CHAT_HEIGHT);
     }
+    // URL setup steps contain OAuth links plus QR codes. The QR must keep its
+    // aspect ratio and quiet zone, so let this view use the full inline pane
+    // instead of the generic compact overlay cap.
+    if matches!(state.elicitation_view(), Some(ElicitationView::Url { .. })) {
+        return terminal_size
+            .height
+            .saturating_sub(1)
+            .max(INLINE_CHAT_HEIGHT);
+    }
     // The Ragnarok arena also takes the whole terminal; battles deserve a
     // stage. Pending permission/elicitation prompts still win (above rule
     // does not apply — they render inside the arena-sized viewport fine).
@@ -2013,6 +2023,10 @@ fn apply_terminal_request(
             Ok(())
         }
         TerminalRequest::ForceInlineRepair => Ok(()),
+        TerminalRequest::CopyText(text) => {
+            copy_text_to_clipboard(state, &text, Some("URL"));
+            Ok(())
+        }
     }
 }
 
@@ -2818,22 +2832,19 @@ fn normalize_paste(text: &str) -> String {
     normalized
 }
 
-/// Copy the text of the most recent agent message to the system clipboard.
-/// Records a system message so the user knows whether it worked.
-fn copy_last_agent_message(state: &mut AppState) {
-    let Some(text) = state.last_agent_message() else {
-        state.record_status_message(StatusKind::Warning, "no agent message to copy");
-        return;
-    };
-
-    match copy_to_clipboard(&text) {
+/// Copy arbitrary text to the system clipboard and surface the result.
+fn copy_text_to_clipboard(state: &mut AppState, text: &str, label: Option<&str>) {
+    match copy_to_clipboard(text) {
         Ok(lease) => {
             let preview_len = text.chars().count().min(60);
             let preview: String = text.chars().take(preview_len).collect();
             let suffix = if text.chars().count() > 60 { "…" } else { "" };
+            let copied = label
+                .map(|label| format!("copied {label} to clipboard"))
+                .unwrap_or_else(|| "copied to clipboard".to_string());
             state.record_status_message(
                 StatusKind::Info,
-                format!("copied to clipboard: \"{preview}{suffix}\""),
+                format!("{copied}: \"{preview}{suffix}\""),
             );
             // Store the lease to keep the clipboard handle alive on Linux/X11
             state.clipboard_lease = lease;
@@ -2842,6 +2853,17 @@ fn copy_last_agent_message(state: &mut AppState) {
             state.record_status_message(StatusKind::Warning, format!("clipboard error: {e}"));
         }
     }
+}
+
+/// Copy the text of the most recent agent message to the system clipboard.
+/// Records a system message so the user knows whether it worked.
+fn copy_last_agent_message(state: &mut AppState) {
+    let Some(text) = state.last_agent_message() else {
+        state.record_status_message(StatusKind::Warning, "no agent message to copy");
+        return;
+    };
+
+    copy_text_to_clipboard(state, &text, None);
 }
 
 /// `Home` jumps to the oldest line. `usize::MAX` is clamped by
@@ -3680,13 +3702,13 @@ fn handle_permission_key(state: &mut AppState, code: KeyCode, mode: UiMode) -> T
 /// for an unsupported shape); Esc dismisses (cancel for supported views,
 /// `decline` for the unsupported info modal).
 fn handle_elicitation_key(state: &mut AppState, code: KeyCode, mode: UiMode) -> TerminalRequest {
-    if !state.has_pending_elicitation() {
+    let Some(view) = state.elicitation_view() else {
         return TerminalRequest::None;
-    }
+    };
     // A free-text field captures typed characters first -- including `j`/`k`,
     // which are option-navigation keys for single-select views. Editing is
     // append/backspace at the end of the buffer.
-    if matches!(state.elicitation_view(), Some(ElicitationView::Text { .. })) {
+    if matches!(view, ElicitationView::Text { .. }) {
         match code {
             KeyCode::Char(c) => {
                 if let Some(pending) = state.pending_elicitation_mut() {
@@ -3731,6 +3753,11 @@ fn handle_elicitation_key(state: &mut AppState, code: KeyCode, mode: UiMode) -> 
         KeyCode::End => {
             if let Some(pending) = state.pending_elicitation_mut() {
                 pending.scroll_offset = Some(usize::MAX);
+            }
+        }
+        KeyCode::Char('c') if matches!(view, ElicitationView::Url { .. }) => {
+            if let ElicitationView::Url { url } = view {
+                return TerminalRequest::CopyText(url);
             }
         }
         // No-op for URL / unsupported views (they have no selectable options).
@@ -6683,19 +6710,41 @@ fn elicitation_view_lines(
         }
         ElicitationView::Url { url } => {
             lines.push(Line::from(""));
-            lines.extend(
-                wrap_text_to_width(&url, width)
-                    .into_iter()
-                    .map(|line| Line::from(Span::styled(line, Style::default().fg(theme.accent)))),
-            );
+            let label = "URL (press c to copy): ";
+            if label.width() + url.width() <= usize::from(width) {
+                lines.push(Line::from(vec![
+                    Span::styled(label, Style::default().fg(theme.muted)),
+                    Span::styled(url.clone(), Style::default().fg(theme.accent)),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    label.trim_end().to_string(),
+                    Style::default().fg(theme.muted),
+                )));
+                lines.extend(
+                    wrap_text_to_width(&url, width).into_iter().map(|line| {
+                        Line::from(Span::styled(line, Style::default().fg(theme.accent)))
+                    }),
+                );
+            }
             lines.push(Line::from(""));
             match crate::qr::render_qr(&url) {
-                Ok(qr) => lines.extend(qr.lines().map(|line| {
-                    Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(theme.text),
-                    ))
-                })),
+                Ok(qr) => {
+                    let qr_width = qr.lines().map(|line| line.width()).max().unwrap_or(0);
+                    if qr_width <= usize::from(width) {
+                        lines.extend(qr.lines().map(|line| {
+                            Line::from(Span::styled(
+                                line.to_string(),
+                                Style::default().fg(theme.text),
+                            ))
+                        }));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            "(terminal too narrow for QR; press c to copy URL)".to_string(),
+                            Style::default().fg(theme.muted),
+                        )));
+                    }
+                }
                 Err(_) => lines.push(Line::from(Span::styled(
                     "(could not render QR code; use the URL above)".to_string(),
                     Style::default().fg(theme.muted),
@@ -6749,7 +6798,9 @@ fn elicitation_view_lines(
 fn elicitation_footer_text(view: &ElicitationView) -> &'static str {
     match view {
         ElicitationView::SingleSelect { .. } => "Up/Down choose | Enter confirm | Esc cancel",
-        ElicitationView::Url { .. } => "Enter acknowledge | PgUp/PgDn scroll | Esc cancel",
+        ElicitationView::Url { .. } => {
+            "c copy URL | Enter acknowledge | PgUp/PgDn scroll | Esc cancel"
+        }
         ElicitationView::Text { .. } => "Type value | Backspace delete | Enter submit | Esc cancel",
         ElicitationView::Unsupported => "Enter / Esc to skip",
     }
@@ -6774,7 +6825,9 @@ fn elicitation_content_width_hint(view: &ElicitationView, message: &str) -> usiz
                 .ok()
                 .and_then(|qr| qr.lines().map(|line| line.chars().count()).max())
                 .unwrap_or(0);
-            message_width.max(url.width()).max(qr_width)
+            message_width
+                .max(format!("URL (press c to copy): {url}").width())
+                .max(qr_width)
         }
         ElicitationView::Text {
             title, description, ..
@@ -6916,12 +6969,24 @@ fn draw_inline_elicitation_view(
         return;
     }
 
+    let view = classify_elicitation(&pending.prompt);
+    let content_width = if matches!(view, ElicitationView::Url { .. }) {
+        elicitation_content_width_hint(&view, &pending.prompt.message)
+            .max(elicitation_footer_text(&view).width())
+            .min(content.width as usize) as u16
+    } else {
+        content.width
+    };
+    let x = content
+        .x
+        .saturating_add((content.width.saturating_sub(content_width)) / 2);
+    let content = Rect::new(x, content.y, content_width, content.height);
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(content);
 
-    let view = classify_elicitation(&pending.prompt);
     let content_lines = elicitation_view_lines(pending, queue_len, content.width, theme);
     let visible_lines =
         elicitation_visible_window(&content_lines, pending.scroll_offset, layout[0].height);
@@ -9302,13 +9367,17 @@ mod tests {
     }
 
     fn url_elicitation_prompt() -> ElicitationPrompt {
+        url_elicitation_prompt_with_url("https://example.com/oauth/authorize?client_id=abc")
+    }
+
+    fn url_elicitation_prompt_with_url(url: &str) -> ElicitationPrompt {
         let (responder, _rx) = tokio::sync::oneshot::channel();
         ElicitationPrompt {
             message: "Open this URL to sign in".to_string(),
             mode: ElicitationMode::from(ElicitationUrlMode::new(
                 ElicitationSessionScope::new("setup".to_string()),
                 ElicitationId::new("login-1"),
-                "https://example.com/oauth/authorize?client_id=abc",
+                url,
             )),
             responder,
         }
@@ -9417,6 +9486,65 @@ mod tests {
 
         let pending = state.pending_elicitation().expect("pending elicitation");
         assert_eq!(pending.selected, 1);
+    }
+
+    #[test]
+    fn url_elicitation_copies_url_on_c() {
+        let mut state = AppState::new();
+        let url = "https://example.com/oauth/authorize?client_id=abc";
+        state.apply_event(UiEvent::ElicitationRequest(
+            url_elicitation_prompt_with_url(url),
+        ));
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        let request = handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('c')));
+
+        assert_eq!(request, TerminalRequest::CopyText(url.to_string()));
+        assert!(
+            state.has_pending_elicitation(),
+            "copy must not dismiss login prompt"
+        );
+    }
+
+    #[test]
+    fn inline_url_elicitation_uses_full_height_and_preserves_qr_width() {
+        let mut state = AppState::new();
+        let url = "https://auth.openai.com/oauth/authorize?client_id=codex_cli&scope=openid%20profile%20email&code_challenge=abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789&state=abcdefghijklmnopqrstuvwxyz0123456789";
+        state.apply_event(UiEvent::ElicitationRequest(
+            url_elicitation_prompt_with_url(url),
+        ));
+        let terminal_size = Size {
+            width: 140,
+            height: 50,
+        };
+
+        let desired = desired_inline_height(&state, terminal_size);
+        assert_eq!(desired, terminal_size.height - 1);
+        assert!(desired > INLINE_EXPANDED_MAX_HEIGHT);
+
+        let qr_width = crate::qr::render_qr(url)
+            .expect("qr")
+            .lines()
+            .map(|line| line.width())
+            .max()
+            .expect("qr lines");
+        assert!(qr_width <= usize::from(terminal_size.width - 2));
+
+        let backend = TestBackend::new(terminal_size.width, desired);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_inline_chat(frame, &mut state))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(
+            rendered.contains("press c to copy"),
+            "rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains('█') || rendered.contains('▀') || rendered.contains('▄'),
+            "QR should render in the inline URL view; rendered:\n{rendered}"
+        );
     }
 
     fn text_elicitation_prompt() -> ElicitationPrompt {
@@ -9647,10 +9775,10 @@ mod tests {
     #[test]
     fn force_inline_repair_requests_one_soft_repair() {
         assert!(terminal_request_forces_inline_repair(
-            TerminalRequest::ForceInlineRepair
+            &TerminalRequest::ForceInlineRepair
         ));
         assert!(!terminal_request_forces_inline_repair(
-            TerminalRequest::None
+            &TerminalRequest::None
         ));
     }
 
@@ -11550,7 +11678,7 @@ mod tests {
         assert!(!state.transcript_viewer);
         assert_eq!(state.scroll_offset, 0);
         assert!(
-            terminal_request_forces_inline_repair(request),
+            terminal_request_forces_inline_repair(&request),
             "closing the reader must repair the shrunken inline viewport"
         );
     }
