@@ -92,6 +92,13 @@ fn create_for_project_cwd(project_root: &Path, cwd: &Path) -> Result<CreatedWork
     })
 }
 
+/// Create a fresh randomly-named linked worktree without prompting and without
+/// touching `.gitignore` (server-owned sessions are non-interactive).
+pub fn create_noninteractive(cwd: &Path) -> Result<CreatedWorktree> {
+    let project_root = git_toplevel(cwd)?;
+    create_for_project_cwd(&project_root, cwd)
+}
+
 /// Create a linked worktree for an automated flow (Ragnarok fighters).
 /// Never prompts and never touches `.gitignore`; the caller owns any user
 /// messaging. `name_hint` seeds the directory name and is sanitized and
@@ -460,7 +467,7 @@ fn prompt_to_ignore_worktrees(
     Ok(())
 }
 
-fn git_toplevel(cwd: &Path) -> Result<PathBuf> {
+pub(crate) fn git_toplevel(cwd: &Path) -> Result<PathBuf> {
     let output = Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -469,7 +476,7 @@ fn git_toplevel(cwd: &Path) -> Result<PathBuf> {
         .with_context(|| format!("run git rev-parse in {}", cwd.display()))?;
     if !output.status.success() {
         bail!(
-            "--worktree requires a Git worktree; git rev-parse failed in {}: {}",
+            "not inside a Git repository; git rev-parse failed in {}: {}",
             cwd.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -834,6 +841,31 @@ mod tests {
         );
         // No prompting means the parent checkout's .gitignore is untouched.
         assert!(!dir.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn create_noninteractive_creates_random_worktree_without_touching_gitignore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("file.txt"), "hello").expect("write file");
+        run_git(dir.path(), [OsStr::new("add"), OsStr::new(".")]).expect("git add");
+        commit_all(dir.path());
+
+        let created = create_noninteractive(dir.path()).expect("create");
+        assert!(created.was_created);
+        assert!(created.session_cwd.is_dir());
+        assert!(created.session_cwd.join("file.txt").exists());
+        let repo_root = dir.path().canonicalize().expect("canonicalize");
+        let worktree_root = created.worktree_root.canonicalize().expect("canonicalize");
+        assert!(worktree_root.starts_with(repo_root.join(".mjolnir").join("worktrees")));
+        assert!(!dir.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn create_noninteractive_fails_outside_git_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = create_noninteractive(dir.path()).expect_err("should fail");
+        assert!(err.to_string().contains("not inside a Git repository"));
     }
 
     #[test]

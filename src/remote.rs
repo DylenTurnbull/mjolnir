@@ -129,6 +129,10 @@ pub struct SessionRecord {
     pub last_prompt_at: Option<String>,
     pub total_messages: u64,
     pub project: String,
+    /// Short name of the Mjolnir worktree the session runs in (e.g.
+    /// `bold-fox`), when it runs under `<project>/.mjolnir/worktrees/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
     pub agent: String,
     #[serde(default)]
     pub transcript: Vec<TranscriptEntry>,
@@ -509,12 +513,18 @@ struct QueuePromptRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct NewServerSessionRequest {
     cwd: String,
+    /// When true, start the session in a fresh Mjolnir worktree of the git
+    /// project containing `cwd` instead of `cwd` itself.
+    #[serde(default)]
+    worktree: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct NewServerSessionResponse {
     cwd: String,
     display_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worktree: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -627,6 +637,7 @@ struct TrackerState {
     last_prompt_at: Option<String>,
     total_messages: u64,
     project: String,
+    worktree: Option<String>,
     agent: String,
     agent_message_open: bool,
     prompt_in_flight: bool,
@@ -748,6 +759,7 @@ impl TrackerState {
             last_prompt_at: None,
             total_messages: 0,
             project,
+            worktree: None,
             agent,
             agent_message_open: false,
             prompt_in_flight: false,
@@ -1080,6 +1092,7 @@ impl TrackerState {
             last_prompt_at: self.last_prompt_at.clone(),
             total_messages: self.total_messages,
             project: self.project.clone(),
+            worktree: self.worktree.clone(),
             agent: self.agent.clone(),
             transcript: self.transcript.clone(),
             queued_prompt_count: 0,
@@ -1154,16 +1167,19 @@ impl TrackerState {
 impl RemoteSessionTracker {
     pub fn new(
         project: String,
+        worktree: Option<String>,
         agent: String,
         command_tx: Option<tokio::sync::mpsc::UnboundedSender<UiCommand>>,
         ui_event_tx: Option<tokio::sync::mpsc::UnboundedSender<UiEvent>>,
     ) -> Self {
         let dir = remote_control_dir();
         let connection = build_connection(&dir);
+        let mut state = TrackerState::new(project, agent);
+        state.worktree = worktree;
         let tracker = Self {
             remote_dir: Arc::new(dir),
             connection: Arc::new(Mutex::new(connection)),
-            state: Arc::new(Mutex::new(TrackerState::new(project, agent))),
+            state: Arc::new(Mutex::new(state)),
             publisher: Arc::new(Mutex::new(None)),
             publish_signal: Arc::new(tokio::sync::Notify::new()),
             queue_poller: Arc::new(Mutex::new(None)),
@@ -1899,8 +1915,10 @@ fn start_server_agent_session(
         .unwrap_or_default();
     let agent_label = agent_display_label(&agent);
     let project_label = crate::paths::project_label_from_cwd(&cwd);
+    let worktree_label = crate::paths::worktree_name_from_cwd(&cwd);
     let tracker = RemoteSessionTracker::new(
         project_label,
+        worktree_label,
         agent_label,
         Some(runtime_cmd_tx.clone()),
         Some(remote_event_tx),
@@ -2804,15 +2822,45 @@ async fn create_server_owned_session(
         return Err((StatusCode::BAD_REQUEST, "cwd must not be empty".to_string()));
     }
     let roots = Arc::clone(&state.workspace_roots);
-    let cwd = tokio::task::spawn_blocking(move || directory_under_roots(roots.as_slice(), &cwd))
-        .await
-        .map_err(internal_error)??;
+    let want_worktree = request.worktree;
+    // Path validation and worktree creation shell out to git; both are
+    // blocking work.
+    let (cwd, worktree) = tokio::task::spawn_blocking(move || {
+        let cwd = directory_under_roots(roots.as_slice(), &cwd)?;
+        if !want_worktree {
+            return Ok((cwd, None));
+        }
+        let project_root = crate::worktree::git_toplevel(&cwd)
+            .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+        let canonical_project_root = std::fs::canonicalize(&project_root).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "resolve git project root {}: {error}",
+                    project_root.display()
+                ),
+            )
+        })?;
+        if !crate::paths::path_is_under_any_root(roots.as_slice(), &canonical_project_root) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "project root is outside configured workspace roots".to_string(),
+            ));
+        }
+        let created = crate::worktree::create_noninteractive(&cwd)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))?;
+        let name = crate::paths::folder_label(&created.worktree_root);
+        Ok((created.session_cwd, Some(name)))
+    })
+    .await
+    .map_err(internal_error)??;
     state.session_manager.start_session(cwd.clone());
     Ok((
         StatusCode::ACCEPTED,
         Json(NewServerSessionResponse {
             display_path: crate::paths::display_path_with_tilde(&cwd),
             cwd: cwd.display().to_string(),
+            worktree,
         }),
     ))
 }
@@ -3361,6 +3409,7 @@ fn init_db(db_path: &Path) -> Result<()> {
         "text not null default '[]'",
     )?;
     ensure_sessions_column(&conn, "prompt_in_flight", "integer not null default 0")?;
+    ensure_sessions_column(&conn, "worktree", "text")?;
     Ok(())
 }
 
@@ -3425,8 +3474,9 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             session_config_json,
             available_commands_json,
             prompt_in_flight,
+            worktree,
             connected
-        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1)
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1)
         on conflict(session_id) do update set
             name = excluded.name,
             start_time = sessions.start_time,
@@ -3445,6 +3495,7 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             session_config_json = excluded.session_config_json,
             available_commands_json = excluded.available_commands_json,
             prompt_in_flight = excluded.prompt_in_flight,
+            worktree = excluded.worktree,
             connected = 1
         where excluded.last_update >= sessions.last_update",
         params![
@@ -3461,6 +3512,7 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             session_config_json,
             available_commands_json,
             prompt_in_flight,
+            session.worktree,
         ],
     )
     .context("upsert remote-control session")?;
@@ -3636,7 +3688,8 @@ fn load_session_records(db_path: &Path) -> Result<Vec<SessionRecord>> {
                     select count(*)
                     from queued_prompts
                     where queued_prompts.session_id = sessions.session_id
-                ) as queued_prompt_count
+                ) as queued_prompt_count,
+                worktree
             from sessions
             order by session_id asc",
         )
@@ -3675,7 +3728,8 @@ fn load_connected_session_records(db_path: &Path, cutoff: &str) -> Result<Vec<Se
                     select count(*)
                     from queued_prompts
                     where queued_prompts.session_id = sessions.session_id
-                ) as queued_prompt_count
+                ) as queued_prompt_count,
+                worktree
             from sessions
             where connected = 1 and last_update >= ?1
             order by session_id asc",
@@ -3717,6 +3771,7 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         last_prompt_at,
         total_messages: u64::try_from(total_messages).unwrap_or(0),
         project: row.get(6)?,
+        worktree: row.get::<_, Option<String>>(14)?,
         agent: row.get(7)?,
         transcript,
         queued_prompt_count: u64::try_from(queued_prompt_count).unwrap_or(0),
@@ -5013,6 +5068,7 @@ mod tests {
             last_prompt_at: None,
             total_messages: 4,
             project: "mjolnir".to_string(),
+            worktree: Some("bold-fox".to_string()),
             agent: "anvil".to_string(),
             transcript: vec![
                 TranscriptEntry {
@@ -5094,6 +5150,134 @@ mod tests {
         assert_eq!(sessions[0].transcript[1].kind, "agent");
         assert_eq!(sessions[0].transcript[1].text, "hi there");
         assert_eq!(sessions[0].available_commands, session.available_commands);
+        assert_eq!(sessions[0].worktree.as_deref(), Some("bold-fox"));
+    }
+
+    #[test]
+    fn session_record_without_worktree_field_deserializes_to_none() {
+        let json = r#"{
+            "session_id": "sess-old",
+            "name": "old-client",
+            "start_time": "2026-06-03T10:00:00Z",
+            "last_update": "2026-06-03T10:00:20Z",
+            "total_messages": 1,
+            "project": "mjolnir",
+            "agent": "anvil"
+        }"#;
+        let record: SessionRecord = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(record.worktree, None);
+    }
+
+    fn init_committed_git_repo(path: &Path) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg(path)
+            .status()
+            .expect("git init");
+        assert!(status.success(), "git init failed");
+        std::fs::write(path.join("file.txt"), "hello").expect("write file");
+        run(&["add", "."]);
+        run(&[
+            "-c",
+            "user.name=Mjolnir Test",
+            "-c",
+            "user.email=mjolnir@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ]);
+    }
+
+    fn new_session_request(
+        token: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/server-sessions")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request")
+    }
+
+    #[tokio::test]
+    async fn server_session_endpoint_creates_worktree_when_requested() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("project");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        init_committed_git_repo(&repo);
+        let db_path = dir.path().join("sessions.sqlite3");
+        let token = "integration-token".to_string();
+        let app = build_router(RouterConfig {
+            db_path,
+            token: token.clone(),
+            viewer_code: "123456".to_string(),
+            cookie_key: "test-cookie-key".to_string(),
+            session_ttl: DEFAULT_SESSION_TTL,
+            workspace_roots: test_workspace_roots(dir.path()),
+            session_manager: test_session_manager(),
+        });
+
+        let response = app
+            .oneshot(new_session_request(
+                &token,
+                serde_json::json!({ "cwd": repo.display().to_string(), "worktree": true }),
+            ))
+            .await
+            .expect("create session");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let parsed: NewServerSessionResponse = serde_json::from_slice(&body).expect("parse");
+        let name = parsed.worktree.expect("worktree name");
+        assert!(!name.is_empty());
+        let session_cwd = Path::new(&parsed.cwd);
+        assert!(session_cwd.is_dir());
+        assert_eq!(
+            crate::paths::worktree_name_from_cwd(session_cwd).as_deref(),
+            Some(name.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn server_session_endpoint_rejects_worktree_outside_git_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).expect("create dir");
+        let db_path = dir.path().join("sessions.sqlite3");
+        let token = "integration-token".to_string();
+        let app = build_router(RouterConfig {
+            db_path,
+            token: token.clone(),
+            viewer_code: "123456".to_string(),
+            cookie_key: "test-cookie-key".to_string(),
+            session_ttl: DEFAULT_SESSION_TTL,
+            workspace_roots: test_workspace_roots(dir.path()),
+            session_manager: test_session_manager(),
+        });
+
+        let response = app
+            .oneshot(new_session_request(
+                &token,
+                serde_json::json!({ "cwd": plain.display().to_string(), "worktree": true }),
+            ))
+            .await
+            .expect("create session");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -5109,6 +5293,7 @@ mod tests {
             last_prompt_at: None,
             total_messages: 1,
             project: "mjolnir".to_string(),
+            worktree: None,
             agent: "agent".to_string(),
             transcript: Vec::new(),
             queued_prompt_count: 0,
@@ -5606,6 +5791,7 @@ mod tests {
             last_prompt_at: None,
             total_messages: 1,
             project: "proj".to_string(),
+            worktree: None,
             agent: "agent".to_string(),
             transcript: Vec::new(),
             queued_prompt_count: 0,
@@ -5764,6 +5950,25 @@ mod tests {
         );
         let prompts = load_queued_prompts(&db_path, "sess-1").expect("load prompts");
         assert_eq!(prompts.len(), 1, "queued prompts must survive disconnect");
+    }
+
+    #[tokio::test]
+    async fn tracker_worktree_survives_into_snapshot() {
+        let tracker =
+            RemoteSessionTracker::new_disconnected("proj".to_string(), "agent".to_string());
+        tracker.state.lock().expect("state").worktree = Some("bold-fox".to_string());
+        tracker.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+
+        let snapshot = tracker
+            .state
+            .lock()
+            .expect("state")
+            .snapshot()
+            .expect("snapshot");
+        assert_eq!(snapshot.worktree.as_deref(), Some("bold-fox"));
     }
 
     #[tokio::test]
@@ -6165,6 +6370,7 @@ mod tests {
             last_prompt_at: None,
             total_messages: 1,
             project: "mjolnir".to_string(),
+            worktree: None,
             agent: "anvil".to_string(),
             transcript: Vec::new(),
             queued_prompt_count: 0,
@@ -7216,6 +7422,7 @@ mod tests {
             last_prompt_at: None,
             total_messages: 1,
             project: "proj".to_string(),
+            worktree: None,
             agent: "agent".to_string(),
             transcript: Vec::new(),
             queued_prompt_count: 0,
