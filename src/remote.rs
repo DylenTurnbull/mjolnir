@@ -1922,7 +1922,12 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
         }
     };
     session_manager.shutdown_all().await;
-    result.with_context(|| format!("serve remote-control API on {}", listen.bind_addrs.join(", ")))
+    result.with_context(|| {
+        format!(
+            "serve remote-control API on {}",
+            listen.bind_addrs.join(", ")
+        )
+    })
 }
 
 fn start_server_agent_session(
