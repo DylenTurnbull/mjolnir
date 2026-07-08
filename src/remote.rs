@@ -25,6 +25,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
+use chrono::{DateTime, FixedOffset};
 use crossterm::{
     cursor::MoveTo,
     execute,
@@ -68,6 +69,10 @@ const QUEUED_PROMPT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// in a live session's memory. A live session claims within seconds, so an
 /// old unclaimed decision is unambiguously dead.
 const PERMISSION_DECISION_TTL: Duration = Duration::from_secs(60 * 60);
+/// Stop requests are meaningful only for the currently active prompt turn.
+/// Keep them long enough for a live session's poller to claim, but prune old
+/// rows aggressively so they cannot affect a later turn.
+const PROMPT_CANCEL_TTL: Duration = Duration::from_secs(5 * 60);
 const SESSION_COOKIE_NAME: &str = "mj_remote_session";
 const REMOTE_BUILTIN_NEW_COMMAND: &str = "new";
 const REMOTE_BUILTIN_CLEAR_COMMAND: &str = "clear";
@@ -124,6 +129,9 @@ pub struct SessionRecord {
     pub transcript: Vec<TranscriptEntry>,
     #[serde(default)]
     pub queued_prompt_count: u64,
+    /// True while this session has an ACP prompt turn in flight.
+    #[serde(default)]
+    pub prompt_in_flight: bool,
     /// Permission prompts currently waiting for an answer in this session.
     #[serde(default)]
     pub pending_permissions: Vec<PendingPermissionRecord>,
@@ -434,6 +442,13 @@ pub struct QueuedPrompt {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptCancelRequestRecord {
+    pub id: i64,
+    pub session_id: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RemoteQueuedPromptAction {
     SendPrompt(String),
@@ -506,6 +521,12 @@ struct FilesystemBrowseResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ClaimQueuedPromptRequest {
     session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ClaimPromptCancelRequest {
+    session_id: String,
+    prompt_started_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -589,6 +610,7 @@ struct TrackerState {
     agent: String,
     agent_message_open: bool,
     prompt_in_flight: bool,
+    prompt_turn_started_at: Option<String>,
     transcript: Vec<TranscriptEntry>,
     terminal_outputs: HashMap<String, TerminalOutputSnapshot>,
     tool_transcript_entries: HashMap<usize, ToolTranscriptEntry>,
@@ -709,6 +731,7 @@ impl TrackerState {
             agent,
             agent_message_open: false,
             prompt_in_flight: false,
+            prompt_turn_started_at: None,
             transcript: Vec::new(),
             terminal_outputs: HashMap::new(),
             tool_transcript_entries: HashMap::new(),
@@ -734,6 +757,7 @@ impl TrackerState {
         self.total_messages = 0;
         self.agent_message_open = false;
         self.prompt_in_flight = false;
+        self.prompt_turn_started_at = None;
         self.transcript.clear();
         self.terminal_outputs.clear();
         self.tool_transcript_entries.clear();
@@ -770,6 +794,7 @@ impl TrackerState {
                     }
                     self.agent_message_open = false;
                     self.prompt_in_flight = false;
+                    self.prompt_turn_started_at = None;
                     self.pending_permissions.clear();
                     self.session_config.clear();
                     self.available_commands =
@@ -790,6 +815,7 @@ impl TrackerState {
             UiEvent::PromptDone { .. } | UiEvent::PromptFailed { .. } | UiEvent::Fatal(_) => {
                 self.agent_message_open = false;
                 self.prompt_in_flight = false;
+                self.prompt_turn_started_at = None;
                 // The turn is over; any prompt still listed here was
                 // cancelled by the runtime, so don't advertise it.
                 self.pending_permissions.clear();
@@ -797,6 +823,7 @@ impl TrackerState {
             }
             UiEvent::SessionForkFailed { .. } => {
                 self.prompt_in_flight = false;
+                self.prompt_turn_started_at = None;
                 self.touch();
             }
             UiEvent::ClaudeUsage(_) => {}
@@ -933,6 +960,7 @@ impl TrackerState {
     fn push_system_notice(&mut self, text: impl Into<String>) {
         self.agent_message_open = false;
         self.prompt_in_flight = false;
+        self.prompt_turn_started_at = None;
         self.push_transcript_entry("system", text.into());
         self.touch();
     }
@@ -942,6 +970,7 @@ impl TrackerState {
         self.total_messages = self.total_messages.saturating_add(1);
         self.agent_message_open = false;
         self.prompt_in_flight = true;
+        self.prompt_turn_started_at = Some(now_rfc3339());
         if self
             .last_prompt_at
             .as_deref()
@@ -1032,6 +1061,7 @@ impl TrackerState {
             agent: self.agent.clone(),
             transcript: self.transcript.clone(),
             queued_prompt_count: 0,
+            prompt_in_flight: self.prompt_in_flight && self.prompt_turn_started_at.is_some(),
             pending_permissions: self.pending_permissions.clone(),
             session_config: self.session_config.clone(),
             available_commands: self.available_commands.clone(),
@@ -1053,6 +1083,7 @@ impl TrackerState {
 
     fn release_remote_prompt_slot(&mut self) {
         self.prompt_in_flight = false;
+        self.prompt_turn_started_at = None;
     }
 
     fn push_pending_permission(&mut self, record: PendingPermissionRecord) {
@@ -1085,6 +1116,16 @@ impl TrackerState {
             return None;
         }
         self.session_id.clone()
+    }
+
+    fn prompt_cancel_claim(&self) -> Option<(String, String)> {
+        if !self.prompt_in_flight {
+            return None;
+        }
+        Some((
+            self.session_id.clone()?,
+            self.prompt_turn_started_at.clone()?,
+        ))
     }
 }
 
@@ -1440,6 +1481,38 @@ impl RemoteSessionTracker {
         *slot = Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
+
+                let cancel_claim = state
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.prompt_cancel_claim());
+                if let Some((session_id, prompt_started_at)) = cancel_claim {
+                    let Some(connection) =
+                        tracker.connection().or_else(|| tracker.reload_connection())
+                    else {
+                        continue;
+                    };
+                    match claim_remote_prompt_cancel(
+                        connection.clone(),
+                        &session_id,
+                        &prompt_started_at,
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => {
+                            if command_tx.send(UiCommand::CancelPrompt).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            debug!("remote prompt-cancel poll failed: {error:#}");
+                            tracker.reload_connection();
+                            continue;
+                        }
+                    }
+                }
 
                 // Permission decisions first: while a permission prompt is
                 // pending the turn is blocked, so the prompt-claim path
@@ -1954,8 +2027,13 @@ fn spawn_queue_pruner(db_path: PathBuf, history_ttl: Option<Duration>) {
                 Ok(Ok(counts)) if counts.any() => {
                     debug!(
                         "remote-control prune removed {} queued prompt(s), \
-                         {} permission decision(s), {} config change(s), and {} session(s)",
-                        counts.prompts, counts.decisions, counts.changes, counts.sessions
+                         {} permission decision(s), {} prompt cancel(s), \
+                         {} config change(s), and {} session(s)",
+                        counts.prompts,
+                        counts.decisions,
+                        counts.cancels,
+                        counts.changes,
+                        counts.sessions
                     );
                 }
                 Ok(Ok(_)) => {}
@@ -2203,7 +2281,16 @@ fn build_router(config: RouterConfig) -> Router {
             "/api/queued-prompts",
             get(list_queued_prompts).post(queue_prompt),
         )
+        .route(
+            "/api/queued-prompts/{prompt_id}",
+            axum::routing::delete(delete_queued_prompt),
+        )
         .route("/api/queued-prompts/claim", post(claim_queued_prompt))
+        .route(
+            "/api/sessions/{session_id}/cancel",
+            post(queue_prompt_cancel),
+        )
+        .route("/api/prompt-cancels/claim", post(claim_prompt_cancel))
         .route("/api/permission-decisions", post(queue_permission_decision))
         .route(
             "/api/permission-decisions/claim",
@@ -2747,6 +2834,26 @@ async fn queue_prompt(
     Ok(StatusCode::ACCEPTED)
 }
 
+async fn delete_queued_prompt(
+    State(state): State<ServerState>,
+    AxumPath(prompt_id): AxumPath<i64>,
+    Query(query): Query<SessionQueueQuery>,
+) -> std::result::Result<StatusCode, (StatusCode, String)> {
+    let db_path = Arc::clone(&state.db_path);
+    let session_id = query.session_id;
+    let deleted = tokio::task::spawn_blocking(move || {
+        delete_queued_prompt_record(db_path.as_ref().as_path(), &session_id, prompt_id)
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "queued prompt not found".to_string()))
+    }
+}
+
 async fn claim_queued_prompt(
     State(state): State<ServerState>,
     Json(request): Json<ClaimQueuedPromptRequest>,
@@ -2755,6 +2862,61 @@ async fn claim_queued_prompt(
     let session_id = request.session_id;
     let prompt = tokio::task::spawn_blocking(move || {
         claim_queued_prompt_record(db_path.as_ref().as_path(), &session_id)
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+    Ok(Json(prompt))
+}
+
+async fn queue_prompt_cancel(
+    State(state): State<ServerState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> std::result::Result<StatusCode, (StatusCode, String)> {
+    if session_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "session_id must not be empty".to_string(),
+        ));
+    }
+    let db_path = Arc::clone(&state.db_path);
+    let queued = tokio::task::spawn_blocking(move || {
+        queue_prompt_cancel_record(db_path.as_ref().as_path(), &session_id)
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+    if queued {
+        Ok(StatusCode::ACCEPTED)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            "active live session not found".to_string(),
+        ))
+    }
+}
+
+async fn claim_prompt_cancel(
+    State(state): State<ServerState>,
+    Json(request): Json<ClaimPromptCancelRequest>,
+) -> std::result::Result<Json<Option<PromptCancelRequestRecord>>, (StatusCode, String)> {
+    if request.prompt_started_at.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "prompt_started_at must not be empty".to_string(),
+        ));
+    }
+    if parse_rfc3339_datetime(&request.prompt_started_at).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "prompt_started_at must be RFC3339".to_string(),
+        ));
+    }
+    let db_path = Arc::clone(&state.db_path);
+    let session_id = request.session_id;
+    let prompt_started_at = request.prompt_started_at;
+    let prompt = tokio::task::spawn_blocking(move || {
+        claim_prompt_cancel_record(db_path.as_ref().as_path(), &session_id, &prompt_started_at)
     })
     .await
     .map_err(internal_error)?
@@ -3147,6 +3309,11 @@ fn init_db(db_path: &Path) -> Result<()> {
             option_id text not null,
             created_at text not null
         );
+        create table if not exists prompt_cancels (
+            id integer primary key autoincrement,
+            session_id text not null,
+            created_at text not null
+        );
         create table if not exists config_changes (
             id integer primary key autoincrement,
             session_id text not null,
@@ -3171,6 +3338,7 @@ fn init_db(db_path: &Path) -> Result<()> {
         "available_commands_json",
         "text not null default '[]'",
     )?;
+    ensure_sessions_column(&conn, "prompt_in_flight", "integer not null default 0")?;
     Ok(())
 }
 
@@ -3215,6 +3383,7 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
     let available_commands_json = serde_json::to_string(&session.available_commands)
         .context("serialize remote-control available commands")?;
     let last_prompt_at = session_last_prompt_at(session);
+    let prompt_in_flight = if session.prompt_in_flight { 1_i64 } else { 0 };
     // The conflict arm refuses to move `last_update` backwards: every state
     // change touches the timestamp before the snapshot is taken, so a
     // delayed or replayed upload can never overwrite newer session state
@@ -3233,8 +3402,9 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             pending_permissions_json,
             session_config_json,
             available_commands_json,
+            prompt_in_flight,
             connected
-        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1)
         on conflict(session_id) do update set
             name = excluded.name,
             start_time = sessions.start_time,
@@ -3252,6 +3422,7 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             pending_permissions_json = excluded.pending_permissions_json,
             session_config_json = excluded.session_config_json,
             available_commands_json = excluded.available_commands_json,
+            prompt_in_flight = excluded.prompt_in_flight,
             connected = 1
         where excluded.last_update >= sessions.last_update",
         params![
@@ -3267,6 +3438,7 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             pending_permissions_json,
             session_config_json,
             available_commands_json,
+            prompt_in_flight,
         ],
     )
     .context("upsert remote-control session")?;
@@ -3297,6 +3469,11 @@ fn disconnect_session_record(db_path: &Path, session_id: &str) -> Result<()> {
         params![session_id],
     )
     .context("clear config changes on disconnect")?;
+    conn.execute(
+        "delete from prompt_cancels where session_id = ?1",
+        params![session_id],
+    )
+    .context("clear prompt cancels on disconnect")?;
     Ok(())
 }
 
@@ -3304,13 +3481,18 @@ fn disconnect_session_record(db_path: &Path, session_id: &str) -> Result<()> {
 struct PruneCounts {
     prompts: usize,
     decisions: usize,
+    cancels: usize,
     changes: usize,
     sessions: usize,
 }
 
 impl PruneCounts {
     fn any(&self) -> bool {
-        self.prompts > 0 || self.decisions > 0 || self.changes > 0 || self.sessions > 0
+        self.prompts > 0
+            || self.decisions > 0
+            || self.cancels > 0
+            || self.changes > 0
+            || self.sessions > 0
     }
 }
 
@@ -3323,6 +3505,8 @@ impl PruneCounts {
 /// - Permission decisions die with their session: anything whose session
 ///   is not currently live (or that sat unclaimed past a generous age cap)
 ///   is unclaimable garbage.
+/// - Prompt cancels also require a live in-memory turn, and they expire
+///   quickly because a stale stop request must not affect a later turn.
 /// - Queued prompts survive disconnects so `mj resume` can claim them;
 ///   beyond expired-session cleanup, only entries past `QUEUED_PROMPT_TTL`
 ///   are dropped.
@@ -3343,6 +3527,16 @@ fn prune_stale_records(db_path: &Path, history_ttl: Option<Duration>) -> Result<
                 params![history_cutoff],
             )
             .context("prune queued prompts of expired sessions")?;
+        counts.cancels += conn
+            .execute(
+                "delete from prompt_cancels
+                where session_id in (
+                    select session_id from sessions
+                    where connected = 0 and last_update < ?1
+                )",
+                params![history_cutoff],
+            )
+            .context("prune prompt cancels of expired sessions")?;
         counts.sessions = conn
             .execute(
                 "delete from sessions where connected = 0 and last_update < ?1",
@@ -3353,6 +3547,7 @@ fn prune_stale_records(db_path: &Path, history_ttl: Option<Duration>) -> Result<
 
     let live_cutoff = connected_session_cutoff_rfc3339();
     let decision_cutoff = rfc3339_before(PERMISSION_DECISION_TTL);
+    let cancel_cutoff = rfc3339_before(PROMPT_CANCEL_TTL);
     let prompt_cutoff = rfc3339_before(QUEUED_PROMPT_TTL);
     counts.decisions = conn
         .execute(
@@ -3365,6 +3560,17 @@ fn prune_stale_records(db_path: &Path, history_ttl: Option<Duration>) -> Result<
             params![decision_cutoff, live_cutoff],
         )
         .context("prune stale permission decisions")?;
+    counts.cancels += conn
+        .execute(
+            "delete from prompt_cancels
+            where created_at < ?1
+                or session_id not in (
+                    select session_id from sessions
+                    where connected = 1 and last_update >= ?2
+                )",
+            params![cancel_cutoff, live_cutoff],
+        )
+        .context("prune stale prompt cancels")?;
     counts.changes = conn
         .execute(
             "delete from config_changes
@@ -3403,6 +3609,7 @@ fn load_session_records(db_path: &Path) -> Result<Vec<SessionRecord>> {
                 pending_permissions_json,
                 session_config_json,
                 available_commands_json,
+                prompt_in_flight,
                 (
                     select count(*)
                     from queued_prompts
@@ -3441,6 +3648,7 @@ fn load_connected_session_records(db_path: &Path, cutoff: &str) -> Result<Vec<Se
                 pending_permissions_json,
                 session_config_json,
                 available_commands_json,
+                prompt_in_flight,
                 (
                     select count(*)
                     from queued_prompts
@@ -3468,7 +3676,8 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
     let pending_permissions_json: String = row.get(9)?;
     let session_config_json: String = row.get(10)?;
     let available_commands_json: String = row.get(11)?;
-    let queued_prompt_count: i64 = row.get(12)?;
+    let prompt_in_flight: i64 = row.get(12)?;
+    let queued_prompt_count: i64 = row.get(13)?;
     let transcript: Vec<TranscriptEntry> =
         serde_json::from_str(&transcript_json).unwrap_or_default();
     let pending_permissions = serde_json::from_str(&pending_permissions_json).unwrap_or_default();
@@ -3489,6 +3698,7 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         agent: row.get(7)?,
         transcript,
         queued_prompt_count: u64::try_from(queued_prompt_count).unwrap_or(0),
+        prompt_in_flight: prompt_in_flight != 0,
         pending_permissions,
         session_config,
         available_commands,
@@ -3614,6 +3824,121 @@ fn claim_queued_prompt_record(db_path: &Path, session_id: &str) -> Result<Option
         Ok(Some(prompt))
     } else {
         tx.commit().context("commit empty queued-prompt claim")?;
+        Ok(None)
+    }
+}
+
+fn delete_queued_prompt_record(db_path: &Path, session_id: &str, prompt_id: i64) -> Result<bool> {
+    init_db(db_path)?;
+    let conn = open_db(db_path)?;
+    let deleted = conn
+        .execute(
+            "delete from queued_prompts where id = ?1 and session_id = ?2",
+            params![prompt_id, session_id],
+        )
+        .context("delete queued prompt")?;
+    Ok(deleted > 0)
+}
+
+fn queue_prompt_cancel_record(db_path: &Path, session_id: &str) -> Result<bool> {
+    init_db(db_path)?;
+    let mut conn = open_db(db_path)?;
+    let created_at = now_rfc3339();
+    let live_cutoff = connected_session_cutoff_rfc3339();
+    let tx = conn
+        .transaction()
+        .context("begin prompt-cancel transaction")?;
+    tx.execute(
+        "delete from prompt_cancels where session_id = ?1",
+        params![session_id],
+    )
+    .context("replace pending prompt cancel")?;
+    let queued = tx
+        .execute(
+            "insert into prompt_cancels (session_id, created_at)
+        select ?1, ?2
+        where exists (
+            select 1
+            from sessions
+            where session_id = ?1
+                and connected = 1
+                and last_update >= ?3
+                and prompt_in_flight != 0
+        )",
+            params![session_id, &created_at, live_cutoff],
+        )
+        .context("insert prompt cancel for active live session")?;
+    tx.commit().context("commit prompt-cancel transaction")?;
+    Ok(queued > 0)
+}
+
+fn claim_prompt_cancel_record(
+    db_path: &Path,
+    session_id: &str,
+    prompt_started_at: &str,
+) -> Result<Option<PromptCancelRequestRecord>> {
+    init_db(db_path)?;
+    let mut conn = open_db(db_path)?;
+    let prompt_started_at =
+        parse_rfc3339_datetime(prompt_started_at).context("parse prompt-start timestamp")?;
+    let tx = conn
+        .transaction()
+        .context("begin prompt-cancel claim transaction")?;
+    let records = {
+        let mut stmt = tx
+            .prepare(
+                "select id, session_id, created_at
+                from prompt_cancels
+                where session_id = ?1
+                order by id asc",
+            )
+            .context("prepare prompt-cancel claim query")?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok(PromptCancelRequestRecord {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })
+            .context("load prompt cancels to claim")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect prompt cancels to claim")?
+    };
+    let cancel = {
+        let mut cancel = None;
+        let mut stale_ids = Vec::new();
+        // Compare parsed RFC3339 instants, not timestamp strings: offsets or
+        // fractional precision changes must not reorder stop requests.
+        for record in records {
+            let created_at = parse_rfc3339_datetime(&record.created_at)
+                .context("parse prompt-cancel timestamp")?;
+            if created_at < prompt_started_at {
+                stale_ids.push(record.id);
+            } else {
+                cancel = Some(record);
+                break;
+            }
+        }
+        for id in stale_ids {
+            tx.execute(
+                "delete from prompt_cancels where session_id = ?1 and id = ?2",
+                params![session_id, id],
+            )
+            .context("delete stale prompt cancel before current turn")?;
+        }
+        cancel
+    };
+    if let Some(cancel) = cancel {
+        tx.execute(
+            "delete from prompt_cancels where session_id = ?1 and id <= ?2",
+            params![session_id, cancel.id],
+        )
+        .context("delete claimed prompt cancels")?;
+        tx.commit().context("commit prompt-cancel claim")?;
+        Ok(Some(cancel))
+    } else {
+        tx.commit().context("commit empty prompt-cancel claim")?;
         Ok(None)
     }
 }
@@ -3799,6 +4124,31 @@ async fn claim_remote_prompt(
         .context("decode claimed remote queued prompt")
 }
 
+async fn claim_remote_prompt_cancel(
+    connection: RemoteConnection,
+    session_id: &str,
+    prompt_started_at: &str,
+) -> Result<Option<PromptCancelRequestRecord>> {
+    let request = connection
+        .client
+        .post("https://localhost:11921/api/prompt-cancels/claim")
+        .bearer_auth(connection.token.as_str())
+        .json(&ClaimPromptCancelRequest {
+            session_id: session_id.to_string(),
+            prompt_started_at: prompt_started_at.to_string(),
+        });
+    let response = request
+        .send()
+        .await
+        .context("claim remote prompt cancel")?
+        .error_for_status()
+        .context("remote prompt-cancel claim returned an error")?;
+    response
+        .json::<Option<PromptCancelRequestRecord>>()
+        .await
+        .context("decode claimed remote prompt cancel")
+}
+
 async fn claim_remote_permission_decision(
     connection: RemoteConnection,
     session_id: &str,
@@ -3977,14 +4327,20 @@ fn rfc3339_before(age: Duration) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
+fn parse_rfc3339_datetime(
+    value: &str,
+) -> std::result::Result<DateTime<FixedOffset>, chrono::ParseError> {
+    DateTime::parse_from_rfc3339(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
         AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, PermissionOption,
-        SessionConfigSelect, SessionConfigSelectOption, Terminal, TerminalExitStatus, TerminalId,
-        ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-        UnstructuredCommandInput,
+        SessionConfigSelect, SessionConfigSelectOption, StopReason, Terminal, TerminalExitStatus,
+        TerminalId, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+        ToolCallUpdateFields, UnstructuredCommandInput,
     };
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
@@ -4137,6 +4493,41 @@ mod tests {
         assert_eq!(snapshot.transcript[1].kind, "agent");
         assert_eq!(snapshot.transcript[1].text, "hi there");
         assert!(!snapshot.transcript[1].timestamp.is_empty());
+    }
+
+    #[test]
+    fn tracker_snapshot_exposes_active_prompt_turn_only_while_in_flight() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+
+        assert!(
+            !state.snapshot().expect("idle snapshot").prompt_in_flight,
+            "idle sessions must not expose stop controls"
+        );
+
+        state.observe_command(&UiCommand::SendPrompt {
+            text: "hello".to_string(),
+            images: Vec::new(),
+        });
+        let snapshot = state.snapshot().expect("active snapshot");
+        assert!(snapshot.prompt_in_flight);
+        let (session_id, prompt_started_at) =
+            state.prompt_cancel_claim().expect("cancel claim target");
+        assert_eq!(session_id, "sess-1");
+        assert!(!prompt_started_at.is_empty());
+
+        state.observe_event(&UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        assert!(
+            !state.snapshot().expect("done snapshot").prompt_in_flight,
+            "completed turns must hide stop controls"
+        );
+        assert!(state.prompt_cancel_claim().is_none());
     }
 
     #[test]
@@ -4444,6 +4835,7 @@ mod tests {
                 },
             ],
             queued_prompt_count: 0,
+            prompt_in_flight: true,
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
             available_commands: vec![command_record(
@@ -4487,6 +4879,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "demo");
         assert_eq!(sessions[0].total_messages, 6);
+        assert!(sessions[0].prompt_in_flight);
         assert_eq!(sessions[0].start_time, "2026-06-03T10:00:00Z");
         assert_eq!(sessions[0].last_update, "2026-06-03T10:00:40Z");
         assert_eq!(
@@ -4517,6 +4910,7 @@ mod tests {
             agent: "agent".to_string(),
             transcript: Vec::new(),
             queued_prompt_count: 0,
+            prompt_in_flight: false,
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
             available_commands: Vec::new(),
@@ -4741,6 +5135,58 @@ mod tests {
     }
 
     #[test]
+    fn delete_queued_prompt_is_scoped_to_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sessions.sqlite3");
+
+        queue_prompt_record(&db_path, "sess-1", "keep").expect("queue first");
+        queue_prompt_record(&db_path, "sess-1", "delete me").expect("queue second");
+        queue_prompt_record(&db_path, "sess-2", "other").expect("queue other");
+
+        let sess_1 = load_queued_prompts(&db_path, "sess-1").expect("load sess-1");
+        let delete_id = sess_1[1].id;
+        assert!(
+            !delete_queued_prompt_record(&db_path, "sess-2", delete_id)
+                .expect("wrong-session delete"),
+            "a prompt id must not be deleted through a different session"
+        );
+        assert!(delete_queued_prompt_record(&db_path, "sess-1", delete_id).expect("delete prompt"));
+
+        let remaining = load_queued_prompts(&db_path, "sess-1").expect("load remaining");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].text, "keep");
+        let other = load_queued_prompts(&db_path, "sess-2").expect("load other");
+        assert_eq!(other.len(), 1);
+    }
+
+    #[test]
+    fn prompt_cancel_claim_ignores_requests_before_current_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sessions.sqlite3");
+        init_db(&db_path).expect("init db");
+
+        insert_prompt_cancel_at(&db_path, "sess-1", "2026-06-10T10:00:00Z");
+        assert!(
+            claim_prompt_cancel_record(&db_path, "sess-1", "2026-06-10T10:00:01Z")
+                .expect("claim stale")
+                .is_none(),
+            "a stale stop request must not affect the next prompt turn"
+        );
+
+        insert_prompt_cancel_at(&db_path, "sess-1", "2026-06-10T10:00:02Z");
+        let claimed = claim_prompt_cancel_record(&db_path, "sess-1", "2026-06-10T10:00:01Z")
+            .expect("claim current")
+            .expect("current cancel request");
+        assert_eq!(claimed.session_id, "sess-1");
+        assert_eq!(claimed.created_at, "2026-06-10T10:00:02Z");
+        assert!(
+            claim_prompt_cancel_record(&db_path, "sess-1", "2026-06-10T10:00:01Z")
+                .expect("claim empty")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn remote_queued_prompt_action_routes_fork_commands() {
         assert_eq!(
             remote_queued_prompt_action("/fork".to_string(), true),
@@ -4760,6 +5206,173 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn queued_prompt_control_endpoints_enforce_token_and_claim_cancel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sessions.sqlite3");
+        init_db(&db_path).expect("init db");
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                prompt_in_flight: true,
+                ..session_named("sess-1", &now_rfc3339())
+            },
+        )
+        .expect("insert active session");
+        queue_prompt_record(&db_path, "sess-1", "queued").expect("queue prompt");
+        let prompt_id = load_queued_prompts(&db_path, "sess-1").expect("load")[0].id;
+        let token = "integration-token".to_string();
+        let app = build_router(RouterConfig {
+            db_path,
+            token: token.clone(),
+            viewer_code: "123456".to_string(),
+            cookie_key: "test-cookie-key".to_string(),
+            session_ttl: DEFAULT_SESSION_TTL,
+            workspace_roots: test_workspace_roots(dir.path()),
+            session_manager: test_session_manager(),
+        });
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/queued-prompts/{prompt_id}?session_id=sess-1"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("delete unauthenticated");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let cancel_unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/sess-1/cancel")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("cancel unauthenticated");
+        assert_eq!(cancel_unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let cancel_invalid_bearer = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/sess-1/cancel")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer wrong-token")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("cancel invalid bearer");
+        assert_eq!(cancel_invalid_bearer.status(), StatusCode::UNAUTHORIZED);
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/queued-prompts/{prompt_id}?session_id=sess-1"))
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("delete queued prompt");
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+        let missing_session_cancel = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/missing/cancel")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("cancel missing session");
+        assert_eq!(missing_session_cancel.status(), StatusCode::NOT_FOUND);
+
+        let queued_cancel = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/sess-1/cancel")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("queue cancel");
+        assert_eq!(queued_cancel.status(), StatusCode::ACCEPTED);
+
+        let claim_body = serde_json::to_vec(&ClaimPromptCancelRequest {
+            session_id: "sess-1".to_string(),
+            prompt_started_at: "1970-01-01T00:00:00Z".to_string(),
+        })
+        .expect("claim json");
+        let claim_unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/prompt-cancels/claim")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(claim_body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("claim unauthenticated");
+        assert_eq!(claim_unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let claim_invalid_bearer = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/prompt-cancels/claim")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer wrong-token")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(claim_body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("claim invalid bearer");
+        assert_eq!(claim_invalid_bearer.status(), StatusCode::UNAUTHORIZED);
+
+        let claimed = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/prompt-cancels/claim")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(claim_body))
+                    .expect("request"),
+            )
+            .await
+            .expect("claim cancel");
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let claimed: Option<PromptCancelRequestRecord> = serde_json::from_slice(
+            &claimed
+                .into_body()
+                .collect()
+                .await
+                .expect("claim body")
+                .to_bytes(),
+        )
+        .expect("claim response");
+        assert_eq!(claimed.expect("cancel request").session_id, "sess-1");
+    }
+
     /// Insert a queue row with an explicit `created_at`, bypassing the
     /// public helpers that always stamp "now".
     fn insert_decision_at(db_path: &Path, session_id: &str, created_at: &str) {
@@ -4770,6 +5383,16 @@ mod tests {
             params![session_id, created_at],
         )
         .expect("insert decision");
+    }
+
+    fn insert_prompt_cancel_at(db_path: &Path, session_id: &str, created_at: &str) {
+        let conn = open_db(db_path).expect("open db");
+        conn.execute(
+            "insert into prompt_cancels (session_id, created_at)
+            values (?1, ?2)",
+            params![session_id, created_at],
+        )
+        .expect("insert prompt cancel");
     }
 
     fn session_named(session_id: &str, last_update: &str) -> SessionRecord {
@@ -4784,6 +5407,7 @@ mod tests {
             agent: "agent".to_string(),
             transcript: Vec::new(),
             queued_prompt_count: 0,
+            prompt_in_flight: false,
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
             available_commands: Vec::new(),
@@ -4904,14 +5528,22 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_clears_permission_decisions_but_keeps_queued_prompts() {
+    fn disconnect_clears_live_only_queues_but_keeps_queued_prompts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("sessions.sqlite3");
         let now = now_rfc3339();
 
-        upsert_session_record(&db_path, &session_named("sess-1", &now)).expect("session");
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                prompt_in_flight: true,
+                ..session_named("sess-1", &now)
+            },
+        )
+        .expect("session");
         queue_permission_decision_record(&db_path, "sess-1", "call-1", "allow")
             .expect("queue decision");
+        assert!(queue_prompt_cancel_record(&db_path, "sess-1").expect("queue cancel"));
         queue_prompt_record(&db_path, "sess-1", "next task").expect("queue prompt");
 
         disconnect_session_record(&db_path, "sess-1").expect("disconnect");
@@ -4921,6 +5553,12 @@ mod tests {
                 .expect("claim decision")
                 .is_none(),
             "disconnect must drop queued permission decisions"
+        );
+        assert!(
+            claim_prompt_cancel_record(&db_path, "sess-1", "1970-01-01T00:00:00Z")
+                .expect("claim cancel")
+                .is_none(),
+            "disconnect must drop prompt cancel requests"
         );
         let prompts = load_queued_prompts(&db_path, "sess-1").expect("load prompts");
         assert_eq!(prompts.len(), 1, "queued prompts must survive disconnect");
@@ -5328,6 +5966,7 @@ mod tests {
             agent: "anvil".to_string(),
             transcript: Vec::new(),
             queued_prompt_count: 0,
+            prompt_in_flight: false,
             pending_permissions: vec![pending.clone()],
             session_config: Vec::new(),
             available_commands: Vec::new(),
@@ -6378,6 +7017,7 @@ mod tests {
             agent: "agent".to_string(),
             transcript: Vec::new(),
             queued_prompt_count: 0,
+            prompt_in_flight: false,
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
             available_commands: Vec::new(),

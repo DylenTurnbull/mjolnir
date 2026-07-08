@@ -251,7 +251,9 @@
       .permission-option,
       .jump-to-latest,
       .icon-button,
-      .theme-toggle {
+      .theme-toggle,
+      .stop-turn,
+      .queue-item-delete {
         position: relative;
         isolation: isolate;
         border: 0;
@@ -308,6 +310,38 @@
         &:hover:not(:disabled) {
           filter: drop-shadow(0 0 9px rgb(235 63 51 / 0.33));
         }
+      }
+
+      .stop-turn {
+        --key-edge: rgb(235 63 51 / 0.58);
+        --key-edge-hover: rgb(235 63 51 / 0.9);
+        --key-fill:
+          linear-gradient(90deg, rgb(235 63 51 / 0.24), transparent 58%),
+          linear-gradient(180deg, rgb(235 63 51 / 0.18), rgb(235 63 51 / 0.04)),
+          #170d0c;
+        --key-text: #ffe1dc;
+        --key-text-hover: #fff;
+        flex: 0 0 auto;
+        height: 30px;
+        padding: 0 13px;
+        white-space: nowrap;
+      }
+
+      .queue-item-delete {
+        --key-edge: rgb(235 63 51 / 0.34);
+        --key-edge-hover: rgb(235 63 51 / 0.76);
+        --key-fill:
+          linear-gradient(180deg, rgb(235 63 51 / 0.1), rgb(235 63 51 / 0.02)),
+          var(--surface-control);
+        --key-text: var(--muted);
+        --key-text-hover: #fff;
+        position: absolute;
+        top: 7px;
+        right: 8px;
+        height: 24px;
+        padding: 0 9px;
+        font-size: 9px;
+        letter-spacing: 0.08em;
       }
 
       .theme-toggle {
@@ -1416,7 +1450,7 @@
 
       .queue-item {
         position: relative;
-        padding: 8px 12px 9px 14px;
+        padding: 8px 78px 9px 14px;
         border-bottom: 1px solid var(--line-row);
         background: var(--row-subtle);
 
@@ -1987,6 +2021,7 @@
           </div>
           <span id="approval-badge" class="approval-badge" hidden>needs approval</span>
           <span id="working-badge" class="working-badge" hidden>working</span>
+          <button id="stop-turn" class="stop-turn" type="button" hidden>Stop</button>
         </header>
         <div class="transcript-wrap">
           <div id="transcript" role="log" aria-label="Session transcript"></div>
@@ -2074,6 +2109,7 @@
       <section class="queue-item">
         <div class="queue-item-time" data-ts=""></div>
         <pre class="queue-item-text"></pre>
+        <button class="queue-item-delete" type="button">Cancel</button>
       </section>
     </template>
 
@@ -2113,6 +2149,7 @@
       const transcriptMetaEl = $("transcript-meta");
       const workingBadgeEl = $("working-badge");
       const approvalBadgeEl = $("approval-badge");
+      const stopTurnEl = $("stop-turn");
       const backButtonEl = $("back-button");
       const permissionsEl = $("permissions");
       const sessionConfigEl = $("session-config");
@@ -2142,6 +2179,7 @@
       // forever. The queued change itself is unaffected: it still applies (or
       // dies with the session) server-side.
       const CONFIG_APPLY_TIMEOUT_MS = 60000;
+      const STOP_REQUEST_TIMEOUT_MS = 15000;
       const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
       const narrowScreen = window.matchMedia("(max-width: 800px)");
 
@@ -2161,6 +2199,8 @@
       const draftBySessionId = new Map();
       const activityBySessionId = new Map();
       const sessionCardById = new Map();
+      const stopRequestBySessionId = new Map();
+      const deletingQueuedPromptIds = new Set();
       // Decisions already POSTed, keyed "<session_id>\u001f<request_id>",
       // so the buttons stay disabled until the pending request disappears
       // from the next snapshot.
@@ -2594,9 +2634,26 @@
         }
       }
 
-      function sessionIsWorking(sessionId) {
-        const activity = activityBySessionId.get(sessionId);
+      function sessionHasActiveTurn(session) {
+        return Boolean(session && session.prompt_in_flight);
+      }
+
+      function sessionIsWorking(session) {
+        if (sessionHasActiveTurn(session)) {
+          return true;
+        }
+        const activity = activityBySessionId.get(session.session_id);
         return Boolean(activity) && Date.now() - activity.at < WORKING_WINDOW_MS;
+      }
+
+      function syncPendingStopState() {
+        const now = Date.now();
+        for (const [sessionId, sentAt] of [...stopRequestBySessionId.entries()]) {
+          const session = sessions.find((candidate) => candidate.session_id === sessionId);
+          if (!sessionHasActiveTurn(session) || now - sentAt > STOP_REQUEST_TIMEOUT_MS) {
+            stopRequestBySessionId.delete(sessionId);
+          }
+        }
       }
 
       function sessionLabel(session) {
@@ -2633,7 +2690,7 @@
 
       function updateSessionCard(card, session) {
         card.root.classList.toggle("active", session.session_id === selectedSessionId);
-        card.root.classList.toggle("working", sessionIsWorking(session.session_id));
+        card.root.classList.toggle("working", sessionIsWorking(session));
         card.title.textContent = sessionLabel(session);
         card.project.textContent = session.project || "-";
         card.agent.textContent = session.agent || "-";
@@ -3724,6 +3781,8 @@
           transcriptTitleEl.textContent = "Transcript";
           transcriptMetaEl.textContent = "Select a session to inspect its history.";
           workingBadgeEl.hidden = true;
+          stopTurnEl.hidden = true;
+          stopTurnEl.disabled = true;
           transcriptEl.replaceChildren(
             emptyNote(routeSessionId() ? "This session is not currently connected." : "No transcript available."),
           );
@@ -3737,7 +3796,11 @@
         const transcript = normalizeTranscript(rawTranscript);
         transcriptTitleEl.textContent = sessionLabel(session);
         transcriptMetaEl.textContent = `${session.project || "-"} · ${session.agent || "-"} · ${transcript.length} entries`;
-        workingBadgeEl.hidden = !sessionIsWorking(session.session_id);
+        workingBadgeEl.hidden = !sessionIsWorking(session);
+        const activeTurn = sessionHasActiveTurn(session);
+        stopTurnEl.hidden = !activeTurn;
+        stopTurnEl.disabled = !activeTurn || stopRequestBySessionId.has(session.session_id);
+        stopTurnEl.setAttribute("aria-label", `Stop active prompt for ${sessionLabel(session)}`);
 
         if (renderedSessionId !== session.session_id) {
           renderedSessionId = session.session_id;
@@ -4043,6 +4106,12 @@
           const item = cloneTemplate(queueTpl);
           setTimestamp(item.querySelector(".queue-item-time"), prompt.created_at || "");
           item.querySelector(".queue-item-text").textContent = prompt.text || "";
+          const deleteButton = item.querySelector(".queue-item-delete");
+          deleteButton.disabled = deletingQueuedPromptIds.has(prompt.id);
+          deleteButton.setAttribute("aria-label", "Cancel queued prompt");
+          deleteButton.addEventListener("click", () => {
+            void deleteQueuedPrompt(prompt);
+          });
           queueListEl.appendChild(item);
         }
       }
@@ -4490,6 +4559,7 @@
           }
 
           sessions = await response.json();
+          syncPendingStopState();
           noteSessionActivity();
           showApp();
           statusEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
@@ -4513,6 +4583,7 @@
             throw new Error(`HTTP ${response.status}`);
           }
           sessions = await response.json();
+          syncPendingStopState();
           noteSessionActivity();
           statusEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
           renderAll();
@@ -4593,6 +4664,59 @@
         }
       }
 
+      async function deleteQueuedPrompt(prompt) {
+        const sessionId = selectedSessionId;
+        if (!sessionId || !prompt || prompt.id === undefined || prompt.id === null) {
+          return;
+        }
+        deletingQueuedPromptIds.add(prompt.id);
+        renderQueue(sessions.find((session) => session.session_id === selectedSessionId) || null);
+        try {
+          const response = await apiFetch(
+            `/api/queued-prompts/${encodeURIComponent(String(prompt.id))}?session_id=${encodeURIComponent(sessionId)}`,
+            { method: "DELETE" },
+          );
+          if (!response.ok && response.status !== 404) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          setQueueStatus("Queued prompt canceled.");
+          await refreshSessions();
+        } catch (error) {
+          if (error.message !== "HTTP 401") {
+            setQueueStatus(`Queue cancel failed: ${error.message}`, true);
+          }
+        } finally {
+          deletingQueuedPromptIds.delete(prompt.id);
+          renderQueue(sessions.find((session) => session.session_id === selectedSessionId) || null);
+        }
+      }
+
+      async function stopActiveTurn() {
+        const sessionId = selectedSessionId;
+        const session = sessions.find((candidate) => candidate.session_id === sessionId) || null;
+        if (!sessionId || !sessionHasActiveTurn(session)) {
+          return;
+        }
+        stopRequestBySessionId.set(sessionId, Date.now());
+        renderChat();
+        try {
+          const response = await apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/cancel`, {
+            method: "POST",
+          });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          setQueueStatus("Stop requested.");
+          await refreshSessions();
+        } catch (error) {
+          stopRequestBySessionId.delete(sessionId);
+          if (error.message !== "HTTP 401") {
+            setQueueStatus(`Stop failed: ${error.message}`, true);
+          }
+          renderChat();
+        }
+      }
+
       async function submitAuth(event) {
         event.preventDefault();
         const code = authTokenEl.value;
@@ -4662,6 +4786,9 @@
         }
       });
       backButtonEl.addEventListener("click", navigateToList);
+      stopTurnEl.addEventListener("click", () => {
+        void stopActiveTurn();
+      });
       window.addEventListener("hashchange", applyRoute);
       narrowScreen.addEventListener("change", () => {
         if (authenticated) {
