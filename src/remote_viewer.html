@@ -3918,10 +3918,7 @@
         commandMatches = prefix.length
           ? prefix
           : commands.filter((command) => commandSearchText(command).includes(query));
-        commandSelected = Math.max(
-          0,
-          commandMatches.findIndex((command) => command.name === previous),
-        );
+        commandSelected = commandMatches.findIndex((command) => command.name === previous);
         if (commandSelected < 0) {
           commandSelected = 0;
         }
@@ -3965,7 +3962,7 @@
 
       function downloadTranscriptMarkdown(session) {
         const transcript = Array.isArray(session?.transcript) ? session.transcript : [];
-        const title = sessionLabel(session || {});
+        const title = sessionLabel(session || {}) || "mjolnir session";
         const body = [
           `# ${title}`,
           "",
@@ -3991,15 +3988,20 @@
         if (trimmed === "/new") {
           openNewSessionPicker();
         } else if (trimmed === "/mjconfig") {
+          if (!session) {
+            return false;
+          }
           const target = sessionConfigEl.querySelector("button, input, select");
           if (target) {
             target.focus();
             sessionConfigEl.scrollIntoView({ block: "nearest" });
-            setQueueStatus("");
           } else {
             setQueueStatus("No session config controls are available.", true);
           }
         } else if (trimmed === "/export") {
+          if (!session) {
+            return false;
+          }
           downloadTranscriptMarkdown(session);
           setQueueStatus("Transcript exported.");
         } else {

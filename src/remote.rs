@@ -1,6 +1,6 @@
 //! Simple remote-control server and local session registration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -146,7 +146,7 @@ pub struct CommandRecord {
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_hint: Option<String>,
-    /// `mjolnir` for browser-local commands, `agent` for ACP-advertised
+    /// `mjolnir` for Mjolnir-owned commands, `agent` for ACP-advertised
     /// commands that are sent as slash prompt text.
     pub source: String,
 }
@@ -198,8 +198,9 @@ fn remote_builtin_command_records(include_fork: bool) -> Vec<CommandRecord> {
 }
 
 fn is_remote_reserved_command(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
     matches!(
-        name,
+        normalized.as_str(),
         REMOTE_BUILTIN_NEW_COMMAND
             | REMOTE_BUILTIN_CLEAR_COMMAND
             | REMOTE_BUILTIN_LOAD_COMMAND
@@ -215,19 +216,28 @@ fn available_command_records(
     include_fork: bool,
 ) -> Vec<CommandRecord> {
     let mut records = remote_builtin_command_records(include_fork);
-    records.extend(
-        commands
-            .iter()
-            .filter(|command| !is_remote_reserved_command(command.name.as_str()))
-            .map(|command| {
-                command_record(
-                    command.name.clone(),
-                    command.description.clone(),
-                    available_command_input_hint(command.input.as_ref()),
-                    "agent",
-                )
-            }),
-    );
+    let mut seen: HashSet<String> = records
+        .iter()
+        .map(|command| command.name.to_ascii_lowercase())
+        .collect();
+    for command in commands {
+        let name = command.name.trim();
+        if name.is_empty()
+            || name.chars().any(char::is_whitespace)
+            || is_remote_reserved_command(name)
+        {
+            continue;
+        }
+        if !seen.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        records.push(command_record(
+            name.to_string(),
+            command.description.clone(),
+            available_command_input_hint(command.input.as_ref()),
+            "agent",
+        ));
+    }
     records
 }
 
@@ -728,6 +738,7 @@ impl TrackerState {
         self.tool_transcript_entries.clear();
         self.pending_permissions.clear();
         self.session_config.clear();
+        self.available_commands = available_command_records(&[], self.session_fork_supported);
     }
 
     fn observe_event(&mut self, event: &UiEvent) {
@@ -760,6 +771,8 @@ impl TrackerState {
                     self.prompt_in_flight = false;
                     self.pending_permissions.clear();
                     self.session_config.clear();
+                    self.available_commands =
+                        available_command_records(&[], self.session_fork_supported);
                 }
                 self.last_update = Some(now);
             }
@@ -910,6 +923,13 @@ impl TrackerState {
             tool_body: None,
         });
         index
+    }
+
+    fn push_system_notice(&mut self, text: impl Into<String>) {
+        self.agent_message_open = false;
+        self.prompt_in_flight = false;
+        self.push_transcript_entry("system", text.into());
+        self.touch();
     }
 
     fn push_tool_transcript_entry(
@@ -1513,13 +1533,13 @@ impl RemoteSessionTracker {
                                 }
                             }
                             RemoteQueuedPromptAction::RejectUnsupportedFork => {
+                                let message =
+                                    "session fork is not supported by this agent".to_string();
                                 if let Some(ui_event_tx) = ui_event_tx.as_ref() {
-                                    let _ = ui_event_tx.send(UiEvent::Warning(
-                                        "session fork is not supported by this agent".to_string(),
-                                    ));
+                                    let _ = ui_event_tx.send(UiEvent::Warning(message.clone()));
                                 }
                                 if let Ok(mut guard) = state.lock() {
-                                    guard.release_remote_prompt_slot();
+                                    guard.push_system_notice(message);
                                 }
                             }
                             RemoteQueuedPromptAction::SendPrompt(text) => {
@@ -4763,9 +4783,13 @@ mod tests {
         state.observe_event(&UiEvent::SessionUpdate(
             SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
                 AvailableCommand::new("new", "agent new should be hidden"),
+                AvailableCommand::new("fork ", "agent fork should be hidden"),
+                AvailableCommand::new("New", "agent case variant should be hidden"),
+                AvailableCommand::new("", "empty should be hidden"),
                 AvailableCommand::new("review", "review the workspace").input(
                     AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("scope")),
                 ),
+                AvailableCommand::new(" review ", "duplicate review should be hidden"),
             ])),
         ));
 
@@ -4781,6 +4805,89 @@ mod tests {
         assert_eq!(
             snapshot.available_commands[4].input_hint.as_deref(),
             Some("scope")
+        );
+    }
+
+    #[test]
+    fn tracker_resets_remote_command_catalog_on_session_start() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::Connected {
+            agent_name: Some("agent".to_string()),
+            agent_version: None,
+            prompt_images_supported: false,
+            session_fork_supported: true,
+        });
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.observe_event(&UiEvent::SessionUpdate(
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                AvailableCommand::new("review", "review the workspace"),
+            ])),
+        ));
+        assert!(
+            state
+                .snapshot()
+                .expect("snapshot")
+                .available_commands
+                .iter()
+                .any(|command| command.name == "review")
+        );
+
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: true,
+        });
+        let same_session_names: Vec<String> = state
+            .snapshot()
+            .expect("same session snapshot")
+            .available_commands
+            .iter()
+            .map(|command| command.name.clone())
+            .collect();
+        assert_eq!(
+            same_session_names,
+            vec!["new", "export", "mjconfig", "fork"]
+        );
+
+        state.observe_event(&UiEvent::SessionUpdate(
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                AvailableCommand::new("review", "review the workspace"),
+            ])),
+        ));
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-2".to_string(),
+            resumed: false,
+        });
+        let new_session_names: Vec<String> = state
+            .snapshot()
+            .expect("new session snapshot")
+            .available_commands
+            .iter()
+            .map(|command| command.name.clone())
+            .collect();
+        assert_eq!(new_session_names, vec!["new", "export", "mjconfig", "fork"]);
+    }
+
+    #[test]
+    fn tracker_records_unsupported_remote_fork_notice() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.prompt_in_flight = true;
+
+        state.push_system_notice("session fork is not supported by this agent");
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert!(!state.prompt_in_flight);
+        assert_eq!(snapshot.transcript.len(), 1);
+        assert_eq!(snapshot.transcript[0].kind, "system");
+        assert_eq!(
+            snapshot.transcript[0].text,
+            "session fork is not supported by this agent"
         );
     }
 
