@@ -107,6 +107,8 @@ pub struct SessionRecord {
     pub name: String,
     pub start_time: String,
     pub last_update: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt_at: Option<String>,
     pub total_messages: u64,
     pub project: String,
     pub agent: String,
@@ -436,6 +438,7 @@ struct TrackerState {
     name: Option<String>,
     start_time: Option<String>,
     last_update: Option<String>,
+    last_prompt_at: Option<String>,
     total_messages: u64,
     project: String,
     agent: String,
@@ -553,6 +556,7 @@ impl TrackerState {
             name: None,
             start_time: None,
             last_update: None,
+            last_prompt_at: None,
             total_messages: 0,
             project,
             agent,
@@ -569,11 +573,7 @@ impl TrackerState {
 
     fn observe_command(&mut self, command: &UiCommand) {
         if let UiCommand::SendPrompt { text, .. } = command {
-            self.total_messages = self.total_messages.saturating_add(1);
-            self.agent_message_open = false;
-            self.prompt_in_flight = true;
-            self.push_transcript_entry("user", text.clone());
-            self.touch();
+            self.observe_prompt_text(text.clone(), None);
         }
     }
 
@@ -581,6 +581,7 @@ impl TrackerState {
         self.session_id = Some(new_session_id.to_string());
         self.name = Some(new_session_id.to_string());
         self.start_time = Some(now.to_string());
+        self.last_prompt_at = None;
         self.total_messages = 0;
         self.agent_message_open = false;
         self.prompt_in_flight = false;
@@ -742,16 +743,30 @@ impl TrackerState {
     }
 
     fn push_transcript_entry(&mut self, kind: &str, text: String) -> usize {
+        self.push_transcript_entry_at(kind, text, now_rfc3339())
+    }
+
+    fn push_transcript_entry_at(&mut self, kind: &str, text: String, timestamp: String) -> usize {
         let index = self.transcript.len();
         self.transcript.push(TranscriptEntry {
             kind: kind.to_string(),
             text,
-            timestamp: now_rfc3339(),
+            timestamp,
             tool_kind: None,
             tool_title: None,
             tool_body: None,
         });
         index
+    }
+
+    fn observe_prompt_text(&mut self, text: String, submitted_at: Option<String>) {
+        let prompt_at = submitted_at.unwrap_or_else(now_rfc3339);
+        self.total_messages = self.total_messages.saturating_add(1);
+        self.agent_message_open = false;
+        self.prompt_in_flight = true;
+        self.last_prompt_at = Some(prompt_at.clone());
+        self.push_transcript_entry_at("user", text, prompt_at);
+        self.touch();
     }
 
     fn push_tool_transcript_entry(
@@ -827,6 +842,7 @@ impl TrackerState {
             session_id,
             start_time,
             last_update,
+            last_prompt_at: self.last_prompt_at.clone(),
             total_messages: self.total_messages,
             project: self.project.clone(),
             agent: self.agent.clone(),
@@ -1343,12 +1359,14 @@ impl RemoteSessionTracker {
                 let queued = claim_remote_prompt(connection.clone(), &session_id).await;
                 match queued {
                     Ok(Some(prompt)) => {
+                        let text = prompt.text;
+                        let created_at = prompt.created_at;
                         let command = UiCommand::SendPrompt {
-                            text: prompt.text,
+                            text: text.clone(),
                             images: Vec::new(),
                         };
                         if let Ok(mut guard) = state.lock() {
-                            guard.observe_command(&command);
+                            guard.observe_prompt_text(text, Some(created_at));
                         }
                         if command_tx.send(command).is_err() {
                             break;
@@ -2902,6 +2920,7 @@ fn init_db(db_path: &Path) -> Result<()> {
             name text not null,
             start_time text not null,
             last_update text not null,
+            last_prompt_at text,
             total_messages integer not null,
             project text not null,
             agent text not null,
@@ -2933,6 +2952,7 @@ fn init_db(db_path: &Path) -> Result<()> {
     .context("create remote-control schema")?;
     ensure_sessions_column(&conn, "transcript_json", "text not null default '[]'")?;
     ensure_sessions_column(&conn, "connected", "integer not null default 0")?;
+    ensure_sessions_column(&conn, "last_prompt_at", "text")?;
     ensure_sessions_column(
         &conn,
         "pending_permissions_json",
@@ -2980,6 +3000,7 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
         .context("serialize remote-control pending permissions")?;
     let session_config_json = serde_json::to_string(&session.session_config)
         .context("serialize remote-control session config")?;
+    let last_prompt_at = session_last_prompt_at(session);
     // The conflict arm refuses to move `last_update` backwards: every state
     // change touches the timestamp before the snapshot is taken, so a
     // delayed or replayed upload can never overwrite newer session state
@@ -2990,6 +3011,7 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             name,
             start_time,
             last_update,
+            last_prompt_at,
             total_messages,
             project,
             agent,
@@ -2997,11 +3019,17 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             pending_permissions_json,
             session_config_json,
             connected
-        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)
         on conflict(session_id) do update set
             name = excluded.name,
             start_time = sessions.start_time,
             last_update = excluded.last_update,
+            last_prompt_at = case
+                when excluded.last_prompt_at is null then sessions.last_prompt_at
+                when sessions.last_prompt_at is null then excluded.last_prompt_at
+                when excluded.last_prompt_at >= sessions.last_prompt_at then excluded.last_prompt_at
+                else sessions.last_prompt_at
+            end,
             total_messages = excluded.total_messages,
             project = excluded.project,
             agent = excluded.agent,
@@ -3015,6 +3043,7 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             session.name,
             session.start_time,
             session.last_update,
+            last_prompt_at,
             total_messages,
             session.project,
             session.agent,
@@ -3149,6 +3178,7 @@ fn load_session_records(db_path: &Path) -> Result<Vec<SessionRecord>> {
                 name,
                 start_time,
                 last_update,
+                last_prompt_at,
                 total_messages,
                 project,
                 agent,
@@ -3161,15 +3191,18 @@ fn load_session_records(db_path: &Path) -> Result<Vec<SessionRecord>> {
                     where queued_prompts.session_id = sessions.session_id
                 ) as queued_prompt_count
             from sessions
-            order by last_update desc, session_id asc",
+            order by session_id asc",
         )
         .context("prepare session query")?;
     let rows = stmt
         .query_map([], session_record_from_row)
         .context("query sessions")?;
 
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("collect sessions")
+    let mut sessions = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("collect sessions")?;
+    sort_session_records(&mut sessions);
+    Ok(sessions)
 }
 
 fn load_connected_session_records(db_path: &Path, cutoff: &str) -> Result<Vec<SessionRecord>> {
@@ -3182,6 +3215,7 @@ fn load_connected_session_records(db_path: &Path, cutoff: &str) -> Result<Vec<Se
                 name,
                 start_time,
                 last_update,
+                last_prompt_at,
                 total_messages,
                 project,
                 agent,
@@ -3195,39 +3229,82 @@ fn load_connected_session_records(db_path: &Path, cutoff: &str) -> Result<Vec<Se
                 ) as queued_prompt_count
             from sessions
             where connected = 1 and last_update >= ?1
-            order by last_update desc, session_id asc",
+            order by session_id asc",
         )
         .context("prepare connected session query")?;
     let rows = stmt
         .query_map(params![cutoff], session_record_from_row)
         .context("query connected sessions")?;
 
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("collect connected sessions")
+    let mut sessions = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("collect connected sessions")?;
+    sort_session_records(&mut sessions);
+    Ok(sessions)
 }
 
 fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
-    let total_messages: i64 = row.get(4)?;
-    let transcript_json: String = row.get(7)?;
-    let pending_permissions_json: String = row.get(8)?;
-    let session_config_json: String = row.get(9)?;
-    let queued_prompt_count: i64 = row.get(10)?;
-    let transcript = serde_json::from_str(&transcript_json).unwrap_or_default();
+    let total_messages: i64 = row.get(5)?;
+    let transcript_json: String = row.get(8)?;
+    let pending_permissions_json: String = row.get(9)?;
+    let session_config_json: String = row.get(10)?;
+    let queued_prompt_count: i64 = row.get(11)?;
+    let transcript: Vec<TranscriptEntry> =
+        serde_json::from_str(&transcript_json).unwrap_or_default();
     let pending_permissions = serde_json::from_str(&pending_permissions_json).unwrap_or_default();
     let session_config = serde_json::from_str(&session_config_json).unwrap_or_default();
+    let last_prompt_at: Option<String> = row
+        .get::<_, Option<String>>(4)?
+        .or_else(|| last_prompt_at_from_transcript(&transcript));
     Ok(SessionRecord {
         session_id: row.get(0)?,
         name: row.get(1)?,
         start_time: row.get(2)?,
         last_update: row.get(3)?,
+        last_prompt_at,
         total_messages: u64::try_from(total_messages).unwrap_or(0),
-        project: row.get(5)?,
-        agent: row.get(6)?,
+        project: row.get(6)?,
+        agent: row.get(7)?,
         transcript,
         queued_prompt_count: u64::try_from(queued_prompt_count).unwrap_or(0),
         pending_permissions,
         session_config,
     })
+}
+
+fn sort_session_records(sessions: &mut [SessionRecord]) {
+    sessions.sort_by(|a, b| {
+        let a_needs_approval = !a.pending_permissions.is_empty();
+        let b_needs_approval = !b.pending_permissions.is_empty();
+        session_prompt_sort_time(b)
+            .cmp(session_prompt_sort_time(a))
+            .then_with(|| b_needs_approval.cmp(&a_needs_approval))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+}
+
+fn session_prompt_sort_time(session: &SessionRecord) -> &str {
+    session
+        .last_prompt_at
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&session.start_time)
+}
+
+fn session_last_prompt_at(session: &SessionRecord) -> Option<String> {
+    session
+        .last_prompt_at
+        .clone()
+        .filter(|value| !value.is_empty())
+        .or_else(|| last_prompt_at_from_transcript(&session.transcript))
+}
+
+fn last_prompt_at_from_transcript(transcript: &[TranscriptEntry]) -> Option<String> {
+    transcript
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == "user" && !entry.timestamp.is_empty())
+        .map(|entry| entry.timestamp.clone())
 }
 
 fn load_queued_prompts(db_path: &Path, session_id: &str) -> Result<Vec<QueuedPrompt>> {
@@ -3258,12 +3335,21 @@ fn load_queued_prompts(db_path: &Path, session_id: &str) -> Result<Vec<QueuedPro
 fn queue_prompt_record(db_path: &Path, session_id: &str, text: &str) -> Result<()> {
     init_db(db_path)?;
     let conn = open_db(db_path)?;
+    let created_at = now_rfc3339();
     conn.execute(
         "insert into queued_prompts (session_id, text, created_at)
         values (?1, ?2, ?3)",
-        params![session_id, text, now_rfc3339()],
+        params![session_id, text, &created_at],
     )
     .context("insert queued prompt")?;
+    conn.execute(
+        "update sessions
+        set last_prompt_at = ?2
+        where session_id = ?1
+            and (last_prompt_at is null or ?2 >= last_prompt_at)",
+        params![session_id, &created_at],
+    )
+    .context("touch session prompt recency")?;
     Ok(())
 }
 
@@ -4110,6 +4196,7 @@ mod tests {
             name: "demo".to_string(),
             start_time: "2026-06-03T10:00:00Z".to_string(),
             last_update: "2026-06-03T10:00:20Z".to_string(),
+            last_prompt_at: None,
             total_messages: 4,
             project: "mjolnir".to_string(),
             agent: "anvil".to_string(),
@@ -4171,6 +4258,10 @@ mod tests {
         assert_eq!(sessions[0].total_messages, 6);
         assert_eq!(sessions[0].start_time, "2026-06-03T10:00:00Z");
         assert_eq!(sessions[0].last_update, "2026-06-03T10:00:40Z");
+        assert_eq!(
+            sessions[0].last_prompt_at.as_deref(),
+            Some("2026-06-03T10:00:05Z")
+        );
         assert_eq!(sessions[0].transcript.len(), 2);
         assert_eq!(sessions[0].transcript[0].kind, "user");
         assert_eq!(sessions[0].transcript[0].text, "hello");
@@ -4188,6 +4279,7 @@ mod tests {
             name: "active".to_string(),
             start_time: fresh.clone(),
             last_update: fresh.clone(),
+            last_prompt_at: None,
             total_messages: 1,
             project: "mjolnir".to_string(),
             agent: "agent".to_string(),
@@ -4222,6 +4314,81 @@ mod tests {
 
         let all = load_session_records(&db_path).expect("load all");
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn session_listing_orders_by_prompt_recency_not_heartbeat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sessions.sqlite3");
+
+        let heartbeat_recent = SessionRecord {
+            last_update: "2026-06-10T10:03:00Z".to_string(),
+            last_prompt_at: Some("2026-06-10T10:00:00Z".to_string()),
+            ..session_named("sess-heartbeat", "2026-06-10T10:03:00Z")
+        };
+        let prompted_recent = SessionRecord {
+            last_update: "2026-06-10T10:01:00Z".to_string(),
+            last_prompt_at: Some("2026-06-10T10:02:00Z".to_string()),
+            ..session_named("sess-prompted", "2026-06-10T10:01:00Z")
+        };
+        let needs_approval = SessionRecord {
+            last_update: "2026-06-10T09:59:00Z".to_string(),
+            last_prompt_at: Some("2026-06-10T09:59:00Z".to_string()),
+            pending_permissions: vec![PendingPermissionRecord {
+                request_id: "call-1".to_string(),
+                title: "run command".to_string(),
+                options: Vec::new(),
+                requested_at: "2026-06-10T09:59:30Z".to_string(),
+            }],
+            ..session_named("sess-approval", "2026-06-10T09:59:00Z")
+        };
+
+        upsert_session_record(&db_path, &heartbeat_recent).expect("heartbeat recent");
+        upsert_session_record(&db_path, &prompted_recent).expect("prompted recent");
+        upsert_session_record(&db_path, &needs_approval).expect("approval");
+
+        let sessions = load_session_records(&db_path).expect("load");
+        let ids: Vec<_> = sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["sess-prompted", "sess-heartbeat", "sess-approval"]
+        );
+    }
+
+    #[test]
+    fn queued_prompt_updates_session_prompt_recency_for_ordering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sessions.sqlite3");
+
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                last_prompt_at: Some("2026-06-10T10:00:00Z".to_string()),
+                ..session_named("sess-first", "2026-06-10T10:05:00Z")
+            },
+        )
+        .expect("first");
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                last_prompt_at: Some("2026-06-10T10:04:00Z".to_string()),
+                ..session_named("sess-second", "2026-06-10T10:04:00Z")
+            },
+        )
+        .expect("second");
+
+        queue_prompt_record(&db_path, "sess-first", "new work").expect("queue prompt");
+
+        let sessions = load_session_records(&db_path).expect("load");
+        assert_eq!(sessions[0].session_id, "sess-first");
+        assert!(
+            sessions[0].last_prompt_at.as_deref() > Some("2026-06-10T10:04:00Z"),
+            "queued prompt should update prompt recency: {:?}",
+            sessions[0].last_prompt_at
+        );
     }
 
     #[test]
@@ -4280,6 +4447,7 @@ mod tests {
             name: session_id.to_string(),
             start_time: "2026-06-10T08:00:00Z".to_string(),
             last_update: last_update.to_string(),
+            last_prompt_at: None,
             total_messages: 1,
             project: "proj".to_string(),
             agent: "agent".to_string(),
@@ -4698,6 +4866,7 @@ mod tests {
             name: "demo".to_string(),
             start_time: "2026-06-10T10:00:00Z".to_string(),
             last_update: "2026-06-10T10:00:20Z".to_string(),
+            last_prompt_at: None,
             total_messages: 1,
             project: "mjolnir".to_string(),
             agent: "anvil".to_string(),
@@ -5746,6 +5915,7 @@ mod tests {
             name: "demo".to_string(),
             start_time: record_time.clone(),
             last_update: record_time,
+            last_prompt_at: None,
             total_messages: 1,
             project: "proj".to_string(),
             agent: "agent".to_string(),
