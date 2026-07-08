@@ -32,13 +32,14 @@ mod backend {
     use std::{
         fs,
         io::{Read, Write},
-        path::{Component, Path, PathBuf},
+        path::{Path, PathBuf},
         sync::mpsc,
         thread,
         time::{Duration, Instant},
     };
 
-    const ASR_MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2";
+    const ASR_MODEL_BASE_URL: &str =
+        "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main";
     const ASR_MODEL_DIR: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
     const ASR_ENCODER: &str = "encoder.int8.onnx";
     const ASR_DECODER: &str = "decoder.int8.onnx";
@@ -158,90 +159,47 @@ mod backend {
             .map_err(|_| anyhow::anyhow!("download thread panicked"))?
     }
 
-    fn extract_tar_bz2_file<F>(archive: &Path, dest: &Path, mut on_progress: F) -> Result<()>
-    where
-        F: FnMut(&Path, u64, u64),
-    {
-        let file =
-            fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
-        let decoder = bzip2::read::BzDecoder::new(file);
-        let mut tar = tar::Archive::new(decoder);
-        for entry in tar.entries().context("read tar.bz2 entries")? {
-            let mut entry = entry.context("read tar.bz2 entry")?;
-            let entry_path = entry.path().context("read tar.bz2 entry path")?;
-            let relative = safe_archive_path(&entry_path).with_context(|| {
-                format!(
-                    "archive entry escapes destination: {}",
-                    entry_path.display()
-                )
-            })?;
-            let out_path = dest.join(&relative);
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("create {}", parent.display()))?;
-            }
-
-            let entry_type = entry.header().entry_type();
-            if entry_type.is_file() {
-                let total = entry.header().size().unwrap_or(0);
-                let mut out = fs::File::create(&out_path)
-                    .with_context(|| format!("create {}", out_path.display()))?;
-                let mut buffer = [0u8; 64 * 1024];
-                let mut written = 0u64;
-                let mut last_percent = u64::MAX;
-                loop {
-                    let read = entry
-                        .read(&mut buffer)
-                        .with_context(|| format!("read {}", relative.display()))?;
-                    if read == 0 {
-                        break;
-                    }
-                    out.write_all(&buffer[..read])
-                        .with_context(|| format!("write {}", out_path.display()))?;
-                    written += read as u64;
-                    if let Some(percent) = written.saturating_mul(100).checked_div(total)
-                        && percent != last_percent
-                    {
-                        last_percent = percent;
-                        on_progress(&relative, written, total);
-                    }
-                }
-                if total == 0 || last_percent < 100 {
-                    on_progress(&relative, written, total);
-                }
-            } else {
-                entry
-                    .unpack(&out_path)
-                    .with_context(|| format!("unpack {}", out_path.display()))?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn safe_archive_path(path: &Path) -> Result<PathBuf> {
-        let mut relative = PathBuf::new();
-        for component in path.components() {
-            match component {
-                Component::Normal(part) => relative.push(part),
-                Component::CurDir => {}
-                _ => bail!("unsafe archive path {}", path.display()),
-            }
-        }
-        if relative.as_os_str().is_empty() {
-            bail!("empty archive path")
-        }
-        Ok(relative)
-    }
-
     fn megabytes(bytes: u64) -> u64 {
         bytes / (1024 * 1024)
     }
 
-    fn model_component_name(path: &Path) -> String {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("voice model")
-            .to_string()
+    fn asr_model_url(file_name: &str) -> String {
+        format!("{ASR_MODEL_BASE_URL}/{file_name}")
+    }
+
+    fn download_model_file<H>(file_name: &str, dest: &Path, on_status: &mut H) -> Result<()>
+    where
+        H: FnMut(String),
+    {
+        let tmp = dest.with_extension("part");
+        let _ = fs::remove_file(&tmp);
+        let mut last_percent = u64::MAX;
+        if let Err(error) =
+            download_to_file(&asr_model_url(file_name), &tmp, |downloaded, total| {
+                let message = match total {
+                    Some(total) if total > 0 => {
+                        let percent = downloaded * 100 / total;
+                        if percent == last_percent {
+                            return;
+                        }
+                        last_percent = percent;
+                        format!(
+                            "downloading voice model: {file_name} {percent}% of {} MB",
+                            megabytes(total)
+                        )
+                    }
+                    _ => format!(
+                        "downloading voice model: {file_name} {} MB",
+                        megabytes(downloaded)
+                    ),
+                };
+                on_status(message);
+            })
+        {
+            let _ = fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("download {file_name}"));
+        }
+        fs::rename(&tmp, dest).with_context(|| format!("install {}", dest.display()))
     }
 
     pub(super) fn ensure_models_installed<H>(paths: &ModelPaths, on_status: &mut H) -> Result<()>
@@ -277,69 +235,24 @@ mod backend {
             let archive = voice_dir.join(format!("{ASR_MODEL_DIR}.tar.bz2.part"));
             let staging = voice_dir.join(format!("{ASR_MODEL_DIR}.extracting"));
             if archive.exists() || staging.exists() {
-                on_status("restarting incomplete voice model setup...".to_string());
+                on_status("clearing incomplete voice model archive setup...".to_string());
                 let _ = fs::remove_file(&archive);
                 let _ = fs::remove_dir_all(&staging);
             }
-            let mut last_percent = u64::MAX;
-            if let Err(error) = download_to_file(ASR_MODEL_URL, &archive, |downloaded, total| {
-                let message = match total {
-                    Some(total) if total > 0 => {
-                        let percent = downloaded * 100 / total;
-                        if percent == last_percent {
-                            return;
-                        }
-                        last_percent = percent;
-                        format!(
-                            "downloading voice model (one-time): {percent}% of {} MB",
-                            megabytes(total)
-                        )
-                    }
-                    _ => format!(
-                        "downloading voice model (one-time): {} MB",
-                        megabytes(downloaded)
-                    ),
-                };
-                on_status(message);
-            }) {
-                let _ = fs::remove_file(&archive);
-                return Err(error).context("download voice recognition model");
+            fs::create_dir_all(&paths.dir)
+                .with_context(|| format!("create {}", paths.dir.display()))?;
+            if !has_model_data(&paths.encoder) {
+                download_model_file(ASR_ENCODER, &paths.encoder, on_status)?;
             }
-            on_status("unpacking voice model...".to_string());
-            // Extract into a staging directory and move the finished model dir
-            // into place in one rename, so an interrupted unpack can never
-            // leave a plausible-looking but truncated install behind.
-            let _ = fs::remove_dir_all(&staging);
-            let mut last_extract_status = String::new();
-            extract_tar_bz2_file(&archive, &staging, |path, written, total| {
-                let component = model_component_name(path);
-                let message = if let Some(percent) = written.saturating_mul(100).checked_div(total)
-                {
-                    format!("unpacking voice model: {component} {percent}%")
-                } else {
-                    format!(
-                        "unpacking voice model: {component} {} MB",
-                        megabytes(written)
-                    )
-                };
-                if message != last_extract_status {
-                    last_extract_status.clone_from(&message);
-                    on_status(message);
-                }
-            })
-            .context("extract voice model")?;
-            let _ = fs::remove_file(&archive);
-            let extracted = staging.join(ASR_MODEL_DIR);
-            if !extracted.is_dir() {
-                bail!("voice model archive did not contain {ASR_MODEL_DIR}");
+            if !has_model_data(&paths.decoder) {
+                download_model_file(ASR_DECODER, &paths.decoder, on_status)?;
             }
-            if paths.dir.exists() {
-                fs::remove_dir_all(&paths.dir)
-                    .with_context(|| format!("remove incomplete {}", paths.dir.display()))?;
+            if !has_model_data(&paths.joiner) {
+                download_model_file(ASR_JOINER, &paths.joiner, on_status)?;
             }
-            fs::rename(&extracted, &paths.dir)
-                .with_context(|| format!("install {}", paths.dir.display()))?;
-            let _ = fs::remove_dir_all(&staging);
+            if !has_model_data(&paths.tokens) {
+                download_model_file(ASR_TOKENS, &paths.tokens, on_status)?;
+            }
         }
 
         if !paths.is_installed() {
@@ -1087,15 +1000,6 @@ mod tests {
             "Hello there. How are you?"
         );
         assert_eq!(backend::compose_transcript(&[], ""), "");
-    }
-
-    #[cfg(not(target_os = "android"))]
-    #[test]
-    fn safe_archive_path_rejects_escapes() {
-        assert!(backend::safe_archive_path(std::path::Path::new("a/b.onnx")).is_ok());
-        assert!(backend::safe_archive_path(std::path::Path::new("../evil")).is_err());
-        assert!(backend::safe_archive_path(std::path::Path::new("/abs/evil")).is_err());
-        assert!(backend::safe_archive_path(std::path::Path::new("")).is_err());
     }
 
     #[cfg(not(target_os = "android"))]
