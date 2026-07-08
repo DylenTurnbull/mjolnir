@@ -2810,7 +2810,16 @@ async fn create_server_owned_session(
         }
         let project_root = crate::worktree::git_toplevel(&cwd)
             .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
-        if !crate::paths::path_is_under_any_root(roots.as_slice(), &project_root) {
+        let canonical_project_root = std::fs::canonicalize(&project_root).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "resolve git project root {}: {error}",
+                    project_root.display()
+                ),
+            )
+        })?;
+        if !crate::paths::path_is_under_any_root(roots.as_slice(), &canonical_project_root) {
             return Err((
                 StatusCode::FORBIDDEN,
                 "project root is outside configured workspace roots".to_string(),

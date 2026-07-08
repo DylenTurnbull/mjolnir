@@ -796,11 +796,8 @@ mod tests {
         assert!(created.session_cwd.is_dir());
         assert!(created.session_cwd.join("file.txt").exists());
         let repo_root = dir.path().canonicalize().expect("canonicalize");
-        assert!(
-            created
-                .worktree_root
-                .starts_with(repo_root.join(".mjolnir").join("worktrees"))
-        );
+        let worktree_root = created.worktree_root.canonicalize().expect("canonicalize");
+        assert!(worktree_root.starts_with(repo_root.join(".mjolnir").join("worktrees")));
         assert!(!dir.path().join(".gitignore").exists());
     }
 
