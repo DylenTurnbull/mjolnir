@@ -324,6 +324,39 @@ pub struct BattleConfig {
     pub thor_host: Option<ThorHost>,
 }
 
+/// Camps (Thor's own, and each champion's) forged over the course of a
+/// battle. On a successful battle these are intentionally left behind so the
+/// user can inspect or adopt them (`mj --worktree <name>`); on abort/failure
+/// there is no winner to adopt, so every camp forged so far is swept away
+/// here instead of leaking under `.mjolnir/worktrees/` forever.
+type WorktreeRegistry = std::sync::Arc<std::sync::Mutex<Vec<worktree::CreatedWorktree>>>;
+
+fn register_camp(registry: &WorktreeRegistry, camp: &worktree::CreatedWorktree) {
+    if let Ok(mut camps) = registry.lock() {
+        camps.push(camp.clone());
+    }
+}
+
+async fn sweep_camps(registry: WorktreeRegistry) {
+    let camps = registry
+        .lock()
+        .map(|mut camps| std::mem::take(&mut *camps))
+        .unwrap_or_default();
+    if camps.is_empty() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        for camp in camps {
+            if let Err(e) =
+                worktree::remove_automation_worktree(&camp.project_root, &camp.worktree_root)
+            {
+                tracing::warn!("sweep camp {:?}: {e:#}", camp.worktree_root);
+            }
+        }
+    })
+    .await;
+}
+
 /// Run one full battle. Never panics the UI: any error surfaces as
 /// [`RagnarokEvent::Failed`], and [`RagnarokEvent::Done`] is always the final
 /// event. `proceed` is the user's pre-combat approval (see [`Phase::Approval`]);
@@ -334,7 +367,9 @@ pub async fn run_battle(
     abort: watch::Receiver<bool>,
     proceed: watch::Receiver<bool>,
 ) {
-    if let Err(e) = battle(&cfg, &tx, abort, proceed).await {
+    let camps: WorktreeRegistry = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    if let Err(e) = battle(&cfg, &tx, abort, proceed, camps.clone()).await {
+        sweep_camps(camps).await;
         let _ = tx.send(RagnarokEvent::Failed(format!("{e:#}")));
     }
     let _ = tx.send(RagnarokEvent::Done);
@@ -422,6 +457,7 @@ async fn battle(
     tx: &mpsc::UnboundedSender<RagnarokEvent>,
     abort: watch::Receiver<bool>,
     proceed: watch::Receiver<bool>,
+    camps: WorktreeRegistry,
 ) -> Result<()> {
     // ---- Phase: muster -----------------------------------------------------
     emit(tx, RagnarokEvent::Phase(Phase::Mustering))?;
@@ -477,6 +513,7 @@ async fn battle(
             .context("thor camp task failed")?
             .context("could not forge Thor's camp")?
     };
+    register_camp(&camps, &thor_camp);
     let mut thor = Thor::summon(thor_host, thor_camp, abort.clone()).await?;
     emit(tx, RagnarokEvent::ThorAction(ThorAction::Deciding))?;
     let route = thor.route(&cfg.task, tx).await?;
@@ -585,6 +622,7 @@ async fn battle(
             ping: ping_tx.clone(),
             tx: tx.clone(),
             abort: abort.clone(),
+            camps: camps.clone(),
         };
         joinset.spawn(async move { fight(fighter, orders).await });
     }
@@ -1947,6 +1985,9 @@ struct FightOrders {
     ping: mpsc::UnboundedSender<WatchdogPing>,
     tx: mpsc::UnboundedSender<RagnarokEvent>,
     abort: watch::Receiver<bool>,
+    /// Camps forged so far in this battle, swept away if the whole battle
+    /// aborts/fails (see [`WorktreeRegistry`]).
+    camps: WorktreeRegistry,
 }
 
 async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
@@ -1959,6 +2000,7 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
         ping,
         tx,
         abort,
+        camps,
     } = orders;
     let id = fighter.card.id;
     let mut report = FighterReport {
@@ -2014,6 +2056,7 @@ async fn fight(fighter: Candidate, orders: FightOrders) -> FighterReport {
         }
         Err(e) => return slain(report, set_state, format!("worktree task failed: {e}")),
     };
+    register_camp(&camps, &created);
     let worktree_name = created
         .worktree_root
         .file_name()
@@ -3558,6 +3601,73 @@ mod tests {
         let failed = failed.expect("failure event");
         assert!(failed.contains("parse"), "failure: {failed}");
         assert!(failed.contains("config.toml"), "failure: {failed}");
+    }
+
+    fn init_git_repo_with_commit(path: &Path) {
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg(path)
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init failed");
+        std::fs::write(path.join("file.txt"), "hello").expect("write file");
+        let status = std::process::Command::new("git")
+            .current_dir(path)
+            .args(["add", "."])
+            .status()
+            .expect("git add should run");
+        assert!(status.success(), "git add failed");
+        let status = std::process::Command::new("git")
+            .current_dir(path)
+            .args([
+                "-c",
+                "user.name=Mjolnir Test",
+                "-c",
+                "user.email=mjolnir@example.invalid",
+                "commit",
+                "-am",
+                "initial",
+            ])
+            .status()
+            .expect("git commit should run");
+        assert!(status.success(), "git commit failed");
+    }
+
+    #[tokio::test]
+    async fn sweep_camps_removes_every_registered_worktree_but_not_unregistered_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_git_repo_with_commit(dir.path());
+
+        let thor_camp =
+            worktree::create_for_automation(dir.path(), "ragnarok-thor").expect("thor camp");
+        let fighter_camp =
+            worktree::create_for_automation(dir.path(), "ragnarok-fighter").expect("fighter camp");
+        let kept_camp =
+            worktree::create_for_automation(dir.path(), "ragnarok-kept").expect("kept camp");
+        assert!(thor_camp.worktree_root.is_dir());
+        assert!(fighter_camp.worktree_root.is_dir());
+        assert!(kept_camp.worktree_root.is_dir());
+
+        let registry: WorktreeRegistry = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        register_camp(&registry, &thor_camp);
+        register_camp(&registry, &fighter_camp);
+        // `kept_camp` is never registered, standing in for a worktree left
+        // behind by a successful battle that `sweep_camps` must not touch.
+
+        sweep_camps(registry).await;
+
+        assert!(
+            !thor_camp.worktree_root.exists(),
+            "Thor's camp should be swept away on battle failure"
+        );
+        assert!(
+            !fighter_camp.worktree_root.exists(),
+            "a fighter's camp should be swept away on battle failure"
+        );
+        assert!(
+            kept_camp.worktree_root.is_dir(),
+            "camps outside the failed battle's registry must survive"
+        );
     }
 
     #[test]
