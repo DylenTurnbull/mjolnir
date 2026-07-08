@@ -3269,6 +3269,77 @@
         return count;
       }
 
+      function lineDiff(oldText, newText) {
+        const oldLines = (oldText || "").split("\n");
+        const newLines = (newText || "").split("\n");
+        if (oldLines[oldLines.length - 1] === "") oldLines.pop();
+        if (newLines[newLines.length - 1] === "") newLines.pop();
+        const oldLen = oldLines.length;
+        const newLen = newLines.length;
+        if (oldLen * newLen > 40000) {
+          const out = [];
+          const max = Math.max(oldLen, newLen);
+          for (let i = 0; i < max; i += 1) {
+            const oldLine = oldLines[i];
+            const newLine = newLines[i];
+            if (oldLine !== undefined && newLine !== undefined && oldLine === newLine) {
+              out.push([" ", oldLine]);
+            } else {
+              if (oldLine !== undefined) out.push(["-", oldLine]);
+              if (newLine !== undefined) out.push(["+", newLine]);
+            }
+          }
+          return out;
+        }
+        const dp = Array.from({ length: oldLen + 1 }, () => Array(newLen + 1).fill(0));
+        for (let i = oldLen - 1; i >= 0; i -= 1) {
+          for (let j = newLen - 1; j >= 0; j -= 1) {
+            dp[i][j] = oldLines[i] === newLines[j]
+              ? dp[i + 1][j + 1] + 1
+              : Math.max(dp[i + 1][j], dp[i][j + 1]);
+          }
+        }
+        const out = [];
+        let i = 0;
+        let j = 0;
+        while (i < oldLen && j < newLen) {
+          if (oldLines[i] === newLines[j]) {
+            out.push([" ", oldLines[i]]);
+            i += 1;
+            j += 1;
+          } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+            out.push(["-", oldLines[i]]);
+            i += 1;
+          } else {
+            out.push(["+", newLines[j]]);
+            j += 1;
+          }
+        }
+        while (i < oldLen) out.push(["-", oldLines[i++]]);
+        while (j < newLen) out.push(["+", newLines[j++]]);
+        return out;
+      }
+
+      function diffText(oldText, newText) {
+        return lineDiff(oldText, newText)
+          .map(([prefix, line]) => `${prefix}${line}`)
+          .join("\n");
+      }
+
+      function diffBlock(body) {
+        const build = () => {
+          const pre = document.createElement("pre");
+          pre.className = "code-block";
+          pre.dataset.lang = "diff";
+          const code = document.createElement("code");
+          appendCodeTokens(code, body, "diff");
+          pre.appendChild(code);
+          return pre;
+        };
+        const lineCount = countLines(body);
+        return lineCount > FOLD_LINE_LIMIT ? foldBlock(`diff · ${lineCount} lines`, build) : build();
+      }
+
       // Big blocks collapse to a labelled fold so a page of JSON cannot
       // swallow the transcript. Content is built lazily on first open, so a
       // five-thousand-line payload costs no DOM until someone asks for it.
@@ -3304,6 +3375,9 @@
       }
 
       function codeBlock(body, lang) {
+        if (lang === "diff") {
+          return diffBlock(body);
+        }
         if (lang === "json" || (!lang && /^\s*[[{]/.test(body))) {
           const parsed = tryParseJson(body);
           if (parsed !== undefined) {
@@ -3630,6 +3704,21 @@
         return legacyToolTextParts(text);
       }
 
+      function entryToolDiffs(entry) {
+        return Array.isArray(entry.tool_diffs) ? entry.tool_diffs : [];
+      }
+
+      function appendToolDiffs(body, entry) {
+        const diffs = entryToolDiffs(entry);
+        for (const diff of diffs) {
+          const path = typeof diff.path === "string" && diff.path ? diff.path : "file";
+          const oldText = typeof diff.old_text === "string" ? diff.old_text : "";
+          const newText = typeof diff.new_text === "string" ? diff.new_text : "";
+          body.appendChild(inlineTextPre([`diff ${path}`]));
+          body.appendChild(diffBlock(diffText(oldText, newText)));
+        }
+      }
+
       // Execute tool cards carry structured title/body fields when published
       // by current mj builds. Fall back to the old flattened split for stored
       // sessions written before those fields existed.
@@ -3650,6 +3739,7 @@
           entry.tool_kind || "",
           entry.tool_title || "",
           entry.tool_body || "",
+          JSON.stringify(entryToolDiffs(entry)),
         ].join("\u0000");
       }
 
@@ -3659,6 +3749,7 @@
           entry.tool_kind || "",
           (entry.tool_title || "").length,
           (entry.tool_body || "").length,
+          JSON.stringify(entryToolDiffs(entry)).length,
         ].join(":");
       }
 
@@ -3678,6 +3769,9 @@
           appendExecuteToolBody(refs.body, entry);
         } else {
           refs.body.appendChild(renderRichText(text, voice));
+        }
+        if (refs.kind === "tool") {
+          appendToolDiffs(refs.body, entry);
         }
         if (openFolds.length) {
           const folds = refs.body.querySelectorAll("details.block-fold");

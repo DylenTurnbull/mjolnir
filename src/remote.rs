@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
-    AvailableCommand, AvailableCommandInput, ContentBlock, PermissionOptionKind, SessionConfigId,
-    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    AvailableCommand, AvailableCommandInput, ContentBlock, Diff, PermissionOptionKind,
+    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOptions, SessionConfigValueId, SessionUpdate, ToolCallContent,
     ToolCallStatus, ToolCallUpdateFields, ToolKind,
 };
@@ -414,6 +414,14 @@ pub struct PermissionDecisionRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptDiff {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    pub new_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TranscriptEntry {
     pub kind: String,
     pub text: String,
@@ -432,6 +440,11 @@ pub struct TranscriptEntry {
     /// execute commands containing blank lines do not get split incorrectly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_body: Option<String>,
+    /// Structured file diffs emitted by ACP tool calls. Kept out of
+    /// `tool_body` so remote viewers can render full old/new text instead of
+    /// the terminal-only one-line summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_diffs: Vec<TranscriptDiff>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -953,6 +966,7 @@ impl TrackerState {
             tool_kind: None,
             tool_title: None,
             tool_body: None,
+            tool_diffs: Vec::new(),
         });
         index
     }
@@ -1044,6 +1058,7 @@ impl TrackerState {
         entry.tool_kind = Some(crate::labels::tool_kind_label(tool_entry.kind).to_string());
         entry.tool_title = Some(tool_entry.title.clone());
         entry.tool_body = tool_body;
+        entry.tool_diffs = transcript_diffs(&tool_entry.content);
     }
 
     fn snapshot(&self) -> Option<SessionRecord> {
@@ -4235,7 +4250,7 @@ fn format_tool_body(
     for item in content {
         match item {
             ToolCallContent::Content(block) => parts.push(content_block_text(&block.content)),
-            ToolCallContent::Diff(diff) => parts.push(format!("diff: {}", diff.path.display())),
+            ToolCallContent::Diff(diff) => parts.push(format_diff_summary(diff)),
             ToolCallContent::Terminal(terminal) => {
                 let terminal_id = terminal.terminal_id.to_string();
                 let mut text = "terminal output".to_string();
@@ -4260,6 +4275,24 @@ fn format_tool_body(
     } else {
         Some(parts.join("\n\n"))
     }
+}
+
+fn format_diff_summary(diff: &Diff) -> String {
+    format!("diff: {}", diff.path.display())
+}
+
+fn transcript_diffs(content: &[ToolCallContent]) -> Vec<TranscriptDiff> {
+    content
+        .iter()
+        .filter_map(|item| match item {
+            ToolCallContent::Diff(diff) => Some(TranscriptDiff {
+                path: diff.path.display().to_string(),
+                old_text: diff.old_text.clone(),
+                new_text: diff.new_text.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 fn tool_call_references_terminal(content: &[ToolCallContent], terminal_id: &str) -> bool {
@@ -4337,7 +4370,7 @@ fn parse_rfc3339_datetime(
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, PermissionOption,
+        AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Diff, PermissionOption,
         SessionConfigSelect, SessionConfigSelectOption, StopReason, Terminal, TerminalExitStatus,
         TerminalId, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
         ToolCallUpdateFields, UnstructuredCommandInput,
@@ -4626,6 +4659,40 @@ mod tests {
     }
 
     #[test]
+    fn tool_transcript_entry_carries_structured_diff() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+
+        let mut tool_call = ToolCall::new("call-1", "workspace changes (1 file)");
+        tool_call.kind = ToolKind::Edit;
+        tool_call.content = vec![ToolCallContent::Diff(
+            Diff::new("src/lib.rs", "one\ntwo\nthree\n")
+                .old_text(Some("one\nold\nthree\n".to_string())),
+        )];
+        state.observe_session_update(&SessionUpdate::ToolCall(tool_call));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.transcript.len(), 1);
+        assert_eq!(
+            snapshot.transcript[0].tool_body.as_deref(),
+            Some("diff: src/lib.rs")
+        );
+        assert_eq!(snapshot.transcript[0].tool_diffs.len(), 1);
+        assert_eq!(snapshot.transcript[0].tool_diffs[0].path, "src/lib.rs");
+        assert_eq!(
+            snapshot.transcript[0].tool_diffs[0].old_text.as_deref(),
+            Some("one\nold\nthree\n")
+        );
+        assert_eq!(
+            snapshot.transcript[0].tool_diffs[0].new_text,
+            "one\ntwo\nthree\n"
+        );
+    }
+
+    #[test]
     fn tool_transcript_kind_update_without_content_updates_existing_entry() {
         let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
         state.observe_event(&UiEvent::SessionStarted {
@@ -4824,6 +4891,7 @@ mod tests {
                     tool_kind: None,
                     tool_title: None,
                     tool_body: None,
+                    tool_diffs: Vec::new(),
                 },
                 TranscriptEntry {
                     kind: "agent".to_string(),
@@ -4832,6 +4900,7 @@ mod tests {
                     tool_kind: None,
                     tool_title: None,
                     tool_body: None,
+                    tool_diffs: Vec::new(),
                 },
             ],
             queued_prompt_count: 0,
@@ -4860,6 +4929,7 @@ mod tests {
                         tool_kind: None,
                         tool_title: None,
                         tool_body: None,
+                        tool_diffs: Vec::new(),
                     },
                     TranscriptEntry {
                         kind: "agent".to_string(),
@@ -4868,6 +4938,7 @@ mod tests {
                         tool_kind: None,
                         tool_title: None,
                         tool_body: None,
+                        tool_diffs: Vec::new(),
                     },
                 ],
                 ..session.clone()
