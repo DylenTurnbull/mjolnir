@@ -25,6 +25,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
+use chrono::{DateTime, FixedOffset};
 use crossterm::{
     cursor::MoveTo,
     execute,
@@ -2879,13 +2880,20 @@ async fn queue_prompt_cancel(
         ));
     }
     let db_path = Arc::clone(&state.db_path);
-    tokio::task::spawn_blocking(move || {
+    let queued = tokio::task::spawn_blocking(move || {
         queue_prompt_cancel_record(db_path.as_ref().as_path(), &session_id)
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
-    Ok(StatusCode::ACCEPTED)
+    if queued {
+        Ok(StatusCode::ACCEPTED)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            "active live session not found".to_string(),
+        ))
+    }
 }
 
 async fn claim_prompt_cancel(
@@ -2896,6 +2904,12 @@ async fn claim_prompt_cancel(
         return Err((
             StatusCode::BAD_REQUEST,
             "prompt_started_at must not be empty".to_string(),
+        ));
+    }
+    if parse_rfc3339_datetime(&request.prompt_started_at).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "prompt_started_at must be RFC3339".to_string(),
         ));
     }
     let db_path = Arc::clone(&state.db_path);
@@ -3826,10 +3840,11 @@ fn delete_queued_prompt_record(db_path: &Path, session_id: &str, prompt_id: i64)
     Ok(deleted > 0)
 }
 
-fn queue_prompt_cancel_record(db_path: &Path, session_id: &str) -> Result<()> {
+fn queue_prompt_cancel_record(db_path: &Path, session_id: &str) -> Result<bool> {
     init_db(db_path)?;
     let mut conn = open_db(db_path)?;
     let created_at = now_rfc3339();
+    let live_cutoff = connected_session_cutoff_rfc3339();
     let tx = conn
         .transaction()
         .context("begin prompt-cancel transaction")?;
@@ -3838,14 +3853,23 @@ fn queue_prompt_cancel_record(db_path: &Path, session_id: &str) -> Result<()> {
         params![session_id],
     )
     .context("replace pending prompt cancel")?;
-    tx.execute(
-        "insert into prompt_cancels (session_id, created_at)
-        values (?1, ?2)",
-        params![session_id, &created_at],
-    )
-    .context("insert prompt cancel")?;
+    let queued = tx
+        .execute(
+            "insert into prompt_cancels (session_id, created_at)
+        select ?1, ?2
+        where exists (
+            select 1
+            from sessions
+            where session_id = ?1
+                and connected = 1
+                and last_update >= ?3
+                and prompt_in_flight != 0
+        )",
+            params![session_id, &created_at, live_cutoff],
+        )
+        .context("insert prompt cancel for active live session")?;
     tx.commit().context("commit prompt-cancel transaction")?;
-    Ok(())
+    Ok(queued > 0)
 }
 
 fn claim_prompt_cancel_record(
@@ -3855,33 +3879,55 @@ fn claim_prompt_cancel_record(
 ) -> Result<Option<PromptCancelRequestRecord>> {
     init_db(db_path)?;
     let mut conn = open_db(db_path)?;
+    let prompt_started_at =
+        parse_rfc3339_datetime(prompt_started_at).context("parse prompt-start timestamp")?;
     let tx = conn
         .transaction()
         .context("begin prompt-cancel claim transaction")?;
-    tx.execute(
-        "delete from prompt_cancels where session_id = ?1 and created_at < ?2",
-        params![session_id, prompt_started_at],
-    )
-    .context("delete stale prompt cancels before current turn")?;
-    let cancel = {
+    let records = {
         let mut stmt = tx
             .prepare(
                 "select id, session_id, created_at
                 from prompt_cancels
-                where session_id = ?1 and created_at >= ?2
-                order by id asc
-                limit 1",
+                where session_id = ?1
+                order by id asc",
             )
             .context("prepare prompt-cancel claim query")?;
-        stmt.query_row(params![session_id, prompt_started_at], |row| {
-            Ok(PromptCancelRequestRecord {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                created_at: row.get(2)?,
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok(PromptCancelRequestRecord {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
             })
-        })
-        .optional()
-        .context("load prompt cancel to claim")?
+            .context("load prompt cancels to claim")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect prompt cancels to claim")?
+    };
+    let cancel = {
+        let mut cancel = None;
+        let mut stale_ids = Vec::new();
+        // Compare parsed RFC3339 instants, not timestamp strings: offsets or
+        // fractional precision changes must not reorder stop requests.
+        for record in records {
+            let created_at = parse_rfc3339_datetime(&record.created_at)
+                .context("parse prompt-cancel timestamp")?;
+            if created_at < prompt_started_at {
+                stale_ids.push(record.id);
+            } else {
+                cancel = Some(record);
+                break;
+            }
+        }
+        for id in stale_ids {
+            tx.execute(
+                "delete from prompt_cancels where session_id = ?1 and id = ?2",
+                params![session_id, id],
+            )
+            .context("delete stale prompt cancel before current turn")?;
+        }
+        cancel
     };
     if let Some(cancel) = cancel {
         tx.execute(
@@ -4279,6 +4325,12 @@ fn rfc3339_before(age: Duration) -> String {
     (OffsetDateTime::now_utc() - time::Duration::seconds(age.as_secs() as i64))
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn parse_rfc3339_datetime(
+    value: &str,
+) -> std::result::Result<DateTime<FixedOffset>, chrono::ParseError> {
+    DateTime::parse_from_rfc3339(value)
 }
 
 #[cfg(test)]
@@ -5159,6 +5211,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("sessions.sqlite3");
         init_db(&db_path).expect("init db");
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                prompt_in_flight: true,
+                ..session_named("sess-1", &now_rfc3339())
+            },
+        )
+        .expect("insert active session");
         queue_prompt_record(&db_path, "sess-1", "queued").expect("queue prompt");
         let prompt_id = load_queued_prompts(&db_path, "sess-1").expect("load")[0].id;
         let token = "integration-token".to_string();
@@ -5185,6 +5245,33 @@ mod tests {
             .expect("delete unauthenticated");
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
+        let cancel_unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/sess-1/cancel")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("cancel unauthenticated");
+        assert_eq!(cancel_unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let cancel_invalid_bearer = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/sess-1/cancel")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer wrong-token")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("cancel invalid bearer");
+        assert_eq!(cancel_invalid_bearer.status(), StatusCode::UNAUTHORIZED);
+
         let deleted = app
             .clone()
             .oneshot(
@@ -5198,6 +5285,20 @@ mod tests {
             .await
             .expect("delete queued prompt");
         assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+        let missing_session_cancel = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/missing/cancel")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("cancel missing session");
+        assert_eq!(missing_session_cancel.status(), StatusCode::NOT_FOUND);
 
         let queued_cancel = app
             .clone()
@@ -5218,6 +5319,35 @@ mod tests {
             prompt_started_at: "1970-01-01T00:00:00Z".to_string(),
         })
         .expect("claim json");
+        let claim_unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/prompt-cancels/claim")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(claim_body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("claim unauthenticated");
+        assert_eq!(claim_unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let claim_invalid_bearer = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/prompt-cancels/claim")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer wrong-token")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(claim_body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("claim invalid bearer");
+        assert_eq!(claim_invalid_bearer.status(), StatusCode::UNAUTHORIZED);
+
         let claimed = app
             .oneshot(
                 axum::http::Request::builder()
@@ -5403,10 +5533,17 @@ mod tests {
         let db_path = dir.path().join("sessions.sqlite3");
         let now = now_rfc3339();
 
-        upsert_session_record(&db_path, &session_named("sess-1", &now)).expect("session");
+        upsert_session_record(
+            &db_path,
+            &SessionRecord {
+                prompt_in_flight: true,
+                ..session_named("sess-1", &now)
+            },
+        )
+        .expect("session");
         queue_permission_decision_record(&db_path, "sess-1", "call-1", "allow")
             .expect("queue decision");
-        queue_prompt_cancel_record(&db_path, "sess-1").expect("queue cancel");
+        assert!(queue_prompt_cancel_record(&db_path, "sess-1").expect("queue cancel"));
         queue_prompt_record(&db_path, "sess-1", "next task").expect("queue prompt");
 
         disconnect_session_record(&db_path, "sess-1").expect("disconnect");

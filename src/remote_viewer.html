@@ -2179,6 +2179,7 @@
       // forever. The queued change itself is unaffected: it still applies (or
       // dies with the session) server-side.
       const CONFIG_APPLY_TIMEOUT_MS = 60000;
+      const STOP_REQUEST_TIMEOUT_MS = 15000;
       const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
       const narrowScreen = window.matchMedia("(max-width: 800px)");
 
@@ -2198,7 +2199,7 @@
       const draftBySessionId = new Map();
       const activityBySessionId = new Map();
       const sessionCardById = new Map();
-      const stoppingSessionIds = new Set();
+      const stopRequestBySessionId = new Map();
       const deletingQueuedPromptIds = new Set();
       // Decisions already POSTed, keyed "<session_id>\u001f<request_id>",
       // so the buttons stay disabled until the pending request disappears
@@ -2646,10 +2647,11 @@
       }
 
       function syncPendingStopState() {
-        for (const sessionId of [...stoppingSessionIds]) {
+        const now = Date.now();
+        for (const [sessionId, sentAt] of [...stopRequestBySessionId.entries()]) {
           const session = sessions.find((candidate) => candidate.session_id === sessionId);
-          if (!sessionHasActiveTurn(session)) {
-            stoppingSessionIds.delete(sessionId);
+          if (!sessionHasActiveTurn(session) || now - sentAt > STOP_REQUEST_TIMEOUT_MS) {
+            stopRequestBySessionId.delete(sessionId);
           }
         }
       }
@@ -3797,7 +3799,7 @@
         workingBadgeEl.hidden = !sessionIsWorking(session);
         const activeTurn = sessionHasActiveTurn(session);
         stopTurnEl.hidden = !activeTurn;
-        stopTurnEl.disabled = !activeTurn || stoppingSessionIds.has(session.session_id);
+        stopTurnEl.disabled = !activeTurn || stopRequestBySessionId.has(session.session_id);
         stopTurnEl.setAttribute("aria-label", `Stop active prompt for ${sessionLabel(session)}`);
 
         if (renderedSessionId !== session.session_id) {
@@ -4695,7 +4697,7 @@
         if (!sessionId || !sessionHasActiveTurn(session)) {
           return;
         }
-        stoppingSessionIds.add(sessionId);
+        stopRequestBySessionId.set(sessionId, Date.now());
         renderChat();
         try {
           const response = await apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/cancel`, {
@@ -4707,7 +4709,7 @@
           setQueueStatus("Stop requested.");
           await refreshSessions();
         } catch (error) {
-          stoppingSessionIds.delete(sessionId);
+          stopRequestBySessionId.delete(sessionId);
           if (error.message !== "HTTP 401") {
             setQueueStatus(`Stop failed: ${error.message}`, true);
           }
