@@ -158,7 +158,10 @@ mod backend {
             .map_err(|_| anyhow::anyhow!("download thread panicked"))?
     }
 
-    fn extract_tar_bz2_file(archive: &Path, dest: &Path) -> Result<()> {
+    fn extract_tar_bz2_file<F>(archive: &Path, dest: &Path, mut on_progress: F) -> Result<()>
+    where
+        F: FnMut(&Path, u64, u64),
+    {
         let file =
             fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
         let decoder = bzip2::read::BzDecoder::new(file);
@@ -172,14 +175,45 @@ mod backend {
                     entry_path.display()
                 )
             })?;
-            let out_path = dest.join(relative);
+            let out_path = dest.join(&relative);
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("create {}", parent.display()))?;
             }
-            entry
-                .unpack(&out_path)
-                .with_context(|| format!("unpack {}", out_path.display()))?;
+
+            let entry_type = entry.header().entry_type();
+            if entry_type.is_file() {
+                let total = entry.header().size().unwrap_or(0);
+                let mut out = fs::File::create(&out_path)
+                    .with_context(|| format!("create {}", out_path.display()))?;
+                let mut buffer = [0u8; 64 * 1024];
+                let mut written = 0u64;
+                let mut last_percent = u64::MAX;
+                loop {
+                    let read = entry
+                        .read(&mut buffer)
+                        .with_context(|| format!("read {}", relative.display()))?;
+                    if read == 0 {
+                        break;
+                    }
+                    out.write_all(&buffer[..read])
+                        .with_context(|| format!("write {}", out_path.display()))?;
+                    written += read as u64;
+                    if let Some(percent) = written.saturating_mul(100).checked_div(total)
+                        && percent != last_percent
+                    {
+                        last_percent = percent;
+                        on_progress(&relative, written, total);
+                    }
+                }
+                if total == 0 || last_percent < 100 {
+                    on_progress(&relative, written, total);
+                }
+            } else {
+                entry
+                    .unpack(&out_path)
+                    .with_context(|| format!("unpack {}", out_path.display()))?;
+            }
         }
         Ok(())
     }
@@ -201,6 +235,13 @@ mod backend {
 
     fn megabytes(bytes: u64) -> u64 {
         bytes / (1024 * 1024)
+    }
+
+    fn model_component_name(path: &Path) -> String {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("voice model")
+            .to_string()
     }
 
     pub(super) fn ensure_models_installed<H>(paths: &ModelPaths, on_status: &mut H) -> Result<()>
@@ -269,7 +310,24 @@ mod backend {
             // into place in one rename, so an interrupted unpack can never
             // leave a plausible-looking but truncated install behind.
             let _ = fs::remove_dir_all(&staging);
-            extract_tar_bz2_file(&archive, &staging).context("extract voice model")?;
+            let mut last_extract_status = String::new();
+            extract_tar_bz2_file(&archive, &staging, |path, written, total| {
+                let component = model_component_name(path);
+                let message = if let Some(percent) = written.saturating_mul(100).checked_div(total)
+                {
+                    format!("unpacking voice model: {component} {percent}%")
+                } else {
+                    format!(
+                        "unpacking voice model: {component} {} MB",
+                        megabytes(written)
+                    )
+                };
+                if message != last_extract_status {
+                    last_extract_status.clone_from(&message);
+                    on_status(message);
+                }
+            })
+            .context("extract voice model")?;
             let _ = fs::remove_file(&archive);
             let extracted = staging.join(ASR_MODEL_DIR);
             if !extracted.is_dir() {
