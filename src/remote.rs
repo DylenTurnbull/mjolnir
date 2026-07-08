@@ -52,6 +52,7 @@ use crate::event::{
 };
 
 const REMOTE_CONTROL_LOCAL_ADDR: &str = "127.0.0.1:11921";
+const REMOTE_CONTROL_LOCAL_ADDR_V6: &str = "[::1]:11921";
 const REMOTE_CONTROL_PUBLIC_ADDR: &str = "0.0.0.0:11921";
 const REMOTE_CONTROL_UPSERT_URL: &str = "https://localhost:11921/api/sessions";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
@@ -672,7 +673,10 @@ struct ServerPaths {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServerListenConfig {
-    bind_addr: String,
+    /// Addresses to bind, in priority order. The first is mandatory (a bind
+    /// failure aborts startup); any further addresses are best-effort, so a
+    /// host with IPv6 disabled still starts on IPv4 alone.
+    bind_addrs: Vec<String>,
     viewer_host: String,
 }
 
@@ -1841,7 +1845,17 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
         }
     };
 
-    let listener = bind_server_listener(&listen.bind_addr)?;
+    let mut remaining_addrs = listen.bind_addrs.iter();
+    let primary_addr = remaining_addrs
+        .next()
+        .expect("bind_addrs always has at least one address");
+    let mut listeners = vec![bind_server_listener(primary_addr)?];
+    for addr in remaining_addrs {
+        match bind_server_listener(addr) {
+            Ok(listener) => listeners.push(listener),
+            Err(error) => debug!("skip optional remote-control listener on {addr}: {error:#}"),
+        }
+    }
 
     let history_ttl =
         (history_days > 0).then(|| Duration::from_secs(u64::from(history_days) * 24 * 60 * 60));
@@ -1875,27 +1889,40 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     }
 
     let server_handle = axum_server::Handle::new();
-    let server = axum_server::from_tcp_rustls(listener, tls_config)
-        .handle(server_handle.clone())
-        .serve(app.into_make_service());
-    let server_task = tokio::spawn(server);
+    let mut server_tasks = tokio::task::JoinSet::new();
+    for listener in listeners {
+        let server = axum_server::from_tcp_rustls(listener, tls_config.clone())
+            .handle(server_handle.clone())
+            .serve(app.clone().into_make_service());
+        server_tasks.spawn(server);
+    }
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     session_manager.start_session(cwd);
-    let mut server_task = server_task;
     let result = tokio::select! {
-        joined = &mut server_task => joined.context("remote-control server task join")?,
+        joined = server_tasks.join_next() => {
+            joined
+                .expect("at least one remote-control listener task")
+                .context("remote-control server task join")?
+        }
         signal = tokio::signal::ctrl_c() => {
             if let Err(error) = signal {
                 warn!("remote-control shutdown signal failed: {error}");
             }
             session_manager.shutdown_all().await;
             server_handle.graceful_shutdown(Some(Duration::from_secs(2)));
-            server_task.await.context("remote-control server task join after shutdown")?
+            let mut shutdown_result = Ok(());
+            while let Some(joined) = server_tasks.join_next().await {
+                let joined = joined.context("remote-control server task join after shutdown")?;
+                if joined.is_err() {
+                    shutdown_result = joined;
+                }
+            }
+            shutdown_result
         }
     };
     session_manager.shutdown_all().await;
-    result.with_context(|| format!("serve remote-control API on {}", listen.bind_addr))
+    result.with_context(|| format!("serve remote-control API on {}", listen.bind_addrs.join(", ")))
 }
 
 fn start_server_agent_session(
@@ -2178,7 +2205,7 @@ fn mint_tailscale_cert(
 /// `--hostname` mode. Access is still gated by the bearer token/viewer code.
 fn tailscale_listen_config(cert_domain: &str) -> ServerListenConfig {
     ServerListenConfig {
-        bind_addr: REMOTE_CONTROL_PUBLIC_ADDR.to_string(),
+        bind_addrs: vec![REMOTE_CONTROL_PUBLIC_ADDR.to_string()],
         viewer_host: cert_domain.to_string(),
     }
 }
@@ -3198,11 +3225,19 @@ fn remote_control_dir() -> PathBuf {
 fn server_listen_config(hostname: Option<&str>) -> Result<ServerListenConfig> {
     match normalize_requested_hostname(hostname).as_deref() {
         Some(hostname) => Ok(ServerListenConfig {
-            bind_addr: REMOTE_CONTROL_PUBLIC_ADDR.to_string(),
+            bind_addrs: vec![REMOTE_CONTROL_PUBLIC_ADDR.to_string()],
             viewer_host: hostname.to_string(),
         }),
         None => Ok(ServerListenConfig {
-            bind_addr: REMOTE_CONTROL_LOCAL_ADDR.to_string(),
+            // Many Linux systems resolve "localhost" to the IPv6 loopback
+            // first (see /etc/hosts ordering); binding only the IPv4
+            // loopback forces every client through a refused-then-fallback
+            // hop that some browsers handle inconsistently between page
+            // navigation and same-origin fetch(), so bind both.
+            bind_addrs: vec![
+                REMOTE_CONTROL_LOCAL_ADDR.to_string(),
+                REMOTE_CONTROL_LOCAL_ADDR_V6.to_string(),
+            ],
             viewer_host: "localhost".to_string(),
         }),
     }
@@ -6938,7 +6973,10 @@ mod tests {
         assert_eq!(
             server_listen_config(None).expect("config"),
             ServerListenConfig {
-                bind_addr: REMOTE_CONTROL_LOCAL_ADDR.to_string(),
+                bind_addrs: vec![
+                    REMOTE_CONTROL_LOCAL_ADDR.to_string(),
+                    REMOTE_CONTROL_LOCAL_ADDR_V6.to_string(),
+                ],
                 viewer_host: "localhost".to_string(),
             }
         );
@@ -6949,7 +6987,7 @@ mod tests {
         assert_eq!(
             server_listen_config(Some("example.com")).expect("config"),
             ServerListenConfig {
-                bind_addr: REMOTE_CONTROL_PUBLIC_ADDR.to_string(),
+                bind_addrs: vec![REMOTE_CONTROL_PUBLIC_ADDR.to_string()],
                 viewer_host: "example.com".to_string(),
             }
         );
@@ -7255,7 +7293,7 @@ mod tests {
         assert_eq!(
             tailscale_listen_config("mybox.tail1234.ts.net"),
             ServerListenConfig {
-                bind_addr: REMOTE_CONTROL_PUBLIC_ADDR.to_string(),
+                bind_addrs: vec![REMOTE_CONTROL_PUBLIC_ADDR.to_string()],
                 viewer_host: "mybox.tail1234.ts.net".to_string(),
             }
         );
