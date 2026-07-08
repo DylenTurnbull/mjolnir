@@ -1539,6 +1539,57 @@
         }
       }
 
+      .command-palette {
+        margin: -3px 8px 8px 32px;
+        max-height: 180px;
+        overflow-y: auto;
+        border-top: 1px solid var(--line-row);
+        border-bottom: 1px solid var(--line-row);
+        background: rgb(255 255 255 / 0.018);
+
+        &:empty,
+        &[hidden] {
+          display: none;
+        }
+      }
+
+      .command-option {
+        width: 100%;
+        display: grid;
+        grid-template-columns: minmax(110px, max-content) minmax(0, 1fr);
+        gap: 10px;
+        align-items: baseline;
+        border: 0;
+        border-bottom: 1px solid var(--line-row);
+        background: transparent;
+        color: var(--text-control);
+        padding: 7px 9px;
+        text-align: left;
+        cursor: pointer;
+
+        &:last-child {
+          border-bottom: 0;
+        }
+
+        &.is-selected {
+          background: rgb(235 63 51 / 0.13);
+          color: var(--button-hover-text);
+        }
+      }
+
+      .command-option-name {
+        font: 700 11px/1.35 var(--font-mono);
+        color: var(--red-hot);
+        overflow-wrap: anywhere;
+      }
+
+      .command-option-desc {
+        min-width: 0;
+        color: var(--muted);
+        font: 400 11px/1.35 var(--font-mono);
+        overflow-wrap: anywhere;
+      }
+
       /* control strip: inline settings · queue status · Queue key */
       .console-strip {
         display: flex;
@@ -1947,6 +1998,7 @@
           <div class="console">
             <span class="console-frame" aria-hidden="true"></span>
             <textarea id="queue-input" placeholder="Queue a prompt — runs when the session is idle" enterkeyhint="send" aria-label="Prompt to queue"></textarea>
+            <div id="command-palette" class="command-palette" role="listbox" aria-label="Slash commands" hidden></div>
             <div class="console-strip">
               <div id="session-config" class="config-strip"></div>
               <span id="queue-status" class="queue-meta">Select a session.</span>
@@ -2065,6 +2117,7 @@
       const permissionsEl = $("permissions");
       const sessionConfigEl = $("session-config");
       const queueInputEl = $("queue-input");
+      const commandPaletteEl = $("command-palette");
       const queueSubmitEl = $("queue-submit");
       const queueStatusEl = $("queue-status");
       const queueListEl = $("queue-list");
@@ -2103,6 +2156,8 @@
       let filesystemState = null;
       let filesystemLoading = false;
       let creatingSession = false;
+      let commandMatches = [];
+      let commandSelected = 0;
       const draftBySessionId = new Map();
       const activityBySessionId = new Map();
       const sessionCardById = new Map();
@@ -3760,6 +3815,7 @@
           queueInputEl.value = draft;
           syncComposerHeight();
         }
+        updateCommandPalette();
       }
 
       function syncComposerHeight() {
@@ -3773,6 +3829,202 @@
         queueStatusEl.classList.toggle("is-error", isError);
       }
 
+      function sessionCommands(session) {
+        return session && Array.isArray(session.available_commands) ? session.available_commands : [];
+      }
+
+      function slashCommandQuery(text) {
+        if (!text.startsWith("/")) {
+          return null;
+        }
+        const rest = text.slice(1);
+        return /\s/.test(rest) ? null : rest.toLowerCase();
+      }
+
+      function commandDisplay(command) {
+        return `/${command.name || ""}${command.input_hint ? ` <${command.input_hint}>` : ""}`;
+      }
+
+      function commandSearchText(command) {
+        return [
+          command.name || "",
+          command.description || "",
+          command.input_hint || "",
+        ].join("\n").toLowerCase();
+      }
+
+      function clearCommandPalette() {
+        commandMatches = [];
+        commandSelected = 0;
+        commandPaletteEl.hidden = true;
+        commandPaletteEl.replaceChildren();
+      }
+
+      function setCommandSelected(index) {
+        if (!commandMatches.length) {
+          commandSelected = 0;
+          return;
+        }
+        commandSelected = (index + commandMatches.length) % commandMatches.length;
+        [...commandPaletteEl.children].forEach((el, i) => {
+          const selected = i === commandSelected;
+          el.classList.toggle("is-selected", selected);
+          el.setAttribute("aria-selected", selected ? "true" : "false");
+          if (selected && el.scrollIntoView) {
+            el.scrollIntoView({ block: "nearest" });
+          }
+        });
+      }
+
+      function renderCommandPalette() {
+        commandPaletteEl.replaceChildren();
+        if (!commandMatches.length) {
+          commandPaletteEl.hidden = true;
+          return;
+        }
+        commandPaletteEl.hidden = false;
+        commandMatches.forEach((command, index) => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "command-option";
+          button.setAttribute("role", "option");
+          const name = document.createElement("span");
+          name.className = "command-option-name";
+          name.textContent = commandDisplay(command);
+          const desc = document.createElement("span");
+          desc.className = "command-option-desc";
+          desc.textContent = command.description || (command.source === "agent" ? "agent command" : "mjolnir command");
+          button.append(name, desc);
+          button.addEventListener("mouseenter", () => setCommandSelected(index));
+          button.addEventListener("mousedown", (event) => {
+            event.preventDefault();
+            commandSelected = index;
+            acceptCommandSelection();
+          });
+          commandPaletteEl.appendChild(button);
+        });
+        if (commandSelected >= commandMatches.length) {
+          commandSelected = 0;
+        }
+        setCommandSelected(commandSelected);
+      }
+
+      function updateCommandPalette() {
+        const session = sessions.find((s) => s.session_id === selectedSessionId) || null;
+        const query = slashCommandQuery(queueInputEl.value);
+        if (query === null || !session) {
+          clearCommandPalette();
+          return;
+        }
+        const commands = sessionCommands(session);
+        if (!commands.length) {
+          clearCommandPalette();
+          return;
+        }
+
+        const previous = commandMatches[commandSelected]?.name || "";
+        const prefix = commands.filter((command) => (command.name || "").toLowerCase().startsWith(query));
+        commandMatches = prefix.length
+          ? prefix
+          : commands.filter((command) => commandSearchText(command).includes(query));
+        commandSelected = commandMatches.findIndex((command) => command.name === previous);
+        if (commandSelected < 0) {
+          commandSelected = 0;
+        }
+        renderCommandPalette();
+      }
+
+      function moveCommandSelection(delta) {
+        if (!commandMatches.length || commandPaletteEl.hidden) {
+          return false;
+        }
+        setCommandSelected(commandSelected + delta);
+        return true;
+      }
+
+      function acceptCommandSelection() {
+        if (!commandMatches.length || commandPaletteEl.hidden) {
+          return false;
+        }
+        const command = commandMatches[commandSelected];
+        if (!command?.name) {
+          return false;
+        }
+        queueInputEl.value = `/${command.name} `;
+        saveDraftForSelectedSession();
+        syncComposerHeight();
+        clearCommandPalette();
+        queueInputEl.focus();
+        return true;
+      }
+
+      function markdownForEntry(entry) {
+        const kind = entry.kind || "entry";
+        if (kind === "tool") {
+          const title = entry.tool_title || entry.text || "tool";
+          const body = entry.tool_body || entry.text || "";
+          return [`### Tool: ${title}`, "", body].join("\n").trim();
+        }
+        const label = kind === "user" ? "You" : kind === "agent" ? "Agent" : kind;
+        return [`### ${label}`, "", entry.text || ""].join("\n").trim();
+      }
+
+      function downloadTranscriptMarkdown(session) {
+        const transcript = Array.isArray(session?.transcript) ? session.transcript : [];
+        const title = sessionLabel(session || {}) || "mjolnir session";
+        const body = [
+          `# ${title}`,
+          "",
+          `${session?.project || "-"} · ${session?.agent || "-"}`,
+          "",
+          ...transcript.map(markdownForEntry).filter(Boolean),
+          "",
+        ].join("\n");
+        const blob = new Blob([body], { type: "text/markdown;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        const safeName = (title || "mjolnir-session").toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-|-$/g, "") || "mjolnir-session";
+        link.href = url;
+        link.download = `${safeName}.md`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+      }
+
+      function consumeLocalSlashCommand(session, text) {
+        const trimmed = text.trim();
+        if (trimmed === "/new") {
+          openNewSessionPicker();
+        } else if (trimmed === "/mjconfig") {
+          if (!session) {
+            return false;
+          }
+          const target = sessionConfigEl.querySelector("button, input, select");
+          if (target) {
+            target.focus();
+            sessionConfigEl.scrollIntoView({ block: "nearest" });
+          } else {
+            setQueueStatus("No session config controls are available.", true);
+          }
+        } else if (trimmed === "/export") {
+          if (!session) {
+            return false;
+          }
+          downloadTranscriptMarkdown(session);
+          setQueueStatus("Transcript exported.");
+        } else {
+          return false;
+        }
+        queueInputEl.value = "";
+        if (selectedSessionId) {
+          draftBySessionId.set(selectedSessionId, "");
+        }
+        syncComposerHeight();
+        clearCommandPalette();
+        return true;
+      }
+
       function renderQueue(session) {
         queueListEl.replaceChildren();
         queueInputEl.disabled = !session;
@@ -3780,6 +4032,7 @@
 
         if (!session) {
           setQueueStatus("Select a session.");
+          clearCommandPalette();
           return;
         }
 
@@ -4205,6 +4458,7 @@
         renderConfig(session);
         renderPermissions(session);
         renderQueue(session);
+        updateCommandPalette();
       }
 
       function renderAll() {
@@ -4304,6 +4558,10 @@
         if (!sessionId || !text.trim()) {
           return;
         }
+        const session = sessions.find((s) => s.session_id === selectedSessionId) || null;
+        if (consumeLocalSlashCommand(session, text)) {
+          return;
+        }
         queueSubmitEl.disabled = true;
         try {
           const response = await apiFetch("/api/queued-prompts", {
@@ -4321,6 +4579,7 @@
           }
           queueInputEl.value = "";
           draftBySessionId.set(sessionId, "");
+          clearCommandPalette();
           syncComposerHeight();
           pendingNewEntries = 0;
           forceScrollToBottom = true;
@@ -4428,8 +4687,36 @@
       queueInputEl.addEventListener("input", () => {
         saveDraftForSelectedSession();
         syncComposerHeight();
+        updateCommandPalette();
       });
       queueInputEl.addEventListener("keydown", (event) => {
+        if (!commandPaletteEl.hidden) {
+          if (event.key === "ArrowDown") {
+            event.preventDefault();
+            moveCommandSelection(1);
+            return;
+          }
+          if (event.key === "ArrowUp") {
+            event.preventDefault();
+            moveCommandSelection(-1);
+            return;
+          }
+          if (event.key === "Tab") {
+            event.preventDefault();
+            acceptCommandSelection();
+            return;
+          }
+          if (event.key === "Enter" && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey) {
+            event.preventDefault();
+            acceptCommandSelection();
+            return;
+          }
+          if (event.key === "Escape") {
+            event.preventDefault();
+            clearCommandPalette();
+            return;
+          }
+        }
         if (event.key === "Enter" && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey) {
           event.preventDefault();
           submitQueuedPrompt();
