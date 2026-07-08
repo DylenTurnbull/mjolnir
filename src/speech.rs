@@ -220,8 +220,10 @@ mod backend {
         if !has_model_data(&paths.vad) {
             on_status("downloading voice activity model...".to_string());
             let tmp = paths.vad.with_extension("onnx.part");
-            download_to_file(VAD_MODEL_URL, &tmp, |_, _| {})
-                .context("download silero VAD model")?;
+            if let Err(error) = download_to_file(VAD_MODEL_URL, &tmp, |_, _| {}) {
+                let _ = fs::remove_file(&tmp);
+                return Err(error).context("download silero VAD model");
+            }
             fs::rename(&tmp, &paths.vad)
                 .with_context(|| format!("install {}", paths.vad.display()))?;
         }
@@ -232,8 +234,14 @@ mod backend {
             && has_model_data(&paths.tokens))
         {
             let archive = voice_dir.join(format!("{ASR_MODEL_DIR}.tar.bz2.part"));
+            let staging = voice_dir.join(format!("{ASR_MODEL_DIR}.extracting"));
+            if archive.exists() || staging.exists() {
+                on_status("restarting incomplete voice model setup...".to_string());
+                let _ = fs::remove_file(&archive);
+                let _ = fs::remove_dir_all(&staging);
+            }
             let mut last_percent = u64::MAX;
-            download_to_file(ASR_MODEL_URL, &archive, |downloaded, total| {
+            if let Err(error) = download_to_file(ASR_MODEL_URL, &archive, |downloaded, total| {
                 let message = match total {
                     Some(total) if total > 0 => {
                         let percent = downloaded * 100 / total;
@@ -252,13 +260,14 @@ mod backend {
                     ),
                 };
                 on_status(message);
-            })
-            .context("download voice recognition model")?;
+            }) {
+                let _ = fs::remove_file(&archive);
+                return Err(error).context("download voice recognition model");
+            }
             on_status("unpacking voice model...".to_string());
             // Extract into a staging directory and move the finished model dir
             // into place in one rename, so an interrupted unpack can never
             // leave a plausible-looking but truncated install behind.
-            let staging = voice_dir.join(format!("{ASR_MODEL_DIR}.extracting"));
             let _ = fs::remove_dir_all(&staging);
             extract_tar_bz2_file(&archive, &staging).context("extract voice model")?;
             let _ = fs::remove_file(&archive);
