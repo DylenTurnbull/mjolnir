@@ -106,6 +106,11 @@ const VIEWER_CODE_LOCKOUT: Duration = Duration::from_secs(30);
 /// A `SessionRecord` can include the full transcript history; allow room for
 /// larger snapshots while still capping request bodies to something reasonable.
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Keep structured diff payloads well below the remote-control request limit.
+/// The textual tool summary still carries every touched path when full file
+/// contents are too large to safely publish.
+const MAX_TRANSCRIPT_DIFF_TEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TRANSCRIPT_DIFF_TEXT_BYTES_PER_FILE: usize = 512 * 1024;
 
 /// Tracks consecutive failed viewer-code attempts to rate-limit brute force.
 #[derive(Debug, Default)]
@@ -419,6 +424,8 @@ pub struct TranscriptDiff {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_text: Option<String>,
     pub new_text: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4281,18 +4288,84 @@ fn format_diff_summary(diff: &Diff) -> String {
     format!("diff: {}", diff.path.display())
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn transcript_diffs(content: &[ToolCallContent]) -> Vec<TranscriptDiff> {
+    let mut remaining_budget = MAX_TRANSCRIPT_DIFF_TEXT_BYTES;
     content
         .iter()
         .filter_map(|item| match item {
-            ToolCallContent::Diff(diff) => Some(TranscriptDiff {
-                path: diff.path.display().to_string(),
-                old_text: diff.old_text.clone(),
-                new_text: diff.new_text.clone(),
-            }),
+            ToolCallContent::Diff(diff) => Some(transcript_diff(diff, &mut remaining_budget)),
             _ => None,
         })
         .collect()
+}
+
+fn transcript_diff(diff: &Diff, remaining_budget: &mut usize) -> TranscriptDiff {
+    let diff_budget = (*remaining_budget).min(MAX_TRANSCRIPT_DIFF_TEXT_BYTES_PER_FILE);
+    let old_len = diff.old_text.as_ref().map_or(0, String::len);
+    let new_len = diff.new_text.len();
+    let (old_budget, new_budget) = split_diff_text_budget(old_len, new_len, diff_budget);
+    let old_text = diff
+        .old_text
+        .as_ref()
+        .map(|text| truncate_str_to_budget(text, old_budget));
+    let new_text = truncate_str_to_budget(&diff.new_text, new_budget);
+    let truncated =
+        old_text.as_ref().is_some_and(|text| text.len() < old_len) || new_text.len() < new_len;
+    let used_budget = old_text
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(new_text.len());
+    *remaining_budget = (*remaining_budget).saturating_sub(used_budget);
+
+    TranscriptDiff {
+        path: diff.path.display().to_string(),
+        old_text,
+        new_text,
+        truncated,
+    }
+}
+
+fn split_diff_text_budget(old_len: usize, new_len: usize, budget: usize) -> (usize, usize) {
+    if old_len.saturating_add(new_len) <= budget {
+        return (old_len, new_len);
+    }
+    if old_len == 0 {
+        return (0, new_len.min(budget));
+    }
+    if new_len == 0 {
+        return (old_len.min(budget), 0);
+    }
+
+    let old_budget = old_len.min(budget / 2);
+    let new_budget = new_len.min(budget.saturating_sub(old_budget));
+    let unused = budget.saturating_sub(old_budget + new_budget);
+    if unused == 0 {
+        return (old_budget, new_budget);
+    }
+
+    let old_extra = old_len.saturating_sub(old_budget).min(unused);
+    let old_budget = old_budget + old_extra;
+    let new_extra = new_len
+        .saturating_sub(new_budget)
+        .min(unused.saturating_sub(old_extra));
+    (old_budget, new_budget + new_extra)
+}
+
+fn truncate_str_to_budget(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_string();
+    }
+    let end = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= budget)
+        .last()
+        .unwrap_or(0);
+    text[..end].to_string()
 }
 
 fn tool_call_references_terminal(content: &[ToolCallContent], terminal_id: &str) -> bool {
@@ -4690,6 +4763,64 @@ mod tests {
             snapshot.transcript[0].tool_diffs[0].new_text,
             "one\ntwo\nthree\n"
         );
+        assert!(!snapshot.transcript[0].tool_diffs[0].truncated);
+    }
+
+    #[test]
+    fn tool_transcript_entry_caps_structured_diff_payload() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+
+        let old_text = "a".repeat(MAX_TRANSCRIPT_DIFF_TEXT_BYTES_PER_FILE);
+        let new_text = "b".repeat(MAX_TRANSCRIPT_DIFF_TEXT_BYTES_PER_FILE);
+        let mut tool_call = ToolCall::new("call-1", "workspace changes (1 file)");
+        tool_call.kind = ToolKind::Edit;
+        tool_call.content = vec![ToolCallContent::Diff(
+            Diff::new("src/large.rs", new_text).old_text(Some(old_text)),
+        )];
+        state.observe_session_update(&SessionUpdate::ToolCall(tool_call));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        let diff = &snapshot.transcript[0].tool_diffs[0];
+        let old_len = diff.old_text.as_ref().expect("old text").len();
+        let new_len = diff.new_text.len();
+        assert!(diff.truncated);
+        assert!(old_len + new_len <= MAX_TRANSCRIPT_DIFF_TEXT_BYTES_PER_FILE);
+        assert!(
+            serde_json::to_string(&snapshot.transcript[0])
+                .expect("serialize transcript entry")
+                .contains("\"truncated\":true")
+        );
+    }
+
+    #[test]
+    fn structured_diff_budget_does_not_reserve_unused_per_file_capacity() {
+        let content = (0..6)
+            .map(|index| {
+                ToolCallContent::Diff(
+                    Diff::new(format!("src/{index}.rs"), "new\n")
+                        .old_text(Some("old\n".to_string())),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let diffs = transcript_diffs(&content);
+        assert_eq!(diffs.len(), 6);
+        assert!(diffs.iter().all(|diff| !diff.truncated));
+        assert!(
+            diffs
+                .iter()
+                .all(|diff| diff.old_text.as_deref() == Some("old\n"))
+        );
+        assert!(diffs.iter().all(|diff| diff.new_text == "new\n"));
+    }
+
+    #[test]
+    fn structured_diff_truncation_preserves_utf8_boundaries() {
+        assert_eq!(truncate_str_to_budget("éé", 3), "é");
     }
 
     #[test]

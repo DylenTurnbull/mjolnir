@@ -3714,8 +3714,12 @@
           const path = typeof diff.path === "string" && diff.path ? diff.path : "file";
           const oldText = typeof diff.old_text === "string" ? diff.old_text : "";
           const newText = typeof diff.new_text === "string" ? diff.new_text : "";
+          let diffBody = diffText(oldText, newText);
+          if (diff.truncated === true) {
+            diffBody = `${diffBody}${diffBody ? "\n" : ""}... diff truncated for remote viewer ...`;
+          }
           body.appendChild(inlineTextPre([`diff ${path}`]));
-          body.appendChild(diffBlock(diffText(oldText, newText)));
+          body.appendChild(diffBlock(diffBody));
         }
       }
 
