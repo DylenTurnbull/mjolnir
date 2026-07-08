@@ -1006,8 +1006,24 @@ async fn run_app(
         match session_result.reason {
             UiExitReason::Quit => return Ok(session_result.session_id),
             UiExitReason::NewSession => {
-                pick_agent = true;
-                pending_new_session_boundary = true;
+                match run_agent_picker_and_update_config(&mut cfg, &config_path).await? {
+                    Some(selected_agent) => {
+                        initial_agent = Some(selected_agent);
+                        pending_new_session_boundary = true;
+                    }
+                    None => {
+                        cfg.save(&config_path)
+                            .with_context(|| format!("save {}", config_path.display()))?;
+                        let (agent, resume) = resume_target_after_cancelled_new_session(
+                            agent,
+                            session_result.session_id,
+                            session_result.session_title,
+                        );
+                        initial_agent = Some(agent);
+                        initial_resume = resume;
+                        pending_new_session_boundary = false;
+                    }
+                }
                 continue;
             }
             UiExitReason::ClearSession => {
@@ -1200,6 +1216,18 @@ fn new_session_boundary_for_agent(
 ) -> Option<String> {
     pending_new_session_boundary
         .then(|| format!("new {} session started", agent_header_label(agent)))
+}
+
+fn resume_target_after_cancelled_new_session(
+    agent: SelectedAgent,
+    session_id: Option<String>,
+    session_title: Option<String>,
+) -> (SelectedAgent, Option<ResumeTarget>) {
+    let resume = session_id.map(|session_id| ResumeTarget {
+        session_id,
+        title: session_title,
+    });
+    (agent, resume)
 }
 
 fn session_picker_action(
@@ -2218,6 +2246,31 @@ mod tests {
 
         assert_eq!(cfg.theme, theme::TerminalThemeKind::AnsiLight);
         assert_eq!(cfg.spinner, spinner::SpinnerStyle::Bars);
+    }
+
+    #[test]
+    fn cancelled_new_session_picker_resumes_current_session() {
+        let agent = SelectedAgent {
+            source_id: "claude-acp".to_string(),
+            program: PathBuf::from("npx"),
+            args: vec!["-y".to_string(), "@x/claude".to_string()],
+            env: Default::default(),
+        };
+
+        let (selected_agent, resume) = resume_target_after_cancelled_new_session(
+            agent.clone(),
+            Some("current-session".to_string()),
+            Some("Current title".to_string()),
+        );
+
+        assert_eq!(selected_agent, agent);
+        assert_eq!(
+            resume,
+            Some(ResumeTarget {
+                session_id: "current-session".to_string(),
+                title: Some("Current title".to_string()),
+            })
+        );
     }
 
     #[test]

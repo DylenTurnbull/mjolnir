@@ -1581,6 +1581,14 @@ fn handle_crossterm(
         return TerminalRequest::ToggleTextSelectionMode;
     }
 
+    if key.modifiers == KeyModifiers::CONTROL
+        && matches!(key.code, KeyCode::Char('c'))
+        && state.is_streaming()
+    {
+        cancel_current_turn(state, cmd_tx);
+        return TerminalRequest::None;
+    }
+
     if state.help_overlay {
         if is_help_key(key.modifiers, key.code) || matches!(key.code, KeyCode::Esc) {
             state.help_overlay = false;
@@ -14906,6 +14914,52 @@ mod tests {
             state.queued_prompts().next().expect("queued prompt").text,
             "keep me"
         );
+        assert_eq!(state.connection_state(), ConnectionState::Cancelling);
+        match cmd_rx.try_recv().expect("cancel dispatched") {
+            UiCommand::CancelPrompt => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_c_cancels_streaming_when_help_overlay_has_focus() {
+        let mut state = ready_state_with_session();
+        state.record_user_prompt("first".to_string());
+        state.help_overlay = true;
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert!(
+            state.help_overlay,
+            "Ctrl-C should not spend itself closing help"
+        );
+        assert_eq!(state.connection_state(), ConnectionState::Cancelling);
+        match cmd_rx.try_recv().expect("cancel dispatched") {
+            UiCommand::CancelPrompt => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_c_cancels_streaming_when_permission_prompt_has_focus() {
+        let mut state = ready_state_with_session();
+        state.record_user_prompt("first".to_string());
+        let pending = permission_pending_with_options("run shell command", &["Allow once"], 0);
+        state.apply_event(UiEvent::PermissionRequest(pending.prompt));
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert!(state.has_pending_permission());
         assert_eq!(state.connection_state(), ConnectionState::Cancelling);
         match cmd_rx.try_recv().expect("cancel dispatched") {
             UiCommand::CancelPrompt => {}
