@@ -2710,10 +2710,10 @@ fn start_dictation(
 
     state.input_paste_burst.clear();
     state.voice_input_active = true;
-    state.voice_input_level = Some(0.0);
+    state.voice_input_level = None;
     let cursor = state.input_cursor.min(input_char_count(&state.input));
     state.voice_input_range = Some((cursor, cursor));
-    state.status_line = Some(StatusMessage::info("listening..."));
+    state.status_line = Some(StatusMessage::info("preparing voice input..."));
 
     let (cancel_tx, cancel_rx) = std_mpsc::channel();
     *dictation_cancel_tx = Some(cancel_tx);
@@ -2817,6 +2817,20 @@ fn finish_dictation(state: &mut AppState, result: std::result::Result<String, St
             state.record_status_message(StatusKind::Warning, message);
         }
     }
+}
+
+fn dictation_prompt_title(state: &AppState) -> String {
+    if let Some(level) = state.voice_input_level {
+        return format!(" 🎙 {} Ctrl-R stop ", voice_level_meter(Some(level)));
+    }
+
+    let message = state
+        .status_line
+        .as_ref()
+        .filter(|status| status.kind == StatusKind::Info)
+        .map(|status| status.text.as_str())
+        .unwrap_or("preparing voice input...");
+    format!(" 🎙 {message} Ctrl-R stop ")
 }
 
 fn normalize_paste(text: &str) -> String {
@@ -6277,10 +6291,7 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &AppState, mode: UiMode
     } else if let Some(title) = busy_prompt_title(state) {
         title
     } else if state.voice_input_active {
-        format!(
-            " 🎙 {} Ctrl-R stop ",
-            voice_level_meter(state.voice_input_level)
-        )
+        dictation_prompt_title(state)
     } else {
         idle_prompt_title(state, VOICE_INPUT_SUPPORTED, &text_selection_hint)
     };
@@ -13512,6 +13523,51 @@ mod tests {
     fn voice_level_meter_renders_empty_when_no_level_seen() {
         assert_eq!(voice_level_meter(None), "[..........]");
         assert_eq!(voice_level_meter(Some(0.35)), "[||||......]");
+    }
+
+    #[test]
+    fn dictation_prompt_title_shows_setup_status_before_microphone_levels() {
+        let mut state = AppState::new();
+        state.voice_input_active = true;
+        state.voice_input_level = None;
+        state.status_line = Some(StatusMessage::info(
+            "downloading voice model (one-time): 42% of 464 MB",
+        ));
+
+        let title = dictation_prompt_title(&state);
+
+        assert!(title.contains("downloading voice model (one-time): 42% of 464 MB"));
+        assert!(title.contains("Ctrl-R stop"));
+    }
+
+    #[test]
+    fn dictation_prompt_title_switches_to_meter_after_microphone_levels_arrive() {
+        let mut state = AppState::new();
+        state.voice_input_active = true;
+        state.voice_input_level = Some(0.35);
+        state.status_line = Some(StatusMessage::info("listening..."));
+
+        let title = dictation_prompt_title(&state);
+
+        assert!(title.contains("[||||......]"));
+        assert!(!title.contains("listening..."));
+    }
+
+    #[tokio::test]
+    async fn starting_dictation_shows_preparing_until_microphone_levels_arrive() {
+        let mut state = AppState::new();
+        let (dictation_tx, _dictation_rx) = mpsc::unbounded_channel();
+        let mut cancel_tx = None;
+
+        start_dictation(&mut state, &dictation_tx, &mut cancel_tx);
+
+        assert!(state.voice_input_active);
+        assert!(state.voice_input_level.is_none());
+        let status = state.status_line.as_ref().expect("status");
+        assert_eq!(status.kind, StatusKind::Info);
+        assert_eq!(status.text, "preparing voice input...");
+        assert!(cancel_tx.is_some());
+        stop_dictation(&mut state, &mut cancel_tx);
     }
 
     #[test]
