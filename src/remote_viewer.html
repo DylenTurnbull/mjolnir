@@ -1827,6 +1827,13 @@
         }
       }
 
+      /* Empty status is display:none, so the first visible action keeps the
+         Stop/Queue group anchored to the right edge. */
+      #queue-status:empty + #stop-turn:not([hidden]),
+      #queue-status:empty + #stop-turn[hidden] + #queue-submit {
+        margin-left: auto;
+      }
+
       #queue-submit {
         flex: none;
         height: 30px;
