@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::menu;
+
 const WORKTREE_IGNORE_ENTRY: &str = ".mjolnir/worktrees/";
 
 /// Adjectives for random worktree names (adjective-noun style, like
@@ -294,6 +296,52 @@ pub fn open_existing_for_cwd_prompting(
     })
 }
 
+/// Ask whether to remove the worktree after the session ends, using an
+/// inline arrow-key menu when stdio is an interactive terminal and the
+/// line-based [y/N] prompt otherwise. Returns Ok(true) when the worktree
+/// was successfully removed.
+pub fn prompt_remove_on_exit_menu(worktree: &CreatedWorktree) -> Result<bool> {
+    let label = worktree_exit_label(worktree);
+    let options = [
+        menu::MenuOption {
+            label: "Keep",
+            hint: format!("leave it at {}", worktree.worktree_root.display()),
+            shortcuts: &['n', 'k'],
+        },
+        menu::MenuOption {
+            label: "Remove",
+            hint: "delete the worktree, including any uncommitted changes".to_string(),
+            shortcuts: &['y', 'r'],
+        },
+    ];
+    let choice = menu::select_inline(
+        &format!("Worktree '{label}' — keep or remove?"),
+        "↑/↓ choose · enter confirm · esc keep",
+        &options,
+        0,
+    )?;
+    let Some(choice) = choice else {
+        // Not an interactive terminal: fall back to the line-based prompt.
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        return prompt_remove_on_exit(worktree, &mut input, &mut output);
+    };
+
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    if choice != 1 {
+        writeln!(
+            output,
+            "Keeping worktree: {}",
+            worktree.worktree_root.display()
+        )?;
+        return Ok(false);
+    }
+    remove_with_feedback(worktree, &label, &mut output)
+}
+
 /// Ask the user whether to remove the worktree after the session ends.
 /// Returns Ok(true) when the worktree was successfully removed.
 pub fn prompt_remove_on_exit(
@@ -301,11 +349,7 @@ pub fn prompt_remove_on_exit(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result<bool> {
-    let label = worktree
-        .worktree_root
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| worktree.worktree_root.display().to_string());
+    let label = worktree_exit_label(worktree);
     write!(output, "Remove worktree '{label}'? [y/N] ")?;
     output.flush()?;
 
@@ -320,6 +364,22 @@ pub fn prompt_remove_on_exit(
         return Ok(false);
     }
 
+    remove_with_feedback(worktree, &label, output)
+}
+
+fn worktree_exit_label(worktree: &CreatedWorktree) -> String {
+    worktree
+        .worktree_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| worktree.worktree_root.display().to_string())
+}
+
+fn remove_with_feedback(
+    worktree: &CreatedWorktree,
+    label: &str,
+    output: &mut impl Write,
+) -> Result<bool> {
     match remove_worktree(&worktree.project_root, &worktree.worktree_root) {
         Ok(()) => {
             writeln!(output, "Removed worktree '{label}'.")?;

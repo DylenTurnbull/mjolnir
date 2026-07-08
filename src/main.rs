@@ -16,6 +16,7 @@ mod headless;
 mod install;
 mod labels;
 mod mcp;
+mod menu;
 mod model_resolve;
 mod notifications;
 mod palette;
@@ -827,11 +828,7 @@ fn handle_worktree_after_tui(worktree: Option<&CreatedWorktree>, mode: Option<Ui
     // Offer to clean up a freshly-created worktree. Skip the prompt for
     // reused worktrees — the user explicitly asked to work in an
     // existing one, so removing it would be surprising.
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
-    let stdout = std::io::stdout();
-    let mut output = stdout.lock();
-    match worktree::prompt_remove_on_exit(w, &mut input, &mut output) {
+    match worktree::prompt_remove_on_exit_menu(w) {
         Ok(removed) => !removed,
         Err(e) => {
             tracing::warn!("worktree cleanup prompt failed: {e:#}");
