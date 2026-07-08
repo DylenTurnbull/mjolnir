@@ -1650,8 +1650,16 @@ async fn run_session(
     // display label above, which is a command line for custom agents).
     let agent_source_id = Some(agent.source_id.clone());
     let tracker_project_label = header_labels.project.clone();
+    // `-w` sessions carry the worktree name in the header; sessions launched
+    // directly inside a worktree derive it from cwd so remote viewers badge
+    // both the same way.
+    let tracker_worktree_label = header_labels
+        .worktree
+        .clone()
+        .or_else(|| paths::worktree_name_from_cwd(&cwd));
     let remote_tracker = remote::RemoteSessionTracker::new(
         tracker_project_label,
+        tracker_worktree_label,
         agent_header_label(agent),
         Some(runtime_cmd_tx.clone()),
         Some(ui_event_tx.clone()),

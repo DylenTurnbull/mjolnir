@@ -129,6 +129,23 @@ pub fn parent_above_mjolnir(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Short worktree name when `cwd` is inside `<project>/.mjolnir/worktrees/<name>`,
+/// e.g. `bold-fox`. `None` for paths outside a Mjolnir worktree.
+pub fn worktree_name_from_cwd(cwd: &Path) -> Option<String> {
+    cwd.ancestors()
+        .find(|ancestor| {
+            let Some(parent) = ancestor.parent() else {
+                return false;
+            };
+            parent.file_name().is_some_and(|name| name == "worktrees")
+                && parent
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == ".mjolnir")
+        })
+        .map(folder_label)
+}
+
 /// Project label for a working directory with no worktree context: the parent
 /// above `.mjolnir` when present, otherwise the directory itself.
 pub fn project_label_from_cwd(cwd: &Path) -> String {
@@ -222,6 +239,27 @@ mod tests {
     fn project_label_prefers_parent_above_mjolnir() {
         let path = Path::new("/home/me/project/.mjolnir/worktrees/abc");
         assert_eq!(project_label_from_cwd(path), "project");
+    }
+
+    #[test]
+    fn worktree_name_from_cwd_finds_worktree_root() {
+        let path = Path::new("/home/me/project/.mjolnir/worktrees/bold-fox");
+        assert_eq!(worktree_name_from_cwd(path), Some("bold-fox".to_string()));
+    }
+
+    #[test]
+    fn worktree_name_from_cwd_finds_name_from_nested_cwd() {
+        let path = Path::new("/home/me/project/.mjolnir/worktrees/bold-fox/src/deep");
+        assert_eq!(worktree_name_from_cwd(path), Some("bold-fox".to_string()));
+    }
+
+    #[test]
+    fn worktree_name_from_cwd_is_none_outside_worktrees() {
+        assert_eq!(worktree_name_from_cwd(Path::new("/home/me/project")), None);
+        assert_eq!(
+            worktree_name_from_cwd(Path::new("/home/me/project/.mjolnir/worktrees")),
+            None
+        );
     }
 
     #[test]

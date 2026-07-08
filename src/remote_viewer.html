@@ -709,6 +709,26 @@
         flex: 1 1 auto;
       }
 
+      .fs-worktree-toggle {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        color: var(--muted);
+        font: 700 10px/1 var(--font-mono);
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        cursor: pointer;
+
+        & input {
+          accent-color: var(--red);
+        }
+
+        &:has(input:disabled) {
+          cursor: default;
+          opacity: 0.65;
+        }
+      }
+
       .fs-list {
         min-height: 180px;
         max-height: min(42dvh, 360px);
@@ -878,6 +898,19 @@
           white-space: nowrap;
           max-width: 100%;
         }
+      }
+
+      .session-worktree {
+        flex: 0 0 auto;
+        align-self: center;
+        font: 700 9px/1 var(--font-mono);
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--muted);
+        background: var(--surface-terminal);
+        clip-path: var(--shape-chip);
+        padding: 3px 7px 2px;
+        box-shadow: 0 0 0 1px var(--line-row);
       }
 
       .session-foot {
@@ -2057,6 +2090,10 @@
         <div id="fs-roots" class="fs-roots" aria-label="Workspace roots"></div>
         <div class="fs-toolbar">
           <button id="fs-parent-button" class="fs-parent-button" type="button">Up</button>
+          <label class="fs-worktree-toggle">
+            <input type="checkbox" id="new-session-worktree" />
+            New worktree
+          </label>
           <span class="fs-spacer"></span>
           <button id="new-session-start" class="primary" type="button">Start session</button>
         </div>
@@ -2074,6 +2111,7 @@
         </div>
         <div class="session-meta">
           <span class="session-project"></span>
+          <span class="session-worktree" hidden></span>
           <span class="session-agent"></span>
         </div>
         <div class="session-foot">
@@ -2138,6 +2176,7 @@
       const newSessionCloseEl = $("new-session-close");
       const newSessionStartEl = $("new-session-start");
       const newSessionStatusEl = $("new-session-status");
+      const newSessionWorktreeEl = $("new-session-worktree");
       const fsCurrentPathEl = $("fs-current-path");
       const fsRootsEl = $("fs-roots");
       const fsParentButtonEl = $("fs-parent-button");
@@ -2354,6 +2393,7 @@
         filesystemLoading = busy;
         fsParentButtonEl.disabled = busy || !filesystemState?.parent || creatingSession;
         newSessionStartEl.disabled = busy || !filesystemState?.current || creatingSession;
+        newSessionWorktreeEl.disabled = busy || creatingSession;
         fsRootsEl.querySelectorAll("button").forEach((button) => {
           button.disabled = busy || creatingSession;
         });
@@ -2367,6 +2407,7 @@
           return;
         }
         newSessionModalEl.hidden = false;
+        newSessionWorktreeEl.checked = false;
         setNewSessionStatus("");
         void loadFilesystem();
       }
@@ -2477,7 +2518,7 @@
             headers: {
               "Content-Type": "application/json",
             },
-            body: JSON.stringify({ cwd: current.path }),
+            body: JSON.stringify({ cwd: current.path, worktree: newSessionWorktreeEl.checked }),
           });
           if (!response.ok) {
             const message = await response.text();
@@ -2682,6 +2723,7 @@
           title: root.querySelector(".session-title"),
           approval: root.querySelector(".session-approval"),
           project: root.querySelector(".session-project"),
+          worktree: root.querySelector(".session-worktree"),
           agent: root.querySelector(".session-agent"),
           counts: root.querySelector(".session-counts"),
           updated: root.querySelector(".session-updated"),
@@ -2693,6 +2735,8 @@
         card.root.classList.toggle("working", sessionIsWorking(session));
         card.title.textContent = sessionLabel(session);
         card.project.textContent = session.project || "-";
+        card.worktree.textContent = session.worktree || "";
+        card.worktree.hidden = !session.worktree;
         card.agent.textContent = session.agent || "-";
         const queued = session.queued_prompt_count ?? 0;
         card.counts.textContent = `${session.total_messages ?? 0} messages${queued ? ` · ${queued} queued` : ""}`;
@@ -3795,7 +3839,7 @@
         const rawTranscript = Array.isArray(session.transcript) ? session.transcript : [];
         const transcript = normalizeTranscript(rawTranscript);
         transcriptTitleEl.textContent = sessionLabel(session);
-        transcriptMetaEl.textContent = `${session.project || "-"} · ${session.agent || "-"} · ${transcript.length} entries`;
+        transcriptMetaEl.textContent = `${session.project || "-"}${session.worktree ? ` · ${session.worktree}` : ""} · ${session.agent || "-"} · ${transcript.length} entries`;
         workingBadgeEl.hidden = !sessionIsWorking(session);
         const activeTurn = sessionHasActiveTurn(session);
         stopTurnEl.hidden = !activeTurn;
@@ -4038,7 +4082,7 @@
         const body = [
           `# ${title}`,
           "",
-          `${session?.project || "-"} · ${session?.agent || "-"}`,
+          `${session?.project || "-"}${session?.worktree ? ` · ${session.worktree}` : ""} · ${session?.agent || "-"}`,
           "",
           ...transcript.map(markdownForEntry).filter(Boolean),
           "",

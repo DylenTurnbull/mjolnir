@@ -134,6 +134,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         .unwrap_or_default();
 
     let project_label = crate::paths::project_label_from_cwd(&cfg.cwd);
+    let worktree_label = crate::paths::worktree_name_from_cwd(&cfg.cwd);
     let agent_label = remote::agent_display_label(&agent);
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -155,8 +156,13 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let runtime = tokio::spawn(async move { acp::run(runtime_cfg, event_tx, cmd_rx).await });
     // No UI event channel: headless answers permissions by policy, so
     // remote decisions have nothing to resolve.
-    let remote_tracker =
-        remote::RemoteSessionTracker::new(project_label, agent_label, Some(cmd_tx.clone()), None);
+    let remote_tracker = remote::RemoteSessionTracker::new(
+        project_label,
+        worktree_label,
+        agent_label,
+        Some(cmd_tx.clone()),
+        None,
+    );
 
     let mut state = HeadlessState::default();
     let mut sent_prompt = false;
