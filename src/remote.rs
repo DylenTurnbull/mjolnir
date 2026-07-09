@@ -45,11 +45,14 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::acp::{self, AcpRuntimeConfig};
+use crate::advisor::{self, AdvisorConfig};
 use crate::config::{self, SelectedAgent};
 use crate::event::{
     PermissionDecision, PermissionPrompt, SessionConfigTarget, TerminalOutputSnapshot, UiCommand,
     UiEvent,
 };
+use crate::ragnarok::Launch;
+use crate::scores::ScoreStore;
 
 const REMOTE_CONTROL_LOCAL_ADDR: &str = "127.0.0.1:11921";
 const REMOTE_CONTROL_LOCAL_ADDR_V6: &str = "[::1]:11921";
@@ -1663,7 +1666,6 @@ impl RemoteSessionTracker {
                             .lock()
                             .map(|guard| guard.session_fork_supported)
                             .unwrap_or(false);
-                        let created_at = prompt.created_at;
                         match remote_queued_prompt_action(prompt.text, can_fork) {
                             RemoteQueuedPromptAction::ForkSession => {
                                 if command_tx.send(UiCommand::ForkSession).is_err() {
@@ -1682,12 +1684,9 @@ impl RemoteSessionTracker {
                             }
                             RemoteQueuedPromptAction::SendPrompt(text) => {
                                 let command = UiCommand::SendPrompt {
-                                    text: text.clone(),
+                                    text,
                                     images: Vec::new(),
                                 };
-                                if let Ok(mut guard) = state.lock() {
-                                    guard.observe_prompt_text(text, Some(created_at));
-                                }
                                 if command_tx.send(command).is_err() {
                                     break;
                                 }
@@ -1938,7 +1937,9 @@ fn start_server_agent_session(
 ) -> ServerAgentSession {
     let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
     let (runtime_cmd_tx, runtime_cmd_rx) = mpsc::unbounded_channel();
+    let (server_cmd_tx, mut server_cmd_rx) = mpsc::unbounded_channel();
     let (remote_event_tx, mut remote_event_rx) = mpsc::unbounded_channel();
+    let (advisor_event_tx, mut advisor_event_rx) = mpsc::unbounded_channel();
     let agent_source_id = agent.source_id.clone();
     let config_path = config::default_config_path();
     let saved_session_config = config::Config::load(&config_path)
@@ -1952,9 +1953,21 @@ fn start_server_agent_session(
         project_label,
         worktree_label,
         agent_label,
-        Some(runtime_cmd_tx.clone()),
+        Some(server_cmd_tx.clone()),
         Some(remote_event_tx),
     );
+    let advisor_cfg = AdvisorConfig {
+        cwd: cwd.clone(),
+        additional_directories: additional_directories.clone(),
+        config_path: config_path.clone(),
+        score_store: ScoreStore::default(),
+        thor_agent_source_id: agent_source_id.clone(),
+        thor_launch: Launch {
+            program: agent.program.clone(),
+            args: agent.args.clone(),
+            env: agent.env.clone(),
+        },
+    };
     let runtime_cfg = AcpRuntimeConfig {
         command: agent.program,
         args: agent.args,
@@ -1969,8 +1982,8 @@ fn start_server_agent_session(
         config_path: Some(config_path),
         saved_session_config,
     };
-    let command_tx = runtime_cmd_tx.clone();
-    let shutdown_tx = runtime_cmd_tx;
+    let command_tx = server_cmd_tx.clone();
+    let shutdown_tx = runtime_cmd_tx.clone();
 
     let task = tokio::spawn(async move {
         let runtime = tokio::spawn(async move {
@@ -1978,13 +1991,135 @@ fn start_server_agent_session(
                 debug!("server agent session exited: {error:#}");
             }
         });
+        let command_proxy = {
+            let tracker = tracker.clone();
+            let runtime_cmd_tx = runtime_cmd_tx.clone();
+            let advisor_event_tx = advisor_event_tx.clone();
+            tokio::spawn(async move {
+                let mut advisor_abort: Option<tokio::sync::watch::Sender<bool>> = None;
+                let mut advisor_task: Option<tokio::task::JoinHandle<()>> = None;
+                while let Some(command) = server_cmd_rx.recv().await {
+                    tracker.observe_command(&command);
+                    if advisor_task
+                        .as_ref()
+                        .is_some_and(tokio::task::JoinHandle::is_finished)
+                    {
+                        advisor_task.take();
+                        advisor_abort = None;
+                    }
+
+                    match command {
+                        UiCommand::SendPrompt { text, images } => {
+                            if advisor_task.is_some() {
+                                let _ = advisor_event_tx.send(UiEvent::Warning(
+                                    "Thor advisor is already running a turn".to_string(),
+                                ));
+                                continue;
+                            }
+                            let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+                            advisor_abort = Some(abort_tx);
+                            let cfg = advisor_cfg.clone();
+                            let ui_tx = advisor_event_tx.clone();
+                            advisor_task = Some(tokio::spawn(async move {
+                                let result = advisor::run_turn(
+                                    cfg,
+                                    text,
+                                    images,
+                                    ui_tx.clone(),
+                                    abort_rx.clone(),
+                                )
+                                .await;
+                                if *abort_rx.borrow() {
+                                    let _ = ui_tx.send(UiEvent::PromptDone {
+                                        stop_reason:
+                                            agent_client_protocol::schema::v1::StopReason::Cancelled,
+                                        usage: None,
+                                    });
+                                    return;
+                                }
+                                match result {
+                                    Ok(()) => {
+                                        let _ = ui_tx.send(UiEvent::PromptDone {
+                                            stop_reason:
+                                                agent_client_protocol::schema::v1::StopReason::EndTurn,
+                                            usage: None,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = ui_tx.send(UiEvent::PromptFailed {
+                                            message: format!("Thor advisor failed: {error:#}"),
+                                        });
+                                    }
+                                }
+                            }));
+                        }
+                        UiCommand::CancelPrompt => {
+                            if let Some(abort) = &advisor_abort {
+                                let _ = abort.send(true);
+                            } else if runtime_cmd_tx.send(UiCommand::CancelPrompt).is_err() {
+                                break;
+                            }
+                        }
+                        UiCommand::Shutdown => {
+                            if let Some(abort) = &advisor_abort {
+                                let _ = abort.send(true);
+                            }
+                            if let Some(task) = advisor_task.take() {
+                                let abort_handle = task.abort_handle();
+                                match tokio::time::timeout(advisor::ADVISOR_SHUTDOWN_TIMEOUT, task)
+                                    .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => warn!("advisor task join failed: {error}"),
+                                    Err(_) => {
+                                        warn!(
+                                            "advisor task did not exit before shutdown; aborting"
+                                        );
+                                        abort_handle.abort();
+                                    }
+                                }
+                            }
+                            advisor_abort = None;
+                            let _ = runtime_cmd_tx.send(UiCommand::Shutdown);
+                            break;
+                        }
+                        other => {
+                            if runtime_cmd_tx.send(other).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if let Some(abort) = &advisor_abort {
+                    let _ = abort.send(true);
+                }
+                if let Some(task) = advisor_task.take() {
+                    let abort_handle = task.abort_handle();
+                    match tokio::time::timeout(advisor::ADVISOR_SHUTDOWN_TIMEOUT, task).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => warn!("advisor task join failed: {error}"),
+                        Err(_) => {
+                            warn!("advisor task did not exit before shutdown; aborting");
+                            abort_handle.abort();
+                        }
+                    }
+                }
+            })
+        };
         tokio::pin!(runtime);
+        tokio::pin!(command_proxy);
         let mut pending_permissions = std::collections::HashMap::new();
         let mut runtime_done = false;
 
         loop {
             tokio::select! {
                 event = runtime_event_rx.recv() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    handle_server_agent_event(event, &tracker, &mut pending_permissions);
+                }
+                event = advisor_event_rx.recv() => {
                     let Some(event) = event else {
                         break;
                     };
@@ -2001,6 +2136,12 @@ fn start_server_agent_session(
                         debug!("server agent runtime task join failed: {error}");
                     }
                     runtime_done = true;
+                    break;
+                }
+                joined = &mut command_proxy => {
+                    if let Err(error) = joined {
+                        debug!("server agent command proxy task join failed: {error}");
+                    }
                     break;
                 }
             }
