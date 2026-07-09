@@ -5497,27 +5497,145 @@ fn push_diff_output(
     collapse_limit: Option<usize>,
     theme: TerminalTheme,
 ) {
-    out.push(Line::from(vec![
-        Span::styled("  diff ", Style::default().fg(theme.muted)),
-        Span::styled(path.to_string(), Style::default().fg(theme.primary)),
-    ]));
-
     let old_lines: Vec<&str> = old_text.unwrap_or("").lines().collect();
     let new_lines: Vec<&str> = new_text.lines().collect();
     let diff_budget = collapse_limit.unwrap_or(80);
-    for diff_line in compact_line_diff(&old_lines, &new_lines, diff_budget) {
-        let (prefix, color) = match diff_line.kind {
-            DiffLineKind::Added => ("+ ", theme.diff_added),
-            DiffLineKind::Removed => ("- ", theme.diff_removed),
-            DiffLineKind::Context => ("  ", theme.diff_context),
-            DiffLineKind::Omitted => ("... ", theme.diff_context),
-        };
-        let text = truncate_display_line(&diff_line.text, width.saturating_sub(6) as usize);
-        out.push(Line::from(Span::styled(
-            format!("    {prefix}{text}"),
-            Style::default().fg(color),
-        )));
+    let rows = compact_line_diff(&old_lines, &new_lines, diff_budget);
+
+    let added = rows
+        .iter()
+        .filter(|row| row.kind == DiffLineKind::Added)
+        .count();
+    let removed = rows
+        .iter()
+        .filter(|row| row.kind == DiffLineKind::Removed)
+        .count();
+    let mut header = vec![
+        Span::styled("  diff ", Style::default().fg(theme.muted)),
+        Span::styled(path.to_string(), Style::default().fg(theme.primary)),
+    ];
+    if added > 0 {
+        header.push(Span::styled(
+            format!("  +{added}"),
+            Style::default().fg(theme.diff_added),
+        ));
     }
+    if removed > 0 {
+        header.push(Span::styled(
+            format!(" -{removed}"),
+            Style::default().fg(theme.diff_removed),
+        ));
+    }
+    out.push(Line::from(header));
+
+    let gutter_width = rows
+        .iter()
+        .filter_map(DiffLine::gutter_line)
+        .max()
+        .map_or(1, |number| number.to_string().len());
+    for row in &rows {
+        out.push(render_diff_row(row, gutter_width, width as usize, theme));
+    }
+}
+
+fn render_diff_row(
+    row: &DiffLine,
+    gutter_width: usize,
+    width: usize,
+    theme: TerminalTheme,
+) -> Line<'static> {
+    if row.kind == DiffLineKind::Omitted {
+        return Line::from(Span::styled(
+            format!("  {:>gutter_width$} ··· {}", "", row.text()),
+            Style::default().fg(theme.muted),
+        ));
+    }
+    let (marker, accent, row_bg, emph_bg) = match row.kind {
+        DiffLineKind::Added => (
+            "+",
+            theme.diff_added,
+            theme.diff_added_bg,
+            theme.diff_added_emph_bg,
+        ),
+        DiffLineKind::Removed => (
+            "-",
+            theme.diff_removed,
+            theme.diff_removed_bg,
+            theme.diff_removed_emph_bg,
+        ),
+        _ => (" ", theme.diff_context, None, None),
+    };
+    let on_row = move |style: Style| match row_bg {
+        Some(bg) => style.bg(bg),
+        None => style,
+    };
+    let number = row
+        .gutter_line()
+        .map_or_else(String::new, |number| number.to_string());
+    let prefix = format!("  {number:>gutter_width$} {marker} ");
+    let prefix_width = prefix.chars().count();
+    let mut used = prefix_width;
+    let mut spans = vec![Span::styled(prefix, on_row(Style::default().fg(accent)))];
+    for segment in truncate_segments(&row.segments, width.saturating_sub(prefix_width)) {
+        used += segment.text.chars().count();
+        let style = match (row_bg, segment.emphasized.then_some(emph_bg).flatten()) {
+            // Foreground-only fallback: context rows and ANSI palettes.
+            (None, _) => Style::default().fg(accent),
+            (Some(bg), None) => Style::default().fg(theme.text).bg(bg),
+            (Some(_), Some(emph)) => Style::default().fg(theme.text).bg(emph),
+        };
+        spans.push(Span::styled(segment.text, style));
+    }
+    if row_bg.is_some() && used < width {
+        spans.push(Span::styled(
+            " ".repeat(width - used),
+            on_row(Style::default()),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn truncate_segments(segments: &[DiffSegment], budget: usize) -> Vec<DiffSegment> {
+    let total: usize = segments
+        .iter()
+        .map(|segment| segment.text.chars().count())
+        .sum();
+    if total <= budget {
+        return segments.to_vec();
+    }
+    if budget <= 3 {
+        let text: String = segments
+            .iter()
+            .flat_map(|segment| segment.text.chars())
+            .take(budget)
+            .collect();
+        return vec![DiffSegment {
+            text,
+            emphasized: false,
+        }];
+    }
+    let mut remaining = budget - 3;
+    let mut out = Vec::new();
+    for segment in segments {
+        if remaining == 0 {
+            break;
+        }
+        let text: String = if segment.text.chars().count() <= remaining {
+            segment.text.clone()
+        } else {
+            segment.text.chars().take(remaining).collect()
+        };
+        remaining -= text.chars().count();
+        out.push(DiffSegment {
+            text,
+            emphasized: segment.emphasized,
+        });
+    }
+    out.push(DiffSegment {
+        text: "...".to_string(),
+        emphasized: false,
+    });
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5529,10 +5647,69 @@ enum DiffLineKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffSegment {
+    text: String,
+    emphasized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DiffLine {
     kind: DiffLineKind,
-    text: String,
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    segments: Vec<DiffSegment>,
 }
+
+impl DiffLine {
+    fn plain(
+        kind: DiffLineKind,
+        old_line: Option<usize>,
+        new_line: Option<usize>,
+        text: &str,
+    ) -> Self {
+        Self {
+            kind,
+            old_line,
+            new_line,
+            segments: vec![DiffSegment {
+                text: text.to_string(),
+                emphasized: false,
+            }],
+        }
+    }
+
+    fn omitted(text: String) -> Self {
+        Self {
+            kind: DiffLineKind::Omitted,
+            old_line: None,
+            new_line: None,
+            segments: vec![DiffSegment {
+                text,
+                emphasized: false,
+            }],
+        }
+    }
+
+    fn text(&self) -> String {
+        self.segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect()
+    }
+
+    /// Line number shown in the gutter: old numbering for removals, new
+    /// numbering for additions and context.
+    fn gutter_line(&self) -> Option<usize> {
+        match self.kind {
+            DiffLineKind::Removed => self.old_line,
+            _ => self.new_line,
+        }
+    }
+}
+
+/// Unchanged lines kept around each change; longer stretches collapse to an
+/// omitted marker so whole-file diffs read as hunks.
+const DIFF_CONTEXT_LINES: usize = 3;
 
 fn compact_line_diff(old_lines: &[&str], new_lines: &[&str], limit: usize) -> Vec<DiffLine> {
     if limit == 0 {
@@ -5544,16 +5721,229 @@ fn compact_line_diff(old_lines: &[&str], new_lines: &[&str], limit: usize) -> Ve
     } else {
         positional_line_diff(old_lines, new_lines)
     };
+    emphasize_replacements(&mut lines);
+    let mut lines = compact_context(lines);
 
     if lines.len() > limit {
         let omitted = lines.len() - limit;
         lines.truncate(limit);
-        lines.push(DiffLine {
-            kind: DiffLineKind::Omitted,
-            text: format!("{omitted} diff lines omitted"),
-        });
+        lines.push(DiffLine::omitted(format!("{omitted} diff lines omitted")));
     }
     lines
+}
+
+fn compact_context(lines: Vec<DiffLine>) -> Vec<DiffLine> {
+    let is_change =
+        |line: &DiffLine| matches!(line.kind, DiffLineKind::Added | DiffLineKind::Removed);
+    if lines.is_empty() {
+        return lines;
+    }
+    if !lines.iter().any(is_change) {
+        return vec![DiffLine::omitted(unchanged_label(lines.len()))];
+    }
+    let mut keep = vec![false; lines.len()];
+    for (idx, line) in lines.iter().enumerate() {
+        if is_change(line) {
+            let from = idx.saturating_sub(DIFF_CONTEXT_LINES);
+            let to = (idx + DIFF_CONTEXT_LINES).min(lines.len() - 1);
+            for flag in &mut keep[from..=to] {
+                *flag = true;
+            }
+        }
+    }
+    // An omitted marker replacing a single line saves nothing: keep the line.
+    for idx in 0..keep.len() {
+        if !keep[idx] && (idx == 0 || keep[idx - 1]) && (idx + 1 == keep.len() || keep[idx + 1]) {
+            keep[idx] = true;
+        }
+    }
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    for (idx, line) in lines.into_iter().enumerate() {
+        if keep[idx] {
+            if skipped > 0 {
+                out.push(DiffLine::omitted(unchanged_label(skipped)));
+                skipped = 0;
+            }
+            out.push(line);
+        } else {
+            skipped += 1;
+        }
+    }
+    if skipped > 0 {
+        out.push(DiffLine::omitted(unchanged_label(skipped)));
+    }
+    out
+}
+
+fn unchanged_label(count: usize) -> String {
+    if count == 1 {
+        "1 unchanged line".to_string()
+    } else {
+        format!("{count} unchanged lines")
+    }
+}
+
+/// Pair each removed run with the added run that follows it and highlight
+/// the tokens that actually changed within each line pair.
+fn emphasize_replacements(lines: &mut [DiffLine]) {
+    let mut idx = 0;
+    while idx < lines.len() {
+        if lines[idx].kind != DiffLineKind::Removed {
+            idx += 1;
+            continue;
+        }
+        let removed_start = idx;
+        while idx < lines.len() && lines[idx].kind == DiffLineKind::Removed {
+            idx += 1;
+        }
+        let added_start = idx;
+        while idx < lines.len() && lines[idx].kind == DiffLineKind::Added {
+            idx += 1;
+        }
+        let pairs = (added_start - removed_start).min(idx - added_start);
+        for pair in 0..pairs {
+            let old_text = lines[removed_start + pair].text();
+            let new_text = lines[added_start + pair].text();
+            if let Some((old_segments, new_segments)) = intra_line_segments(&old_text, &new_text) {
+                lines[removed_start + pair].segments = old_segments;
+                lines[added_start + pair].segments = new_segments;
+            }
+        }
+    }
+}
+
+/// Word-level diff of a removed/added line pair. Returns per-line segments
+/// with the differing tokens emphasized, or `None` when the lines share too
+/// little for token-level highlights to help.
+fn intra_line_segments(old: &str, new: &str) -> Option<(Vec<DiffSegment>, Vec<DiffSegment>)> {
+    let old_tokens = split_word_tokens(old);
+    let new_tokens = split_word_tokens(new);
+    if old_tokens.is_empty()
+        || new_tokens.is_empty()
+        || old_tokens.len().saturating_mul(new_tokens.len()) > 10_000
+    {
+        return None;
+    }
+
+    let old_len = old_tokens.len();
+    let new_len = new_tokens.len();
+    let mut dp = vec![vec![0usize; new_len + 1]; old_len + 1];
+    for old_idx in (0..old_len).rev() {
+        for new_idx in (0..new_len).rev() {
+            dp[old_idx][new_idx] = if old_tokens[old_idx] == new_tokens[new_idx] {
+                dp[old_idx + 1][new_idx + 1] + 1
+            } else {
+                dp[old_idx + 1][new_idx].max(dp[old_idx][new_idx + 1])
+            };
+        }
+    }
+    let mut old_common = vec![false; old_len];
+    let mut new_common = vec![false; new_len];
+    let (mut old_idx, mut new_idx) = (0, 0);
+    while old_idx < old_len && new_idx < new_len {
+        if old_tokens[old_idx] == new_tokens[new_idx] {
+            old_common[old_idx] = true;
+            new_common[new_idx] = true;
+            old_idx += 1;
+            new_idx += 1;
+        } else if dp[old_idx + 1][new_idx] >= dp[old_idx][new_idx + 1] {
+            old_idx += 1;
+        } else {
+            new_idx += 1;
+        }
+    }
+
+    let common_chars: usize = old_tokens
+        .iter()
+        .zip(&old_common)
+        .filter(|(_, common)| **common)
+        .map(|(token, _)| token.chars().count())
+        .sum();
+    let longest = old.chars().count().max(new.chars().count());
+    // Mostly-different lines read better as plainly replaced rows than as a
+    // wall of emphasis.
+    if common_chars.saturating_mul(10) < longest.saturating_mul(3) {
+        return None;
+    }
+    Some((
+        tokens_to_segments(&old_tokens, &old_common),
+        tokens_to_segments(&new_tokens, &new_common),
+    ))
+}
+
+fn tokens_to_segments(tokens: &[&str], common: &[bool]) -> Vec<DiffSegment> {
+    let mut segments: Vec<DiffSegment> = Vec::new();
+    for (token, common) in tokens.iter().zip(common) {
+        let emphasized = !common;
+        match segments.last_mut() {
+            Some(last) if last.emphasized == emphasized => last.text.push_str(token),
+            _ => segments.push(DiffSegment {
+                text: (*token).to_string(),
+                emphasized,
+            }),
+        }
+    }
+    // Fold unchanged whitespace bridges between two emphasized runs so a
+    // changed phrase reads as one highlight, not per-word confetti.
+    let mut folded: Vec<DiffSegment> = Vec::new();
+    let mut idx = 0;
+    while idx < segments.len() {
+        let segment = &segments[idx];
+        if !segment.emphasized
+            && segment.text.chars().all(char::is_whitespace)
+            && folded
+                .last()
+                .is_some_and(|prev: &DiffSegment| prev.emphasized)
+            && segments.get(idx + 1).is_some_and(|next| next.emphasized)
+        {
+            let prev = folded.last_mut().expect("checked above");
+            prev.text.push_str(&segment.text);
+            prev.text.push_str(&segments[idx + 1].text);
+            idx += 2;
+            continue;
+        }
+        folded.push(segment.clone());
+        idx += 1;
+    }
+    folded
+}
+
+/// Tokens for intra-line diffing: word runs, whitespace runs, and single
+/// punctuation characters.
+fn split_word_tokens(text: &str) -> Vec<&str> {
+    #[derive(PartialEq, Clone, Copy)]
+    enum TokenClass {
+        Word,
+        Space,
+        Punct,
+    }
+    fn classify(ch: char) -> TokenClass {
+        if ch.is_alphanumeric() || ch == '_' {
+            TokenClass::Word
+        } else if ch.is_whitespace() {
+            TokenClass::Space
+        } else {
+            TokenClass::Punct
+        }
+    }
+    let mut tokens = Vec::new();
+    let mut start = 0;
+    let mut current: Option<TokenClass> = None;
+    for (idx, ch) in text.char_indices() {
+        let class = classify(ch);
+        if current != Some(class) || class == TokenClass::Punct {
+            if idx > start {
+                tokens.push(&text[start..idx]);
+            }
+            start = idx;
+            current = Some(class);
+        }
+    }
+    if text.len() > start {
+        tokens.push(&text[start..]);
+    }
+    tokens
 }
 
 fn lcs_line_diff(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffLine> {
@@ -5576,35 +5966,51 @@ fn lcs_line_diff(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffLine> {
     let mut new_idx = 0;
     while old_idx < old_len && new_idx < new_len {
         if old_lines[old_idx] == new_lines[new_idx] {
-            lines.push(DiffLine {
-                kind: DiffLineKind::Context,
-                text: old_lines[old_idx].to_string(),
-            });
+            lines.push(DiffLine::plain(
+                DiffLineKind::Context,
+                Some(old_idx + 1),
+                Some(new_idx + 1),
+                old_lines[old_idx],
+            ));
             old_idx += 1;
             new_idx += 1;
         } else if dp[old_idx + 1][new_idx] >= dp[old_idx][new_idx + 1] {
-            lines.push(DiffLine {
-                kind: DiffLineKind::Removed,
-                text: old_lines[old_idx].to_string(),
-            });
+            lines.push(DiffLine::plain(
+                DiffLineKind::Removed,
+                Some(old_idx + 1),
+                None,
+                old_lines[old_idx],
+            ));
             old_idx += 1;
         } else {
-            lines.push(DiffLine {
-                kind: DiffLineKind::Added,
-                text: new_lines[new_idx].to_string(),
-            });
+            lines.push(DiffLine::plain(
+                DiffLineKind::Added,
+                None,
+                Some(new_idx + 1),
+                new_lines[new_idx],
+            ));
             new_idx += 1;
         }
     }
 
-    lines.extend(old_lines[old_idx..].iter().map(|line| DiffLine {
-        kind: DiffLineKind::Removed,
-        text: (*line).to_string(),
-    }));
-    lines.extend(new_lines[new_idx..].iter().map(|line| DiffLine {
-        kind: DiffLineKind::Added,
-        text: (*line).to_string(),
-    }));
+    while old_idx < old_len {
+        lines.push(DiffLine::plain(
+            DiffLineKind::Removed,
+            Some(old_idx + 1),
+            None,
+            old_lines[old_idx],
+        ));
+        old_idx += 1;
+    }
+    while new_idx < new_len {
+        lines.push(DiffLine::plain(
+            DiffLineKind::Added,
+            None,
+            Some(new_idx + 1),
+            new_lines[new_idx],
+        ));
+        new_idx += 1;
+    }
     lines
 }
 
@@ -5612,44 +6018,44 @@ fn positional_line_diff(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffLine>
     let mut lines = Vec::new();
     let max = old_lines.len().max(new_lines.len());
     for idx in 0..max {
+        let line_no = idx + 1;
         match (old_lines.get(idx), new_lines.get(idx)) {
-            (Some(old), Some(new)) if old == new => lines.push(DiffLine {
-                kind: DiffLineKind::Context,
-                text: (*old).to_string(),
-            }),
+            (Some(old), Some(new)) if old == new => lines.push(DiffLine::plain(
+                DiffLineKind::Context,
+                Some(line_no),
+                Some(line_no),
+                old,
+            )),
             (Some(old), Some(new)) => {
-                lines.push(DiffLine {
-                    kind: DiffLineKind::Removed,
-                    text: (*old).to_string(),
-                });
-                lines.push(DiffLine {
-                    kind: DiffLineKind::Added,
-                    text: (*new).to_string(),
-                });
+                lines.push(DiffLine::plain(
+                    DiffLineKind::Removed,
+                    Some(line_no),
+                    None,
+                    old,
+                ));
+                lines.push(DiffLine::plain(
+                    DiffLineKind::Added,
+                    None,
+                    Some(line_no),
+                    new,
+                ));
             }
-            (Some(old), None) => lines.push(DiffLine {
-                kind: DiffLineKind::Removed,
-                text: (*old).to_string(),
-            }),
-            (None, Some(new)) => lines.push(DiffLine {
-                kind: DiffLineKind::Added,
-                text: (*new).to_string(),
-            }),
+            (Some(old), None) => lines.push(DiffLine::plain(
+                DiffLineKind::Removed,
+                Some(line_no),
+                None,
+                old,
+            )),
+            (None, Some(new)) => lines.push(DiffLine::plain(
+                DiffLineKind::Added,
+                None,
+                Some(line_no),
+                new,
+            )),
             (None, None) => {}
         }
     }
     lines
-}
-
-fn truncate_display_line(text: &str, width: usize) -> String {
-    let count = text.chars().count();
-    if count <= width {
-        return text.to_string();
-    }
-    if width <= 3 {
-        return text.chars().take(width).collect();
-    }
-    text.chars().take(width - 3).collect::<String>() + "..."
 }
 
 /// Returns true if `token` is a shell control/redirection operator that
@@ -12441,9 +12847,13 @@ mod tests {
         assert!(rendered.iter().any(|line| line == "│ tool exec run checks"));
         assert!(rendered.iter().any(|line| line == "│   ## Output"));
         assert!(rendered.iter().any(|line| line == "│   ok"));
-        assert!(rendered.iter().any(|line| line == "│   diff src/main.rs"));
-        assert!(rendered.iter().any(|line| line == "│     - old"));
-        assert!(rendered.iter().any(|line| line == "│     + new"));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "│   diff src/main.rs  +1 -1")
+        );
+        assert!(rendered.iter().any(|line| line.trim_end() == "│   1 - old"));
+        assert!(rendered.iter().any(|line| line.trim_end() == "│   1 + new"));
         assert!(rendered.iter().any(|line| line == "│   terminal output"));
         assert!(
             rendered
@@ -12750,25 +13160,17 @@ mod tests {
 
         let diff = compact_line_diff(&old, &new, 20);
 
+        let summary: Vec<(DiffLineKind, String, Option<usize>, Option<usize>)> = diff
+            .iter()
+            .map(|line| (line.kind, line.text(), line.old_line, line.new_line))
+            .collect();
         assert_eq!(
-            diff,
+            summary,
             vec![
-                DiffLine {
-                    kind: DiffLineKind::Context,
-                    text: "a".to_string(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Added,
-                    text: "inserted".to_string(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Context,
-                    text: "b".to_string(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Context,
-                    text: "c".to_string(),
-                },
+                (DiffLineKind::Context, "a".to_string(), Some(1), Some(1)),
+                (DiffLineKind::Added, "inserted".to_string(), None, Some(2)),
+                (DiffLineKind::Context, "b".to_string(), Some(2), Some(3)),
+                (DiffLineKind::Context, "c".to_string(), Some(3), Some(4)),
             ]
         );
     }
@@ -12780,7 +13182,7 @@ mod tests {
         let diff = compact_line_diff(&old, &new, 20);
         assert!(
             diff.iter()
-                .any(|line| line.text == "abcdefghijklmnopqrstuvwxyz")
+                .any(|line| line.text() == "abcdefghijklmnopqrstuvwxyz")
         );
 
         let mut out = Vec::new();
@@ -12795,7 +13197,78 @@ mod tests {
         );
         let rendered: Vec<String> = out.iter().map(line_text).collect();
 
-        assert!(rendered.iter().any(|line| line == "    + abc..."));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.trim_end() == "  1 + abc...")
+        );
+    }
+
+    #[test]
+    fn intra_line_word_diff_emphasizes_changed_tokens() {
+        let diff = compact_line_diff(&["let x = 1;"], &["let x = 2;"], 20);
+
+        let emphasized = |line: &DiffLine| -> String {
+            line.segments
+                .iter()
+                .filter(|segment| segment.emphasized)
+                .map(|segment| segment.text.as_str())
+                .collect()
+        };
+        let removed = diff
+            .iter()
+            .find(|line| line.kind == DiffLineKind::Removed)
+            .expect("removed row");
+        let added = diff
+            .iter()
+            .find(|line| line.kind == DiffLineKind::Added)
+            .expect("added row");
+        assert_eq!(emphasized(removed), "1");
+        assert_eq!(emphasized(added), "2");
+        assert_eq!(removed.text(), "let x = 1;");
+        assert_eq!(added.text(), "let x = 2;");
+    }
+
+    #[test]
+    fn dissimilar_replacement_lines_skip_word_emphasis() {
+        let diff = compact_line_diff(&["alpha beta gamma"], &["zz qq ww"], 20);
+        assert!(
+            diff.iter()
+                .all(|line| line.segments.iter().all(|segment| !segment.emphasized))
+        );
+    }
+
+    #[test]
+    fn long_unchanged_stretches_collapse_to_omitted_rows() {
+        let old: Vec<String> = (1..=30).map(|idx| format!("line {idx}")).collect();
+        let mut new = old.clone();
+        new[14] = "changed".to_string();
+        let old_refs: Vec<&str> = old.iter().map(String::as_str).collect();
+        let new_refs: Vec<&str> = new.iter().map(String::as_str).collect();
+
+        let diff = compact_line_diff(&old_refs, &new_refs, 200);
+
+        assert_eq!(
+            diff.iter()
+                .filter(|line| line.kind == DiffLineKind::Omitted)
+                .count(),
+            2
+        );
+        // One removed, one added, three context lines on each side.
+        assert_eq!(
+            diff.iter()
+                .filter(|line| line.kind != DiffLineKind::Omitted)
+                .count(),
+            8
+        );
+        assert!(
+            diff.iter()
+                .any(|line| line.kind == DiffLineKind::Removed && line.old_line == Some(15))
+        );
+        assert!(
+            diff.iter()
+                .any(|line| line.kind == DiffLineKind::Added && line.new_line == Some(15))
+        );
     }
 
     #[test]

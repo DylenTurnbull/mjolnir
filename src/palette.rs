@@ -27,6 +27,13 @@ pub struct TerminalTheme {
     pub diff_added: Color,
     pub diff_removed: Color,
     pub diff_context: Color,
+    /// Row and changed-token background fills for diff rendering. `None`
+    /// falls back to foreground-only styling, which the ANSI palettes need
+    /// because subtle backgrounds cannot be expressed in 16 colors.
+    pub diff_added_bg: Option<Color>,
+    pub diff_removed_bg: Option<Color>,
+    pub diff_added_emph_bg: Option<Color>,
+    pub diff_removed_emph_bg: Option<Color>,
     pub permission: Color,
 }
 
@@ -57,6 +64,10 @@ impl TerminalThemeKind {
                 diff_added: Color::Rgb(34, 134, 58),
                 diff_removed: Color::Rgb(203, 36, 49),
                 diff_context: Color::Rgb(88, 96, 105),
+                diff_added_bg: Some(Color::Rgb(230, 255, 237)),
+                diff_removed_bg: Some(Color::Rgb(255, 235, 233)),
+                diff_added_emph_bg: Some(Color::Rgb(171, 242, 189)),
+                diff_removed_emph_bg: Some(Color::Rgb(255, 197, 194)),
                 permission: Color::Rgb(154, 103, 0),
             },
             Self::Dark => TerminalTheme {
@@ -83,6 +94,10 @@ impl TerminalThemeKind {
                 diff_added: Color::Green,
                 diff_removed: Color::Red,
                 diff_context: Color::DarkGray,
+                diff_added_bg: Some(Color::Rgb(18, 53, 30)),
+                diff_removed_bg: Some(Color::Rgb(70, 22, 22)),
+                diff_added_emph_bg: Some(Color::Rgb(24, 100, 48)),
+                diff_removed_emph_bg: Some(Color::Rgb(130, 35, 35)),
                 permission: Color::Yellow,
             },
             Self::AnsiLight => TerminalTheme {
@@ -109,6 +124,10 @@ impl TerminalThemeKind {
                 diff_added: Color::Green,
                 diff_removed: Color::Red,
                 diff_context: Color::Black,
+                diff_added_bg: None,
+                diff_removed_bg: None,
+                diff_added_emph_bg: None,
+                diff_removed_emph_bg: None,
                 permission: Color::Yellow,
             },
             Self::AnsiDark => TerminalTheme {
@@ -135,6 +154,10 @@ impl TerminalThemeKind {
                 diff_added: Color::Green,
                 diff_removed: Color::Red,
                 diff_context: Color::White,
+                diff_added_bg: None,
+                diff_removed_bg: None,
+                diff_added_emph_bg: None,
+                diff_removed_emph_bg: None,
                 permission: Color::Yellow,
             },
         }
