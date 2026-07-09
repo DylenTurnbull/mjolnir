@@ -96,6 +96,12 @@
         --red-hot: #f05a50;
         --red-deep: #4d1614;
 
+        /* diff rows */
+        --diff-add-bg: rgb(79 174 132 / 0.13);
+        --diff-add-emph-bg: rgb(79 174 132 / 0.36);
+        --diff-del-bg: rgb(235 63 51 / 0.13);
+        --diff-del-emph-bg: rgb(235 63 51 / 0.36);
+
         /* hairlines */
         --line-row: rgb(255 255 255 / 0.085);
         --line: rgb(255 255 255 / 0.11);
@@ -163,6 +169,11 @@
         --red: #c83228;
         --red-hot: #a92c24;
         --red-deep: #f1c6c0;
+
+        --diff-add-bg: rgb(26 127 75 / 0.14);
+        --diff-add-emph-bg: rgb(26 127 75 / 0.33);
+        --diff-del-bg: rgb(200 50 40 / 0.12);
+        --diff-del-emph-bg: rgb(200 50 40 / 0.3);
 
         --line-row: rgb(24 23 21 / 0.095);
         --line: rgb(24 23 21 / 0.14);
@@ -1684,6 +1695,83 @@
         display: flex;
         flex-direction: column;
         gap: 10px;
+      }
+
+      /* Structured file diffs: numbered gutter, tinted rows, and brighter
+         emphasis on just the tokens that changed within a line pair. */
+      .diff-view {
+        margin: 8px 0;
+        border: 1px solid var(--line-row);
+        background: var(--surface-terminal);
+        font: 400 12px/1.6 var(--font-mono);
+        overflow-x: auto;
+        overscroll-behavior-x: contain;
+      }
+
+      .diff-row {
+        display: flex;
+        min-width: 100%;
+        width: max-content;
+        white-space: pre;
+      }
+
+      .diff-no {
+        flex: 0 0 auto;
+        min-width: calc(var(--diff-gutter-ch, 3) * 1ch);
+        padding-left: 8px;
+        text-align: right;
+        color: var(--dim);
+        user-select: none;
+      }
+
+      .diff-mark {
+        flex: 0 0 auto;
+        width: 2ch;
+        text-align: center;
+        user-select: none;
+      }
+
+      .diff-text {
+        flex: 0 0 auto;
+        padding-right: 12px;
+      }
+
+      .diff-add {
+        background: var(--diff-add-bg);
+
+        & .diff-no,
+        & .diff-mark {
+          color: var(--agent);
+        }
+
+        & .diff-emph {
+          background: var(--diff-add-emph-bg);
+        }
+      }
+
+      .diff-del {
+        background: var(--diff-del-bg);
+
+        & .diff-no,
+        & .diff-mark {
+          color: var(--red);
+        }
+
+        & .diff-emph {
+          background: var(--diff-del-emph-bg);
+        }
+      }
+
+      .diff-ctx .diff-text {
+        color: var(--muted);
+      }
+
+      .diff-omit {
+        color: var(--dim);
+
+        & .diff-text {
+          padding-left: 8px;
+        }
       }
 
       /* queued prompts: compact mono rows above the console */
@@ -3737,6 +3825,7 @@
         if (newLines[newLines.length - 1] === "") newLines.pop();
         const oldLen = oldLines.length;
         const newLen = newLines.length;
+        const row = (kind, oldNo, newNo, text) => ({ kind, oldNo, newNo, text });
         if (oldLen * newLen > 40000) {
           const out = [];
           const max = Math.max(oldLen, newLen);
@@ -3744,10 +3833,10 @@
             const oldLine = oldLines[i];
             const newLine = newLines[i];
             if (oldLine !== undefined && newLine !== undefined && oldLine === newLine) {
-              out.push([" ", oldLine]);
+              out.push(row(" ", i + 1, i + 1, oldLine));
             } else {
-              if (oldLine !== undefined) out.push(["-", oldLine]);
-              if (newLine !== undefined) out.push(["+", newLine]);
+              if (oldLine !== undefined) out.push(row("-", i + 1, null, oldLine));
+              if (newLine !== undefined) out.push(row("+", null, i + 1, newLine));
             }
           }
           return out;
@@ -3765,26 +3854,246 @@
         let j = 0;
         while (i < oldLen && j < newLen) {
           if (oldLines[i] === newLines[j]) {
-            out.push([" ", oldLines[i]]);
+            out.push(row(" ", i + 1, j + 1, oldLines[i]));
             i += 1;
             j += 1;
           } else if (dp[i + 1][j] >= dp[i][j + 1]) {
-            out.push(["-", oldLines[i]]);
+            out.push(row("-", i + 1, null, oldLines[i]));
             i += 1;
           } else {
-            out.push(["+", newLines[j]]);
+            out.push(row("+", null, j + 1, newLines[j]));
             j += 1;
           }
         }
-        while (i < oldLen) out.push(["-", oldLines[i++]]);
-        while (j < newLen) out.push(["+", newLines[j++]]);
+        while (i < oldLen) {
+          out.push(row("-", i + 1, null, oldLines[i]));
+          i += 1;
+        }
+        while (j < newLen) {
+          out.push(row("+", null, j + 1, newLines[j]));
+          j += 1;
+        }
         return out;
       }
 
-      function diffText(oldText, newText) {
-        return lineDiff(oldText, newText)
-          .map(([prefix, line]) => `${prefix}${line}`)
-          .join("\n");
+      /* Unchanged lines kept around each change; longer stretches collapse
+         to an omitted marker so whole-file diffs read as hunks. */
+      const DIFF_CONTEXT_LINES = 3;
+
+      /* Tokens for intra-line diffing: word runs, whitespace runs, and
+         single punctuation characters. */
+      function splitWordTokens(text) {
+        const tokens = [];
+        let current = "";
+        let currentClass = null;
+        for (const ch of text) {
+          const cls = /[\p{L}\p{N}_]/u.test(ch) ? "word" : /\s/.test(ch) ? "space" : "punct";
+          if (cls !== currentClass || cls === "punct") {
+            if (current) tokens.push(current);
+            current = "";
+            currentClass = cls;
+          }
+          current += ch;
+        }
+        if (current) tokens.push(current);
+        return tokens;
+      }
+
+      function tokensToSegments(tokens, common) {
+        const segments = [];
+        tokens.forEach((token, idx) => {
+          const emphasized = !common[idx];
+          const last = segments[segments.length - 1];
+          if (last && last.emphasized === emphasized) {
+            last.text += token;
+          } else {
+            segments.push({ text: token, emphasized });
+          }
+        });
+        // Fold unchanged whitespace bridges between two emphasized runs so a
+        // changed phrase reads as one highlight, not per-word confetti.
+        const folded = [];
+        let idx = 0;
+        while (idx < segments.length) {
+          const segment = segments[idx];
+          const prev = folded[folded.length - 1];
+          const next = segments[idx + 1];
+          if (!segment.emphasized && !segment.text.trim() && prev && prev.emphasized && next && next.emphasized) {
+            prev.text += segment.text + next.text;
+            idx += 2;
+            continue;
+          }
+          folded.push(segment);
+          idx += 1;
+        }
+        return folded;
+      }
+
+      /* Word-level diff of a removed/added line pair. Returns per-line
+         segments with the differing tokens emphasized, or null when the
+         lines share too little for token-level highlights to help. */
+      function intraLineSegments(oldLine, newLine) {
+        const oldTokens = splitWordTokens(oldLine);
+        const newTokens = splitWordTokens(newLine);
+        const oldLen = oldTokens.length;
+        const newLen = newTokens.length;
+        if (!oldLen || !newLen || oldLen * newLen > 10000) {
+          return null;
+        }
+        const dp = Array.from({ length: oldLen + 1 }, () => Array(newLen + 1).fill(0));
+        for (let i = oldLen - 1; i >= 0; i -= 1) {
+          for (let j = newLen - 1; j >= 0; j -= 1) {
+            dp[i][j] = oldTokens[i] === newTokens[j]
+              ? dp[i + 1][j + 1] + 1
+              : Math.max(dp[i + 1][j], dp[i][j + 1]);
+          }
+        }
+        const oldCommon = Array(oldLen).fill(false);
+        const newCommon = Array(newLen).fill(false);
+        let i = 0;
+        let j = 0;
+        while (i < oldLen && j < newLen) {
+          if (oldTokens[i] === newTokens[j]) {
+            oldCommon[i] = true;
+            newCommon[j] = true;
+            i += 1;
+            j += 1;
+          } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+            i += 1;
+          } else {
+            j += 1;
+          }
+        }
+        let commonChars = 0;
+        oldTokens.forEach((token, idx) => {
+          if (oldCommon[idx]) commonChars += token.length;
+        });
+        const longest = Math.max(oldLine.length, newLine.length);
+        // Mostly-different lines read better as plainly replaced rows than
+        // as a wall of emphasis.
+        if (commonChars * 10 < longest * 3) {
+          return null;
+        }
+        return [tokensToSegments(oldTokens, oldCommon), tokensToSegments(newTokens, newCommon)];
+      }
+
+      /* Pair each removed run with the added run that follows it and
+         highlight the tokens that actually changed within each line pair. */
+      function emphasizeReplacements(rows) {
+        let idx = 0;
+        while (idx < rows.length) {
+          if (rows[idx].kind !== "-") {
+            idx += 1;
+            continue;
+          }
+          const removedStart = idx;
+          while (idx < rows.length && rows[idx].kind === "-") idx += 1;
+          const addedStart = idx;
+          while (idx < rows.length && rows[idx].kind === "+") idx += 1;
+          const pairs = Math.min(addedStart - removedStart, idx - addedStart);
+          for (let pair = 0; pair < pairs; pair += 1) {
+            const removed = rows[removedStart + pair];
+            const added = rows[addedStart + pair];
+            const segments = intraLineSegments(removed.text, added.text);
+            if (segments) {
+              removed.segments = segments[0];
+              added.segments = segments[1];
+            }
+          }
+        }
+      }
+
+      function compactContext(rows) {
+        const isChange = (row) => row.kind === "-" || row.kind === "+";
+        const label = (count) => (count === 1 ? "1 unchanged line" : `${count} unchanged lines`);
+        if (!rows.length) {
+          return rows;
+        }
+        if (!rows.some(isChange)) {
+          return [{ kind: "…", text: label(rows.length) }];
+        }
+        const keep = rows.map(() => false);
+        rows.forEach((row, idx) => {
+          if (!isChange(row)) return;
+          const from = Math.max(0, idx - DIFF_CONTEXT_LINES);
+          const to = Math.min(rows.length - 1, idx + DIFF_CONTEXT_LINES);
+          for (let k = from; k <= to; k += 1) keep[k] = true;
+        });
+        // An omitted marker replacing a single line saves nothing: keep it.
+        for (let idx = 0; idx < keep.length; idx += 1) {
+          if (!keep[idx] && (idx === 0 || keep[idx - 1]) && (idx + 1 === keep.length || keep[idx + 1])) {
+            keep[idx] = true;
+          }
+        }
+        const out = [];
+        let skipped = 0;
+        rows.forEach((row, idx) => {
+          if (keep[idx]) {
+            if (skipped) {
+              out.push({ kind: "…", text: label(skipped) });
+              skipped = 0;
+            }
+            out.push(row);
+          } else {
+            skipped += 1;
+          }
+        });
+        if (skipped) {
+          out.push({ kind: "…", text: label(skipped) });
+        }
+        return out;
+      }
+
+      function diffDisplayRows(oldText, newText) {
+        const rows = lineDiff(oldText, newText);
+        emphasizeReplacements(rows);
+        return compactContext(rows);
+      }
+
+      function buildDiffView(rows, truncated) {
+        const view = document.createElement("div");
+        view.className = "diff-view";
+        const maxNo = rows.reduce((acc, row) => Math.max(acc, row.oldNo || 0, row.newNo || 0), 0);
+        view.style.setProperty("--diff-gutter-ch", String(Math.max(1, String(maxNo).length)));
+        const addRow = (row) => {
+          const rowEl = document.createElement("div");
+          const no = document.createElement("span");
+          no.className = "diff-no";
+          const mark = document.createElement("span");
+          mark.className = "diff-mark";
+          const text = document.createElement("span");
+          text.className = "diff-text";
+          if (row.kind === "…") {
+            rowEl.className = "diff-row diff-omit";
+            text.textContent = `··· ${row.text}`;
+          } else {
+            const kindClass = row.kind === "+" ? "diff-add" : row.kind === "-" ? "diff-del" : "diff-ctx";
+            rowEl.className = `diff-row ${kindClass}`;
+            const number = row.kind === "-" ? row.oldNo : row.newNo;
+            no.textContent = number === null || number === undefined ? "" : String(number);
+            mark.textContent = row.kind === " " ? "" : row.kind;
+            const segments = row.segments || [{ text: row.text, emphasized: false }];
+            for (const segment of segments) {
+              if (segment.emphasized) {
+                const emph = document.createElement("span");
+                emph.className = "diff-emph";
+                emph.textContent = segment.text;
+                text.appendChild(emph);
+              } else {
+                text.appendChild(document.createTextNode(segment.text));
+              }
+            }
+          }
+          rowEl.appendChild(no);
+          rowEl.appendChild(mark);
+          rowEl.appendChild(text);
+          view.appendChild(rowEl);
+        };
+        rows.forEach(addRow);
+        if (truncated) {
+          addRow({ kind: "…", text: "diff truncated for remote viewer" });
+        }
+        return view;
       }
 
       function diffBlock(body, openLarge = false) {
@@ -4187,12 +4496,16 @@
           const path = typeof diff.path === "string" && diff.path ? diff.path : "file";
           const oldText = typeof diff.old_text === "string" ? diff.old_text : "";
           const newText = typeof diff.new_text === "string" ? diff.new_text : "";
-          let diffBody = diffText(oldText, newText);
-          if (diff.truncated === true) {
-            diffBody = `${diffBody}${diffBody ? "\n" : ""}... diff truncated for remote viewer ...`;
-          }
-          body.appendChild(inlineTextPre([`diff ${path}`]));
-          body.appendChild(diffBlock(diffBody));
+          const rows = diffDisplayRows(oldText, newText);
+          const added = rows.filter((row) => row.kind === "+").length;
+          const removed = rows.filter((row) => row.kind === "-").length;
+          const counts = added || removed ? `  +${added} -${removed}` : "";
+          body.appendChild(inlineTextPre([`diff ${path}${counts}`]));
+          const truncated = diff.truncated === true;
+          const build = () => buildDiffView(rows, truncated);
+          body.appendChild(
+            rows.length > FOLD_LINE_LIMIT ? foldBlock(`diff · ${rows.length} lines`, build) : build(),
+          );
         }
       }
 
