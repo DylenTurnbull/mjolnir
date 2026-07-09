@@ -5381,6 +5381,11 @@
         updateCommandPalette();
       });
       queueInputEl.addEventListener("keydown", (event) => {
+        // While an IME composition is active, Enter/arrows confirm or steer the
+        // candidate — they must never submit the prompt or drive the palette.
+        if (event.isComposing || event.keyCode === 229) {
+          return;
+        }
         if (!commandPaletteEl.hidden) {
           if (event.key === "ArrowDown") {
             event.preventDefault();
