@@ -5171,7 +5171,13 @@
         }
       }
 
+      let queueSubmitInFlight = false;
       async function submitQueuedPrompt() {
+        // Enter calls this directly, bypassing the disabled Queue button, so a
+        // second Enter before the POST resolves would queue the prompt twice.
+        if (queueSubmitInFlight) {
+          return;
+        }
         const sessionId = selectedSessionId;
         const text = queueInputEl.value;
         if (!sessionId || !text.trim()) {
@@ -5181,6 +5187,7 @@
         if (consumeLocalSlashCommand(session, text)) {
           return;
         }
+        queueSubmitInFlight = true;
         queueSubmitEl.disabled = true;
         try {
           const response = await apiFetch("/api/queued-prompts", {
@@ -5208,6 +5215,7 @@
             setQueueStatus(`Queue submit failed: ${error.message}`, true);
           }
         } finally {
+          queueSubmitInFlight = false;
           queueSubmitEl.disabled = !selectedSessionId;
         }
       }
