@@ -1210,6 +1210,20 @@
         animation: attention-fade 1.4s ease-in-out infinite;
       }
 
+      /* Poll failures must stay visible on narrow screens, where the sidebar
+         (and its #status line) is hidden while a chat is open. */
+      .connection-badge {
+        flex: 0 0 auto;
+        font: 700 10px/1 var(--font-mono);
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--thought);
+        background: rgb(199 154 75 / 0.16);
+        clip-path: var(--shape-chip);
+        padding: 5px 9px 4px;
+        animation: attention-fade 1.4s ease-in-out infinite;
+      }
+
       @keyframes attention-fade {
         50% {
           opacity: 0.55;
@@ -2216,6 +2230,7 @@
         .entry,
         .working-badge::after,
         .approval-badge,
+        .connection-badge,
         .session-approval,
         .config-option-status,
         .session-item.working .live-dot,
@@ -2269,6 +2284,7 @@
             <h2 id="transcript-title">Transcript</h2>
             <p id="transcript-meta">Select a session to inspect its history.</p>
           </div>
+          <span id="connection-badge" class="connection-badge" role="status" hidden>reconnecting</span>
           <span id="approval-badge" class="approval-badge" hidden>needs approval</span>
           <span id="working-badge" class="working-badge" hidden>working</span>
           <button id="settings-button" class="icon-button" type="button" aria-label="Open viewer settings">⚙</button>
@@ -2443,6 +2459,7 @@
       const transcriptMetaEl = $("transcript-meta");
       const workingBadgeEl = $("working-badge");
       const approvalBadgeEl = $("approval-badge");
+      const connectionBadgeEl = $("connection-badge");
       const stopTurnEl = $("stop-turn");
       const backButtonEl = $("back-button");
       const permissionsEl = $("permissions");
@@ -5137,12 +5154,14 @@
           syncPendingStopState();
           noteSessionActivity();
           statusEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+          connectionBadgeEl.hidden = true;
           renderAll();
           refreshTimestamps();
           await refreshQueuedPrompts();
         } catch (error) {
           if (error.message !== "HTTP 401") {
             statusEl.textContent = `Update failed: ${error.message}`;
+            connectionBadgeEl.hidden = false;
           }
         }
       }
