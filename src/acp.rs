@@ -1615,7 +1615,7 @@ async fn drive_session(
                 next_turn_diff_id = next_turn_diff_id.saturating_add(1);
             }
             UiCommand::SetSessionConfigOption { target, value } => {
-                if !drive_config_update(
+                if drive_config_update(
                     &conn,
                     &session_id,
                     target,
@@ -1626,6 +1626,12 @@ async fn drive_session(
                 )
                 .await?
                 {
+                    persist_current_session_config(
+                        config_path.as_deref(),
+                        agent_source_id.as_deref(),
+                        &session_config,
+                    );
+                } else {
                     break;
                 }
             }
@@ -3921,8 +3927,8 @@ mod tests {
         SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
         SessionConfigId, SessionConfigValueId, SessionForkCapabilities, SessionId,
         SessionNotification, SessionResumeCapabilities, SessionUpdate,
-        SetSessionConfigOptionRequest, StopReason, TextContent, ToolCallUpdate,
-        ToolCallUpdateFields,
+        SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
+        ToolCallUpdate, ToolCallUpdateFields,
     };
     use std::sync::{
         Arc,
@@ -5308,6 +5314,64 @@ mod tests {
                 async move |_req: SetSessionConfigOptionRequest, _responder, _cx| {
                     futures::future::pending::<()>().await;
                     Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(transport, |_cx| async move {
+                futures::future::pending::<()>().await;
+                Ok(())
+            })
+            .await;
+    }
+
+    async fn run_mock_agent_with_session_config(stream: tokio::io::DuplexStream) {
+        let (r, w) = split(stream);
+        let transport = ByteStreams::new(w.compat_write(), r.compat());
+        let _ = AgentRole
+            .builder()
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::v1::InitializeRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(InitializeResponse::new(
+                        agent_client_protocol::schema::ProtocolVersion::V1,
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::v1::NewSessionRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(
+                        NewSessionResponse::new(SessionId::new("test-session")).config_options(
+                            vec![SessionConfigOption::select(
+                                "service_tier",
+                                "Service tier",
+                                "default",
+                                vec![
+                                    SessionConfigSelectOption::new("default", "Default"),
+                                    SessionConfigSelectOption::new("priority", "Priority"),
+                                ],
+                            )],
+                        ),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: SetSessionConfigOptionRequest, responder, _cx| {
+                    responder.respond(SetSessionConfigOptionResponse::new(vec![
+                        SessionConfigOption::select(
+                            req.config_id,
+                            "Service tier",
+                            req.value,
+                            vec![
+                                SessionConfigSelectOption::new("default", "Default"),
+                                SessionConfigSelectOption::new("priority", "Priority"),
+                            ],
+                        ),
+                    ]))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -6861,6 +6925,98 @@ mod tests {
         }
 
         assert!(permission_cancelled.load(Ordering::SeqCst));
+
+        cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
+        let join = tokio::time::timeout(Duration::from_secs(2), client_task)
+            .await
+            .expect("drive_client did not return after shutdown");
+        join.expect("client task panicked")
+            .expect("drive_client returned error");
+        agent_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_config_update_persists_session_config() {
+        let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
+
+        let agent_task = tokio::spawn(run_mock_agent_with_session_config(agent_side));
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let config_path = config_dir.path().join("config.toml");
+
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        let client_task = tokio::spawn(drive_client_with_fs_limit(
+            client_transport,
+            std::env::temp_dir(),
+            Vec::new(),
+            None,
+            ui_tx,
+            cmd_rx,
+            Arc::new(AtomicBool::new(false)),
+            DEFAULT_FS_TEXT_BYTES,
+            RuntimeAccessMode::Full,
+            Some("codex-acp".to_string()),
+            Some(config_path.clone()),
+            HashMap::new(),
+        ));
+
+        let mut saw_service_tier = false;
+        while !saw_service_tier {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("handshake timeout")
+                .expect("channel closed");
+            if let UiEvent::SessionConfigOptions { options, .. } = ev {
+                saw_service_tier = options
+                    .iter()
+                    .any(|option| option.id == "service_tier".into());
+            }
+        }
+
+        cmd_tx
+            .send(UiCommand::SetSessionConfigOption {
+                target: SessionConfigTarget::ConfigOption {
+                    config_id: SessionConfigId::new("service_tier"),
+                },
+                value: SessionConfigValueId::new("priority"),
+            })
+            .expect("send config update");
+
+        let mut saw_priority = false;
+        while !saw_priority {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("config update timeout")
+                .expect("channel closed");
+            if let UiEvent::SessionConfigOptions { options, .. } = ev {
+                saw_priority = options.iter().any(|option| {
+                    option.id == "service_tier".into()
+                        && current_select_value(option).as_deref() == Some("priority")
+                });
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let cfg = crate::config::Config::load(&config_path).expect("load config");
+            if cfg
+                .session_config
+                .get("codex-acp")
+                .and_then(|values| values.get("config:service_tier"))
+                .map(String::as_str)
+                == Some("priority")
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "service tier config was not persisted"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
         let join = tokio::time::timeout(Duration::from_secs(2), client_task)
