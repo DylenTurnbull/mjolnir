@@ -1381,6 +1381,7 @@ impl AgentHandle {
             agent_source_id: None,
             config_path: None,
             saved_session_config,
+            code_agent: None,
         };
         let runtime = tokio::spawn(acp::run(runtime_cfg, event_tx, cmd_rx));
         let mut handle = Self {

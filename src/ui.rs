@@ -242,26 +242,34 @@ fn stable_transcript_entry_count(state: &AppState) -> usize {
 
 fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bool {
     match entry {
-        Entry::UserPrompt(_) | Entry::System(_) | Entry::SessionBoundary(_) | Entry::Plan(_) => {
-            true
-        }
-        Entry::AgentMessage(_) | Entry::AgentThought(_) => {
+        Entry::UserPrompt(_)
+        | Entry::CodeAgentPrompt(_)
+        | Entry::System(_)
+        | Entry::SessionBoundary(_)
+        | Entry::Plan(_)
+        | Entry::CodeAgentPlan(_) => true,
+        Entry::AgentMessage(_)
+        | Entry::AgentThought(_)
+        | Entry::CodeAgentMessage(_)
+        | Entry::CodeAgentThought(_) => {
             !(state.is_streaming() && idx + 1 == state.transcript.len())
         }
-        Entry::ToolCall(id) => state.tool_calls.get(id).is_some_and(|view| {
-            matches!(
-                view.status,
-                ToolCallStatus::Completed | ToolCallStatus::Failed
-            ) && view.body.iter().all(|output| {
-                !matches!(
-                    output,
-                    ToolCallOutput::Terminal {
-                        exit_status: None,
-                        ..
-                    }
-                )
+        Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
+            state.tool_calls.get(id).is_some_and(|view| {
+                matches!(
+                    view.status,
+                    ToolCallStatus::Completed | ToolCallStatus::Failed
+                ) && view.body.iter().all(|output| {
+                    !matches!(
+                        output,
+                        ToolCallOutput::Terminal {
+                            exit_status: None,
+                            ..
+                        }
+                    )
+                })
             })
-        }),
+        }
     }
 }
 
@@ -503,6 +511,10 @@ fn streaming_redraw_budget(mode: UiMode) -> Duration {
 fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
     match event {
         UiEvent::SessionUpdate(_) | UiEvent::TerminalOutput(_) => RedrawCause::Stream,
+        UiEvent::CodeAgent(crate::event::CodeAgentEvent::SessionUpdate(_))
+        | UiEvent::CodeAgent(crate::event::CodeAgentEvent::TerminalOutput(_)) => {
+            RedrawCause::Stream
+        }
         UiEvent::Connected { .. }
         | UiEvent::SessionStarted { .. }
         | UiEvent::SessionConfigOptions { .. }
@@ -516,7 +528,8 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::RemotePermissionDecision { .. }
         | UiEvent::Warning(_)
         | UiEvent::Info(_)
-        | UiEvent::Fatal(_) => RedrawCause::Interactive,
+        | UiEvent::Fatal(_)
+        | UiEvent::CodeAgent(_) => RedrawCause::Interactive,
     }
 }
 
@@ -710,6 +723,11 @@ async fn ui_loop(
                             should_force_inline_repair_for_ui_event(mode, &ev);
                         let notification = notification_message_for_event(mode, &state, &ev);
                         state.apply_event(ev);
+                        if state.runtime_closed
+                            && std::env::var_os("MJ_E2E_EXIT_ON_RUNTIME_CLOSE").is_some()
+                        {
+                            state.exit_reason = Some(UiExitReason::Quit);
+                        }
                         drain_queued_prompt(&mut state, cmd_tx);
                         if mode == UiMode::InlineChat
                             && inline_reader_was_active != inline_transcript_viewer_accepts_input(&state)
@@ -752,6 +770,12 @@ async fn ui_loop(
                     }
                     None => {
                         state.mark_runtime_closed();
+                        // Process-level PTY tests use a scripted agent that exits
+                        // after its assertions. Let the normal UI shutdown path
+                        // run without requiring a second synthetic keystroke.
+                        if std::env::var_os("MJ_E2E_EXIT_ON_RUNTIME_CLOSE").is_some() {
+                            state.exit_reason = Some(UiExitReason::Quit);
+                        }
                         pending_redraw.mark_interactive();
                     }
                 }
@@ -947,6 +971,9 @@ fn notification_message_for_event(
             preview_notification_text(message).unwrap_or_else(|| "agent error".to_string())
         )),
         UiEvent::PermissionRequest(prompt) => Some(permission_request_notification(prompt)),
+        UiEvent::CodeAgent(crate::event::CodeAgentEvent::PermissionRequest(prompt)) => Some(
+            format!("Codex: {}", permission_request_notification(prompt)),
+        ),
         _ => None,
     }
 }
@@ -1051,6 +1078,9 @@ fn should_force_inline_repair_for_ui_event(mode: UiMode, ev: &UiEvent) -> bool {
                 | UiEvent::CancelPendingPermissions
                 | UiEvent::RemotePermissionDecision { .. }
                 | UiEvent::ElicitationRequest(_)
+                | UiEvent::CodeAgent(crate::event::CodeAgentEvent::PermissionRequest(_))
+                | UiEvent::CodeAgent(crate::event::CodeAgentEvent::ElicitationRequest(_))
+                | UiEvent::CodeAgent(crate::event::CodeAgentEvent::CancelPendingPermissions)
         )
 }
 
@@ -1941,6 +1971,10 @@ fn cancel_current_turn(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCo
         return;
     }
     let _ = cmd_tx.send(UiCommand::CancelPrompt);
+    if state.code_agent_active {
+        state.status_line = Some(StatusMessage::info("cancelling code agent..."));
+        return;
+    }
     state.mark_cancelling();
     let queued = state.queued_prompt_count();
     let msg = if queued > 0 {
@@ -3449,10 +3483,18 @@ fn transcript_export_markdown(state: &AppState) -> String {
             Entry::UserPrompt(text) => push_export_text(&mut out, "You", text),
             Entry::AgentMessage(text) => push_export_text(&mut out, "Agent", text),
             Entry::AgentThought(text) => push_export_text(&mut out, "Thought", text),
+            Entry::CodeAgentPrompt(text) => push_export_text(&mut out, "Primary → Codex", text),
+            Entry::CodeAgentMessage(text) => push_export_text(&mut out, "Codex", text),
+            Entry::CodeAgentThought(text) => push_export_text(&mut out, "Codex Thought", text),
             Entry::System(text) => push_export_text(&mut out, "System", text),
             Entry::SessionBoundary(text) => push_export_text(&mut out, "Session", text),
-            Entry::Plan(entries) => {
-                out.push_str("## Plan\n\n");
+            Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
+                let heading = if matches!(entry, Entry::CodeAgentPlan(_)) {
+                    "## Codex Plan\n\n"
+                } else {
+                    "## Plan\n\n"
+                };
+                out.push_str(heading);
                 for entry in entries {
                     out.push_str(&format!(
                         "- {} / {}: {}\n",
@@ -3463,10 +3505,15 @@ fn transcript_export_markdown(state: &AppState) -> String {
                 }
                 out.push('\n');
             }
-            Entry::ToolCall(id) => {
+            Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
                 if let Some(view) = state.tool_calls.get(id) {
+                    let label = if matches!(entry, Entry::CodeAgentToolCall(_)) {
+                        "Codex Tool"
+                    } else {
+                        "Tool"
+                    };
                     out.push_str(&format!(
-                        "## Tool: {}\n\n- Kind: {}\n- Status: {}\n\n",
+                        "## {label}: {}\n\n- Kind: {}\n- Status: {}\n\n",
                         escape_markdown_text(&view.title),
                         tool_kind_label(view.kind),
                         tool_status_label(view.status)
@@ -4783,9 +4830,27 @@ fn render_transcript_entry_range(
             Entry::AgentThought(text) => {
                 push_markdown_block(&mut out, "thought", theme.thought, text.clone(), theme)
             }
-            Entry::Plan(entries) => {
+            Entry::CodeAgentPrompt(text) => {
+                push_plain_block(&mut out, "primary → codex", theme.user, text.clone())
+            }
+            Entry::CodeAgentMessage(text) => {
+                push_markdown_block(&mut out, "codex", theme.agent, text.clone(), theme)
+            }
+            Entry::CodeAgentThought(text) => push_markdown_block(
+                &mut out,
+                "codex thought",
+                theme.thought,
+                text.clone(),
+                theme,
+            ),
+            Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
+                let label = if matches!(entry, Entry::CodeAgentPlan(_)) {
+                    "codex plan"
+                } else {
+                    "plan"
+                };
                 out.push(Line::from(Span::styled(
-                    "plan",
+                    label,
                     Style::default().fg(theme.tool).add_modifier(Modifier::BOLD),
                 )));
                 for e in entries {
@@ -4805,17 +4870,22 @@ fn render_transcript_entry_range(
                 }
                 out.push(Line::from(""));
             }
-            Entry::ToolCall(id) => {
+            Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
                 if let Some(view) = state.tool_calls.get(id) {
                     let color = tool_status_color(view.status, theme);
                     // Successful calls don't need a status marker — the output
                     // already implies success. Only annotate non-completed states
                     // (pending/running/failed/interrupted) so they stand out.
+                    let tool_label = if matches!(entry, Entry::CodeAgentToolCall(_)) {
+                        "codex tool"
+                    } else {
+                        "tool"
+                    };
                     let prefix = match view.status {
                         agent_client_protocol::schema::v1::ToolCallStatus::Completed => {
-                            "tool ".to_string()
+                            format!("{tool_label} ")
                         }
-                        _ => format!("tool [{}] ", tool_status_label(view.status)),
+                        _ => format!("{tool_label} [{}] ", tool_status_label(view.status)),
                     };
                     let mut spans = vec![
                         Span::styled(
@@ -6989,10 +7059,15 @@ fn permission_view_lines(
     theme: TerminalTheme,
 ) -> Vec<Line<'static>> {
     let selected = clamp_permission_selected(pending.selected, pending.prompt.options.len());
-    let title = if queue_len > 1 {
-        format!("permission request (1 of {queue_len})")
+    let source = if pending.code_agent {
+        "codex permission"
     } else {
-        "permission request".to_string()
+        "permission request"
+    };
+    let title = if queue_len > 1 {
+        format!("{source} (1 of {queue_len})")
+    } else {
+        source.to_string()
     };
     let mut lines = vec![Line::from(Span::styled(
         title,
@@ -7078,10 +7153,15 @@ fn elicitation_view_lines(
     theme: TerminalTheme,
 ) -> ElicitationContent {
     let view = classify_elicitation(&pending.prompt);
-    let heading = if queue_len > 1 {
-        format!("setup request (1 of {queue_len})")
+    let source = if pending.code_agent {
+        "codex setup"
     } else {
-        "setup request".to_string()
+        "setup request"
+    };
+    let heading = if queue_len > 1 {
+        format!("{source} (1 of {queue_len})")
+    } else {
+        source.to_string()
     };
     let mut lines = vec![Line::from(Span::styled(
         heading,
@@ -9768,6 +9848,7 @@ mod tests {
             scroll_offset: None,
             opened_at: Instant::now(),
             repair_attempts: 0,
+            code_agent: false,
         }
     }
 
@@ -9815,6 +9896,7 @@ mod tests {
             selected: 0,
             scroll_offset: None,
             input: String::new(),
+            code_agent: false,
         };
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -9848,6 +9930,7 @@ mod tests {
             selected: 0,
             scroll_offset: None,
             input: String::new(),
+            code_agent: false,
         };
         let backend = TestBackend::new(100, 60);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -10002,6 +10085,7 @@ mod tests {
             selected: 0,
             scroll_offset: None,
             input: "sk-or-abc".to_string(),
+            code_agent: false,
         };
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).expect("terminal");

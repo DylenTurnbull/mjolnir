@@ -872,6 +872,7 @@ impl TrackerState {
             // remote viewer is a read-only mirror and has nothing to track.
             | UiEvent::ElicitationRequest(_)
             | UiEvent::RemotePermissionDecision { .. }
+            | UiEvent::CodeAgent(_)
             | UiEvent::Info(_)
             | UiEvent::Warning(_) => {}
         }
@@ -1965,6 +1966,7 @@ fn start_server_agent_session(
         agent_source_id: Some(agent_source_id),
         config_path: Some(config_path),
         saved_session_config,
+        code_agent: None,
     };
     let command_tx = server_cmd_tx.clone();
     let shutdown_tx = runtime_cmd_tx.clone();

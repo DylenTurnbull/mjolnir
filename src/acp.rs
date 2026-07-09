@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AuthMethod, AuthenticateRequest, CancelNotification, ClientCapabilities,
-    CloseSessionRequest, Content, ContentBlock, CreateElicitationRequest,
+    AgentCapabilities, AgentRequest, AuthMethod, AuthenticateRequest, CancelNotification,
+    ClientCapabilities, CloseSessionRequest, Content, ContentBlock, CreateElicitationRequest,
     CreateElicitationResponse, CreateTerminalRequest, CreateTerminalResponse, Diff,
     ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities,
     ElicitationFormCapabilities, ElicitationUrlCapabilities, ErrorCode, FileSystemCapabilities,
@@ -30,6 +30,7 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::Result;
+use serde::Deserialize;
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
@@ -37,6 +38,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use crate::code_agent;
 use crate::config;
 use crate::event::{
     ElicitationOutcome, ElicitationPrompt, LoadSessionResult, PermissionDecision, PermissionPrompt,
@@ -72,6 +74,9 @@ pub struct AcpRuntimeConfig {
     pub config_path: Option<PathBuf>,
     /// Values remembered from the last prompt submitted for this agent.
     pub saved_session_config: HashMap<String, String>,
+    /// Optional client-side `_mj/codeAgent` implementation. Interactive TUI
+    /// sessions set this; nested and non-interactive runtimes leave it absent.
+    pub code_agent: Option<code_agent::Config>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +87,27 @@ pub enum RuntimeAccessMode {
     /// Analysis-only sessions: allow reads, but deny writes and terminal
     /// execution even if the agent asks directly.
     ReadOnly,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodeAgentRequestParams {
+    instructions: String,
+}
+
+fn code_agent_capability_meta() -> serde_json::Map<String, serde_json::Value> {
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "mj".to_string(),
+        serde_json::json!({
+            "codeAgent": {
+                "version": 1,
+                "method": code_agent::WIRE_METHOD,
+                "agent": "codex-acp"
+            }
+        }),
+    );
+    meta
 }
 
 impl RuntimeAccessMode {
@@ -621,6 +647,7 @@ pub async fn run(
             cfg.agent_source_id.clone(),
             cfg.config_path.clone(),
             cfg.saved_session_config.clone(),
+            cfg.code_agent.clone(),
         );
         tokio::pin!(drive);
         tokio::select! {
@@ -1139,6 +1166,7 @@ where
         None,
         None,
         HashMap::new(),
+        None,
     )
     .await
 }
@@ -1169,6 +1197,7 @@ where
         None,
         None,
         HashMap::new(),
+        None,
     )
     .await
 }
@@ -1187,6 +1216,7 @@ async fn drive_client_with_fs_limit<T>(
     agent_source_id: Option<String>,
     config_path: Option<PathBuf>,
     saved_session_config: HashMap<String, String>,
+    code_agent: Option<code_agent::Config>,
 ) -> Result<()>
 where
     T: ConnectTo<Client>,
@@ -1219,6 +1249,18 @@ where
     let wait_terminals = terminals.clone();
     let kill_terminals = terminals.clone();
     let drive_terminals = terminals.clone();
+    let code_agent_controller = code_agent::Controller::default();
+    let extension_controller = code_agent_controller.clone();
+    let drive_code_agent_controller = code_agent_controller.clone();
+    let extension_config = code_agent.clone();
+    let extension_ui_tx = ui_tx.clone();
+    let extension_context = code_agent::RunContext {
+        cwd: cwd.clone(),
+        additional_directories: additional_directories.clone(),
+        fs_max_text_bytes,
+        access_mode,
+    };
+    let code_agent_enabled = code_agent.is_some();
     let result = Client
         .builder()
         .on_receive_notification(
@@ -1358,6 +1400,78 @@ where
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            async move |request: AgentRequest, responder, cx| {
+                let AgentRequest::ExtMethodRequest(extension) = request else {
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::method_not_found(),
+                    );
+                };
+                if extension.method.as_ref() != code_agent::SDK_METHOD {
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::method_not_found(),
+                    );
+                }
+                let Some(config) = extension_config.clone() else {
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::method_not_found(),
+                    );
+                };
+                let params: CodeAgentRequestParams =
+                    match serde_json::from_str(extension.params.get()) {
+                        Ok(params) => params,
+                        Err(error) => {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data(serde_json::Value::String(error.to_string())),
+                            );
+                        }
+                    };
+                if params.instructions.trim().is_empty() {
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params().data(
+                            serde_json::Value::String(
+                                "instructions must not be empty".to_string(),
+                            ),
+                        ),
+                    );
+                }
+                if !extension_controller.begin().await {
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::internal_error().data(
+                            serde_json::Value::String(
+                                "a code agent run is already active".to_string(),
+                            ),
+                        ),
+                    );
+                }
+
+                let controller = extension_controller.clone();
+                let context = extension_context.clone();
+                let ui_tx = extension_ui_tx.clone();
+                cx.spawn(async move {
+                    match code_agent::run_boxed(
+                        config,
+                        context,
+                        params.instructions,
+                        ui_tx,
+                        controller,
+                    )
+                    .await
+                    {
+                        Ok(message) => responder.respond(serde_json::json!({
+                            "message": message,
+                        })),
+                        Err(error) => responder.respond_with_error(
+                            agent_client_protocol::Error::internal_error()
+                                .data(serde_json::Value::String(error.to_string())),
+                        ),
+                    }
+                })?;
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .connect_with(transport, |conn: ConnectionTo<Agent>| async move {
             if let Err(e) = drive_session(
                 conn,
@@ -1374,6 +1488,8 @@ where
                 agent_source_id,
                 config_path,
                 saved_session_config,
+                code_agent_enabled,
+                drive_code_agent_controller,
             )
             .await
             {
@@ -1385,6 +1501,7 @@ where
         })
         .await;
 
+    code_agent_controller.shutdown().await;
     terminals.shutdown_all().await;
     result.map_err(|e| anyhow::anyhow!("acp client error: {e}"))?;
     Ok(())
@@ -1409,28 +1526,27 @@ async fn drive_session(
     agent_source_id: Option<String>,
     config_path: Option<PathBuf>,
     saved_session_config: HashMap<String, String>,
+    code_agent_enabled: bool,
+    code_agent_controller: code_agent::Controller,
 ) -> Result<()> {
     // Advertise the client capabilities backed by handlers registered in
     // `drive_client` above.
+    let mut client_capabilities = ClientCapabilities::new()
+        .fs(FileSystemCapabilities::new()
+            .read_text_file(true)
+            .write_text_file(access_mode.allows_filesystem_writes()))
+        .terminal(access_mode.allows_terminals())
+        .elicitation(
+            ElicitationCapabilities::new()
+                .form(ElicitationFormCapabilities::new())
+                .url(ElicitationUrlCapabilities::new()),
+        );
+    if code_agent_enabled {
+        client_capabilities = client_capabilities.meta(code_agent_capability_meta());
+    }
     let init_req = InitializeRequest::new(ProtocolVersion::V1)
         .client_info(client_implementation())
-        .client_capabilities(
-            ClientCapabilities::new()
-                .fs(FileSystemCapabilities::new()
-                    .read_text_file(true)
-                    .write_text_file(access_mode.allows_filesystem_writes()))
-                .terminal(access_mode.allows_terminals())
-                // Advertise both elicitation modes. `form` covers single-select
-                // `/setup` menus and `url` covers OAuth-login steps. v1 fully
-                // implements single-select forms and URL/QR; any richer form
-                // shape degrades to a `decline` response (a valid answer), so
-                // advertising `form` does not over-promise.
-                .elicitation(
-                    ElicitationCapabilities::new()
-                        .form(ElicitationFormCapabilities::new())
-                        .url(ElicitationUrlCapabilities::new()),
-                ),
-        );
+        .client_capabilities(client_capabilities);
     let init_resp = match conn.send_request(init_req).block_task().await {
         Ok(r) => r,
         Err(source) => {
@@ -1607,6 +1723,7 @@ async fn drive_session(
                         max_text_bytes: fs_max_text_bytes,
                         turn_id: next_turn_diff_id,
                     },
+                    &code_agent_controller,
                 )
                 .await?
                 {
@@ -3539,6 +3656,7 @@ struct PromptTurnDiffConfig<'a> {
     turn_id: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive_prompt_turn(
     conn: &ConnectionTo<Agent>,
     session_id: &SessionId,
@@ -3547,6 +3665,7 @@ async fn drive_prompt_turn(
     ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
     session_state: &RuntimeSessionState,
     diff_config: PromptTurnDiffConfig<'_>,
+    code_agent_controller: &code_agent::Controller,
 ) -> Result<bool> {
     let turn_diff_tracker =
         TurnDiffTracker::snapshot(diff_config.workspace_roots, diff_config.max_text_bytes).await;
@@ -3581,6 +3700,9 @@ async fn drive_prompt_turn(
             maybe_cmd = ui_rx.recv() => {
                 match maybe_cmd {
                     Some(UiCommand::CancelPrompt) => {
+                        if code_agent_controller.cancel().await {
+                            continue;
+                        }
                         if !cancel_sent {
                             session_state.mark_permissions_cancelled(session_id).await;
                             let _ = ui_tx.send(UiEvent::CancelPendingPermissions);
@@ -3591,6 +3713,7 @@ async fn drive_prompt_turn(
                         }
                     }
                     Some(UiCommand::Shutdown) | None => {
+                        code_agent_controller.shutdown().await;
                         return Ok(false);
                     }
                     Some(UiCommand::SendPrompt { .. }) => {
@@ -7159,6 +7282,7 @@ mod tests {
             agent_source_id: None,
             config_path: None,
             saved_session_config: HashMap::new(),
+            code_agent: None,
         };
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
@@ -7215,6 +7339,7 @@ mod tests {
             agent_source_id: None,
             config_path: None,
             saved_session_config: HashMap::new(),
+            code_agent: None,
         };
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
@@ -7350,6 +7475,7 @@ mod tests {
             agent_source_id: None,
             config_path: None,
             saved_session_config: HashMap::new(),
+            code_agent: None,
         };
         assert_run_reports_agent_exited(cfg).await;
     }
@@ -7375,6 +7501,7 @@ mod tests {
             agent_source_id: None,
             config_path: None,
             saved_session_config: HashMap::new(),
+            code_agent: None,
         };
         assert_run_reports_agent_exited(cfg).await;
     }
@@ -7946,5 +8073,26 @@ mod tests {
 
         let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
         agent_task.abort();
+    }
+
+    #[test]
+    fn code_agent_request_params_are_strict() {
+        let parsed: CodeAgentRequestParams =
+            serde_json::from_str(r#"{"instructions":"fix it"}"#).expect("valid params");
+        assert_eq!(parsed.instructions, "fix it");
+        assert!(
+            serde_json::from_str::<CodeAgentRequestParams>(
+                r#"{"instructions":"fix it","unexpected":true}"#
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_str::<CodeAgentRequestParams>("{}").is_err());
+    }
+
+    #[test]
+    fn code_agent_capability_uses_wire_method() {
+        let meta = code_agent_capability_meta();
+        assert_eq!(meta["mj"]["codeAgent"]["version"], 1);
+        assert_eq!(meta["mj"]["codeAgent"]["method"], code_agent::WIRE_METHOD);
     }
 }

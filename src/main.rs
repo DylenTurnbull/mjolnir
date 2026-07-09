@@ -10,6 +10,7 @@ mod acp;
 mod app;
 mod claude_usage;
 mod clipboard;
+mod code_agent;
 mod config;
 mod event;
 mod headless;
@@ -1624,6 +1625,10 @@ async fn run_session(
             .ok()
             .and_then(|cfg| cfg.session_config.get(&agent.source_id).cloned())
             .unwrap_or_default(),
+        code_agent: Some(code_agent::Config::codex(
+            runtime_options.agent_stderr.clone(),
+            agent.env.clone(),
+        )),
     };
 
     // Drive the ACP runtime on its own task so the UI can own the

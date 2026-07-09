@@ -22,8 +22,9 @@ use crate::claude_usage::ClaudeUsageReport;
 use crate::clipboard::ClipboardLease;
 
 use crate::event::{
-    ElicitationOutcome, ElicitationPrompt, PermissionDecision, PermissionPrompt, PromptImage,
-    SessionConfigTarget, TerminalOutputSnapshot, UiEvent, content_block_text,
+    CodeAgentEvent, CodeAgentOutcome, ElicitationOutcome, ElicitationPrompt, PermissionDecision,
+    PermissionPrompt, PromptImage, SessionConfigTarget, TerminalOutputSnapshot, UiEvent,
+    content_block_text,
 };
 use crate::palette::TerminalTheme;
 use crate::ragnarok;
@@ -124,11 +125,18 @@ pub enum Entry {
     AgentMessage(String),
     /// Streaming agent reasoning ("thoughts").
     AgentThought(String),
+    /// Instructions delegated by the primary ACP server to the nested agent.
+    CodeAgentPrompt(String),
+    /// Nested agent response and reasoning, kept visually distinct from the primary.
+    CodeAgentMessage(String),
+    CodeAgentThought(String),
     /// A tool call slot identified by id. The body is rendered from
     /// `tool_calls[id]`; we keep an entry pointer so it shows up in order.
     ToolCall(String),
+    CodeAgentToolCall(String),
     /// Latest plan posted by the agent.
     Plan(Vec<PlanEntry>),
+    CodeAgentPlan(Vec<PlanEntry>),
     /// System-level note (errors, warnings, mode changes).
     System(String),
     /// Visual separator inserted at local session boundaries so a freshly
@@ -254,6 +262,16 @@ impl ToolCallView {
             }
         }
         changed
+    }
+
+    fn namespace_terminal_ids(&mut self, prefix: &str) {
+        for output in &mut self.body {
+            if let ToolCallOutput::Terminal { terminal_id, .. } = output
+                && !terminal_id.starts_with(prefix)
+            {
+                *terminal_id = format!("{prefix}{terminal_id}");
+            }
+        }
     }
 }
 
@@ -609,6 +627,8 @@ pub struct AppState {
     pub exit_reason: Option<UiExitReason>,
     /// True once the runtime has stopped accepting commands.
     pub runtime_closed: bool,
+    /// A client-side nested ACP turn is currently serving `_mj/codeAgent`.
+    pub code_agent_active: bool,
     /// Transient status line with severity.
     pub status_line: Option<StatusMessage>,
     /// True while the local microphone dictation helper is running.
@@ -675,6 +695,7 @@ pub struct PendingPermission {
     pub scroll_offset: Option<usize>,
     pub opened_at: Instant,
     pub repair_attempts: usize,
+    pub code_agent: bool,
 }
 
 #[derive(Debug)]
@@ -690,6 +711,7 @@ pub struct PendingElicitation {
     /// append/backspace at the end (the cursor renders after the last char);
     /// empty for every other view.
     pub input: String,
+    pub code_agent: bool,
 }
 
 /// How a pending elicitation should be rendered and resolved, derived once
@@ -894,6 +916,7 @@ impl AppState {
             transcript_viewer: false,
             exit_reason: None,
             runtime_closed: false,
+            code_agent_active: false,
             status_line: None,
             voice_input_active: false,
             voice_input_range: None,
@@ -1173,8 +1196,13 @@ impl AppState {
             Entry::AgentMessage(text) => Some(text.clone()),
             Entry::UserPrompt(_)
             | Entry::AgentThought(_)
+            | Entry::CodeAgentPrompt(_)
+            | Entry::CodeAgentMessage(_)
+            | Entry::CodeAgentThought(_)
             | Entry::ToolCall(_)
+            | Entry::CodeAgentToolCall(_)
             | Entry::Plan(_)
+            | Entry::CodeAgentPlan(_)
             | Entry::System(_)
             | Entry::SessionBoundary(_) => None,
         })
@@ -1309,6 +1337,9 @@ impl AppState {
     /// Note that the user has requested cancellation of the in-flight
     /// prompt. Idempotent and only meaningful while `Streaming`.
     pub fn mark_cancelling(&mut self) {
+        if self.code_agent_active {
+            return;
+        }
         if self.connection_state == ConnectionState::Streaming {
             self.set_connection_state(ConnectionState::Cancelling);
         }
@@ -1834,6 +1865,7 @@ impl AppState {
                     scroll_offset: None,
                     opened_at: Instant::now(),
                     repair_attempts: 0,
+                    code_agent: false,
                 });
                 self.update_autocomplete();
             }
@@ -1853,9 +1885,11 @@ impl AppState {
                     selected: 0,
                     scroll_offset: None,
                     input: String::new(),
+                    code_agent: false,
                 });
                 self.update_autocomplete();
             }
+            UiEvent::CodeAgent(event) => self.apply_code_agent_event(event),
             UiEvent::RemotePermissionDecision {
                 request_id,
                 option_id,
@@ -1915,6 +1949,188 @@ impl AppState {
                 self.record_status_message(StatusKind::Fatal, msg);
                 self.mark_runtime_closed();
             }
+        }
+    }
+
+    fn apply_code_agent_event(&mut self, event: CodeAgentEvent) {
+        const PREFIX: &str = "codeagent:";
+        match event {
+            CodeAgentEvent::Started {
+                label,
+                instructions,
+            } => {
+                self.code_agent_active = true;
+                self.push_session_boundary(format!("code agent · {label}"));
+                self.transcript.push(Entry::CodeAgentPrompt(instructions));
+                self.bump_transcript_revision();
+                self.set_status_line(StatusKind::Info, format!("code agent · {label}"));
+            }
+            CodeAgentEvent::SessionUpdate(update) => self.apply_code_agent_update(update),
+            CodeAgentEvent::TerminalOutput(mut snapshot) => {
+                snapshot.terminal_id = format!("{PREFIX}{}", snapshot.terminal_id);
+                self.terminal_outputs
+                    .insert(snapshot.terminal_id.clone(), snapshot);
+                self.apply_known_terminal_outputs();
+            }
+            CodeAgentEvent::PermissionRequest(prompt) => {
+                self.help_overlay = false;
+                self.permission_queue.push_back(PendingPermission {
+                    prompt,
+                    selected: 0,
+                    scroll_offset: None,
+                    opened_at: Instant::now(),
+                    repair_attempts: 0,
+                    code_agent: true,
+                });
+                self.update_autocomplete();
+            }
+            CodeAgentEvent::ElicitationRequest(prompt) => {
+                self.help_overlay = false;
+                self.elicitation_queue.push_back(PendingElicitation {
+                    prompt,
+                    selected: 0,
+                    scroll_offset: None,
+                    input: String::new(),
+                    code_agent: true,
+                });
+                self.update_autocomplete();
+            }
+            CodeAgentEvent::CancelPendingPermissions => {
+                self.cancel_code_agent_prompts();
+                self.mark_code_agent_tools_failed("tool call cancelled");
+            }
+            CodeAgentEvent::Status(message) => {
+                self.push_system_message(format!("codex: {message}"));
+            }
+            CodeAgentEvent::Finished { outcome } => {
+                self.code_agent_active = false;
+                self.cancel_code_agent_prompts();
+                let label = match outcome {
+                    CodeAgentOutcome::Completed => "code agent complete".to_string(),
+                    CodeAgentOutcome::Cancelled => {
+                        self.mark_code_agent_tools_failed("tool call cancelled");
+                        "code agent cancelled".to_string()
+                    }
+                    CodeAgentOutcome::Failed(message) => {
+                        self.mark_code_agent_tools_failed("tool call failed");
+                        format!("code agent failed · {message}")
+                    }
+                };
+                self.push_session_boundary(label);
+            }
+        }
+    }
+
+    fn apply_code_agent_update(&mut self, update: SessionUpdate) {
+        const PREFIX: &str = "codeagent:";
+        match update {
+            SessionUpdate::UserMessageChunk(_) => {}
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                append_or_start(
+                    &mut self.transcript,
+                    EntryKind::CodeAgent,
+                    content_block_text(&chunk.content),
+                );
+                self.bump_transcript_revision();
+            }
+            SessionUpdate::AgentThoughtChunk(chunk) => {
+                append_or_start(
+                    &mut self.transcript,
+                    EntryKind::CodeAgentThought,
+                    content_block_text(&chunk.content),
+                );
+                self.bump_transcript_revision();
+            }
+            SessionUpdate::ToolCall(tool_call) => {
+                let key = format!("{PREFIX}{}", tool_call.tool_call_id);
+                let mut view = ToolCallView::from_tool_call(&tool_call);
+                view.namespace_terminal_ids(PREFIX);
+                self.tool_calls.insert(key.clone(), view);
+                self.transcript.push(Entry::CodeAgentToolCall(key));
+                self.bump_transcript_revision();
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                let key = format!("{PREFIX}{}", update.tool_call_id);
+                if let Some(view) = self.tool_calls.get_mut(&key) {
+                    view.apply_update(&update);
+                    view.namespace_terminal_ids(PREFIX);
+                } else {
+                    let mut view = ToolCallView {
+                        title: update
+                            .fields
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| "tool".to_string()),
+                        kind: update.fields.kind.unwrap_or(ToolKind::Other),
+                        status: update.fields.status.unwrap_or(ToolCallStatus::Pending),
+                        body: Vec::new(),
+                    };
+                    if let Some(content) = &update.fields.content {
+                        view.set_content(content);
+                        view.namespace_terminal_ids(PREFIX);
+                    }
+                    self.tool_calls.insert(key.clone(), view);
+                    self.transcript.push(Entry::CodeAgentToolCall(key));
+                }
+                self.bump_transcript_revision();
+            }
+            SessionUpdate::Plan(Plan { entries, .. }) => {
+                if let Some(Entry::CodeAgentPlan(existing)) = self
+                    .transcript
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| matches!(entry, Entry::CodeAgentPlan(_)))
+                {
+                    *existing = entries;
+                } else {
+                    self.transcript.push(Entry::CodeAgentPlan(entries));
+                }
+                self.bump_transcript_revision();
+            }
+            _ => {}
+        }
+        self.apply_known_terminal_outputs();
+    }
+
+    fn cancel_code_agent_prompts(&mut self) {
+        let mut primary_permissions = VecDeque::new();
+        while let Some(pending) = self.permission_queue.pop_front() {
+            if pending.code_agent {
+                let _ = pending.prompt.responder.send(PermissionDecision::Cancelled);
+            } else {
+                primary_permissions.push_back(pending);
+            }
+        }
+        self.permission_queue = primary_permissions;
+
+        let mut primary_elicitations = VecDeque::new();
+        while let Some(pending) = self.elicitation_queue.pop_front() {
+            if pending.code_agent {
+                let _ = pending.prompt.responder.send(ElicitationOutcome::Cancel);
+            } else {
+                primary_elicitations.push_back(pending);
+            }
+        }
+        self.elicitation_queue = primary_elicitations;
+        self.update_autocomplete();
+    }
+
+    fn mark_code_agent_tools_failed(&mut self, note: &str) {
+        let mut changed = false;
+        for (id, view) in &mut self.tool_calls {
+            if id.starts_with("codeagent:")
+                && matches!(
+                    view.status,
+                    ToolCallStatus::Pending | ToolCallStatus::InProgress
+                )
+            {
+                view.status = ToolCallStatus::Failed;
+                view.body.push(ToolCallOutput::Note(note.to_string()));
+                changed = true;
+            }
+        }
+        if changed {
+            self.bump_transcript_revision();
         }
     }
 
@@ -2182,6 +2398,8 @@ enum EntryKind {
     User,
     Agent,
     Thought,
+    CodeAgent,
+    CodeAgentThought,
 }
 
 /// Append `text` to the trailing entry of the same kind, or start a new
@@ -2191,7 +2409,9 @@ fn append_or_start(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) {
         match (&kind, last) {
             (EntryKind::User, Entry::UserPrompt(s))
             | (EntryKind::Agent, Entry::AgentMessage(s))
-            | (EntryKind::Thought, Entry::AgentThought(s)) => {
+            | (EntryKind::Thought, Entry::AgentThought(s))
+            | (EntryKind::CodeAgent, Entry::CodeAgentMessage(s))
+            | (EntryKind::CodeAgentThought, Entry::CodeAgentThought(s)) => {
                 s.push_str(&text);
                 return;
             }
@@ -2202,6 +2422,8 @@ fn append_or_start(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) {
         EntryKind::User => Entry::UserPrompt(text),
         EntryKind::Agent => Entry::AgentMessage(text),
         EntryKind::Thought => Entry::AgentThought(text),
+        EntryKind::CodeAgent => Entry::CodeAgentMessage(text),
+        EntryKind::CodeAgentThought => Entry::CodeAgentThought(text),
     });
 }
 
@@ -2902,6 +3124,46 @@ mod tests {
         let view = s.tool_calls.get("call-1").expect("view");
         assert_eq!(view.status, ToolCallStatus::Completed);
         assert_eq!(view.title, "running ls");
+    }
+
+    #[test]
+    fn code_agent_tool_ids_are_isolated_from_primary_tools() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(
+            ToolCall::new("shared-id", "primary tool"),
+        )));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "codex".to_string(),
+            instructions: "work".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::ToolCall(ToolCall::new("shared-id", "nested tool")),
+        )));
+
+        assert_eq!(
+            state.tool_calls.get("shared-id").expect("primary").title,
+            "primary tool"
+        );
+        assert_eq!(
+            state
+                .tool_calls
+                .get("codeagent:shared-id")
+                .expect("nested")
+                .title,
+            "nested tool"
+        );
+    }
+
+    #[test]
+    fn primary_turn_does_not_enter_cancelling_while_code_agent_is_active() {
+        let mut state = AppState::new();
+        state.record_user_prompt("delegate".to_string());
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "codex".to_string(),
+            instructions: "work".to_string(),
+        }));
+        state.mark_cancelling();
+        assert_eq!(state.connection_state, ConnectionState::Streaming);
     }
 
     #[test]

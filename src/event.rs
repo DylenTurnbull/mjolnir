@@ -58,6 +58,10 @@ pub enum UiEvent {
     /// by agent-driven `/setup` menus, which are global (not per-session) and
     /// therefore must NOT be routed through `session/set_config_option`.
     ElicitationRequest(ElicitationPrompt),
+    /// Activity from a temporary ACP agent launched for `_mj/codeAgent`.
+    /// Kept under one wrapper so nested lifecycle/config state cannot be
+    /// mistaken for the primary session's state.
+    CodeAgent(CodeAgentEvent),
     /// The runtime sent `session/cancel`; queued permission prompts for the
     /// cancelled turn must answer with `cancelled` and disappear.
     CancelPendingPermissions,
@@ -91,6 +95,25 @@ pub enum UiEvent {
     /// Fatal error; the runtime is shutting down. UI should display the
     /// message and exit.
     Fatal(String),
+}
+
+#[derive(Debug)]
+pub enum CodeAgentEvent {
+    Started { label: String, instructions: String },
+    SessionUpdate(SessionUpdate),
+    TerminalOutput(TerminalOutputSnapshot),
+    PermissionRequest(PermissionPrompt),
+    ElicitationRequest(ElicitationPrompt),
+    CancelPendingPermissions,
+    Status(String),
+    Finished { outcome: CodeAgentOutcome },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodeAgentOutcome {
+    Completed,
+    Cancelled,
+    Failed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

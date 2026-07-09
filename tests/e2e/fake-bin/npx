@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 2 ] || [ "$1" != "-y" ] || [ "$2" != "@agentclientprotocol/codex-acp" ]; then
+  echo "unexpected code-agent launch: npx $*" >&2
+  exit 64
+fi
+
+fixture_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec node "$fixture_dir/nested-agent.mjs"

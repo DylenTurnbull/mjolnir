@@ -398,7 +398,8 @@ impl ConnState {
             // surface Claude Code's local quota scrape.
             UiEvent::TerminalOutput(_)
             | UiEvent::RemotePermissionDecision { .. }
-            | UiEvent::ClaudeUsage(_) => {}
+            | UiEvent::ClaudeUsage(_)
+            | UiEvent::CodeAgent(_) => {}
         }
     }
 
@@ -841,6 +842,7 @@ impl McpServer {
             agent_source_id: resolved.source_id,
             config_path: Some(config::default_config_path()),
             saved_session_config: resolved.saved_session_config,
+            code_agent: None,
         })
     }
 

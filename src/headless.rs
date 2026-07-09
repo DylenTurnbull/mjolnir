@@ -151,6 +151,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         agent_source_id: Some(agent_source_id),
         config_path: Some(config_path),
         saved_session_config,
+        code_agent: None,
     };
 
     let runtime = tokio::spawn(async move { acp::run(runtime_cfg, event_tx, cmd_rx).await });
@@ -275,6 +276,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             // Headless runs never receive remote decisions (no UI event
             // channel is registered with the tracker).
             UiEvent::RemotePermissionDecision { .. } => {}
+            UiEvent::CodeAgent(_) => {}
             UiEvent::ElicitationRequest(prompt) => {
                 // Headless runs have no interactive modal to render a form or
                 // URL, so we cannot collect the user's answer. Decline so the

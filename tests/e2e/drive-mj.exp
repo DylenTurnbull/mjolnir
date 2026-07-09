@@ -1,0 +1,38 @@
+#!/usr/bin/expect -f
+
+set timeout 90
+set stty_init "rows 40 columns 120"
+set mode $env(MJ_E2E_MODE)
+set transcript $env(MJ_E2E_TRANSCRIPT)
+log_file -noappend $transcript
+
+proc send_ctrl_c {} {
+    global spawn_id
+    send -i $spawn_id -- "\003"
+}
+
+spawn $env(MJ_E2E_BIN) --no-update-check --debug-file $env(MJ_E2E_DEBUG_LOG) --agent-stderr $env(MJ_E2E_AGENT_STDERR) --fullscreen-tui --cwd $env(MJ_E2E_WORKSPACE)
+expect {
+    -re {F10 help} { send -- "delegate to the code agent\r" }
+    timeout { exit 19 }
+}
+
+if {$mode eq "cancel"} {
+    expect {
+        -re {code agent.*codex} { send_ctrl_c }
+        timeout { exit 20 }
+    }
+    expect {
+        -re {PRIMARY CANCELLED} {}
+        timeout { exit 21 }
+    }
+} else {
+    expect {
+        -re {codex permission} { send -- "\r" }
+        timeout { exit 22 }
+    }
+    expect {
+        -re {PRIMARY RECEIVED:.*CODEAGENT_E2E_OK} {}
+        timeout { exit 23 }
+    }
+}
