@@ -703,6 +703,79 @@
         font: 700 15px/1 var(--font-mono);
       }
 
+      .primary.is-loading {
+        --key-edge: rgb(235 63 51 / 0.9);
+        filter: drop-shadow(0 0 11px rgb(235 63 51 / 0.38));
+      }
+
+      .modal-backdrop.is-creating .fs-list,
+      .modal-backdrop.is-creating .fs-roots,
+      .modal-backdrop.is-creating .fs-current {
+        opacity: 0.58;
+      }
+
+      .new-session-progress {
+        display: grid;
+        gap: 8px;
+        padding: 11px 12px 12px;
+        border: 1px solid rgb(235 63 51 / 0.35);
+        background:
+          linear-gradient(90deg, rgb(235 63 51 / 0.16), transparent 70%),
+          var(--surface-terminal);
+        box-shadow: inset 3px 0 0 rgb(235 63 51 / 0.72);
+      }
+
+      .launch-progress-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .launch-kicker {
+        color: var(--red-hot);
+        font: 700 9.5px/1 var(--font-mono);
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+      }
+
+      .launch-text {
+        color: var(--muted);
+        font: 500 12px/1.4 var(--font-body);
+      }
+
+      .launch-rail {
+        display: grid;
+        grid-template-columns: repeat(7, 1fr);
+        gap: 4px;
+      }
+
+      .launch-rail span {
+        height: 4px;
+        background: var(--red);
+        opacity: 0.28;
+        transform-origin: left center;
+        animation: launch-segment 1.25s ease-in-out infinite;
+      }
+
+      .launch-rail span:nth-child(2) { animation-delay: 0.08s; }
+      .launch-rail span:nth-child(3) { animation-delay: 0.16s; }
+      .launch-rail span:nth-child(4) { animation-delay: 0.24s; }
+      .launch-rail span:nth-child(5) { animation-delay: 0.32s; }
+      .launch-rail span:nth-child(6) { animation-delay: 0.4s; }
+      .launch-rail span:nth-child(7) { animation-delay: 0.48s; }
+
+      @keyframes launch-segment {
+        0%, 100% {
+          opacity: 0.22;
+          transform: scaleX(0.45);
+        }
+        45%, 60% {
+          opacity: 1;
+          transform: scaleX(1);
+        }
+      }
+
       .fs-current {
         display: grid;
         gap: 5px;
@@ -907,6 +980,79 @@
         50% {
           opacity: 0.4;
         }
+      }
+
+      .launch-session-card {
+        position: relative;
+        overflow: hidden;
+        display: grid;
+        gap: 7px;
+        padding: 13px 14px 13px 18px;
+        border-bottom: 1px solid var(--line-row);
+        background:
+          linear-gradient(90deg, rgb(235 63 51 / 0.18), rgb(235 63 51 / 0.05) 58%, transparent),
+          var(--surface-panel);
+      }
+
+      .launch-session-card::before {
+        content: "";
+        position: absolute;
+        inset: 0 auto 0 0;
+        width: 3px;
+        background: var(--red-hot);
+        box-shadow: 0 0 14px rgb(235 63 51 / 0.64);
+      }
+
+      .launch-card-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .launch-card-title {
+        color: var(--text-control);
+        font: 600 15px/1.25 var(--font-body);
+      }
+
+      .launch-card-meta,
+      .launch-card-detail {
+        color: var(--dim);
+        font: 400 10.5px/1.4 var(--font-mono);
+        overflow-wrap: anywhere;
+      }
+
+      .launch-card-detail {
+        color: var(--muted);
+      }
+
+      .launch-card-badge {
+        flex: 0 0 auto;
+        color: var(--red-hot);
+        font: 700 9px/1 var(--font-mono);
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .launch-card-bar {
+        position: relative;
+        height: 3px;
+        overflow: hidden;
+        background: rgb(235 63 51 / 0.16);
+      }
+
+      .launch-card-bar::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        width: 46%;
+        background: linear-gradient(90deg, transparent, var(--red-hot), transparent);
+        animation: launch-scan 1.35s ease-in-out infinite;
+      }
+
+      @keyframes launch-scan {
+        from { transform: translateX(-110%); }
+        to { transform: translateX(240%); }
       }
 
       .session-top {
@@ -2070,7 +2216,9 @@
         .session-approval,
         .config-option-status,
         .session-item.working .live-dot,
-        .session-item.needs-approval .live-dot {
+        .session-item.needs-approval .live-dot,
+        .launch-rail span,
+        .launch-card-bar::before {
           animation: none;
         }
 
@@ -2185,6 +2333,16 @@
           <span class="fs-spacer"></span>
           <button id="new-session-start" class="primary" type="button">Start session</button>
         </div>
+        <div id="new-session-progress" class="new-session-progress" role="status" aria-live="polite" hidden>
+          <div class="launch-progress-head">
+            <span class="launch-kicker">Starting session</span>
+            <span class="launch-kicker">ACP</span>
+          </div>
+          <div class="launch-rail" aria-hidden="true">
+            <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+          </div>
+          <div id="new-session-progress-text" class="launch-text">Preparing agent runtime…</div>
+        </div>
         <div id="fs-list" class="fs-list" aria-label="Folders"></div>
         <div id="new-session-status" class="new-session-status" role="status"></div>
       </div>
@@ -2268,6 +2426,8 @@
       const newSessionCloseEl = $("new-session-close");
       const newSessionStartEl = $("new-session-start");
       const newSessionStatusEl = $("new-session-status");
+      const newSessionProgressEl = $("new-session-progress");
+      const newSessionProgressTextEl = $("new-session-progress-text");
       const newSessionWorktreeEl = $("new-session-worktree");
       const fsCurrentPathEl = $("fs-current-path");
       const fsRootsEl = $("fs-roots");
@@ -2312,6 +2472,7 @@
       // dies with the session) server-side.
       const CONFIG_APPLY_TIMEOUT_MS = 60000;
       const STOP_REQUEST_TIMEOUT_MS = 15000;
+      const SESSION_LAUNCH_INDICATOR_TTL_MS = 120000;
       const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
       const narrowScreen = window.matchMedia("(max-width: 800px)");
 
@@ -2326,6 +2487,8 @@
       let filesystemState = null;
       let filesystemLoading = false;
       let creatingSession = false;
+      let pendingSessionLaunch = null;
+      let launchSessionCard = null;
       let commandMatches = [];
       let commandSelected = 0;
       let showTranscriptDiffs = true;
@@ -2459,7 +2622,13 @@
         filesystemLoading = false;
         creatingSession = false;
         settingsModalEl.hidden = true;
+        pendingSessionLaunch = null;
+        if (launchSessionCard) {
+          launchSessionCard.root.remove();
+        }
+        launchSessionCard = null;
         newSessionModalEl.hidden = true;
+        setSessionCreationUi(false);
         sessionCardById.clear();
         activityBySessionId.clear();
         sentDecisions.clear();
@@ -2513,6 +2682,17 @@
         newSessionStatusEl.classList.toggle("is-error", isError);
       }
 
+      function setSessionCreationUi(active, text = "") {
+        newSessionModalEl.classList.toggle("is-creating", active);
+        newSessionProgressEl.hidden = !active;
+        newSessionStartEl.classList.toggle("is-loading", active);
+        newSessionStartEl.setAttribute("aria-busy", active ? "true" : "false");
+        newSessionStartEl.textContent = active ? "Starting…" : "Start session";
+        if (active) {
+          newSessionProgressTextEl.textContent = text || "Preparing agent runtime…";
+        }
+      }
+
       function setFilesystemBusy(busy) {
         filesystemLoading = busy;
         fsParentButtonEl.disabled = busy || !filesystemState?.parent || creatingSession;
@@ -2532,6 +2712,7 @@
         }
         newSessionModalEl.hidden = false;
         newSessionWorktreeEl.checked = false;
+        setSessionCreationUi(false);
         setNewSessionStatus("");
         void loadFilesystem();
       }
@@ -2633,8 +2814,17 @@
           return;
         }
         creatingSession = true;
+        pendingSessionLaunch = {
+          cwd: current.display_path || current.path,
+          detail: "Creating ACP session…",
+          startedAt: Date.now(),
+          worktree: newSessionWorktreeEl.checked ? "new worktree" : "",
+        };
+        renderSessions();
         setFilesystemBusy(true);
+        setSessionCreationUi(true, pendingSessionLaunch.detail);
         setNewSessionStatus("Starting session…");
+        statusEl.textContent = "Starting session…";
         const knownSessionIds = new Set(sessions.map((session) => session.session_id));
         try {
           const response = await apiFetch("/api/server-sessions", {
@@ -2648,15 +2838,26 @@
             const message = await response.text();
             throw new Error(message || `HTTP ${response.status}`);
           }
+          const created = await response.json();
+          pendingSessionLaunch = {
+            ...pendingSessionLaunch,
+            cwd: created.display_path || pendingSessionLaunch.cwd,
+            detail: "Waiting for the agent to publish the session…",
+            worktree: created.worktree || pendingSessionLaunch.worktree,
+          };
+          renderSessions();
           newSessionModalEl.hidden = true;
           statusEl.textContent = "Starting session…";
           await selectNewlyStartedSession(knownSessionIds);
         } catch (error) {
+          pendingSessionLaunch = null;
+          renderSessions();
           if (error.message !== "HTTP 401") {
             setNewSessionStatus(`Start failed: ${error.message}`, true);
           }
         } finally {
           creatingSession = false;
+          setSessionCreationUi(false);
           setFilesystemBusy(false);
         }
       }
@@ -2669,9 +2870,18 @@
             .filter((session) => !knownSessionIds.has(session.session_id))
             .sort((a, b) => new Date(b.start_time || 0) - new Date(a.start_time || 0))[0];
           if (created) {
+            pendingSessionLaunch = null;
+            renderSessions();
             navigateToSession(created.session_id);
             return;
           }
+        }
+        if (pendingSessionLaunch) {
+          pendingSessionLaunch = {
+            ...pendingSessionLaunch,
+            detail: "Still waiting for the session list to update…",
+          };
+          renderSessions();
         }
         statusEl.textContent = "Session is starting; refresh will pick it up.";
       }
@@ -2835,6 +3045,58 @@
 
       /* ---- session list (keyed, patched in place) ---- */
 
+      function createLaunchSessionCard() {
+        const root = document.createElement("section");
+        root.className = "launch-session-card";
+        root.setAttribute("role", "status");
+        root.setAttribute("aria-live", "polite");
+
+        const top = document.createElement("div");
+        top.className = "launch-card-top";
+        const title = document.createElement("span");
+        title.className = "launch-card-title";
+        const badge = document.createElement("span");
+        badge.className = "launch-card-badge";
+        badge.textContent = "launching";
+        top.append(title, badge);
+
+        const meta = document.createElement("div");
+        meta.className = "launch-card-meta";
+        const bar = document.createElement("div");
+        bar.className = "launch-card-bar";
+        bar.setAttribute("aria-hidden", "true");
+        const detail = document.createElement("div");
+        detail.className = "launch-card-detail";
+
+        root.append(top, meta, bar, detail);
+        return { root, title, meta, detail };
+      }
+
+      function renderLaunchSessionCard() {
+        if (
+          pendingSessionLaunch &&
+          Date.now() - pendingSessionLaunch.startedAt > SESSION_LAUNCH_INDICATOR_TTL_MS
+        ) {
+          pendingSessionLaunch = null;
+        }
+        if (!pendingSessionLaunch) {
+          if (launchSessionCard) {
+            launchSessionCard.root.remove();
+            launchSessionCard = null;
+          }
+          return null;
+        }
+        if (!launchSessionCard) {
+          launchSessionCard = createLaunchSessionCard();
+        }
+        launchSessionCard.title.textContent = "Starting new session";
+        launchSessionCard.meta.textContent = [pendingSessionLaunch.cwd, pendingSessionLaunch.worktree]
+          .filter(Boolean)
+          .join(" · ");
+        launchSessionCard.detail.textContent = pendingSessionLaunch.detail;
+        return launchSessionCard.root;
+      }
+
       function createSessionCard(sessionId) {
         const root = cloneTemplate(sessionTpl);
         root.dataset.sessionId = sessionId;
@@ -2871,13 +3133,17 @@
       }
 
       function renderSessions() {
+        const launchCardRoot = renderLaunchSessionCard();
         if (!sessions.length) {
           sessionCardById.clear();
-          sessionsEl.replaceChildren(emptyNote("No sessions have been published yet."));
+          sessionsEl.replaceChildren(launchCardRoot || emptyNote("No sessions have been published yet."));
           return;
         }
         if (sessionsEl.querySelector(".empty")) {
           sessionsEl.replaceChildren();
+        }
+        if (launchCardRoot && launchCardRoot.parentElement !== sessionsEl) {
+          sessionsEl.prepend(launchCardRoot);
         }
         maybeAutoSelectSession();
         const seen = new Set();
@@ -2900,11 +3166,14 @@
         // Only touch DOM order when it actually changed; re-inserting nodes
         // restarts their CSS animations.
         const desired = sessions.map((s) => s.session_id);
-        const current = [...sessionsEl.children].map((el) => el.dataset.sessionId);
+        const current = [...sessionsEl.querySelectorAll(".session-item")].map((el) => el.dataset.sessionId);
         if (desired.join("\u001f") !== current.join("\u001f")) {
           for (const id of desired) {
             sessionsEl.appendChild(sessionCardById.get(id).root);
           }
+        }
+        if (launchCardRoot && sessionsEl.firstElementChild !== launchCardRoot) {
+          sessionsEl.prepend(launchCardRoot);
         }
       }
 
