@@ -354,6 +354,60 @@
         padding: 0 13px;
       }
 
+      /* ---- viewer settings ---- */
+
+      .viewer-settings-panel {
+        width: min(520px, 100%);
+      }
+
+      .viewer-setting-list {
+        display: grid;
+        gap: 12px;
+      }
+
+      .viewer-setting-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 16px;
+        align-items: center;
+        padding: 12px;
+        border: 1px solid var(--line-row);
+        background: var(--surface-terminal);
+      }
+
+      .viewer-setting-copy {
+        display: grid;
+        gap: 5px;
+      }
+
+      .viewer-setting-title {
+        color: var(--text-control);
+        font: 700 10px/1 var(--font-mono);
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+      }
+
+      .viewer-setting-desc {
+        color: var(--dim);
+        font: 400 11px/1.5 var(--font-mono);
+      }
+
+      .viewer-setting-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--muted);
+        font: 700 10px/1 var(--font-mono);
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        cursor: pointer;
+        white-space: nowrap;
+
+        & input {
+          accent-color: var(--red);
+        }
+      }
+
       /* ---- auth screen ---- */
 
       .auth-screen {
@@ -1932,6 +1986,11 @@
           padding: 12px 14px 14px;
         }
 
+        .viewer-setting-row {
+          grid-template-columns: 1fr;
+          gap: 10px;
+        }
+
         .chat-header {
           padding-left: 12px;
           padding-right: calc(12px + var(--theme-toggle-reserve) + env(safe-area-inset-right));
@@ -2061,6 +2120,7 @@
           </div>
           <span id="approval-badge" class="approval-badge" hidden>needs approval</span>
           <span id="working-badge" class="working-badge" hidden>working</span>
+          <button id="settings-button" class="icon-button" type="button" aria-label="Open viewer settings">⚙</button>
         </header>
         <div class="transcript-wrap">
           <div id="transcript" role="log" aria-label="Session transcript"></div>
@@ -2083,6 +2143,27 @@
         </section>
       </main>
     </div>
+
+    <section id="settings-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-title" hidden>
+      <div class="new-session-panel viewer-settings-panel">
+        <header class="new-session-head">
+          <h2 id="settings-title">Viewer settings</h2>
+          <button id="settings-close" class="new-session-close" type="button" aria-label="Close viewer settings">×</button>
+        </header>
+        <div class="viewer-setting-list">
+          <label class="viewer-setting-row">
+            <span class="viewer-setting-copy">
+              <span class="viewer-setting-title">Show diffs in transcript</span>
+              <span class="viewer-setting-desc">Render file diffs inside tool entries when sessions publish structured diff content.</span>
+            </span>
+            <span class="viewer-setting-toggle">
+              <input id="show-diffs-toggle" type="checkbox" />
+              On
+            </span>
+          </label>
+        </div>
+      </div>
+    </section>
 
     <section id="new-session-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="new-session-title" hidden>
       <div class="new-session-panel">
@@ -2179,6 +2260,10 @@
       const authErrorEl = $("auth-error");
       const logoutButtonEl = $("logout-button");
       const newSessionButtonEl = $("new-session-button");
+      const settingsButtonEl = $("settings-button");
+      const settingsModalEl = $("settings-modal");
+      const settingsCloseEl = $("settings-close");
+      const showDiffsToggleEl = $("show-diffs-toggle");
       const newSessionModalEl = $("new-session-modal");
       const newSessionCloseEl = $("new-session-close");
       const newSessionStartEl = $("new-session-start");
@@ -2214,6 +2299,7 @@
       const POLL_MS = 2000;
       const WORKING_WINDOW_MS = 6000;
       const THEME_STORAGE_KEY = "mjolnir-remote-theme";
+      const SHOW_DIFFS_STORAGE_KEY = "mjolnir-remote-show-diffs";
       const THEME_COLORS = {
         dark: "#050606",
         light: "#f7f2e8",
@@ -2242,6 +2328,7 @@
       let creatingSession = false;
       let commandMatches = [];
       let commandSelected = 0;
+      let showTranscriptDiffs = true;
       const draftBySessionId = new Map();
       const activityBySessionId = new Map();
       const sessionCardById = new Map();
@@ -2299,6 +2386,35 @@
         }
       }
 
+      function loadViewerSettings() {
+        try {
+          showTranscriptDiffs = localStorage.getItem(SHOW_DIFFS_STORAGE_KEY) !== "false";
+        } catch {
+          showTranscriptDiffs = true;
+        }
+        showDiffsToggleEl.checked = showTranscriptDiffs;
+      }
+
+      function setShowTranscriptDiffs(show) {
+        showTranscriptDiffs = show;
+        showDiffsToggleEl.checked = show;
+        try {
+          localStorage.setItem(SHOW_DIFFS_STORAGE_KEY, show ? "true" : "false");
+        } catch {
+          // The current page can still update the setting when storage is blocked.
+        }
+        renderChat();
+      }
+
+      function openViewerSettings() {
+        settingsModalEl.hidden = false;
+        showDiffsToggleEl.focus();
+      }
+
+      function closeViewerSettings() {
+        settingsModalEl.hidden = true;
+      }
+
       function syncKeyboardInset() {
         const viewport = window.visualViewport;
         const inset = viewport
@@ -2342,6 +2458,7 @@
         filesystemState = null;
         filesystemLoading = false;
         creatingSession = false;
+        settingsModalEl.hidden = true;
         newSessionModalEl.hidden = true;
         sessionCardById.clear();
         activityBySessionId.clear();
@@ -3377,7 +3494,7 @@
           .join("\n");
       }
 
-      function diffBlock(body) {
+      function diffBlock(body, openLarge = false) {
         const build = () => {
           const pre = document.createElement("pre");
           pre.className = "code-block";
@@ -3388,25 +3505,34 @@
           return pre;
         };
         const lineCount = countLines(body);
-        return lineCount > FOLD_LINE_LIMIT ? foldBlock(`diff · ${lineCount} lines`, build) : build();
+        return lineCount > FOLD_LINE_LIMIT ? foldBlock(`diff · ${lineCount} lines`, build, openLarge) : build();
       }
 
       // Big blocks collapse to a labelled fold so a page of JSON cannot
       // swallow the transcript. Content is built lazily on first open, so a
       // five-thousand-line payload costs no DOM until someone asks for it.
-      function foldBlock(label, build) {
+      function foldBlock(label, build, open = false) {
         const details = document.createElement("details");
         details.className = "block-fold";
         const summary = document.createElement("summary");
         summary.textContent = label;
         details.appendChild(summary);
         let built = false;
-        details.addEventListener("toggle", () => {
-          if (details.open && !built) {
+        const buildContent = () => {
+          if (!built) {
             built = true;
             details.appendChild(build());
           }
+        };
+        details.addEventListener("toggle", () => {
+          if (details.open) {
+            buildContent();
+          }
         });
+        if (open) {
+          details.open = true;
+          buildContent();
+        }
         return details;
       }
 
@@ -3760,6 +3886,9 @@
       }
 
       function appendToolDiffs(body, entry) {
+        if (!showTranscriptDiffs) {
+          return;
+        }
         const diffs = entryToolDiffs(entry);
         for (const diff of diffs) {
           const path = typeof diff.path === "string" && diff.path ? diff.path : "file";
@@ -3795,6 +3924,7 @@
           entry.tool_title || "",
           entry.tool_body || "",
           JSON.stringify(entryToolDiffs(entry)),
+          showTranscriptDiffs ? "diffs-on" : "diffs-off",
         ].join("\u0000");
       }
 
@@ -4918,6 +5048,16 @@
       themeToggleEl.addEventListener("click", () => {
         setTheme(currentTheme() === "light" ? "dark" : "light");
       });
+      settingsButtonEl.addEventListener("click", openViewerSettings);
+      settingsCloseEl.addEventListener("click", closeViewerSettings);
+      settingsModalEl.addEventListener("click", (event) => {
+        if (event.target === settingsModalEl) {
+          closeViewerSettings();
+        }
+      });
+      showDiffsToggleEl.addEventListener("change", () => {
+        setShowTranscriptDiffs(showDiffsToggleEl.checked);
+      });
       authFormEl.addEventListener("submit", submitAuth);
       logoutButtonEl.addEventListener("click", logout);
       newSessionButtonEl.addEventListener("click", openNewSessionPicker);
@@ -4929,7 +5069,13 @@
         }
       });
       window.addEventListener("keydown", (event) => {
-        if (event.key === "Escape" && !newSessionModalEl.hidden) {
+        if (event.key !== "Escape") {
+          return;
+        }
+        if (!settingsModalEl.hidden) {
+          event.preventDefault();
+          closeViewerSettings();
+        } else if (!newSessionModalEl.hidden) {
           event.preventDefault();
           closeNewSessionPicker();
         }
@@ -5005,6 +5151,7 @@
       });
 
       applyTheme(currentTheme());
+      loadViewerSettings();
       syncComposerHeight();
       syncKeyboardInset();
       applyRoute();
