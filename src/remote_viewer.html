@@ -2458,6 +2458,7 @@
         filesystemState = null;
         filesystemLoading = false;
         creatingSession = false;
+        settingsModalEl.hidden = true;
         newSessionModalEl.hidden = true;
         sessionCardById.clear();
         activityBySessionId.clear();
@@ -3898,7 +3899,7 @@
             diffBody = `${diffBody}${diffBody ? "\n" : ""}... diff truncated for remote viewer ...`;
           }
           body.appendChild(inlineTextPre([`diff ${path}`]));
-          body.appendChild(diffBlock(diffBody, true));
+          body.appendChild(diffBlock(diffBody));
         }
       }
 
