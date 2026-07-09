@@ -872,6 +872,7 @@ impl TrackerState {
             // remote viewer is a read-only mirror and has nothing to track.
             | UiEvent::ElicitationRequest(_)
             | UiEvent::RemotePermissionDecision { .. }
+            | UiEvent::ActorActivity(_)
             | UiEvent::CodeAgent(_)
             | UiEvent::Info(_)
             | UiEvent::Warning(_) => {}
@@ -1958,6 +1959,7 @@ fn start_server_agent_session(
         args: agent.args,
         cwd,
         additional_directories,
+        mcp_servers: Vec::new(),
         resume_session: None,
         env: agent.env,
         agent_stderr: None,

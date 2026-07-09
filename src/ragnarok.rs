@@ -1373,6 +1373,7 @@ impl AgentHandle {
             args: launch.args.clone(),
             cwd: cwd.to_path_buf(),
             additional_directories: additional_directories.to_vec(),
+            mcp_servers: Vec::new(),
             resume_session: None,
             env: launch.env.clone(),
             agent_stderr: None,

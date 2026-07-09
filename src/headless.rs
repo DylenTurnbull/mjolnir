@@ -143,6 +143,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         args: agent.args,
         cwd: cfg.cwd,
         additional_directories: cfg.additional_directories,
+        mcp_servers: Vec::new(),
         resume_session: cfg.resume_session.clone(),
         env: agent.env,
         agent_stderr: cfg.agent_stderr,
@@ -277,6 +278,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             // channel is registered with the tracker).
             UiEvent::RemotePermissionDecision { .. } => {}
             UiEvent::CodeAgent(_) => {}
+            UiEvent::ActorActivity(_) => {}
             UiEvent::ElicitationRequest(prompt) => {
                 // Headless runs have no interactive modal to render a form or
                 // URL, so we cannot collect the user's answer. Decline so the

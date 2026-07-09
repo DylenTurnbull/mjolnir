@@ -22,9 +22,9 @@ use crate::claude_usage::ClaudeUsageReport;
 use crate::clipboard::ClipboardLease;
 
 use crate::event::{
-    CodeAgentEvent, CodeAgentOutcome, ElicitationOutcome, ElicitationPrompt, PermissionDecision,
-    PermissionPrompt, PromptImage, SessionConfigTarget, TerminalOutputSnapshot, UiEvent,
-    content_block_text,
+    ActorActivity, CodeAgentEvent, CodeAgentOutcome, ElicitationOutcome, ElicitationPrompt,
+    PermissionDecision, PermissionPrompt, PromptImage, SessionConfigTarget, TerminalOutputSnapshot,
+    UiEvent, content_block_text,
 };
 use crate::palette::TerminalTheme;
 use crate::ragnarok;
@@ -137,6 +137,8 @@ pub enum Entry {
     /// Latest plan posted by the agent.
     Plan(Vec<PlanEntry>),
     CodeAgentPlan(Vec<PlanEntry>),
+    /// Role/model-attributed activity projected from structured MCP progress.
+    ActorActivity(Box<ActorActivity>),
     /// System-level note (errors, warnings, mode changes).
     System(String),
     /// Visual separator inserted at local session boundaries so a freshly
@@ -561,6 +563,7 @@ pub struct AppState {
     pub session_fork_supported: bool,
     pub transcript: Vec<Entry>,
     pub tool_calls: HashMap<String, ToolCallView>,
+    actor_tool_entries: HashMap<String, usize>,
     terminal_outputs: HashMap<String, TerminalOutputSnapshot>,
     /// Bumped whenever `transcript` or `tool_calls` change in a way that
     /// affects rendering. The UI layer uses this as a cache key so it can
@@ -896,6 +899,7 @@ impl AppState {
             session_fork_supported: false,
             transcript: Vec::new(),
             tool_calls: HashMap::new(),
+            actor_tool_entries: HashMap::new(),
             terminal_outputs: HashMap::new(),
             transcript_revision: 0,
             input: String::new(),
@@ -1203,6 +1207,7 @@ impl AppState {
             | Entry::CodeAgentToolCall(_)
             | Entry::Plan(_)
             | Entry::CodeAgentPlan(_)
+            | Entry::ActorActivity(_)
             | Entry::System(_)
             | Entry::SessionBoundary(_) => None,
         })
@@ -1853,6 +1858,7 @@ impl AppState {
             UiEvent::SessionConfigOptions { options, targets } => {
                 self.apply_session_config_options(options, targets);
             }
+            UiEvent::ActorActivity(activity) => self.apply_actor_activity(activity),
             UiEvent::PermissionRequest(prompt) => {
                 // Append to the queue rather than replacing the current
                 // pending prompt: overwriting would drop the prior
@@ -2090,6 +2096,57 @@ impl AppState {
             _ => {}
         }
         self.apply_known_terminal_outputs();
+    }
+
+    fn apply_actor_activity(&mut self, activity: ActorActivity) {
+        if let ActorActivity::Tool { actor, tool_id, .. } = &activity {
+            let key = format!("{}:{tool_id}", actor.connection_id);
+            if let Some(&index) = self.actor_tool_entries.get(&key)
+                && let Some(Entry::ActorActivity(previous)) = self.transcript.get_mut(index)
+                && matches!(previous.as_ref(), ActorActivity::Tool { .. })
+            {
+                **previous = activity;
+                self.bump_transcript_revision();
+                return;
+            }
+            let index = self.transcript.len();
+            self.transcript
+                .push(Entry::ActorActivity(Box::new(activity)));
+            self.actor_tool_entries.insert(key, index);
+            self.bump_transcript_revision();
+            return;
+        }
+
+        if let Some(Entry::ActorActivity(previous)) = self.transcript.last_mut() {
+            match (&activity, previous.as_mut()) {
+                (
+                    ActorActivity::Message { actor, text },
+                    ActorActivity::Message {
+                        actor: previous_actor,
+                        text: previous_text,
+                    },
+                ) if actor.connection_id == previous_actor.connection_id => {
+                    previous_text.push_str(text);
+                    self.bump_transcript_revision();
+                    return;
+                }
+                (
+                    ActorActivity::Thought { actor, text },
+                    ActorActivity::Thought {
+                        actor: previous_actor,
+                        text: previous_text,
+                    },
+                ) if actor.connection_id == previous_actor.connection_id => {
+                    previous_text.push_str(text);
+                    self.bump_transcript_revision();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.transcript
+            .push(Entry::ActorActivity(Box::new(activity)));
+        self.bump_transcript_revision();
     }
 
     fn cancel_code_agent_prompts(&mut self) {

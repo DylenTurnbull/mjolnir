@@ -50,7 +50,10 @@ use crate::clipboard::{
     ClipboardImage, copy_to_clipboard, load_image_path_as_png, read_clipboard_image_as_png,
 };
 use crate::config;
-use crate::event::{PermissionDecision, PermissionPrompt, PromptImage, UiCommand, UiEvent};
+use crate::event::{
+    ActorActivity, ActorIdentity, PermissionDecision, PermissionPrompt, PromptImage, UiCommand,
+    UiEvent,
+};
 use crate::notifications::TerminalNotificationBackend;
 use crate::palette::TerminalTheme;
 use crate::ragnarok;
@@ -247,7 +250,8 @@ fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bo
         | Entry::System(_)
         | Entry::SessionBoundary(_)
         | Entry::Plan(_)
-        | Entry::CodeAgentPlan(_) => true,
+        | Entry::CodeAgentPlan(_)
+        | Entry::ActorActivity(_) => true,
         Entry::AgentMessage(_)
         | Entry::AgentThought(_)
         | Entry::CodeAgentMessage(_)
@@ -510,7 +514,9 @@ fn streaming_redraw_budget(mode: UiMode) -> Duration {
 
 fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
     match event {
-        UiEvent::SessionUpdate(_) | UiEvent::TerminalOutput(_) => RedrawCause::Stream,
+        UiEvent::SessionUpdate(_) | UiEvent::TerminalOutput(_) | UiEvent::ActorActivity(_) => {
+            RedrawCause::Stream
+        }
         UiEvent::CodeAgent(crate::event::CodeAgentEvent::SessionUpdate(_))
         | UiEvent::CodeAgent(crate::event::CodeAgentEvent::TerminalOutput(_)) => {
             RedrawCause::Stream
@@ -3398,6 +3404,75 @@ fn draw_mjconfig_menu(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     f.render_widget(footer, rows[2]);
 }
 
+fn actor_identity_label(actor: &ActorIdentity) -> String {
+    let role = if actor.role == "nested" {
+        "Nested agent".to_string()
+    } else {
+        let mut chars = actor.role.chars();
+        chars
+            .next()
+            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+            .unwrap_or_else(|| "Agent".to_string())
+    };
+    actor
+        .model_name
+        .as_deref()
+        .or(actor.model_value.as_deref())
+        .map(|model| format!("{role} · {model}"))
+        .unwrap_or(role)
+}
+
+fn actor_activity_label(activity: &ActorActivity) -> String {
+    match activity {
+        ActorActivity::Connected { actor } | ActorActivity::Status { actor, .. } => {
+            actor_identity_label(actor)
+        }
+        ActorActivity::Message { actor, .. } => actor_identity_label(actor),
+        ActorActivity::Thought { actor, .. } => {
+            format!("{} · thought", actor_identity_label(actor))
+        }
+        ActorActivity::Tool { actor, .. } => {
+            format!("{} · tool", actor_identity_label(actor))
+        }
+        ActorActivity::PermissionRequested { actor, .. } => {
+            format!("{} · permission", actor_identity_label(actor))
+        }
+        ActorActivity::Warning { actor, .. } => {
+            format!("{} · warning", actor_identity_label(actor))
+        }
+        ActorActivity::Info { actor, .. } => actor_identity_label(actor),
+    }
+}
+
+fn actor_activity_text(activity: &ActorActivity) -> String {
+    match activity {
+        ActorActivity::Connected { .. } => "connected".to_string(),
+        ActorActivity::Status {
+            connection_status,
+            turn_id,
+            turn_status,
+            ..
+        } => format!("{connection_status} · turn {turn_id} · {turn_status}"),
+        ActorActivity::Message { text, .. } | ActorActivity::Thought { text, .. } => text.clone(),
+        ActorActivity::Tool {
+            title,
+            kind,
+            status,
+            ..
+        } => {
+            let kind = kind.as_deref().unwrap_or("tool");
+            let status = status.as_deref().unwrap_or("pending");
+            format!("[{status}] {kind} · {title}")
+        }
+        ActorActivity::PermissionRequested { title, .. } => {
+            format!("permission requested · {title}")
+        }
+        ActorActivity::Warning { message, .. } | ActorActivity::Info { message, .. } => {
+            message.clone()
+        }
+    }
+}
+
 fn export_transcript(state: &AppState) -> Result<PathBuf> {
     let Some(dir) = &state.transcript_export_dir else {
         anyhow::bail!("transcript export directory is not configured");
@@ -3486,6 +3561,11 @@ fn transcript_export_markdown(state: &AppState) -> String {
             Entry::CodeAgentPrompt(text) => push_export_text(&mut out, "Primary → Codex", text),
             Entry::CodeAgentMessage(text) => push_export_text(&mut out, "Codex", text),
             Entry::CodeAgentThought(text) => push_export_text(&mut out, "Codex Thought", text),
+            Entry::ActorActivity(activity) => push_export_text(
+                &mut out,
+                &actor_activity_label(activity),
+                &actor_activity_text(activity),
+            ),
             Entry::System(text) => push_export_text(&mut out, "System", text),
             Entry::SessionBoundary(text) => push_export_text(&mut out, "Session", text),
             Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
@@ -4843,6 +4923,29 @@ fn render_transcript_entry_range(
                 text.clone(),
                 theme,
             ),
+            Entry::ActorActivity(activity) => {
+                let label = actor_activity_label(activity);
+                let text = actor_activity_text(activity);
+                match activity.as_ref() {
+                    ActorActivity::Message { .. } => {
+                        push_markdown_block(&mut out, &label, theme.agent, text, theme)
+                    }
+                    ActorActivity::Thought { .. } => {
+                        push_markdown_block(&mut out, &label, theme.thought, text, theme)
+                    }
+                    ActorActivity::Warning { .. } | ActorActivity::PermissionRequested { .. } => {
+                        push_plain_block(&mut out, &label, theme.warning, text)
+                    }
+                    ActorActivity::Tool { .. } => {
+                        push_plain_block(&mut out, &label, theme.tool, text)
+                    }
+                    ActorActivity::Connected { .. }
+                    | ActorActivity::Status { .. }
+                    | ActorActivity::Info { .. } => {
+                        push_plain_block(&mut out, &label, theme.muted, text)
+                    }
+                }
+            }
             Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
                 let label = if matches!(entry, Entry::CodeAgentPlan(_)) {
                     "codex plan"

@@ -40,6 +40,7 @@ mod term;
 mod text;
 mod theme;
 mod theme_picker;
+mod transcript_bridge;
 mod ui;
 mod version;
 mod worktree;
@@ -404,6 +405,7 @@ async fn main() -> Result<()> {
                     additional_directories: workspace_roots.additional_directories().to_vec(),
                     agent_stderr: cli.agent_stderr,
                     fs_max_text_bytes,
+                    config_path: config::default_config_path(),
                 })
                 .await
             }
@@ -1614,6 +1616,7 @@ async fn run_session(
         args: agent.args.clone(),
         cwd: cwd.clone(),
         additional_directories: runtime_options.additional_directories.clone(),
+        mcp_servers: Vec::new(),
         resume_session,
         env: agent.env.clone(),
         agent_stderr: runtime_options.agent_stderr.clone(),

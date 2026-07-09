@@ -441,6 +441,7 @@ async fn run(
         args: config.args,
         cwd: context.cwd,
         additional_directories: context.additional_directories,
+        mcp_servers: Vec::new(),
         resume_session: None,
         env: config.env,
         agent_stderr: config.agent_stderr,
@@ -512,7 +513,9 @@ async fn run(
                     UiEvent::PromptFailed { message }
                     | UiEvent::SessionForkFailed { message }
                     | UiEvent::Fatal(message) => break Err(anyhow!(message)),
-                    UiEvent::ClaudeUsage(_) | UiEvent::RemotePermissionDecision { .. } => {}
+                    UiEvent::ClaudeUsage(_)
+                    | UiEvent::RemotePermissionDecision { .. }
+                    | UiEvent::ActorActivity(_) => {}
                     UiEvent::CodeAgent(_) => {
                         break Err(anyhow!("nested code agent attempted recursive delegation"));
                     }

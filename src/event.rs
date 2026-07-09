@@ -22,6 +22,57 @@ pub struct PromptImage {
     pub height: u32,
 }
 
+/// One actor discovered through structured nested MCP progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorIdentity {
+    pub role: String,
+    pub connection_id: String,
+    pub source_id: Option<String>,
+    pub model_name: Option<String>,
+    pub model_value: Option<String>,
+}
+
+/// Transcript-safe projection of an actor controlled through `mj mcp`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActorActivity {
+    Connected {
+        actor: ActorIdentity,
+    },
+    Status {
+        actor: ActorIdentity,
+        connection_status: String,
+        turn_id: u64,
+        turn_status: String,
+    },
+    Message {
+        actor: ActorIdentity,
+        text: String,
+    },
+    Thought {
+        actor: ActorIdentity,
+        text: String,
+    },
+    Tool {
+        actor: ActorIdentity,
+        tool_id: String,
+        title: String,
+        kind: Option<String>,
+        status: Option<String>,
+    },
+    PermissionRequested {
+        actor: ActorIdentity,
+        title: String,
+    },
+    Warning {
+        actor: ActorIdentity,
+        message: String,
+    },
+    Info {
+        actor: ActorIdentity,
+        message: String,
+    },
+}
+
 /// Events flowing from the ACP runtime into the UI task.
 #[derive(Debug)]
 pub enum UiEvent {
@@ -50,6 +101,8 @@ pub enum UiEvent {
         options: Vec<SessionConfigOption>,
         targets: Vec<SessionConfigTarget>,
     },
+    /// Structured nested-agent activity projected from an MCP tool result.
+    ActorActivity(ActorActivity),
     /// `session/request_permission` from the agent. The UI is expected to
     /// render a modal and answer through `responder` exactly once.
     PermissionRequest(PermissionPrompt),

@@ -26,8 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    PermissionOption, SessionConfigId, SessionConfigOption, SessionConfigValueId, SessionUpdate,
-    StopReason, Usage,
+    PermissionOption, SessionConfigOption, SessionConfigValueId, SessionUpdate, StopReason, Usage,
 };
 use anyhow::Result;
 use rmcp::{
@@ -45,6 +44,7 @@ use tokio::task::JoinHandle;
 use crate::acp::{self, AcpRuntimeConfig};
 use crate::app::{
     config_option_choices, config_option_current_value_id, config_option_current_value_label,
+    is_model_config_option,
 };
 use crate::config;
 use crate::event::{
@@ -60,11 +60,17 @@ use crate::remote;
 /// giving up. Agents may install packages or authenticate on first launch, so
 /// this is generous.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+const CONFIG_OPTIONS_TIMEOUT: Duration = Duration::from_secs(15);
+const CONFIG_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(crate) const POLL_PROGRESS_SCHEMA: &str = "mj.poll_progress.v1";
 
 /// Upper bound on buffered progress entries per connection. Cursor-based polling
 /// keeps working past this; only the oldest entries (already-polled in practice)
 /// are dropped to bound memory.
 const MAX_PROGRESS_ENTRIES: usize = 10_000;
+const MAX_PROGRESS_VALUE_BYTES: usize = 256 * 1024;
+const MAX_PROGRESS_BYTES: usize = 16 * 1024 * 1024;
 
 /// Upper bound on accumulated `final_text` per turn. Bounds memory and the
 /// per-poll clone cost for a runaway/very long agent turn; once reached, further
@@ -121,6 +127,8 @@ pub struct McpConfig {
     pub agent_stderr: Option<PathBuf>,
     /// Maximum text bytes for ACP filesystem reads/writes.
     pub fs_max_text_bytes: u64,
+    /// Exact configuration file used by this server instance.
+    pub config_path: PathBuf,
 }
 
 // Enum→label mappers live in `crate::labels`, shared with the headless runner.
@@ -180,9 +188,9 @@ impl TurnStatus {
 
 /// A streamed progress item, tagged so `poll_progress` can return a typed,
 /// cursor-addressable feed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum ProgressItem {
+pub(crate) enum ProgressItem {
     AgentMessage {
         text: String,
     },
@@ -194,12 +202,18 @@ enum ProgressItem {
         title: String,
         kind: String,
         status: String,
+        content: serde_json::Value,
+        raw_input: Option<serde_json::Value>,
+        raw_output: Option<serde_json::Value>,
     },
     ToolCallUpdate {
         id: String,
         title: Option<String>,
         kind: Option<String>,
         status: Option<String>,
+        content: Option<serde_json::Value>,
+        raw_input: Option<serde_json::Value>,
+        raw_output: Option<serde_json::Value>,
     },
     PermissionRequested {
         perm_id: String,
@@ -220,21 +234,55 @@ struct ProgressEntry {
     seq: u64,
     turn_id: u64,
     item: ProgressItem,
+    byte_len: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct PermOptionView {
-    option_id: String,
-    name: String,
-    kind: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PermOptionView {
+    pub(crate) option_id: String,
+    pub(crate) name: String,
+    pub(crate) kind: String,
 }
 
 fn perm_option_view(option: &PermissionOption) -> PermOptionView {
     PermOptionView {
         option_id: option.option_id.to_string(),
-        name: option.name.clone(),
+        name: bounded_text(option.name.clone()),
         kind: permission_option_kind_label(option.kind).to_string(),
     }
+}
+
+fn bounded_text(mut text: String) -> String {
+    if text.len() <= MAX_PROGRESS_VALUE_BYTES {
+        return text;
+    }
+    let mut end = MAX_PROGRESS_VALUE_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str("\n[… progress value truncated …]");
+    text
+}
+
+fn bounded_json_value<T: Serialize>(value: &T) -> serde_json::Value {
+    match serde_json::to_vec(value) {
+        Ok(encoded) if encoded.len() <= MAX_PROGRESS_VALUE_BYTES => {
+            serde_json::from_slice(&encoded).unwrap_or(serde_json::Value::Null)
+        }
+        Ok(encoded) => serde_json::json!({
+            "truncated": true,
+            "original_bytes": encoded.len(),
+        }),
+        Err(error) => serde_json::json!({
+            "unavailable": true,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn bounded_optional_json(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    value.map(bounded_json_value)
 }
 
 /// A permission request awaiting a `respond_permission` answer. Holds the
@@ -283,8 +331,12 @@ struct ConnState {
     session_fork_supported: bool,
     session_id: Option<String>,
     config_options: Vec<SessionConfigOption>,
+    config_targets: Vec<SessionConfigTarget>,
+    config_revision: u64,
+    last_config_error: Option<(u64, String)>,
     turn: TurnState,
     progress: Vec<ProgressEntry>,
+    progress_bytes: usize,
     seq: u64,
     /// Cumulative count of progress entries dropped from the front when the
     /// buffer exceeded `MAX_PROGRESS_ENTRIES`. Surfaced so a slow poller can
@@ -305,8 +357,12 @@ impl ConnState {
             session_fork_supported: false,
             session_id: None,
             config_options: Vec::new(),
+            config_targets: Vec::new(),
+            config_revision: 0,
+            last_config_error: None,
             turn: TurnState::new(0),
             progress: Vec::new(),
+            progress_bytes: 0,
             seq: 0,
             dropped_progress: 0,
             pending_permissions: HashMap::new(),
@@ -335,15 +391,26 @@ impl ConnState {
                     self.status = ConnStatus::Ready;
                 }
             }
-            UiEvent::SessionConfigOptions { options, .. } => {
+            UiEvent::SessionConfigOptions { options, targets } => {
+                self.config_targets = if options.len() == targets.len() {
+                    targets
+                } else {
+                    options
+                        .iter()
+                        .map(|option| SessionConfigTarget::ConfigOption {
+                            config_id: option.id.clone(),
+                        })
+                        .collect()
+                };
                 self.config_options = options;
+                self.config_revision = self.config_revision.saturating_add(1);
             }
             UiEvent::SessionUpdate(update) => self.fold_update(update),
             UiEvent::PermissionRequest(prompt) => {
                 let perm_id = self.alloc_perm_id();
                 let options: Vec<PermOptionView> =
                     prompt.options.iter().map(perm_option_view).collect();
-                let title = prompt.tool_call.fields.title.clone().unwrap_or_default();
+                let title = bounded_text(prompt.tool_call.fields.title.clone().unwrap_or_default());
                 let kind = prompt
                     .tool_call
                     .fields
@@ -385,8 +452,17 @@ impl ConnState {
                 }
                 self.drain_pending_permissions();
             }
-            UiEvent::Warning(message) => self.push(ProgressItem::Warning { message }),
-            UiEvent::Info(message) => self.push(ProgressItem::Info { message }),
+            UiEvent::Warning(message) => {
+                if message.contains("session config update failed") {
+                    self.last_config_error = Some((self.config_revision, message.clone()));
+                }
+                self.push(ProgressItem::Warning {
+                    message: bounded_text(message),
+                });
+            }
+            UiEvent::Info(message) => self.push(ProgressItem::Info {
+                message: bounded_text(message),
+            }),
             UiEvent::ElicitationRequest(prompt) => {
                 // The MCP bridge exposes mj's ACP-client surface as tools and
                 // cannot render an interactive form/URL modal. Decline so the
@@ -399,6 +475,7 @@ impl ConnState {
             UiEvent::TerminalOutput(_)
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::ClaudeUsage(_)
+            | UiEvent::ActorActivity(_)
             | UiEvent::CodeAgent(_) => {}
         }
     }
@@ -415,29 +492,39 @@ impl ConnState {
                 } else {
                     self.turn.final_text_truncated = true;
                 }
-                self.push(ProgressItem::AgentMessage { text });
+                self.push(ProgressItem::AgentMessage {
+                    text: bounded_text(text),
+                });
             }
             SessionUpdate::AgentThoughtChunk(chunk) => {
                 let text = content_block_text(&chunk.content);
-                self.push(ProgressItem::AgentThought { text });
+                self.push(ProgressItem::AgentThought {
+                    text: bounded_text(text),
+                });
             }
             SessionUpdate::ToolCall(tool_call) => {
                 self.push(ProgressItem::ToolCall {
                     id: tool_call.tool_call_id.to_string(),
-                    title: tool_call.title.clone(),
+                    title: bounded_text(tool_call.title.clone()),
                     kind: tool_kind_label(tool_call.kind).to_string(),
                     status: tool_status_label(tool_call.status).to_string(),
+                    content: bounded_json_value(&tool_call.content),
+                    raw_input: bounded_optional_json(tool_call.raw_input.as_ref()),
+                    raw_output: bounded_optional_json(tool_call.raw_output.as_ref()),
                 });
             }
             SessionUpdate::ToolCallUpdate(update) => {
                 self.push(ProgressItem::ToolCallUpdate {
                     id: update.tool_call_id.to_string(),
-                    title: update.fields.title.clone(),
+                    title: update.fields.title.clone().map(bounded_text),
                     kind: update.fields.kind.map(|k| tool_kind_label(k).to_string()),
                     status: update
                         .fields
                         .status
                         .map(|s| tool_status_label(s).to_string()),
+                    content: update.fields.content.as_ref().map(bounded_json_value),
+                    raw_input: bounded_optional_json(update.fields.raw_input.as_ref()),
+                    raw_output: bounded_optional_json(update.fields.raw_output.as_ref()),
                 });
             }
             _ => {}
@@ -446,15 +533,29 @@ impl ConnState {
 
     fn push(&mut self, item: ProgressItem) {
         self.seq += 1;
+        let byte_len = serde_json::to_vec(&item).map_or(0, |encoded| encoded.len());
+        self.progress_bytes = self.progress_bytes.saturating_add(byte_len);
         self.progress.push(ProgressEntry {
             seq: self.seq,
             turn_id: self.turn.id,
             item,
+            byte_len,
         });
-        if self.progress.len() > MAX_PROGRESS_ENTRIES {
-            let overflow = self.progress.len() - MAX_PROGRESS_ENTRIES;
-            self.progress.drain(0..overflow);
-            self.dropped_progress += overflow as u64;
+        let mut drop_count = self.progress.len().saturating_sub(MAX_PROGRESS_ENTRIES);
+        let mut retained_bytes = self.progress_bytes.saturating_sub(
+            self.progress[..drop_count]
+                .iter()
+                .map(|entry| entry.byte_len)
+                .sum(),
+        );
+        while retained_bytes > MAX_PROGRESS_BYTES && drop_count < self.progress.len() {
+            retained_bytes = retained_bytes.saturating_sub(self.progress[drop_count].byte_len);
+            drop_count += 1;
+        }
+        if drop_count > 0 {
+            self.progress.drain(0..drop_count);
+            self.progress_bytes = retained_bytes;
+            self.dropped_progress += drop_count as u64;
         }
     }
 
@@ -479,6 +580,8 @@ impl ConnState {
 struct Connection {
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
     state: Arc<Mutex<ConnState>>,
+    source_id: Option<String>,
+    operation_lock: Mutex<()>,
     /// Handle to the spawned `acp::run` task, taken during teardown so we can
     /// await its exit (which runs `kill_agent_tree`) before giving up.
     runtime_task: Mutex<Option<JoinHandle<()>>>,
@@ -635,40 +738,45 @@ struct PollArgs {
     since_seq: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
-struct ProgressEntryView {
-    seq: u64,
-    turn_id: u64,
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ProgressEntryView {
+    pub(crate) seq: u64,
+    pub(crate) turn_id: u64,
     #[serde(flatten)]
-    item: ProgressItem,
+    pub(crate) item: ProgressItem,
 }
 
-#[derive(Debug, Serialize)]
-struct PendingPermissionView {
-    perm_id: String,
-    title: String,
-    kind: Option<String>,
-    options: Vec<PermOptionView>,
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct PendingPermissionView {
+    pub(crate) perm_id: String,
+    pub(crate) title: String,
+    pub(crate) kind: Option<String>,
+    pub(crate) options: Vec<PermOptionView>,
 }
 
-#[derive(Debug, Serialize)]
-struct PollResult {
-    connection_status: &'static str,
-    turn_id: u64,
-    turn_status: &'static str,
-    items: Vec<ProgressEntryView>,
-    next_seq: u64,
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct PollResult {
+    pub(crate) schema: String,
+    pub(crate) connection_id: String,
+    pub(crate) source_id: Option<String>,
+    pub(crate) model_value: Option<String>,
+    pub(crate) model_name: Option<String>,
+    pub(crate) connection_status: String,
+    pub(crate) turn_id: u64,
+    pub(crate) turn_status: String,
+    pub(crate) items: Vec<ProgressEntryView>,
+    pub(crate) next_seq: u64,
     /// Total progress entries dropped from the buffer's front because it hit
     /// `MAX_PROGRESS_ENTRIES`. Nonzero means a slow poller may have missed items.
-    dropped_progress: u64,
-    final_text_so_far: String,
+    pub(crate) dropped_progress: u64,
+    pub(crate) final_text_so_far: String,
     /// True if `final_text` hit its size cap and later agent text was dropped
     /// from the accumulated buffer (individual items still appear in `items`).
-    final_text_truncated: bool,
-    stop_reason: Option<&'static str>,
-    usage: Option<UsageView>,
-    pending_permissions: Vec<PendingPermissionView>,
-    error: Option<String>,
+    pub(crate) final_text_truncated: bool,
+    pub(crate) stop_reason: Option<String>,
+    pub(crate) usage: Option<UsageView>,
+    pub(crate) pending_permissions: Vec<PendingPermissionView>,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -705,17 +813,17 @@ struct GetResultView {
 /// MCP-owned view of token usage. Decouples the tool wire contract from the
 /// `agent-client-protocol` `Usage` type so an ACP crate bump cannot silently
 /// change the MCP schema. Mirrors the token fields, dropping protocol `_meta`.
-#[derive(Debug, Serialize)]
-struct UsageView {
-    total_tokens: u64,
-    input_tokens: u64,
-    output_tokens: u64,
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct UsageView {
+    pub(crate) total_tokens: u64,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    thought_tokens: Option<u64>,
+    pub(crate) thought_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cached_read_tokens: Option<u64>,
+    pub(crate) cached_read_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cached_write_tokens: Option<u64>,
+    pub(crate) cached_write_tokens: Option<u64>,
 }
 
 impl UsageView {
@@ -751,9 +859,13 @@ fn err(msg: impl Into<String>) -> McpError {
 }
 
 fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
-    let text = serde_json::to_string_pretty(value)
+    let serialized =
+        serde_json::to_value(value).map_err(|e| McpError::internal_error(e.to_string(), None))?;
+    let text = serde_json::to_string_pretty(&serialized)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    let mut result = CallToolResult::success(vec![Content::text(text)]);
+    result.structured_content = Some(serialized);
+    Ok(result)
 }
 
 fn ack(message: impl Into<String>) -> Result<CallToolResult, McpError> {
@@ -802,6 +914,101 @@ impl McpServer {
             .ok_or_else(|| err(format!("unknown connection_id: {id}")))
     }
 
+    async fn set_config_value_and_wait(
+        &self,
+        conn: &Connection,
+        config_id: &str,
+        value: &str,
+    ) -> Result<(), McpError> {
+        let deadline = tokio::time::Instant::now() + CONFIG_OPTIONS_TIMEOUT;
+        let (target, already_current, revision) = loop {
+            let found = {
+                let state = conn.state.lock().await;
+                if state.status != ConnStatus::Ready {
+                    return Err(err(format!(
+                        "connection not ready (status: {})",
+                        state.status.label()
+                    )));
+                }
+                state
+                    .config_options
+                    .iter()
+                    .zip(&state.config_targets)
+                    .find(|(option, _)| option.id.to_string() == config_id)
+                    .map(|(option, target)| {
+                        let choices = config_option_choices(option).unwrap_or_default();
+                        let advertised = choices
+                            .iter()
+                            .any(|choice| choice.value.to_string() == value);
+                        let current = config_option_current_value_id(option)
+                            .is_some_and(|current| current.to_string() == value);
+                        (target.clone(), advertised, current, state.config_revision)
+                    })
+            };
+            if let Some((target, advertised, current, revision)) = found {
+                if !advertised {
+                    return Err(err(format!(
+                        "config option '{config_id}' does not advertise value '{value}'"
+                    )));
+                }
+                break (target, current, revision);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(err(format!(
+                    "agent never advertised config option '{config_id}'"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+
+        if already_current {
+            return Ok(());
+        }
+        conn.cmd_tx
+            .send(UiCommand::SetSessionConfigOption {
+                target,
+                value: SessionConfigValueId::new(value),
+            })
+            .map_err(|_| err("connection is closed"))?;
+
+        let confirmed = wait_for(&conn.state, CONFIG_UPDATE_TIMEOUT, |state| {
+            state.config_revision > revision
+                && state.config_options.iter().any(|option| {
+                    option.id.to_string() == config_id
+                        && config_option_current_value_id(option)
+                            .is_some_and(|current| current.to_string() == value)
+                })
+                || state
+                    .last_config_error
+                    .as_ref()
+                    .is_some_and(|(error_revision, _)| *error_revision >= revision)
+        })
+        .await;
+        if !confirmed {
+            return Err(err(format!(
+                "model/config selection '{config_id}={value}' was not confirmed in time"
+            )));
+        }
+        let state = conn.state.lock().await;
+        if let Some((_, message)) = state
+            .last_config_error
+            .as_ref()
+            .filter(|(error_revision, _)| *error_revision >= revision)
+        {
+            return Err(err(message.clone()));
+        }
+        if !state.config_options.iter().any(|option| {
+            option.id.to_string() == config_id
+                && config_option_current_value_id(option)
+                    .is_some_and(|current| current.to_string() == value)
+        }) {
+            return Err(err(format!(
+                "agent did not select '{value}' for config option '{config_id}'"
+            )));
+        }
+        Ok(())
+    }
+
     /// Resolve a `ConnectArgs` into an `AcpRuntimeConfig`.
     fn build_runtime_config(&self, args: &ConnectArgs) -> Result<AcpRuntimeConfig, String> {
         let resolved = if let Some(program) = &args.program {
@@ -822,7 +1029,7 @@ impl McpServer {
                 saved_session_config: HashMap::new(),
             }
         } else {
-            let cfg = config::Config::load(&config::default_config_path())
+            let cfg = config::Config::load(&self.config.config_path)
                 .map_err(|e| format!("load config: {e}"))?;
             self.resolve_configured_agent(&cfg, args.agent.as_deref())?
         };
@@ -834,13 +1041,14 @@ impl McpServer {
             args: resolved.args,
             cwd,
             additional_directories,
+            mcp_servers: Vec::new(),
             resume_session: args.resume_session.clone(),
             env: resolved.env,
             agent_stderr: self.config.agent_stderr.clone(),
             fs_max_text_bytes: self.config.fs_max_text_bytes,
             access_mode: acp::RuntimeAccessMode::Full,
             agent_source_id: resolved.source_id,
-            config_path: Some(config::default_config_path()),
+            config_path: Some(self.config.config_path.clone()),
             saved_session_config: resolved.saved_session_config,
             code_agent: None,
         })
@@ -947,7 +1155,7 @@ impl McpServer {
         &self,
         Parameters(_): Parameters<NoArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let cfg = config::Config::load(&config::default_config_path())
+        let cfg = config::Config::load(&self.config.config_path)
             .map_err(|e| err(format!("load config: {e}")))?;
         let mut agents = Vec::new();
         if let Some(a) = &cfg.agent {
@@ -984,6 +1192,7 @@ impl McpServer {
             )));
         }
         let runtime_cfg = self.build_runtime_config(&args).map_err(err)?;
+        let source_id = runtime_cfg.agent_source_id.clone();
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -1054,6 +1263,8 @@ impl McpServer {
             Arc::new(Connection {
                 cmd_tx,
                 state: state.clone(),
+                source_id,
+                operation_lock: Mutex::new(()),
                 runtime_task: Mutex::new(Some(runtime_task)),
             }),
         );
@@ -1104,16 +1315,13 @@ impl McpServer {
         Parameters(args): Parameters<SetConfigArgs>,
     ) -> Result<CallToolResult, McpError> {
         let conn = self.get_conn(&args.connection_id).await?;
-        let target = SessionConfigTarget::ConfigOption {
-            config_id: SessionConfigId::new(args.config_id),
-        };
-        conn.cmd_tx
-            .send(UiCommand::SetSessionConfigOption {
-                target,
-                value: SessionConfigValueId::new(args.value),
-            })
-            .map_err(|_| err("connection is closed"))?;
-        ack("config option set")
+        let _operation = conn.operation_lock.lock().await;
+        if conn.state.lock().await.turn.status.is_active() {
+            return Err(err("cannot change config while a prompt turn is active"));
+        }
+        self.set_config_value_and_wait(&conn, &args.config_id, &args.value)
+            .await?;
+        ack("config option set and confirmed")
     }
 
     #[tool(
@@ -1124,9 +1332,10 @@ impl McpServer {
         Parameters(args): Parameters<SubmitPromptArgs>,
     ) -> Result<CallToolResult, McpError> {
         let conn = self.get_conn(&args.connection_id).await?;
+        let _operation = conn.operation_lock.lock().await;
 
-        let result = {
-            let mut st = conn.state.lock().await;
+        {
+            let st = conn.state.lock().await;
             if st.status != ConnStatus::Ready {
                 return Err(err(format!(
                     "connection not ready (status: {})",
@@ -1138,7 +1347,15 @@ impl McpServer {
                     "a prompt turn is already in progress; poll_progress or cancel_prompt first",
                 ));
             }
-            // Replace per-turn state wholesale so nothing leaks from the prior turn.
+        }
+
+        for (config_id, value) in &args.config_overrides {
+            self.set_config_value_and_wait(&conn, config_id, value)
+                .await?;
+        }
+
+        let result = {
+            let mut st = conn.state.lock().await;
             let next_id = st.turn.id + 1;
             st.turn = TurnState::new(next_id);
             st.turn.status = TurnStatus::Running;
@@ -1147,17 +1364,6 @@ impl McpServer {
                 since_seq: st.seq,
             }
         };
-
-        for (config_id, value) in &args.config_overrides {
-            conn.cmd_tx
-                .send(UiCommand::SetSessionConfigOption {
-                    target: SessionConfigTarget::ConfigOption {
-                        config_id: SessionConfigId::new(config_id.clone()),
-                    },
-                    value: SessionConfigValueId::new(value.clone()),
-                })
-                .map_err(|_| err("connection is closed"))?;
-        }
 
         let images = args
             .images
@@ -1210,17 +1416,33 @@ impl McpServer {
             })
             .collect();
         pending.sort_by(|a, b| a.perm_id.cmp(&b.perm_id));
+        let model_option = st
+            .config_options
+            .iter()
+            .find(|option| is_model_config_option(option));
+        let model_value = model_option
+            .and_then(config_option_current_value_id)
+            .map(ToString::to_string);
+        let model_name = model_option.map(config_option_current_value_label);
 
         json_result(&PollResult {
-            connection_status: st.status.label(),
+            schema: POLL_PROGRESS_SCHEMA.to_string(),
+            connection_id: args.connection_id,
+            source_id: conn.source_id.clone(),
+            model_value,
+            model_name,
+            connection_status: st.status.label().to_string(),
             turn_id: st.turn.id,
-            turn_status: st.turn.status.label(),
+            turn_status: st.turn.status.label().to_string(),
             items,
             next_seq: st.seq,
             dropped_progress: st.dropped_progress,
             final_text_so_far: st.turn.final_text.clone(),
             final_text_truncated: st.turn.final_text_truncated,
-            stop_reason: st.turn.stop_reason.map(stop_reason_label),
+            stop_reason: st
+                .turn
+                .stop_reason
+                .map(|reason| stop_reason_label(reason).to_string()),
             usage: st.turn.usage.as_ref().map(UsageView::from_usage),
             pending_permissions: pending,
             error: st.turn.error_message.clone(),
@@ -1236,15 +1458,27 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         let conn = self.get_conn(&args.connection_id).await?;
         let mut st = conn.state.lock().await;
+        let known = st.pending_permissions.get(&args.perm_id).ok_or_else(|| {
+            err(format!(
+                "unknown, expired, or already-answered perm_id: {}",
+                args.perm_id
+            ))
+        })?;
+        if let Some(option_id) = args.option_id.as_deref()
+            && !known
+                .options
+                .iter()
+                .any(|option| option.option_id == option_id)
+        {
+            return Err(err(format!(
+                "option_id '{option_id}' was not advertised for permission {}",
+                args.perm_id
+            )));
+        }
         let pending = st
             .pending_permissions
             .remove(&args.perm_id)
-            .ok_or_else(|| {
-                err(format!(
-                    "unknown or already-answered perm_id: {}",
-                    args.perm_id
-                ))
-            })?;
+            .expect("permission was checked above");
         let decision = match args.option_id {
             Some(option_id) => PermissionDecision::Selected(option_id),
             None => PermissionDecision::Cancelled,
@@ -1264,6 +1498,7 @@ impl McpServer {
         Parameters(args): Parameters<ConnectionArg>,
     ) -> Result<CallToolResult, McpError> {
         let conn = self.get_conn(&args.connection_id).await?;
+        let _operation = conn.operation_lock.lock().await;
         conn.cmd_tx
             .send(UiCommand::CancelPrompt)
             .map_err(|_| err("connection is closed"))?;

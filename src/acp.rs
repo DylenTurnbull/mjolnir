@@ -53,6 +53,9 @@ pub struct AcpRuntimeConfig {
     /// Additional absolute workspace roots to pass to ACP session lifecycle
     /// requests. These expand workspace scope but do not imply trust.
     pub additional_directories: Vec<PathBuf>,
+    /// MCP servers provisioned for every session lifecycle request made by
+    /// this runtime. Runtime-owned services (currently Eitri) are appended.
+    pub mcp_servers: Vec<McpServer>,
     pub resume_session: Option<String>,
     /// Environment variables to inject into the spawned agent process.
     /// Used for agents that require knobs like `AUGMENT_DISABLE_AUTO_UPDATE=1`.
@@ -683,6 +686,7 @@ pub async fn run(
             transport,
             cfg.cwd.clone(),
             cfg.additional_directories.clone(),
+            cfg.mcp_servers.clone(),
             cfg.resume_session.clone(),
             ui_tx.clone(),
             ui_rx,
@@ -1202,6 +1206,7 @@ where
         transport,
         cwd,
         Vec::new(),
+        Vec::new(),
         resume_session,
         ui_tx,
         ui_rx,
@@ -1233,6 +1238,7 @@ where
         transport,
         cwd,
         additional_directories,
+        Vec::new(),
         resume_session,
         ui_tx,
         ui_rx,
@@ -1252,6 +1258,7 @@ async fn drive_client_with_fs_limit<T>(
     transport: T,
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
+    mcp_servers: Vec<McpServer>,
     resume_session: Option<String>,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     mut ui_rx: mpsc::UnboundedReceiver<UiCommand>,
@@ -1288,6 +1295,10 @@ where
     let notif_session_state = session_state.clone();
     let primary_updates_suppressed = Arc::new(AtomicBool::new(false));
     let notif_primary_updates_suppressed = primary_updates_suppressed.clone();
+    let transcript_bridge = Arc::new(Mutex::new(
+        crate::transcript_bridge::TranscriptBridge::default(),
+    ));
+    let notif_transcript_bridge = transcript_bridge.clone();
     let context_usage = Arc::new(ContextUsageTracker::default());
     let notif_context_usage = context_usage.clone();
     let read_filesystem = filesystem.clone();
@@ -1312,6 +1323,13 @@ where
                         notif_context_usage.observe(usage.used);
                     }
                     if !notif_primary_updates_suppressed.load(Ordering::Acquire) {
+                        for activity in notif_transcript_bridge
+                            .lock()
+                            .await
+                            .observe_session_update(&notification.update)
+                        {
+                            let _ = notif_ui_tx.send(UiEvent::ActorActivity(activity));
+                        }
                         let _ = notif_ui_tx.send(UiEvent::SessionUpdate(notification.update));
                     }
                 }
@@ -1449,6 +1467,7 @@ where
                 conn,
                 cwd,
                 additional_directories,
+                mcp_servers,
                 resume_session,
                 &ui_tx,
                 &mut ui_rx,
@@ -1489,6 +1508,7 @@ async fn drive_session(
     conn: ConnectionTo<Agent>,
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
+    mut mcp_servers: Vec<McpServer>,
     resume_session: Option<String>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
@@ -1572,10 +1592,9 @@ async fn drive_session(
     } else {
         None
     };
-    let mcp_servers = code_agent_http
-        .as_ref()
-        .map(|server| vec![server.advertised().clone()])
-        .unwrap_or_default();
+    if let Some(server) = code_agent_http.as_ref() {
+        mcp_servers.push(server.advertised().clone());
+    }
     let connected_fields = ConnectedEventFields {
         agent_name: init_resp.agent_info.as_ref().map(|i| i.name.clone()),
         agent_version: init_resp.agent_info.as_ref().map(|i| i.version.clone()),
@@ -7406,6 +7425,7 @@ mod tests {
             args: Vec::new(),
             cwd: std::env::temp_dir(),
             additional_directories: Vec::new(),
+            mcp_servers: Vec::new(),
             resume_session: None,
             env: HashMap::new(),
             agent_stderr: None,
@@ -7463,6 +7483,7 @@ mod tests {
             args: Vec::new(),
             cwd: std::env::temp_dir(),
             additional_directories: Vec::new(),
+            mcp_servers: Vec::new(),
             resume_session: None,
             env: HashMap::new(),
             agent_stderr: Some(bad_stderr),
@@ -7599,6 +7620,7 @@ mod tests {
             args,
             cwd: std::env::temp_dir(),
             additional_directories: Vec::new(),
+            mcp_servers: Vec::new(),
             resume_session: None,
             env: HashMap::new(),
             agent_stderr: None,
@@ -7625,6 +7647,7 @@ mod tests {
             args,
             cwd: std::env::temp_dir(),
             additional_directories: Vec::new(),
+            mcp_servers: Vec::new(),
             resume_session: None,
             env: HashMap::new(),
             agent_stderr: None,
