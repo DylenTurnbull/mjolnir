@@ -1875,7 +1875,7 @@
         overflow-wrap: anywhere;
       }
 
-      /* control strip: inline settings · queue status · Stop/Queue keys */
+      /* control strip: inline settings · queue status · Stop/Send keys */
       .console-strip {
         display: flex;
         flex-wrap: wrap;
@@ -2079,7 +2079,7 @@
       }
 
       /* Empty status is display:none, so the first visible action keeps the
-         Stop/Queue group anchored to the right edge. */
+         Stop/Send group anchored to the right edge. */
       #queue-status:empty + #stop-turn:not([hidden]),
       #queue-status:empty + #stop-turn[hidden] + #queue-submit {
         margin-left: auto;
@@ -2302,13 +2302,13 @@
           <div id="queue-list" class="queue-list"></div>
           <div class="console">
             <span class="console-frame" aria-hidden="true"></span>
-            <textarea id="queue-input" placeholder="Queue a prompt — runs when the session is idle" enterkeyhint="send" aria-label="Prompt to queue"></textarea>
+            <textarea id="queue-input" placeholder="Message the agent" enterkeyhint="send" aria-label="Message the agent"></textarea>
             <div id="command-palette" class="command-palette" role="listbox" aria-label="Slash commands" hidden></div>
             <div class="console-strip">
               <div id="session-config" class="config-strip"></div>
               <span id="queue-status" class="queue-meta">Select a session.</span>
               <button id="stop-turn" class="stop-turn" type="button" hidden>Stop</button>
-              <button id="queue-submit" class="primary" type="button">Queue</button>
+              <button id="queue-submit" class="primary" type="button">Send</button>
             </div>
           </div>
         </section>
@@ -4666,12 +4666,18 @@
         queueSubmitEl.disabled = !session;
 
         if (!session) {
+          queueInputEl.placeholder = "Message the agent";
           setQueueStatus("Select a session.");
           clearCommandPalette();
           return;
         }
 
-        // The placeholder explains queueing; the strip only reports depth.
+        // Verb = intent, status = mechanism: the button says Send while the
+        // strip and rows report what is queued. The placeholder tracks the
+        // agent state instead of explaining the queue transport.
+        queueInputEl.placeholder = session.prompt_in_flight
+          ? "Agent is working — your prompt runs when it's free"
+          : "Message the agent";
         setQueueStatus(queuedPrompts.length ? `${queuedPrompts.length} queued` : "");
 
         for (const prompt of queuedPrompts) {
@@ -5192,7 +5198,7 @@
           renderQueue(selected);
         } catch (error) {
           if (error.message !== "HTTP 401") {
-            setQueueStatus(`Queue update failed: ${error.message}`, true);
+            setQueueStatus(`Couldn't refresh the queue: ${error.message}`, true);
           }
         }
       }
@@ -5238,7 +5244,7 @@
           await refreshSessions();
         } catch (error) {
           if (error.message !== "HTTP 401") {
-            setQueueStatus(`Queue submit failed: ${error.message}`, true);
+            setQueueStatus(`Couldn't send: ${error.message}`, true);
           }
         } finally {
           queueSubmitInFlight = false;
