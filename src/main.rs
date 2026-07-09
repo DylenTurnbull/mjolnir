@@ -1659,7 +1659,7 @@ async fn run_session(
         tracker_project_label,
         tracker_worktree_label,
         agent_header_label(agent),
-        Some(runtime_cmd_tx.clone()),
+        Some(cmd_tx.clone()),
         Some(ui_event_tx.clone()),
     );
 
