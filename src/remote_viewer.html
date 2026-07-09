@@ -1631,9 +1631,13 @@
       }
 
       .permission-option {
-        height: 32px;
-        padding: 0 14px;
+        /* Option labels must never truncate (AGENTS.md UI safety): let long
+           labels wrap and grow the key instead of clipping at a fixed height. */
+        min-height: 32px;
+        padding: 7px 14px;
+        line-height: 1.5;
         letter-spacing: 0.08em;
+        overflow-wrap: anywhere;
 
         &[data-kind^="allow"] {
           --key-edge: rgb(79 174 132 / 0.45);
