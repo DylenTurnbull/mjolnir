@@ -2189,6 +2189,9 @@
 
         .console textarea {
           padding: 11px 12px 8px 30px;
+          /* ≥16px stops iOS Safari from zooming the page when the composer
+             gains focus (same trick as .config-combo-search). */
+          font-size: 16px;
         }
 
         .console::before {
