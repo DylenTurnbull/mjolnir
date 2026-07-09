@@ -12,14 +12,23 @@ proc send_ctrl_c {} {
 }
 
 spawn $env(MJ_E2E_BIN) --no-update-check --debug-file $env(MJ_E2E_DEBUG_LOG) --agent-stderr $env(MJ_E2E_AGENT_STDERR) --fullscreen-tui --cwd $env(MJ_E2E_WORKSPACE)
+
+if {$mode eq "unsupported"} {
+    expect {
+        -re {does not support HTTP MCP servers required for code-agent delegation} { after 500 }
+        timeout { exit 18 }
+    }
+    exit 0
+}
+
 expect {
-    -re {F10 help} { send -- "delegate to the code agent\r" }
+    -re {F10 help} { after 1500; send -- "write a hello world program in Python\r" }
     timeout { exit 19 }
 }
 
 if {$mode eq "cancel"} {
     expect {
-        -re {code agent.*codex} { send_ctrl_c }
+        -re {code agent.*codex} { after 500; send_ctrl_c }
         timeout { exit 20 }
     }
     expect {

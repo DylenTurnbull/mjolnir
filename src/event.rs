@@ -58,7 +58,7 @@ pub enum UiEvent {
     /// by agent-driven `/setup` menus, which are global (not per-session) and
     /// therefore must NOT be routed through `session/set_config_option`.
     ElicitationRequest(ElicitationPrompt),
-    /// Activity from a temporary ACP agent launched for `_mj/codeAgent`.
+    /// Activity from a temporary ACP agent launched through the injected MCP tool.
     /// Kept under one wrapper so nested lifecycle/config state cannot be
     /// mistaken for the primary session's state.
     CodeAgent(CodeAgentEvent),

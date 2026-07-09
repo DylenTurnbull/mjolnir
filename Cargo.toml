@@ -56,7 +56,7 @@ qrcode = { version = "0.14", default-features = false }
 # ACP-client capabilities (connect, config, prompt, poll, cancel, result) as
 # MCP tools. `transport-io` adds the stdio transport; `server`/`macros` are
 # default features but listed for clarity. MIT-licensed (GPL-3.0-compatible).
-rmcp = { version = "1", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "1", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Parses the tailscale-issued certificate/key PEMs for the SNI resolver in

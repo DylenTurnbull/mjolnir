@@ -5,6 +5,7 @@ import readline from "node:readline";
 
 const mode = process.env.MJ_E2E_MODE ?? "complete";
 const logPath = process.env.MJ_E2E_NESTED_LOG;
+if (process.env.MJ_E2E_NESTED_PID) fs.writeFileSync(process.env.MJ_E2E_NESTED_PID, String(process.pid));
 let promptRequestId = null;
 let terminalRequestId = null;
 

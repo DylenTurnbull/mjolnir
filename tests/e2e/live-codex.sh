@@ -3,7 +3,7 @@ set -eu
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 bin=${MJ_E2E_BIN:-"$repo/target/debug/mj"}
-node=$(command -v node)
+npx=$(command -v npx)
 real_home=$HOME
 root=$(mktemp -d "${TMPDIR:-/tmp}/mj-code-agent-live.XXXXXX")
 cleanup() {
@@ -22,7 +22,7 @@ nonce=$(date +%s)-$$
 target="$workspace/codeagent-live-$nonce.txt"
 token="CODEAGENT_LIVE_OK_$nonce"
 
-config="[agent]\nsource_id = \"custom:e2e-primary\"\nprogram = \"$node\"\nargs = [\"$repo/tests/e2e/primary-agent.mjs\"]\n"
+config="[agent]\nsource_id = \"custom:live-codex-primary\"\nprogram = \"$npx\"\nargs = [\"-y\", \"@agentclientprotocol/codex-acp\"]\n"
 printf '%b' "$config" >"$root/home/.config/mj/config.toml"
 printf '%b' "$config" >"$root/home/Library/Application Support/mj/config.toml"
 
@@ -36,18 +36,15 @@ CODEX_HOME="${CODEX_HOME:-$real_home/.codex}" \
 MJ_E2E_BIN="$bin" \
 MJ_E2E_MODE=live \
 MJ_E2E_WORKSPACE="$workspace" \
-MJ_E2E_PRIMARY_RESULT="$root/primary-result.json" \
-MJ_E2E_PRIMARY_LOG="$root/primary.log" \
 MJ_E2E_TRANSCRIPT="$root/transcript.log" \
 MJ_E2E_DEBUG_LOG="$root/mj.log" \
 MJ_E2E_AGENT_STDERR="$root/agent.stderr" \
 MJ_E2E_LIVE_TOKEN="$token" \
-MJ_E2E_CODE_AGENT_INSTRUCTIONS="Create the file $target with exactly this text and no trailing newline: live-code-agent-ok. Then finish your response with exactly $token." \
+MJ_E2E_LIVE_PROMPT="Create the file $target with exactly this text and no trailing newline: live-code-agent-ok. Complete the coding task using the tools available to you. After all work is complete, reply with exactly $token and nothing else." \
 MJ_E2E_EXIT_ON_RUNTIME_CLOSE=1 \
   expect "$repo/tests/e2e/drive-live.exp"
 
 node -e 'const fs=require("fs"); if(!fs.readFileSync(process.argv[1]).equals(Buffer.from("live-code-agent-ok"))) process.exit(1)' "$target"
-node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])); if(!r.response.result.message.includes(process.argv[2])) process.exit(1)' "$root/primary-result.json" "$token"
 grep -a "code agent" "$root/transcript.log" >/dev/null
 grep -a "codex tool" "$root/transcript.log" >/dev/null
 grep -a "$token" "$root/transcript.log" >/dev/null

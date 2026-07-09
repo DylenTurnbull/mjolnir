@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AgentRequest, AuthMethod, AuthenticateRequest, CancelNotification,
-    ClientCapabilities, CloseSessionRequest, Content, ContentBlock, CreateElicitationRequest,
+    AgentCapabilities, AuthMethod, AuthenticateRequest, CancelNotification, ClientCapabilities,
+    CloseSessionRequest, Content, ContentBlock, CreateElicitationRequest,
     CreateElicitationResponse, CreateTerminalRequest, CreateTerminalResponse, Diff,
     ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities,
     ElicitationFormCapabilities, ElicitationUrlCapabilities, ErrorCode, FileSystemCapabilities,
     ForkSessionRequest, ImageContent, Implementation, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, NewSessionRequest, PermissionOption,
+    KillTerminalResponse, LoadSessionRequest, McpServer, NewSessionRequest, PermissionOption,
     PermissionOptionKind, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
     ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
@@ -30,7 +30,6 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::Result;
-use serde::Deserialize;
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
@@ -74,8 +73,8 @@ pub struct AcpRuntimeConfig {
     pub config_path: Option<PathBuf>,
     /// Values remembered from the last prompt submitted for this agent.
     pub saved_session_config: HashMap<String, String>,
-    /// Optional client-side `_mj/codeAgent` implementation. Interactive TUI
-    /// sessions set this; nested and non-interactive runtimes leave it absent.
+    /// Optional model-visible code-agent MCP service. Interactive TUI sessions
+    /// set this; nested and non-interactive runtimes leave it absent.
     pub code_agent: Option<code_agent::Config>,
 }
 
@@ -87,27 +86,6 @@ pub enum RuntimeAccessMode {
     /// Analysis-only sessions: allow reads, but deny writes and terminal
     /// execution even if the agent asks directly.
     ReadOnly,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CodeAgentRequestParams {
-    instructions: String,
-}
-
-fn code_agent_capability_meta() -> serde_json::Map<String, serde_json::Value> {
-    let mut meta = serde_json::Map::new();
-    meta.insert(
-        "mj".to_string(),
-        serde_json::json!({
-            "codeAgent": {
-                "version": 1,
-                "method": code_agent::WIRE_METHOD,
-                "agent": "codex-acp"
-            }
-        }),
-    );
-    meta
 }
 
 impl RuntimeAccessMode {
@@ -259,6 +237,49 @@ impl RuntimeSessionState {
     }
 }
 
+/// ACP does not expose a dedicated compaction notification. A decrease in the
+/// reported number of tokens currently in context is the portable signal that
+/// the agent replaced its history with a compacted one.
+#[derive(Default)]
+struct ContextUsageTracker {
+    last_used: AtomicU64,
+    directive_needed: AtomicBool,
+}
+
+impl ContextUsageTracker {
+    fn observe(&self, used: u64) {
+        let previous = self.last_used.swap(used, Ordering::AcqRel);
+        if previous > 0 && used < previous {
+            self.directive_needed.store(true, Ordering::Release);
+        }
+    }
+
+    fn mark_directive_sent(&self) {
+        self.directive_needed.store(false, Ordering::Release);
+    }
+
+    fn reset_for_session(&self) {
+        self.last_used.store(0, Ordering::Release);
+        self.mark_directive_sent();
+    }
+
+    fn take_directive_needed(&self) -> bool {
+        self.directive_needed.swap(false, Ordering::AcqRel)
+    }
+
+    fn mark_directive_needed(&self) {
+        self.directive_needed.store(true, Ordering::Release);
+    }
+}
+
+struct PrimaryUpdateSuppression<'a>(&'a AtomicBool);
+
+impl Drop for PrimaryUpdateSuppression<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// User-facing classification of launch-phase failures. Each variant
 /// renders as a one-line headline plus an action hint on the next line;
 /// `UiEvent::Fatal` carries that text through to the transcript so users
@@ -292,6 +313,9 @@ pub enum LaunchError {
     UnsupportedProtocolVersion { negotiated: ProtocolVersion },
     /// The user requested a lifecycle method the agent did not advertise.
     UnsupportedCapability { capability: &'static str },
+    /// Interactive code-agent delegation requires the primary agent to accept
+    /// client-provided Streamable HTTP MCP servers.
+    CodeAgentHttpUnsupported,
     /// `session/new` failed for some other reason (bad cwd, agent-side
     /// crash, ...).
     SessionCreateFailed {
@@ -345,6 +369,11 @@ impl std::fmt::Display for LaunchError {
                 f,
                 "agent does not advertise ACP capability {capability}\n\
                  hint: choose an agent that supports {capability}, or avoid the command that requires it"
+            ),
+            LaunchError::CodeAgentHttpUnsupported => write!(
+                f,
+                "configured ACP agent does not support HTTP MCP servers required for code-agent delegation\n\
+                 hint: update or choose an ACP adapter that advertises mcpCapabilities.http"
             ),
             LaunchError::SessionCreateFailed { source } => write!(
                 f,
@@ -471,33 +500,47 @@ fn require_additional_directories(
     }
 }
 
-fn new_session_request(cwd: PathBuf, additional_directories: &[PathBuf]) -> NewSessionRequest {
-    NewSessionRequest::new(cwd).additional_directories(additional_directories.to_vec())
+fn new_session_request(
+    cwd: PathBuf,
+    additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
+) -> NewSessionRequest {
+    NewSessionRequest::new(cwd)
+        .additional_directories(additional_directories.to_vec())
+        .mcp_servers(mcp_servers.to_vec())
 }
 
 fn resume_session_request(
     session_id: SessionId,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
 ) -> ResumeSessionRequest {
     ResumeSessionRequest::new(session_id, cwd)
         .additional_directories(additional_directories.to_vec())
+        .mcp_servers(mcp_servers.to_vec())
 }
 
 fn load_session_request(
     session_id: SessionId,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
 ) -> LoadSessionRequest {
-    LoadSessionRequest::new(session_id, cwd).additional_directories(additional_directories.to_vec())
+    LoadSessionRequest::new(session_id, cwd)
+        .additional_directories(additional_directories.to_vec())
+        .mcp_servers(mcp_servers.to_vec())
 }
 
 fn fork_session_request(
     session_id: SessionId,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
 ) -> ForkSessionRequest {
-    ForkSessionRequest::new(session_id, cwd).additional_directories(additional_directories.to_vec())
+    ForkSessionRequest::new(session_id, cwd)
+        .additional_directories(additional_directories.to_vec())
+        .mcp_servers(mcp_servers.to_vec())
 }
 
 async fn resume_existing_session(
@@ -505,12 +548,14 @@ async fn resume_existing_session(
     session_id: SessionId,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
     capabilities: &AgentCapabilities,
     auth_methods: &[AuthMethod],
 ) -> std::result::Result<Option<(Vec<SessionConfigOption>, Vec<SessionConfigTarget>)>, LaunchError>
 {
     if capabilities.session_capabilities.resume.is_some() {
-        let resume_req = resume_session_request(session_id, cwd, additional_directories);
+        let resume_req =
+            resume_session_request(session_id, cwd, additional_directories, mcp_servers);
         let resumed = match conn.send_request(resume_req.clone()).block_task().await {
             Ok(s) => s,
             Err(source) => match auth_required_detail(&source) {
@@ -531,7 +576,7 @@ async fn resume_existing_session(
     }
 
     require_load_session(capabilities)?;
-    let load_req = load_session_request(session_id, cwd, additional_directories);
+    let load_req = load_session_request(session_id, cwd, additional_directories, mcp_servers);
     let loaded = match conn.send_request(load_req.clone()).block_task().await {
         Ok(s) => s,
         Err(source) => match auth_required_detail(&source) {
@@ -1241,6 +1286,10 @@ where
     let perm_session_state = session_state.clone();
     let notif_ui_tx = ui_tx.clone();
     let notif_session_state = session_state.clone();
+    let primary_updates_suppressed = Arc::new(AtomicBool::new(false));
+    let notif_primary_updates_suppressed = primary_updates_suppressed.clone();
+    let context_usage = Arc::new(ContextUsageTracker::default());
+    let notif_context_usage = context_usage.clone();
     let read_filesystem = filesystem.clone();
     let write_filesystem = filesystem.clone();
     let create_terminals = terminals.clone();
@@ -1250,17 +1299,7 @@ where
     let kill_terminals = terminals.clone();
     let drive_terminals = terminals.clone();
     let code_agent_controller = code_agent::Controller::default();
-    let extension_controller = code_agent_controller.clone();
     let drive_code_agent_controller = code_agent_controller.clone();
-    let extension_config = code_agent.clone();
-    let extension_ui_tx = ui_tx.clone();
-    let extension_context = code_agent::RunContext {
-        cwd: cwd.clone(),
-        additional_directories: additional_directories.clone(),
-        fs_max_text_bytes,
-        access_mode,
-    };
-    let code_agent_enabled = code_agent.is_some();
     let result = Client
         .builder()
         .on_receive_notification(
@@ -1269,7 +1308,12 @@ where
                     .is_active_session(&notification.session_id)
                     .await
                 {
-                    let _ = notif_ui_tx.send(UiEvent::SessionUpdate(notification.update));
+                    if let SessionUpdate::UsageUpdate(usage) = &notification.update {
+                        notif_context_usage.observe(usage.used);
+                    }
+                    if !notif_primary_updates_suppressed.load(Ordering::Acquire) {
+                        let _ = notif_ui_tx.send(UiEvent::SessionUpdate(notification.update));
+                    }
                 }
                 Ok(())
             },
@@ -1400,78 +1444,6 @@ where
             },
             agent_client_protocol::on_receive_request!(),
         )
-        .on_receive_request(
-            async move |request: AgentRequest, responder, cx| {
-                let AgentRequest::ExtMethodRequest(extension) = request else {
-                    return responder.respond_with_error(
-                        agent_client_protocol::Error::method_not_found(),
-                    );
-                };
-                if extension.method.as_ref() != code_agent::SDK_METHOD {
-                    return responder.respond_with_error(
-                        agent_client_protocol::Error::method_not_found(),
-                    );
-                }
-                let Some(config) = extension_config.clone() else {
-                    return responder.respond_with_error(
-                        agent_client_protocol::Error::method_not_found(),
-                    );
-                };
-                let params: CodeAgentRequestParams =
-                    match serde_json::from_str(extension.params.get()) {
-                        Ok(params) => params,
-                        Err(error) => {
-                            return responder.respond_with_error(
-                                agent_client_protocol::Error::invalid_params()
-                                    .data(serde_json::Value::String(error.to_string())),
-                            );
-                        }
-                    };
-                if params.instructions.trim().is_empty() {
-                    return responder.respond_with_error(
-                        agent_client_protocol::Error::invalid_params().data(
-                            serde_json::Value::String(
-                                "instructions must not be empty".to_string(),
-                            ),
-                        ),
-                    );
-                }
-                if !extension_controller.begin().await {
-                    return responder.respond_with_error(
-                        agent_client_protocol::Error::internal_error().data(
-                            serde_json::Value::String(
-                                "a code agent run is already active".to_string(),
-                            ),
-                        ),
-                    );
-                }
-
-                let controller = extension_controller.clone();
-                let context = extension_context.clone();
-                let ui_tx = extension_ui_tx.clone();
-                cx.spawn(async move {
-                    match code_agent::run_boxed(
-                        config,
-                        context,
-                        params.instructions,
-                        ui_tx,
-                        controller,
-                    )
-                    .await
-                    {
-                        Ok(message) => responder.respond(serde_json::json!({
-                            "message": message,
-                        })),
-                        Err(error) => responder.respond_with_error(
-                            agent_client_protocol::Error::internal_error()
-                                .data(serde_json::Value::String(error.to_string())),
-                        ),
-                    }
-                })?;
-                Ok(())
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
         .connect_with(transport, |conn: ConnectionTo<Agent>| async move {
             if let Err(e) = drive_session(
                 conn,
@@ -1488,8 +1460,10 @@ where
                 agent_source_id,
                 config_path,
                 saved_session_config,
-                code_agent_enabled,
+                code_agent,
                 drive_code_agent_controller,
+                primary_updates_suppressed,
+                context_usage,
             )
             .await
             {
@@ -1526,12 +1500,14 @@ async fn drive_session(
     agent_source_id: Option<String>,
     config_path: Option<PathBuf>,
     saved_session_config: HashMap<String, String>,
-    code_agent_enabled: bool,
+    code_agent: Option<code_agent::Config>,
     code_agent_controller: code_agent::Controller,
+    primary_updates_suppressed: Arc<AtomicBool>,
+    context_usage: Arc<ContextUsageTracker>,
 ) -> Result<()> {
     // Advertise the client capabilities backed by handlers registered in
     // `drive_client` above.
-    let mut client_capabilities = ClientCapabilities::new()
+    let client_capabilities = ClientCapabilities::new()
         .fs(FileSystemCapabilities::new()
             .read_text_file(true)
             .write_text_file(access_mode.allows_filesystem_writes()))
@@ -1541,9 +1517,6 @@ async fn drive_session(
                 .form(ElicitationFormCapabilities::new())
                 .url(ElicitationUrlCapabilities::new()),
         );
-    if code_agent_enabled {
-        client_capabilities = client_capabilities.meta(code_agent_capability_meta());
-    }
     let init_req = InitializeRequest::new(ProtocolVersion::V1)
         .client_info(client_implementation())
         .client_capabilities(client_capabilities);
@@ -1568,6 +1541,41 @@ async fn drive_session(
         emit_fatal(ui_tx, &fatal_emitted, text.clone());
         return Err(anyhow::anyhow!(text));
     }
+    let code_agent_http = if let Some(config) = code_agent {
+        if !init_resp.agent_capabilities.mcp_capabilities.http {
+            let launch_err = LaunchError::CodeAgentHttpUnsupported;
+            let text = launch_err.to_string();
+            emit_fatal(ui_tx, &fatal_emitted, text.clone());
+            return Err(anyhow::anyhow!(text));
+        }
+        let context = code_agent::RunContext {
+            cwd: cwd.clone(),
+            additional_directories: additional_directories.clone(),
+            fs_max_text_bytes,
+            access_mode,
+        };
+        match code_agent::HttpServer::start(
+            config,
+            context,
+            ui_tx.clone(),
+            code_agent_controller.clone(),
+        )
+        .await
+        {
+            Ok(server) => Some(server),
+            Err(error) => {
+                let text = format!("could not start code-agent HTTP MCP server: {error:#}");
+                emit_fatal(ui_tx, &fatal_emitted, text.clone());
+                return Err(anyhow::anyhow!(text));
+            }
+        }
+    } else {
+        None
+    };
+    let mcp_servers = code_agent_http
+        .as_ref()
+        .map(|server| vec![server.advertised().clone()])
+        .unwrap_or_default();
     let connected_fields = ConnectedEventFields {
         agent_name: init_resp.agent_info.as_ref().map(|i| i.name.clone()),
         agent_version: init_resp.agent_info.as_ref().map(|i| i.version.clone()),
@@ -1590,6 +1598,7 @@ async fn drive_session(
                 session_id.clone(),
                 cwd.clone(),
                 &additional_directories,
+                &mcp_servers,
                 &init_resp.agent_capabilities,
                 &init_resp.auth_methods,
             )
@@ -1609,7 +1618,11 @@ async fn drive_session(
             (session_id, initial_config, true)
         }
         None => match conn
-            .send_request(new_session_request(cwd.clone(), &additional_directories))
+            .send_request(new_session_request(
+                cwd.clone(),
+                &additional_directories,
+                &mcp_servers,
+            ))
             .block_task()
             .await
         {
@@ -1636,7 +1649,11 @@ async fn drive_session(
                         return Err(anyhow::anyhow!(text));
                     }
                     match conn
-                        .send_request(new_session_request(cwd.clone(), &additional_directories))
+                        .send_request(new_session_request(
+                            cwd.clone(),
+                            &additional_directories,
+                            &mcp_servers,
+                        ))
                         .block_task()
                         .await
                     {
@@ -1670,6 +1687,25 @@ async fn drive_session(
         },
     };
     let (session_config_options, session_config_targets) = initial_config.unwrap_or_default();
+    if let Some(server) = &code_agent_http
+        && let Err(error) = server
+            .wait_until_tools_listed(Duration::from_secs(30))
+            .await
+    {
+        let text = format!("primary agent did not load the injected code-agent MCP tool: {error}");
+        emit_fatal(ui_tx, &fatal_emitted, text.clone());
+        return Err(anyhow::anyhow!(text));
+    }
+    if code_agent_http.is_some() {
+        context_usage.reset_for_session();
+        if let Err(error) =
+            send_primary_session_directive(&conn, &session_id, &primary_updates_suppressed).await
+        {
+            let text = format!("primary agent rejected the code-agent session directive: {error}");
+            emit_fatal(ui_tx, &fatal_emitted, text.clone());
+            return Err(anyhow::anyhow!(text));
+        }
+    }
     let mut session_config = SessionConfigCache {
         options: session_config_options,
         targets: session_config_targets,
@@ -1709,8 +1745,25 @@ async fn drive_session(
                     &session_config,
                 );
                 session_state.clear_permissions_cancelled(&session_id).await;
-                let req =
-                    PromptRequest::new(session_id.clone(), prompt_content_blocks(text, images));
+                if code_agent_http.is_some()
+                    && context_usage.take_directive_needed()
+                    && let Err(error) = send_primary_session_directive(
+                        &conn,
+                        &session_id,
+                        &primary_updates_suppressed,
+                    )
+                    .await
+                {
+                    context_usage.mark_directive_needed();
+                    let _ = ui_tx.send(UiEvent::PromptFailed {
+                        message: format!(
+                            "could not restore code-agent policy after context compaction: {error}"
+                        ),
+                    });
+                    continue;
+                }
+                let prompt = prompt_content_blocks(text, images);
+                let req = PromptRequest::new(session_id.clone(), prompt);
                 if !drive_prompt_turn(
                     &conn,
                     &session_id,
@@ -1760,6 +1813,7 @@ async fn drive_session(
                     &conn,
                     cwd.clone(),
                     &additional_directories,
+                    &mcp_servers,
                     &mut session_id,
                     &mut session_config,
                     &session_state,
@@ -1769,6 +1823,21 @@ async fn drive_session(
                 .await?
                 {
                     break;
+                }
+                if code_agent_http.is_some() {
+                    context_usage.reset_for_session();
+                    if let Err(error) = send_primary_session_directive(
+                        &conn,
+                        &session_id,
+                        &primary_updates_suppressed,
+                    )
+                    .await
+                    {
+                        context_usage.mark_directive_needed();
+                        let _ = ui_tx.send(UiEvent::Warning(format!(
+                            "could not install code-agent policy in forked session: {error}"
+                        )));
+                    }
                 }
             }
             UiCommand::LoadSession {
@@ -1829,6 +1898,7 @@ async fn drive_session(
                     target_session_id,
                     requested_cwd,
                     &additional_directories,
+                    &mcp_servers,
                     title,
                     &init_resp.agent_capabilities,
                     &init_resp.auth_methods,
@@ -1842,6 +1912,21 @@ async fn drive_session(
                 {
                     Ok(switched_session_id) => {
                         session_id = switched_session_id;
+                        if code_agent_http.is_some() {
+                            context_usage.reset_for_session();
+                            if let Err(error) = send_primary_session_directive(
+                                &conn,
+                                &session_id,
+                                &primary_updates_suppressed,
+                            )
+                            .await
+                            {
+                                context_usage.mark_directive_needed();
+                                let _ = ui_tx.send(UiEvent::Warning(format!(
+                                    "could not install code-agent policy in loaded session: {error}"
+                                )));
+                            }
+                        }
                         let _ = responder.send(LoadSessionResult::Switched);
                     }
                     Err(launch_err) => {
@@ -1874,6 +1959,7 @@ async fn switch_existing_session(
     target_session_id: SessionId,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
     title: Option<String>,
     capabilities: &AgentCapabilities,
     auth_methods: &[AuthMethod],
@@ -1895,6 +1981,7 @@ async fn switch_existing_session(
         target_session_id.clone(),
         cwd.clone(),
         additional_directories,
+        mcp_servers,
         capabilities,
         auth_methods,
     )
@@ -1955,6 +2042,7 @@ async fn drive_fork_session(
     conn: &ConnectionTo<Agent>,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
     session_id: &mut SessionId,
     session_config: &mut SessionConfigCache,
     session_state: &RuntimeSessionState,
@@ -1967,6 +2055,7 @@ async fn drive_fork_session(
         &source_session_id,
         cwd.clone(),
         additional_directories,
+        mcp_servers,
     );
     tokio::pin!(fork);
 
@@ -2043,12 +2132,14 @@ async fn fork_session(
     session_id: &SessionId,
     cwd: PathBuf,
     additional_directories: &[PathBuf],
+    mcp_servers: &[McpServer],
 ) -> std::result::Result<(SessionId, Option<SessionConfigCache>), agent_client_protocol::Error> {
     let resp = conn
         .send_request(fork_session_request(
             session_id.clone(),
             cwd,
             additional_directories,
+            mcp_servers,
         ))
         .block_task()
         .await?;
@@ -3656,6 +3747,22 @@ struct PromptTurnDiffConfig<'a> {
     turn_id: u64,
 }
 
+async fn send_primary_session_directive(
+    conn: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    updates_suppressed: &AtomicBool,
+) -> std::result::Result<(), agent_client_protocol::Error> {
+    updates_suppressed.store(true, Ordering::Release);
+    let _suppression = PrimaryUpdateSuppression(updates_suppressed);
+    let request = PromptRequest::new(
+        session_id.clone(),
+        vec![ContentBlock::Text(TextContent::new(
+            code_agent::PRIMARY_SESSION_DIRECTIVE,
+        ))],
+    );
+    conn.send_request(request).block_task().await.map(|_| ())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_prompt_turn(
     conn: &ConnectionTo<Agent>,
@@ -4053,6 +4160,31 @@ mod tests {
     };
     use std::time::Duration;
     use tokio::io::split;
+
+    #[test]
+    fn context_usage_drop_requests_session_directive_reinjection() {
+        let usage = ContextUsageTracker::default();
+
+        usage.observe(20_000);
+        usage.observe(24_000);
+        assert!(!usage.take_directive_needed());
+
+        usage.observe(7_000);
+        assert!(usage.take_directive_needed());
+        assert!(!usage.take_directive_needed());
+    }
+
+    #[test]
+    fn context_usage_reset_does_not_treat_new_session_as_compaction() {
+        let usage = ContextUsageTracker::default();
+        usage.observe(20_000);
+        usage.observe(7_000);
+        assert!(usage.take_directive_needed());
+
+        usage.reset_for_session();
+        usage.observe(2_000);
+        assert!(!usage.take_directive_needed());
+    }
 
     #[test]
     fn resolve_no_install_returns_none_for_missing_program() {
@@ -8076,23 +8208,42 @@ mod tests {
     }
 
     #[test]
-    fn code_agent_request_params_are_strict() {
-        let parsed: CodeAgentRequestParams =
-            serde_json::from_str(r#"{"instructions":"fix it"}"#).expect("valid params");
-        assert_eq!(parsed.instructions, "fix it");
-        assert!(
-            serde_json::from_str::<CodeAgentRequestParams>(
-                r#"{"instructions":"fix it","unexpected":true}"#
-            )
-            .is_err()
+    fn lifecycle_requests_include_client_mcp_servers() {
+        use agent_client_protocol::schema::v1::McpServerHttp;
+
+        let server = McpServer::Http(McpServerHttp::new(
+            code_agent::MCP_SERVER_NAME,
+            "http://127.0.0.1:1234/mcp",
+        ));
+        let servers = vec![server.clone()];
+        let cwd = PathBuf::from("/tmp/workspace");
+        let additional = vec![PathBuf::from("/tmp/other")];
+        let session_id = SessionId::from("session-1");
+
+        assert_eq!(
+            new_session_request(cwd.clone(), &additional, &servers).mcp_servers,
+            servers
         );
-        assert!(serde_json::from_str::<CodeAgentRequestParams>("{}").is_err());
+        assert_eq!(
+            resume_session_request(session_id.clone(), cwd.clone(), &additional, &servers)
+                .mcp_servers,
+            servers
+        );
+        assert_eq!(
+            load_session_request(session_id.clone(), cwd.clone(), &additional, &servers)
+                .mcp_servers,
+            servers
+        );
+        assert_eq!(
+            fork_session_request(session_id, cwd, &additional, &servers).mcp_servers,
+            servers
+        );
     }
 
     #[test]
-    fn code_agent_capability_uses_wire_method() {
-        let meta = code_agent_capability_meta();
-        assert_eq!(meta["mj"]["codeAgent"]["version"], 1);
-        assert_eq!(meta["mj"]["codeAgent"]["method"], code_agent::WIRE_METHOD);
+    fn missing_http_mcp_capability_has_actionable_error() {
+        let message = LaunchError::CodeAgentHttpUnsupported.to_string();
+        assert!(message.contains("mcpCapabilities.http"));
+        assert!(message.contains("code-agent delegation"));
     }
 }

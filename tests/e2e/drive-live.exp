@@ -1,16 +1,32 @@
 #!/usr/bin/expect -f
 
-set timeout 360
+set timeout 600
 set stty_init "rows 40 columns 120"
 log_file -noappend $env(MJ_E2E_TRANSCRIPT)
 spawn $env(MJ_E2E_BIN) --no-update-check --debug-file $env(MJ_E2E_DEBUG_LOG) --agent-stderr $env(MJ_E2E_AGENT_STDERR) --fullscreen-tui --cwd $env(MJ_E2E_WORKSPACE)
 expect {
-    -re {F10 help} { send -- "delegate to the code agent\r" }
+    -re {F1 Mode:} { send -- "$env(MJ_E2E_LIVE_PROMPT)\r" }
     timeout { exit 29 }
 }
 
 expect {
-    -re {codex permission} { send -- "\r"; exp_continue }
-    -re "PRIMARY RECEIVED:.*$env(MJ_E2E_LIVE_TOKEN)" {}
+    -re {permission request} { send -- "\r"; exp_continue }
+    -re {code agent.*codex} {}
     timeout { exit 30 }
+}
+
+expect {
+    -re {permission request} { send -- "\r"; exp_continue }
+    -re {code agent complete} {}
+    timeout { exit 31 }
+}
+
+expect {
+    -re "$env(MJ_E2E_LIVE_TOKEN)" { send -- "\003" }
+    timeout { exit 32 }
+}
+
+expect {
+    eof {}
+    timeout { exit 33 }
 }
