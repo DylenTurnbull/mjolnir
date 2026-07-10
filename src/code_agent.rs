@@ -44,7 +44,9 @@ use crate::loki;
 
 pub const LABEL: &str = "Eitri";
 pub const MCP_SERVER_NAME: &str = "mj-code-agent";
-pub const PRIMARY_SESSION_DIRECTIVE: &str = "<mj-code-agent-policy>\nYou are Thor, the primary coordinator and owner of the user's outcome. You are responsible for understanding the request, doing necessary research and context gathering, forming the plan, delegating implementation, reviewing and verifying the result, and delivering the final answer. You are not a thin handoff between the user and Eitri. Eitri is the implementation agent exposed as the code_agent MCP tool. This policy applies to every subsequent user request in this ACP session. For any request that requires creating, modifying, debugging, refactoring, testing, or otherwise implementing code, you MUST delegate the actual implementation to Eitri through code_agent. Before delegation, investigate and plan as needed; you may inspect the workspace and use tools for research. Give Eitri complete standalone instructions containing the task, your plan, relevant context, and acceptance criteria. After Eitri returns, independently review its result, inspect or verify the work as needed, and delegate a corrective follow-up if implementation changes remain. Do not directly edit files or make code changes yourself. If a request requires no code changes, handle it yourself. Do not call any tool now. Acknowledge this policy with exactly MJ_CODE_AGENT_POLICY_READY.\n</mj-code-agent-policy>";
+pub const PRIMARY_SESSION_DIRECTIVE: &str = "<mj-code-agent-policy>\nYou are Thor, the primary coordinator and owner of the user's outcome. You are responsible for understanding the request, doing necessary research and context gathering, forming the plan, coordinating implementation, reviewing and verifying the result, and delivering the final answer. You are not a thin handoff between the user and Eitri. Eitri is the implementation agent exposed as the code_agent MCP tool. This policy applies to every subsequent user request in this ACP session. Delegate substantial implementation chunks to Eitri after you have investigated and planned enough to give useful direction. You may personally make small, local code changes when describing and delegating them would take more effort than simply doing them; use judgment rather than delegating mechanically. Eitri starts a brand-new ACP process and session for every code_agent call. Eitri has no conversation context and no memory of the user's request, your research, or any previous Eitri call—even the immediately preceding call. Every invocation must therefore contain complete standalone instructions with the task, relevant findings, your plan, current workspace state, and acceptance criteria. After Eitri returns, independently review its result, inspect or verify the work as needed, and delegate a substantial corrective follow-up if implementation changes remain. If a request requires no code changes, handle it yourself. Do not call any tool now. Acknowledge this policy with exactly MJ_CODE_AGENT_POLICY_READY.\n</mj-code-agent-policy>";
+
+const FRESH_CONTEXT_PREAMBLE: &str = "You are Eitri, the implementation agent. This is a fresh ACP process and session. You have no memory of the user conversation or of any earlier Eitri call, including an immediately preceding call. Treat the standalone instructions below and the current workspace as your only task context.\n\n";
 const MCP_PATH: &str = "/mcp";
 
 #[derive(Debug, Clone)]
@@ -146,7 +148,7 @@ impl McpHandler {
 
     #[tool(
         name = "code_agent",
-        description = "MANDATORY IMPLEMENTATION DELEGATE (EITRI). Thor owns research, planning, coordination, review, verification, and the final response; Eitri performs code implementation. For every request requiring code changes, call this tool after gathering enough context and forming a plan. Pass complete standalone instructions with the task, plan, relevant findings, and acceptance criteria. Review Eitri's result independently and call it again if implementation corrections remain. Thor must not directly edit files or make code changes."
+        description = "IMPLEMENTATION DELEGATE (EITRI). Thor owns research, planning, coordination, review, verification, and the final response. Delegate substantial implementation chunks to Eitri, but make small local changes directly when describing and delegating them would take more effort than doing them. Every call starts a fresh ACP process/session with zero conversation or prior-call memory. Pass complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. Review Eitri's result independently and call it again for substantial corrections."
     )]
     async fn code_agent(
         &self,
@@ -184,7 +186,7 @@ impl ServerHandler for McpHandler {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("mj-code-agent", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "MANDATORY DELEGATION POLICY: Thor owns research, planning, coordination, review, verification, and the final answer. Eitri implements code through code_agent. Thor may investigate before delegation and verify afterward, but must delegate actual code changes to Eitri with complete standalone instructions.",
+                "DELEGATION POLICY: Thor owns research, planning, coordination, review, verification, and the final answer. Delegate substantial implementation chunks to Eitri; Thor may directly make small local changes when delegation would cost more effort. Every code_agent call is a fresh ACP process/session with zero conversation or prior-call memory, so every invocation needs complete standalone instructions.",
             )
     }
 
@@ -462,6 +464,7 @@ async fn run(
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     controller: Controller,
 ) -> Result<String> {
+    let standalone_prompt = format!("{FRESH_CONTEXT_PREAMBLE}{instructions}");
     let display_label = config.display_label.clone();
     let _ = ui_tx.send(UiEvent::InternalMessage(InternalMessage {
         source: "Thor".to_string(),
@@ -554,7 +557,7 @@ async fn run(
                         prompt_sent = true;
                         if nested_cmd_tx
                             .send(UiCommand::SendPrompt {
-                                text: instructions.clone(),
+                                text: standalone_prompt.clone(),
                                 images: Vec::new(),
                             })
                             .is_err()
@@ -806,9 +809,12 @@ mod tests {
         let tool = serde_json::to_value(&tools[0]).expect("serialize tool");
         assert_eq!(tool["name"], "code_agent");
         let description = tool["description"].as_str().expect("description");
-        assert!(description.contains("MANDATORY IMPLEMENTATION DELEGATE"));
+        assert!(description.contains("IMPLEMENTATION DELEGATE"));
         assert!(description.contains("Thor owns research, planning"));
-        assert!(description.contains("Eitri performs code implementation"));
+        assert!(description.contains("substantial implementation chunks"));
+        assert!(description.contains("small local changes directly"));
+        assert!(description.contains("fresh ACP process/session"));
+        assert!(description.contains("zero conversation or prior-call memory"));
         assert!(description.contains("Review Eitri's result independently"));
         assert_eq!(
             tool["inputSchema"]["required"],
@@ -822,7 +828,20 @@ mod tests {
         assert!(PRIMARY_SESSION_DIRECTIVE.contains("research and context gathering"));
         assert!(PRIMARY_SESSION_DIRECTIVE.contains("forming the plan"));
         assert!(PRIMARY_SESSION_DIRECTIVE.contains("independently review its result"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("delegate the actual implementation"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("Delegate substantial implementation chunks"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("small, local code changes"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("would take more effort"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("brand-new ACP process and session"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("immediately preceding call"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("complete standalone instructions"));
         assert!(!PRIMARY_SESSION_DIRECTIVE.contains("before using any other tool"));
+    }
+
+    #[test]
+    fn eitri_preamble_explicitly_declares_fresh_context() {
+        assert!(FRESH_CONTEXT_PREAMBLE.contains("fresh ACP process and session"));
+        assert!(FRESH_CONTEXT_PREAMBLE.contains("no memory of the user conversation"));
+        assert!(FRESH_CONTEXT_PREAMBLE.contains("immediately preceding call"));
+        assert!(FRESH_CONTEXT_PREAMBLE.contains("current workspace"));
     }
 }

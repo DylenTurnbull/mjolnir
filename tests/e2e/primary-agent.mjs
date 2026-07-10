@@ -130,7 +130,10 @@ async function prepareMcp() {
   );
   const tools = listed.message?.result?.tools ?? [];
   const tool = tools.find((candidate) => candidate.name === "code_agent");
-  if (!tool || !tool.description?.includes("MANDATORY IMPLEMENTATION DELEGATE")) {
+  if (!tool
+      || !tool.description?.includes("IMPLEMENTATION DELEGATE")
+      || !tool.description?.includes("small local changes")
+      || !tool.description?.includes("fresh ACP process/session")) {
     throw new Error(`code_agent tool missing or weakly described: ${JSON.stringify(tools)}`);
   }
   return { unauthorizedStatus: unauthorized.status };

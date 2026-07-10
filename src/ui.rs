@@ -750,6 +750,7 @@ const INLINE_PERMISSION_REPAIR_ATTEMPTS: usize = 3;
 /// stdout / diff dumps visible without flushing the surrounding
 /// conversation out of the viewport while a turn is streaming.
 const TOOL_OUTPUT_COLLAPSED_LINES: usize = 6;
+const TOOL_OUTPUT_COLLAPSED_CHARS: usize = 600;
 const MESSAGE_COLLAPSED_LINES: usize = 6;
 const MESSAGE_COLLAPSED_CHARS: usize = 600;
 
@@ -5051,7 +5052,7 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn token_usage_label(state: &AppState) -> String {
-    let usage = &state.token_usage;
+    let usage = state.displayed_token_usage();
     let mut parts = Vec::new();
 
     if let Some(input) = usage.input_tokens {
@@ -5276,7 +5277,7 @@ fn render_transcript_entry_range(
                     ActorActivity::PermissionRequested { .. } => {
                         push_styled_content(&mut out, text, theme.warning)
                     }
-                    ActorActivity::Tool { .. } => push_styled_content(&mut out, text, theme.tool),
+                    ActorActivity::Tool { .. } => push_italic_tool_call(&mut out, text, theme),
                     ActorActivity::Connected { .. } | ActorActivity::Status { .. } => {
                         push_styled_message(&mut out, &text, theme.muted, collapse_message, theme)
                     }
@@ -5339,33 +5340,19 @@ fn render_transcript_entry_range(
             Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
                 if let Some(view) = state.tool_calls.get(id) {
                     let color = tool_status_color(view.status, theme);
-                    // Successful calls don't need a status marker — the output
-                    // already implies success. Only annotate non-completed states
-                    // (pending/running/failed/interrupted) so they stand out.
-                    let prefix = match view.status {
+                    let status = match view.status {
                         agent_client_protocol::schema::v1::ToolCallStatus::Completed => {
-                            "tool ".to_string()
+                            String::new()
                         }
-                        _ => format!("tool [{}] ", tool_status_label(view.status)),
+                        _ => format!("[{}] ", tool_status_label(view.status)),
                     };
-                    let mut spans = vec![
-                        Span::styled(
-                            prefix,
-                            Style::default().fg(color).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!("{} ", tool_kind_label(view.kind)),
-                            Style::default().fg(theme.muted),
-                        ),
-                    ];
-                    if matches!(
-                        view.kind,
-                        agent_client_protocol::schema::v1::ToolKind::Execute
-                    ) {
-                        spans.extend(highlight_command(&view.title, theme));
-                    } else {
-                        spans.push(Span::raw(view.title.clone()));
-                    }
+                    let call = format!("{status}{} {}", tool_kind_label(view.kind), view.title);
+                    let spans = vec![Span::styled(
+                        call,
+                        Style::default()
+                            .fg(theme.muted)
+                            .add_modifier(Modifier::ITALIC),
+                    )];
                     // Render the whole tool call — header plus outputs — into a
                     // temporary buffer, wrap each line to the width left of the
                     // gutter, then frame every resulting row with a colored left
@@ -5592,6 +5579,18 @@ fn push_styled_content(out: &mut Vec<Line<'static>>, text: String, color: Color)
     out.push(Line::from(""));
 }
 
+fn push_italic_tool_call(out: &mut Vec<Line<'static>>, text: String, theme: TerminalTheme) {
+    for raw in text.split('\n') {
+        out.push(Line::from(Span::styled(
+            raw.to_string(),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+    out.push(Line::from(""));
+}
+
 fn push_styled_message(
     out: &mut Vec<Line<'static>>,
     text: &str,
@@ -5694,7 +5693,59 @@ fn push_tool_markdown_lines_limited(
     collapse_limit: Option<usize>,
     theme: TerminalTheme,
 ) {
-    push_markdown_lines_limited_inner(out, text, indent, collapse_limit, theme, true);
+    let (preview, hidden) = tool_output_preview(&text, collapse_limit);
+    push_markdown_lines_limited_inner(out, preview, indent, None, theme, true);
+    if let Some(hidden) = hidden {
+        push_tool_collapse_hint(out, indent, hidden, theme);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolOutputHidden {
+    Lines(usize),
+    Details,
+}
+
+fn tool_output_preview(
+    text: &str,
+    collapse_limit: Option<usize>,
+) -> (String, Option<ToolOutputHidden>) {
+    let Some(line_limit) = collapse_limit else {
+        return (text.to_string(), None);
+    };
+    let total_chars = text.chars().count();
+    let total_lines = text.split('\n').count();
+    let chars_over = total_chars > TOOL_OUTPUT_COLLAPSED_CHARS;
+    let lines_over = total_lines > line_limit;
+    if !chars_over && !lines_over {
+        return (text.to_string(), None);
+    }
+
+    let mut preview = String::new();
+    let mut remaining_chars = TOOL_OUTPUT_COLLAPSED_CHARS;
+    for (index, line) in text.split('\n').take(line_limit).enumerate() {
+        if index > 0 {
+            if remaining_chars == 0 {
+                break;
+            }
+            preview.push('\n');
+            remaining_chars -= 1;
+        }
+        for ch in line.chars().take(remaining_chars) {
+            preview.push(ch);
+            remaining_chars -= 1;
+        }
+        if remaining_chars == 0 {
+            break;
+        }
+    }
+
+    let hidden = if chars_over {
+        ToolOutputHidden::Details
+    } else {
+        ToolOutputHidden::Lines(total_lines.saturating_sub(line_limit))
+    };
+    (preview, Some(hidden))
 }
 
 fn push_markdown_lines_limited_inner(
@@ -6108,35 +6159,29 @@ fn push_tool_outputs(
                 exit_status,
                 ..
             } => {
-                out.push(Line::from(Span::styled(
-                    "  terminal output",
-                    Style::default()
-                        .fg(theme.terminal)
-                        .add_modifier(Modifier::BOLD),
-                )));
                 if *truncated {
                     out.push(Line::from(Span::styled(
-                        "    [output truncated]",
+                        "  [output truncated]",
                         Style::default().fg(theme.muted),
                     )));
                 }
                 if !output.trim().is_empty() {
-                    push_tool_text_lines(out, output.clone(), 4, collapse_limit, theme);
+                    push_tool_text_lines(out, output.clone(), 2, collapse_limit, theme);
                 } else if exit_status.is_some() {
                     out.push(Line::from(Span::styled(
-                        "    no stdout/stderr captured",
+                        "  no stdout/stderr captured",
                         Style::default().fg(theme.muted),
                     )));
                 } else {
                     let state = terminal_empty_state_label(tool_status);
                     out.push(Line::from(Span::styled(
-                        format!("    {state}"),
+                        format!("  {state}"),
                         Style::default().fg(theme.muted),
                     )));
                 }
                 if let Some(status) = exit_status {
                     out.push(Line::from(Span::styled(
-                        format!("    exit {}", terminal_exit_status_label(status)),
+                        format!("  exit {}", terminal_exit_status_label(status)),
                         Style::default().fg(theme.muted),
                     )));
                 }
@@ -6176,21 +6221,37 @@ fn push_tool_text_lines(
     collapse_limit: Option<usize>,
     theme: TerminalTheme,
 ) {
+    let (preview, hidden) = tool_output_preview(&text, collapse_limit);
     let prefix = " ".repeat(indent);
-    let lines: Vec<&str> = text.split('\n').collect();
-    let (visible_count, hidden) = match collapse_limit {
-        Some(limit) if lines.len() > limit => (limit, lines.len() - limit),
-        _ => (lines.len(), 0),
-    };
-    for raw in &lines[..visible_count] {
+    for raw in preview.split('\n') {
         let line = format!("{prefix}{raw}");
         out.push(Line::from(Span::styled(
             line,
             tool_output_line_style(raw, theme),
         )));
     }
-    if hidden > 0 {
-        push_collapse_hint(out, indent, hidden, theme);
+    if let Some(hidden) = hidden {
+        push_tool_collapse_hint(out, indent, hidden, theme);
+    }
+}
+
+fn push_tool_collapse_hint(
+    out: &mut Vec<Line<'static>>,
+    indent: usize,
+    hidden: ToolOutputHidden,
+    theme: TerminalTheme,
+) {
+    match hidden {
+        ToolOutputHidden::Lines(lines) => push_collapse_hint(out, indent, lines, theme),
+        ToolOutputHidden::Details => {
+            let prefix = " ".repeat(indent);
+            out.push(Line::from(Span::styled(
+                format!("{prefix}… details hidden (Ctrl-T to expand)"),
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        }
     }
 }
 
@@ -6212,29 +6273,8 @@ fn push_collapse_hint(
     )));
 }
 
-fn tool_output_line_style(raw: &str, theme: TerminalTheme) -> Style {
-    let lower = raw.to_ascii_lowercase();
-    if lower.contains("error")
-        || lower.contains("failed")
-        || lower.contains("panic")
-        || lower.contains("denied")
-    {
-        Style::default()
-            .fg(theme.error)
-            .add_modifier(Modifier::BOLD)
-    } else if lower.contains("warning") || lower.contains("warn") {
-        Style::default().fg(theme.warning)
-    } else if lower.contains("success")
-        || lower.contains("passed")
-        || lower == "ok"
-        || lower.ends_with(" ok")
-    {
-        Style::default().fg(theme.success)
-    } else if raw.trim_start().starts_with('$') {
-        Style::default().fg(theme.primary)
-    } else {
-        Style::default().fg(theme.subtle)
-    }
+fn tool_output_line_style(_raw: &str, theme: TerminalTheme) -> Style {
+    Style::default().fg(theme.subtle)
 }
 
 fn push_diff_output(
@@ -6805,91 +6845,6 @@ fn positional_line_diff(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffLine>
         }
     }
     lines
-}
-
-/// Returns true if `token` is a shell control/redirection operator that
-/// separates distinct commands (so the next word starts a fresh program).
-fn is_shell_operator(token: &str) -> bool {
-    matches!(
-        token,
-        "|" | "||" | "&&" | "&" | ";" | ">" | ">>" | "<" | "<<" | "2>" | "2>&1" | "|&"
-    )
-}
-
-/// Lightweight syntax highlighting for a displayed shell command.
-///
-/// Tokenizes on whitespace (preserving the original spacing) and colors the
-/// program name, subcommand, flags, and shell operators distinctly. This is
-/// intentionally simple — it does not parse quoting or expansions, it just
-/// improves at-a-glance readability of the command line.
-fn highlight_command(cmd: &str, theme: TerminalTheme) -> Vec<Span<'static>> {
-    let program_style = Style::default()
-        .fg(theme.primary)
-        .add_modifier(Modifier::BOLD);
-    let subcommand_style = Style::default().fg(theme.secondary);
-    let flag_style = Style::default().fg(theme.accent);
-    let operator_style = Style::default().fg(theme.muted);
-    let arg_style = Style::default().fg(theme.text);
-
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    // Next word token is expected to be a program name (start of the command
-    // or immediately after a shell operator).
-    let mut expect_program = true;
-    let mut subcommand_seen = false;
-
-    let mut rest = cmd;
-    while !rest.is_empty() {
-        // Emit any leading whitespace run verbatim so spacing is preserved.
-        let ws_len: usize = rest
-            .chars()
-            .take_while(|c| c.is_whitespace())
-            .map(char::len_utf8)
-            .sum();
-        if ws_len > 0 {
-            spans.push(Span::raw(rest[..ws_len].to_string()));
-            rest = &rest[ws_len..];
-            continue;
-        }
-
-        let tok_len: usize = rest
-            .chars()
-            .take_while(|c| !c.is_whitespace())
-            .map(char::len_utf8)
-            .sum();
-        let token = &rest[..tok_len];
-        rest = &rest[tok_len..];
-
-        let style = if is_shell_operator(token) {
-            expect_program = true;
-            subcommand_seen = false;
-            operator_style
-        } else if expect_program {
-            // Leading `FOO=bar` assignments precede the program; keep waiting.
-            if token.contains('=') && !token.starts_with('-') {
-                arg_style
-            } else {
-                expect_program = false;
-                program_style
-            }
-        } else if token.starts_with('-') {
-            flag_style
-        } else if !subcommand_seen
-            && !token.contains('/')
-            && !token.contains('.')
-            && !token.contains('=')
-        {
-            // First plain word after the program reads as a subcommand
-            // (e.g. `status` in `git status`); paths and `key=value` args do not.
-            subcommand_seen = true;
-            subcommand_style
-        } else {
-            arg_style
-        };
-
-        spans.push(Span::styled(token.to_string(), style));
-    }
-
-    spans
 }
 
 fn tool_kind_label(kind: agent_client_protocol::schema::v1::ToolKind) -> &'static str {
@@ -10208,7 +10163,7 @@ mod tests {
         EnumOption, PermissionOption, PermissionOptionKind, SessionConfigOption,
         SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
         SessionUpdate, StopReason, StringPropertySchema, TerminalExitStatus, TextContent, ToolCall,
-        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::backend::{Backend, TestBackend};
@@ -10393,6 +10348,29 @@ mod tests {
     fn token_usage_label_uses_dash_format_when_usage_is_missing() {
         let state = AppState::new();
         assert_eq!(token_usage_label(&state), "in: - · out: - · ctx: -");
+    }
+
+    #[test]
+    fn header_switches_to_fresh_eitri_usage_and_restores_thor_afterward() {
+        let mut state = AppState::new();
+        state.token_usage.context_used = Some(42_000);
+        state.token_usage.context_size = Some(128_000);
+        assert_eq!(token_usage_label(&state), "ctx: 42.0k");
+
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "Eitri · builder".to_string(),
+        }));
+        assert_eq!(token_usage_label(&state), "in: - · out: - · ctx: -");
+
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::UsageUpdate(UsageUpdate::new(900, 128_000)),
+        )));
+        assert_eq!(token_usage_label(&state), "ctx: 900");
+
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
+            outcome: CodeAgentOutcome::Completed,
+        }));
+        assert_eq!(token_usage_label(&state), "ctx: 42.0k");
     }
 
     #[test]
@@ -12855,7 +12833,7 @@ mod tests {
                 "",
                 "Thor · 0s",
                 "│ 1 tool · 1 failed",
-                "│ tool [failed] exec cargo test",
+                "│ [failed] exec cargo test",
                 "│   running",
                 "│   [tool call ended before completion]",
                 ""
@@ -13519,6 +13497,58 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("more lines hidden"))
         );
+    }
+
+    #[test]
+    fn tool_output_collapses_a_single_huge_logical_line_by_character_count() {
+        let unicode = format!("{}SUFFIX", "é".repeat(700));
+        let (unicode_preview, hidden) =
+            tool_output_preview(&unicode, Some(TOOL_OUTPUT_COLLAPSED_LINES));
+        assert_eq!(unicode_preview.chars().count(), TOOL_OUTPUT_COLLAPSED_CHARS);
+        assert_eq!(hidden, Some(ToolOutputHidden::Details));
+        assert!(!unicode_preview.contains("SUFFIX"));
+
+        let mut state = AppState::new();
+        let long = format!("{{\"body\":\"{}ONE_LINE_SUFFIX\"}}", "x".repeat(900));
+        state.tool_calls.insert(
+            "call-1".to_string(),
+            crate::app::ToolCallView {
+                title: "gh issue view 350".to_string(),
+                kind: ToolKind::Execute,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Terminal {
+                    terminal_id: "term-1".to_string(),
+                    output: long,
+                    truncated: false,
+                    exit_status: Some(TerminalExitStatus::new().exit_code(0)),
+                }],
+            },
+        );
+        state.transcript.push(Entry::ToolCall("call-1".to_string()));
+
+        let collapsed = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(
+            !collapsed
+                .iter()
+                .any(|line| line.contains("ONE_LINE_SUFFIX"))
+        );
+        assert!(collapsed.iter().any(|line| line.contains("details hidden")));
+        assert!(
+            !collapsed
+                .iter()
+                .any(|line| line.contains("terminal output"))
+        );
+
+        state.expand_transcript_details = true;
+        let expanded = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(expanded.iter().any(|line| line.contains("ONE_LINE_SUFFIX")));
+        assert!(!expanded.iter().any(|line| line.contains("details hidden")));
     }
 
     #[test]
@@ -14225,7 +14255,7 @@ mod tests {
             .map(line_text)
             .collect();
 
-        assert!(rendered.iter().any(|line| line == "│ tool exec run checks"));
+        assert!(rendered.iter().any(|line| line == "│ exec run checks"));
         assert!(rendered.iter().any(|line| line == "│   ## Output"));
         assert!(rendered.iter().any(|line| line == "│   ok"));
         assert!(
@@ -14235,11 +14265,10 @@ mod tests {
         );
         assert!(rendered.iter().any(|line| line.trim_end() == "│   1 - old"));
         assert!(rendered.iter().any(|line| line.trim_end() == "│   1 + new"));
-        assert!(rendered.iter().any(|line| line == "│   terminal output"));
         assert!(
             rendered
                 .iter()
-                .any(|line| line == "│     no terminal output received")
+                .any(|line| line == "│   no terminal output received")
         );
         assert!(
             !rendered.iter().any(|line| line.contains("term-1")),
@@ -14276,20 +14305,11 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .any(|line| line == "│ tool [failed] exec cargo test")
+                .any(|line| line == "│ [failed] exec cargo test")
         );
-        assert!(rendered.iter().any(|line| line == "│   terminal output"));
-        assert!(
-            rendered
-                .iter()
-                .any(|line| line == "│     [output truncated]")
-        );
-        assert!(
-            rendered
-                .iter()
-                .any(|line| line == "│     error: test failed")
-        );
-        assert!(rendered.iter().any(|line| line == "│     exit code 101"));
+        assert!(rendered.iter().any(|line| line == "│   [output truncated]"));
+        assert!(rendered.iter().any(|line| line == "│   error: test failed"));
+        assert!(rendered.iter().any(|line| line == "│   exit code 101"));
         assert!(
             !rendered.iter().any(|line| line.contains("call_q403")),
             "terminal ids should not leak into user-facing transcript rows: {rendered:?}"
@@ -14370,7 +14390,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_tool_markdown_preserves_log_severity_styles() {
+    fn transcript_tool_markdown_output_is_desaturated() {
         let mut state = AppState::new();
         let theme = state.theme;
         state.tool_calls.insert(
@@ -14400,16 +14420,16 @@ mod tests {
                 .spans
                 .iter()
                 .skip(1)
-                .any(|span| span.style.fg == Some(theme.warning)),
-            "warning line should retain tool-output severity color: {warning_line:?}"
+                .all(|span| span.style.fg == Some(theme.subtle)),
+            "tool output should stay desaturated: {warning_line:?}"
         );
         assert!(
             warning_line.spans.iter().skip(1).any(|span| {
                 span.content.as_ref() == "check"
-                    && span.style.fg == Some(theme.warning)
+                    && span.style.fg == Some(theme.subtle)
                     && span.style.add_modifier.contains(Modifier::BOLD)
             }),
-            "inline markdown should still style the strong segment: {warning_line:?}"
+            "inline markdown should preserve emphasis without recoloring: {warning_line:?}"
         );
     }
 
@@ -14434,10 +14454,16 @@ mod tests {
         let lines = render_transcript_lines(&state, 80);
 
         // Both the tool header and its output are framed by the gutter rail.
+        let call_line = lines
+            .iter()
+            .find(|line| line_text(line) == "│ exec cargo test")
+            .expect("tool call line");
+        assert_eq!(call_line.spans[1].style.fg, Some(theme.muted));
         assert!(
-            lines
-                .iter()
-                .any(|l| line_text(l) == "│ tool exec cargo test")
+            call_line.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
         );
         assert!(lines.iter().any(|l| line_text(l) == "│   ok"));
 
@@ -17157,68 +17183,5 @@ mod tests {
         assert!(!preview.contains('\n'));
         assert!(!preview.contains('\r'));
         assert!(preview.starts_with("line one"));
-    }
-
-    fn command_spans(cmd: &str) -> Vec<(String, Style)> {
-        let theme = TerminalThemeKind::Dark.palette();
-        super::highlight_command(cmd, theme)
-            .into_iter()
-            .map(|s| (s.content.into_owned(), s.style))
-            .collect()
-    }
-
-    fn style_of<'a>(spans: &'a [(String, Style)], token: &str) -> &'a Style {
-        &spans
-            .iter()
-            .find(|(content, _)| content == token)
-            .unwrap_or_else(|| panic!("token {token:?} not found in spans"))
-            .1
-    }
-
-    #[test]
-    fn highlight_command_colors_program_subcommand_and_flags() {
-        let theme = TerminalThemeKind::Dark.palette();
-        let spans = command_spans("git commit --amend -m msg");
-
-        // Reassembling the spans reproduces the original command verbatim.
-        let reassembled: String = spans.iter().map(|(c, _)| c.as_str()).collect();
-        assert_eq!(reassembled, "git commit --amend -m msg");
-
-        let program = style_of(&spans, "git");
-        assert_eq!(program.fg, Some(theme.primary));
-        assert!(program.add_modifier.contains(Modifier::BOLD));
-
-        assert_eq!(style_of(&spans, "commit").fg, Some(theme.secondary));
-        assert_eq!(style_of(&spans, "--amend").fg, Some(theme.accent));
-        assert_eq!(style_of(&spans, "-m").fg, Some(theme.accent));
-        assert_eq!(style_of(&spans, "msg").fg, Some(theme.text));
-    }
-
-    #[test]
-    fn highlight_command_treats_operator_as_new_program() {
-        let theme = TerminalThemeKind::Dark.palette();
-        let spans = command_spans("cat file.txt | grep foo");
-
-        // `cat` is the program; `file.txt` is an arg (has a dot), not a subcommand.
-        assert_eq!(style_of(&spans, "cat").fg, Some(theme.primary));
-        assert_eq!(style_of(&spans, "file.txt").fg, Some(theme.text));
-        assert_eq!(style_of(&spans, "|").fg, Some(theme.muted));
-        // After the pipe, `grep` is treated as a fresh program.
-        let grep = style_of(&spans, "grep");
-        assert_eq!(grep.fg, Some(theme.primary));
-        assert!(grep.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(style_of(&spans, "foo").fg, Some(theme.secondary));
-    }
-
-    #[test]
-    fn highlight_command_skips_leading_env_assignment() {
-        let theme = TerminalThemeKind::Dark.palette();
-        let spans = command_spans("FOO=bar cargo test");
-
-        assert_eq!(style_of(&spans, "FOO=bar").fg, Some(theme.text));
-        let cargo = style_of(&spans, "cargo");
-        assert_eq!(cargo.fg, Some(theme.primary));
-        assert!(cargo.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(style_of(&spans, "test").fg, Some(theme.secondary));
     }
 }

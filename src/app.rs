@@ -730,6 +730,9 @@ pub struct AppState {
     connection_state_started_at: Instant,
     /// Last token/context usage reported by the agent.
     pub token_usage: TokenUsage,
+    /// Usage for the fresh nested Eitri session currently holding the wheel.
+    /// Kept separate so the header never presents Thor's context as Eitri's.
+    code_agent_token_usage: TokenUsage,
     /// Last Claude Code `/usage` quota scrape, when the active agent is Claude.
     pub claude_usage: Option<ClaudeUsageReport>,
     /// Slash-command autocomplete state, recomputed on every input edit.
@@ -1022,6 +1025,7 @@ impl AppState {
             active_prompt_turn: None,
             connection_state_started_at: now,
             token_usage: TokenUsage::default(),
+            code_agent_token_usage: TokenUsage::default(),
             claude_usage: None,
             autocomplete: Autocomplete::default(),
             help_overlay: false,
@@ -1440,6 +1444,14 @@ impl AppState {
 
     pub fn connection_state_elapsed(&self) -> Duration {
         self.connection_state_started_at.elapsed()
+    }
+
+    pub fn displayed_token_usage(&self) -> &TokenUsage {
+        if self.code_agent_active {
+            &self.code_agent_token_usage
+        } else {
+            &self.token_usage
+        }
     }
 
     pub fn connection_state(&self) -> ConnectionState {
@@ -2206,6 +2218,7 @@ impl AppState {
             CodeAgentEvent::Started { label } => {
                 self.code_agent_active = true;
                 self.code_agent_label = Some(label.clone());
+                self.code_agent_token_usage = TokenUsage::default();
                 self.set_status_line(StatusKind::Info, label);
             }
             CodeAgentEvent::SessionUpdate(update) => self.apply_code_agent_update(update),
@@ -2351,6 +2364,9 @@ impl AppState {
                     self.transcript.push(Entry::CodeAgentPlan(entries));
                 }
                 self.bump_transcript_revision();
+            }
+            SessionUpdate::UsageUpdate(update) => {
+                let _ = self.code_agent_token_usage.apply_usage_update(update);
             }
             _ => {}
         }
