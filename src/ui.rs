@@ -70,6 +70,7 @@ const TRANSCRIPT_SCROLL_WHEEL_STEP: usize = 3;
 const PROMPT_SIDE_PADDING: u16 = 1;
 pub const INLINE_CHAT_HEIGHT: u16 = 8;
 const INLINE_EXPANDED_MAX_HEIGHT: u16 = 20;
+const INLINE_LIVE_TRANSCRIPT_MAX_ROWS: usize = 12;
 const INLINE_HELP_HEIGHT: u16 = 18;
 /// Inline viewport height for the `/mjconfig` overlay (border + two sections).
 const INLINE_MJCONFIG_HEIGHT: u16 = 15;
@@ -1572,6 +1573,7 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
         usize::from(INLINE_CHAT_HEIGHT)
             + usize::from(queued_prompt_row_count(state))
             + usize::from(state.claude_usage.is_some())
+            + inline_live_transcript_row_count(state, width)
     };
 
     (desired.min(usize::from(u16::MAX)) as u16).clamp(INLINE_CHAT_HEIGHT, max_height)
@@ -3435,15 +3437,7 @@ fn draw_mjconfig_menu(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
 }
 
 fn actor_identity_label(actor: &ActorIdentity) -> String {
-    let role = if actor.role == "nested" {
-        "Nested agent".to_string()
-    } else {
-        let mut chars = actor.role.chars();
-        chars
-            .next()
-            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-            .unwrap_or_else(|| "Agent".to_string())
-    };
+    let role = actor_role_name(actor);
     actor
         .model_name
         .as_deref()
@@ -3452,15 +3446,25 @@ fn actor_identity_label(actor: &ActorIdentity) -> String {
         .unwrap_or(role)
 }
 
+fn actor_role_name(actor: &ActorIdentity) -> String {
+    if actor.role == "nested" {
+        "Nested agent".to_string()
+    } else {
+        let mut chars = actor.role.chars();
+        chars
+            .next()
+            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+            .unwrap_or_else(|| "Agent".to_string())
+    }
+}
+
 fn actor_activity_label(activity: &ActorActivity) -> String {
     match activity {
         ActorActivity::Connected { actor } | ActorActivity::Status { actor, .. } => {
             actor_identity_label(actor)
         }
         ActorActivity::Message { actor, .. } => actor_identity_label(actor),
-        ActorActivity::Thought { actor, .. } => {
-            format!("{} · thought", actor_identity_label(actor))
-        }
+        ActorActivity::Thought { actor, .. } => actor_role_name(actor),
         ActorActivity::Tool { actor, .. } => {
             format!("{} · tool", actor_identity_label(actor))
         }
@@ -4359,6 +4363,53 @@ fn draw(
     }
 }
 
+fn inline_live_transcript_lines(state: &AppState, width: u16) -> Vec<Line<'static>> {
+    if !state.code_agent_active || width == 0 {
+        return Vec::new();
+    }
+    let stable_entries = stable_transcript_entry_count(state);
+    render_transcript_entry_range(
+        state,
+        width,
+        stable_entries..state.transcript.len(),
+        transcript_collapse_limit(state),
+        state.theme,
+    )
+}
+
+fn inline_live_transcript_row_count(state: &AppState, width: u16) -> usize {
+    let lines = inline_live_transcript_lines(state, width);
+    if lines.is_empty() {
+        return 0;
+    }
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .min(INLINE_LIVE_TRANSCRIPT_MAX_ROWS)
+}
+
+fn draw_inline_live_transcript(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let lines = inline_live_transcript_lines(state, area.width);
+    if lines.is_empty() {
+        return;
+    }
+    let total = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(area.width);
+    let top = total
+        .saturating_sub(usize::from(area.height))
+        .min(u16::MAX as usize) as u16;
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((top, 0)),
+        area,
+    );
+}
+
 fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
     if let Some(pending) = state.pending_permission() {
         draw_inline_permission_view(
@@ -4405,9 +4456,12 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
     let has_config_options = !state.selectable_config_options().is_empty();
     let has_usage_quota = state.claude_usage.is_some();
     let queued_row = queued_prompt_row_count(state);
+    let live_rows = inline_live_transcript_row_count(state, f.area().width)
+        .min(usize::from(f.area().height)) as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(live_rows),
             Constraint::Length(1),
             Constraint::Length(queued_row),
             Constraint::Min(MIN_INPUT_HEIGHT),
@@ -4416,11 +4470,12 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
         ])
         .split(f.area());
 
-    draw_header(f, chunks[0], state);
-    draw_queued_prompt_row(f, chunks[1], state);
-    draw_input(f, chunks[2], state, UiMode::InlineChat);
-    draw_usage_quota_row(f, chunks[3], state);
-    draw_config_shortcuts_row(f, chunks[4], state);
+    draw_inline_live_transcript(f, chunks[0], state);
+    draw_header(f, chunks[1], state);
+    draw_queued_prompt_row(f, chunks[2], state);
+    draw_input(f, chunks[3], state, UiMode::InlineChat);
+    draw_usage_quota_row(f, chunks[4], state);
+    draw_config_shortcuts_row(f, chunks[5], state);
 
     if state.autocomplete.visible
         && !state.has_pending_permission()
@@ -4655,7 +4710,11 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         ),
         Span::raw("   "),
     ];
-    let agent_label = state.agent_label.trim();
+    let agent_label = state
+        .code_agent_label
+        .as_deref()
+        .unwrap_or(&state.agent_label)
+        .trim();
     if !agent_label.is_empty() {
         spans.push(Span::styled(
             agent_label.to_string(),
@@ -4934,34 +4993,56 @@ fn render_transcript_entry_range(
     for entry in state.transcript[entry_range].iter() {
         match entry {
             Entry::UserPrompt(text) => push_plain_block(&mut out, "you", theme.user, text.clone()),
-            Entry::AgentMessage(text) => {
-                push_markdown_block(&mut out, "agent", theme.agent, text.clone(), theme)
-            }
+            Entry::AgentMessage(text) => push_markdown_block(
+                &mut out,
+                "Thor",
+                god_name_color("Thor", theme),
+                text.clone(),
+                theme,
+            ),
             Entry::AgentThought(text) => {
-                push_markdown_block(&mut out, "thought", theme.thought, text.clone(), theme)
+                push_role_thought(&mut out, "Thor", god_name_color("Thor", theme), text, theme)
             }
             Entry::CodeAgentPrompt(text) => {
                 push_plain_block(&mut out, "Thor → Eitri", theme.user, text.clone())
             }
-            Entry::CodeAgentMessage(text) => {
-                push_markdown_block(&mut out, "Eitri", theme.agent, text.clone(), theme)
-            }
-            Entry::CodeAgentThought(text) => push_markdown_block(
+            Entry::CodeAgentMessage(text) => push_markdown_block(
                 &mut out,
-                "Eitri thought",
-                theme.thought,
+                "Eitri",
+                god_name_color("Eitri", theme),
                 text.clone(),
+                theme,
+            ),
+            Entry::CodeAgentThought(text) => push_role_thought(
+                &mut out,
+                "Eitri",
+                god_name_color("Eitri", theme),
+                text,
                 theme,
             ),
             Entry::ActorActivity(activity) => {
                 let label = actor_activity_label(activity);
                 let text = actor_activity_text(activity);
                 match activity.as_ref() {
-                    ActorActivity::Message { .. } => {
-                        push_markdown_block(&mut out, &label, theme.agent, text, theme)
+                    ActorActivity::Message { actor, .. } => {
+                        let role = actor_role_name(actor);
+                        push_markdown_block(
+                            &mut out,
+                            &role,
+                            god_name_color(&role, theme),
+                            text,
+                            theme,
+                        )
                     }
-                    ActorActivity::Thought { .. } => {
-                        push_markdown_block(&mut out, &label, theme.thought, text, theme)
+                    ActorActivity::Thought { actor, .. } => {
+                        let role = actor_role_name(actor);
+                        push_role_thought(
+                            &mut out,
+                            &role,
+                            god_name_color(&role, theme),
+                            &text,
+                            theme,
+                        )
                     }
                     ActorActivity::Warning { .. } | ActorActivity::PermissionRequested { .. } => {
                         push_plain_block(&mut out, &label, theme.warning, text)
@@ -5116,6 +5197,47 @@ fn push_markdown_block(
     )));
     push_markdown_lines(out, text, 0, theme);
     out.push(Line::from(""));
+}
+
+fn god_name_color(role: &str, theme: TerminalTheme) -> Color {
+    if role.eq_ignore_ascii_case("Thor") {
+        theme.primary
+    } else if role.eq_ignore_ascii_case("Loki") {
+        theme.secondary
+    } else if role.eq_ignore_ascii_case("Eitri") {
+        theme.code
+    } else {
+        theme.agent
+    }
+}
+
+fn push_role_thought(
+    out: &mut Vec<Line<'static>>,
+    role: &str,
+    role_color: Color,
+    text: &str,
+    theme: TerminalTheme,
+) {
+    let text = text
+        .replace("<!-- -->", " ")
+        .replace("<!---->", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        return;
+    }
+    let thought_style = Style::default().fg(theme.thought);
+    let mut spans = vec![Span::styled(
+        format!("{role}: "),
+        Style::default().fg(role_color).add_modifier(Modifier::BOLD),
+    )];
+    spans.extend(inline_markdown_spans_with_style(
+        &text,
+        theme,
+        thought_style,
+    ));
+    out.push(Line::from(spans));
 }
 
 fn push_plain_block(out: &mut Vec<Line<'static>>, label: &str, color: Color, text: String) {
@@ -9652,7 +9774,10 @@ mod tests {
 
     use crate::app::StatusKind;
     use crate::claude_usage::ClaudeUsageReport;
-    use crate::event::{ElicitationPrompt, SessionConfigTarget, TerminalOutputSnapshot};
+    use crate::event::{
+        CodeAgentEvent, CodeAgentOutcome, ElicitationPrompt, SessionConfigTarget,
+        TerminalOutputSnapshot,
+    };
 
     use super::*;
     use agent_client_protocol::schema::v1::{
@@ -11849,8 +11974,57 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(rendered, vec!["agent:", "world", ""]);
+        assert_eq!(rendered, vec!["Thor:", "world", ""]);
         assert!(sink.pending_lines(&state, 80).is_empty());
+    }
+
+    #[test]
+    fn inline_chat_shows_live_eitri_tail_and_swaps_active_header() {
+        let mut state = AppState::new();
+        state.agent_label = "Thor · gpt-primary".to_string();
+        state.record_user_prompt("delegate this".to_string());
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "Eitri · gpt-builder".to_string(),
+            instructions: "implement it".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentThoughtChunk(text_chunk("working now")),
+        )));
+
+        let live = inline_live_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert_eq!(live, vec!["Eitri: working now"]);
+        assert!(inline_live_transcript_row_count(&state, 80) > 0);
+        assert!(
+            desired_inline_height(
+                &state,
+                Size {
+                    width: 80,
+                    height: 40,
+                },
+            ) > INLINE_CHAT_HEIGHT
+        );
+
+        let backend = TestBackend::new(120, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_header(frame, frame.area(), &state))
+            .expect("draw active header");
+        let active = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(active.contains("Eitri · gpt-builder"), "{active}");
+        assert!(!active.contains("Thor · gpt-primary"), "{active}");
+
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
+            outcome: CodeAgentOutcome::Completed,
+        }));
+        assert!(inline_live_transcript_lines(&state, 80).is_empty());
+        terminal
+            .draw(|frame| draw_header(frame, frame.area(), &state))
+            .expect("draw restored header");
+        let restored = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(restored.contains("Thor · gpt-primary"), "{restored}");
     }
 
     #[test]
@@ -13024,7 +13198,7 @@ mod tests {
             .map(line_text)
             .collect();
 
-        assert!(rendered.iter().any(|line| line == "agent:"));
+        assert!(rendered.iter().any(|line| line == "Thor:"));
         assert!(rendered.iter().any(|line| line == "# Result"));
         assert!(rendered.iter().any(|line| line == "- bold item"));
         assert!(rendered.iter().any(|line| line == "code rs"));
@@ -13054,6 +13228,47 @@ mod tests {
                 "",
             ]
         );
+    }
+
+    #[test]
+    fn thoughts_are_compact_role_prefixed_paragraphs_with_distinct_name_colors() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state.transcript.push(Entry::AgentThought(
+            "Planning initial\n\n<!-- -->\n\ncode_agent   invocation".to_string(),
+        ));
+        state.transcript.push(Entry::CodeAgentThought(
+            "Checking the implementation".to_string(),
+        ));
+        state
+            .transcript
+            .push(Entry::ActorActivity(Box::new(ActorActivity::Thought {
+                actor: ActorIdentity {
+                    role: "Loki".to_string(),
+                    connection_id: "loki".to_string(),
+                    source_id: None,
+                    model_name: None,
+                    model_value: None,
+                },
+                text: "Reviewing the boundary".to_string(),
+            })));
+
+        let rendered = render_transcript_lines(&state, 80);
+        let text = rendered.iter().map(line_text).collect::<Vec<_>>();
+        assert_eq!(
+            text,
+            vec![
+                "Thor: Planning initial code_agent invocation",
+                "Eitri: Checking the implementation",
+                "Loki: Reviewing the boundary",
+            ]
+        );
+        assert_eq!(rendered[0].spans[0].style.fg, Some(theme.primary));
+        assert_eq!(rendered[1].spans[0].style.fg, Some(theme.code));
+        assert_eq!(rendered[2].spans[0].style.fg, Some(theme.secondary));
+        for line in &rendered {
+            assert_eq!(line.spans[1].style.fg, Some(theme.thought));
+        }
     }
 
     #[test]
@@ -13316,7 +13531,7 @@ mod tests {
 
         // The agent message stays flush-left with no rail; that contrast is
         // the fix for issue #257.
-        assert!(lines.iter().any(|l| line_text(l) == "agent:"));
+        assert!(lines.iter().any(|l| line_text(l) == "Thor:"));
         assert!(lines.iter().any(|l| line_text(l) == "hi there"));
         assert!(
             !lines

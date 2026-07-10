@@ -11,7 +11,18 @@ proc send_ctrl_c {} {
     send -i $spawn_id -- "\003"
 }
 
-spawn $env(MJ_E2E_BIN) --no-update-check --debug-file $env(MJ_E2E_DEBUG_LOG) --agent-stderr $env(MJ_E2E_AGENT_STDERR) --fullscreen-tui --cwd $env(MJ_E2E_WORKSPACE)
+set command [list $env(MJ_E2E_BIN) --no-update-check --debug-file $env(MJ_E2E_DEBUG_LOG) --agent-stderr $env(MJ_E2E_AGENT_STDERR)]
+if {$mode ne "inline-stream"} {
+    lappend command --fullscreen-tui
+}
+lappend command --cwd $env(MJ_E2E_WORKSPACE)
+spawn {*}$command
+if {$mode eq "inline-stream"} {
+    expect_before -re {\x1b\[6n} {
+        send -- "\x1b\[1;1R"
+        exp_continue
+    }
+}
 
 if {$mode eq "unsupported"} {
     expect {
@@ -26,7 +37,19 @@ expect {
     timeout { exit 19 }
 }
 
-if {$mode eq "cancel"} {
+if {$mode eq "inline-stream"} {
+    expect {
+        -re {Eitri:.*fixture reasoning} {
+            if {[file exists $env(MJ_E2E_PRIMARY_RESULT)]} { exit 25 }
+            send_ctrl_c
+        }
+        timeout { exit 26 }
+    }
+    expect {
+        -re {Eitri.*cancelled} { after 500; send_ctrl_c }
+        timeout { exit 27 }
+    }
+} elseif {$mode eq "cancel"} {
     expect {
         -re {Eitri.*gpt-5-6-luna} { after 500; send_ctrl_c }
         timeout { exit 20 }

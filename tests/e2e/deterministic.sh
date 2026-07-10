@@ -130,13 +130,14 @@ run_case() {
 
 case ${MJ_E2E_CASE:-both} in
   complete) run_case complete ;;
+  inline-stream) run_case inline-stream ;;
   cancel) run_case cancel ;;
   unsupported) run_case unsupported ;;
   loki-eitri) run_case loki-eitri ;;
   loki-thor) run_case loki-thor ;;
   loki-final) run_case loki-final ;;
   both) run_case complete; run_case cancel; run_case unsupported ;;
-  council) run_case complete; run_case cancel; run_case unsupported; run_case loki-eitri; run_case loki-thor; run_case loki-final ;;
-  *) echo "MJ_E2E_CASE must be complete, cancel, unsupported, loki-eitri, loki-thor, loki-final, both, or council" >&2; exit 2 ;;
+  council) run_case complete; run_case inline-stream; run_case cancel; run_case unsupported; run_case loki-eitri; run_case loki-thor; run_case loki-final ;;
+  *) echo "MJ_E2E_CASE must be complete, inline-stream, cancel, unsupported, loki-eitri, loki-thor, loki-final, both, or council" >&2; exit 2 ;;
 esac
 echo "deterministic code-agent PTY E2E passed"

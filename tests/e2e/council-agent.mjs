@@ -99,7 +99,11 @@ function startEitriTurn() {
   if (process.env.MJ_E2E_NESTED_PID) fs.writeFileSync(process.env.MJ_E2E_NESTED_PID, String(process.pid));
   log("prompt-started");
   update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "fixture reasoning" } });
-  if (mode === "cancel") return;
+  if (mode === "cancel" || mode === "inline-stream") return;
+  requestEitriPermission();
+}
+
+function requestEitriPermission() {
   send({ id: "permission-1", method: "session/request_permission", params: {
     sessionId: "fixture-session", toolCall: { toolCallId: "nested-tool", title: "allow fixture command", kind: "execute" },
     options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }, { optionId: "reject-once", name: "Reject", kind: "reject_once" }],

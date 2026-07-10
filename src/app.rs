@@ -642,6 +642,8 @@ pub struct AppState {
     pub runtime_closed: bool,
     /// A client-side nested ACP turn is currently serving the injected MCP tool.
     pub code_agent_active: bool,
+    /// Nested ACP identity currently holding the interactive UI/control lane.
+    pub code_agent_label: Option<String>,
     /// Transient status line with severity.
     pub status_line: Option<StatusMessage>,
     /// True while the local microphone dictation helper is running.
@@ -934,6 +936,7 @@ impl AppState {
             exit_reason: None,
             runtime_closed: false,
             code_agent_active: false,
+            code_agent_label: None,
             status_line: None,
             voice_input_active: false,
             voice_input_range: None,
@@ -2048,6 +2051,7 @@ impl AppState {
                 instructions,
             } => {
                 self.code_agent_active = true;
+                self.code_agent_label = Some(label.clone());
                 self.push_session_boundary(label.clone());
                 self.transcript.push(Entry::CodeAgentPrompt(instructions));
                 self.bump_transcript_revision();
@@ -2092,6 +2096,7 @@ impl AppState {
             }
             CodeAgentEvent::Finished { outcome } => {
                 self.code_agent_active = false;
+                self.code_agent_label = None;
                 self.cancel_code_agent_prompts();
                 let label = match outcome {
                     CodeAgentOutcome::Completed => "Eitri · complete".to_string(),
