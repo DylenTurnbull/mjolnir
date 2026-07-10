@@ -259,21 +259,11 @@ fn explicit<'a>(
 fn choose_eitri<'a>(rows: &[Row], available: &'a [ResolvedRole]) -> Option<&'a ResolvedRole> {
     let anchor = deepswe::sonnet_anchor(rows)?;
     let launchable_rows: Vec<Row> = available.iter().map(|role| role.model.clone()).collect();
-    let frontier = deepswe::pareto_frontier(&launchable_rows);
-    frontier
-        .iter()
-        .min_by(|a, b| {
-            deepswe::normalized_distance(a, anchor, rows)
-                .total_cmp(&deepswe::normalized_distance(b, anchor, rows))
-                .then_with(|| a.mean_cost_usd.total_cmp(&b.mean_cost_usd))
-                .then_with(|| b.pass_at_1.total_cmp(&a.pass_at_1))
-                .then_with(|| a.model.cmp(&b.model))
-        })
-        .and_then(|row| {
-            available
-                .iter()
-                .find(|candidate| candidate.model.model == row.model)
-        })
+    deepswe::eitri_frontier_choice(&launchable_rows, anchor.pass_at_1).and_then(|row| {
+        available
+            .iter()
+            .find(|candidate| candidate.model.model == row.model)
+    })
 }
 
 fn provider_key(model: &str) -> &str {
@@ -379,12 +369,16 @@ mod tests {
     use super::*;
 
     fn role(model: &str, pass_at_1: f64) -> ResolvedRole {
+        role_at(model, pass_at_1, 1.0)
+    }
+
+    fn role_at(model: &str, pass_at_1: f64, mean_cost_usd: f64) -> ResolvedRole {
         ResolvedRole {
             model: Row {
                 model: model.to_string(),
                 reasoning_effort: Some("high".to_string()),
                 pass_at_1,
-                mean_cost_usd: 1.0,
+                mean_cost_usd,
             },
             model_value: model.to_string(),
             launch: launch_for(adapter_kind(model)),
@@ -461,5 +455,28 @@ mod tests {
         let available = vec![role("gpt-5-6-sol", 0.70), role("gpt-5-5", 0.65)];
 
         assert!(choose_loki(&available[0], &available).is_none());
+    }
+
+    #[test]
+    fn auto_eitri_uses_sonnet_quality_floor_and_selects_terra() {
+        let rows = vec![
+            role_at("claude-sonnet-5", 0.482, 7.43).model,
+            role_at("gpt-5-6-sol", 0.694, 3.47).model,
+            role_at("gpt-5-6-terra", 0.538, 1.13).model,
+            role_at("gpt-5-6-luna", 0.442, 0.78).model,
+        ];
+        let available = vec![
+            role_at("gpt-5-6-sol", 0.694, 3.47),
+            role_at("gpt-5-6-terra", 0.538, 1.13),
+            role_at("gpt-5-6-luna", 0.442, 0.78),
+        ];
+
+        assert_eq!(
+            choose_eitri(&rows, &available)
+                .expect("Eitri choice")
+                .model
+                .model,
+            "gpt-5-6-terra"
+        );
     }
 }

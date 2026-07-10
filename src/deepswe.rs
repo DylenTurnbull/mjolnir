@@ -212,34 +212,28 @@ pub fn sonnet_anchor(rows: &[Row]) -> Option<&Row> {
         .max_by(|a, b| compare_strength(a, b))
 }
 
-pub fn normalized_distance(a: &Row, b: &Row, scale_rows: &[Row]) -> f64 {
-    let (min_pass, max_pass) = scale_rows
+/// Choose the cheapest Pareto point that meets the Sonnet High quality
+/// floor. If none does, retain the strongest point on the frontier.
+pub fn eitri_frontier_choice(rows: &[Row], sonnet_pass_at_1: f64) -> Option<Row> {
+    let frontier = pareto_frontier(rows);
+    frontier
         .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |acc, row| {
-            (acc.0.min(row.pass_at_1), acc.1.max(row.pass_at_1))
-        });
-    let (min_cost, max_cost) = scale_rows
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |acc, row| {
-            (acc.0.min(row.mean_cost_usd), acc.1.max(row.mean_cost_usd))
-        });
-    let pass_scale = (max_pass - min_pass).max(f64::EPSILON);
-    let cost_scale = (max_cost - min_cost).max(f64::EPSILON);
-    let pass = (a.pass_at_1 - b.pass_at_1) / pass_scale;
-    let cost = (a.mean_cost_usd - b.mean_cost_usd) / cost_scale;
-    pass.hypot(cost)
-}
-
-#[cfg(test)]
-pub fn eitri_choice(rows: &[Row]) -> Option<Row> {
-    let anchor = sonnet_anchor(rows)?;
-    pareto_frontier(rows).into_iter().min_by(|a, b| {
-        normalized_distance(a, anchor, rows)
-            .total_cmp(&normalized_distance(b, anchor, rows))
-            .then_with(|| a.mean_cost_usd.total_cmp(&b.mean_cost_usd))
-            .then_with(|| b.pass_at_1.total_cmp(&a.pass_at_1))
-            .then_with(|| a.model.cmp(&b.model))
-    })
+        .filter(|row| row.pass_at_1 >= sonnet_pass_at_1)
+        .min_by(|a, b| {
+            a.mean_cost_usd
+                .total_cmp(&b.mean_cost_usd)
+                .then_with(|| b.pass_at_1.total_cmp(&a.pass_at_1))
+                .then_with(|| a.model.cmp(&b.model))
+        })
+        .cloned()
+        .or_else(|| {
+            frontier.into_iter().max_by(|a, b| {
+                a.pass_at_1
+                    .total_cmp(&b.pass_at_1)
+                    .then_with(|| b.mean_cost_usd.total_cmp(&a.mean_cost_usd))
+                    .then_with(|| b.model.cmp(&a.model))
+            })
+        })
 }
 
 pub fn model_provider(model: &str) -> &'static str {
@@ -289,14 +283,24 @@ mod tests {
     }
 
     #[test]
-    fn pareto_and_sonnet_distance_choose_expected_builder() {
+    fn pareto_and_sonnet_floor_choose_cheapest_qualified_builder() {
         let rows = vec![
             row("claude-sonnet-5", Some("high"), 0.48, 7.0),
             row("luna", Some("high"), 0.44, 0.7),
             row("terra", Some("high"), 0.54, 1.1),
+            row("sol", Some("high"), 0.69, 3.4),
             row("dominated", Some("high"), 0.43, 2.0),
         ];
-        assert_eq!(eitri_choice(&rows).unwrap().model, "luna");
+        assert_eq!(eitri_frontier_choice(&rows, 0.48).unwrap().model, "terra");
+    }
+
+    #[test]
+    fn eitri_floor_falls_back_to_strongest_frontier_model() {
+        let rows = vec![
+            row("cheap", Some("high"), 0.40, 0.5),
+            row("strong", Some("high"), 0.47, 1.5),
+        ];
+        assert_eq!(eitri_frontier_choice(&rows, 0.48).unwrap().model, "strong");
     }
 
     #[test]
@@ -331,6 +335,12 @@ mod tests {
         let parsed = parse(BUNDLED_SNAPSHOT).unwrap();
         let eligible = eligible_high(&parsed.rows);
         assert_eq!(eligible[0].model, "gpt-5-6-sol");
-        assert_eq!(eitri_choice(&eligible).unwrap().model, "gpt-5-6-sol");
+        let anchor = sonnet_anchor(&eligible).expect("Sonnet anchor");
+        assert_eq!(
+            eitri_frontier_choice(&eligible, anchor.pass_at_1)
+                .unwrap()
+                .model,
+            "gpt-5-6-terra"
+        );
     }
 }

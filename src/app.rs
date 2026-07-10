@@ -1048,7 +1048,7 @@ impl AppState {
 
     pub fn council_summary(&self) -> String {
         let mut text = format!(
-            "Council models\n\nChange with: /council <thor|loki|eitri> <auto|model-id>\n\nConfigured\n  Thor   {}\n  Loki   {}\n  Eitri  {}\n\nAuto selection · DeepSWE\n  Loki chooses the best launchable model from a provider other than Thor's.\n\nAvailable models\n",
+            "Council models\n\nChange with: /council <thor|loki|eitri> <auto|model-id>\n\nConfigured\n  Thor   {}\n  Loki   {}\n  Eitri  {}\n\nAuto selection · DeepSWE\n  Loki chooses the best launchable model from a provider other than Thor's.\n  Eitri chooses the cheapest Pareto model meeting the Sonnet High quality floor.\n\nAvailable models\n",
             self.council_models.thor, self.council_models.loki, self.council_models.eitri
         );
         for choice in &self.council_choices {
