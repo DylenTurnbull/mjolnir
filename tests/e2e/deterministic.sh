@@ -120,6 +120,7 @@ run_case() {
       grep -a "Loki intervenes against" "$root/transcript.log" >/dev/null
     fi
     grep -a "nested-terminal-output" "$root/transcript.log" >/dev/null
+    grep -a "codex-metadata-terminal-output" "$root/transcript.log" >/dev/null
     grep -a 'permission:' "$root/nested.log" >/dev/null
     if [ "$mode" = details ]; then
       node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); const done=Number(fs.readFileSync(process.argv[2],"utf8").match(/completion:(\d+)/)?.[1]); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || r.response.isError || !text.endsWith("EITRI_LONG_SUFFIX") || !done || r.toolReceivedAt<done) process.exit(1)' "$root/primary-result.json" "$root/nested.log"

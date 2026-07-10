@@ -186,6 +186,11 @@ input.on("line", (line) => {
     update({ sessionUpdate: "tool_call", toolCallId: "nested-tool", title: "fixture terminal command", kind: "execute", status: "in_progress", content: [{ type: "terminal", terminalId: message.result.terminalId }] });
     setTimeout(() => {
       update({ sessionUpdate: "tool_call_update", toolCallId: "nested-tool", status: "completed" });
+      update({ sessionUpdate: "tool_call", toolCallId: "codex-meta-tool", title: "fixture codex metadata command", kind: "execute", status: "in_progress", content: [{ type: "terminal", terminalId: "codex-meta-tool" }] });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "codex-meta-tool", status: "completed", _meta: {
+        terminal_output: { terminal_id: "codex-meta-tool", data: "codex-metadata-terminal-output" },
+        terminal_exit: { terminal_id: "codex-meta-tool", exit_code: 0, signal: null },
+      } });
       update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: eitriResult() } });
       log(`completion:${Date.now()}`); send({ id: promptRequestId, result: { stopReason: "end_turn" } });
     }, 250);

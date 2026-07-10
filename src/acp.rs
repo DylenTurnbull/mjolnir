@@ -1312,6 +1312,8 @@ where
         crate::transcript_bridge::TranscriptBridge::default(),
     ));
     let notif_transcript_bridge = transcript_bridge.clone();
+    let terminal_metadata_bridge = Arc::new(Mutex::new(TerminalMetadataBridge::default()));
+    let notif_terminal_metadata_bridge = terminal_metadata_bridge.clone();
     let context_usage = Arc::new(ContextUsageTracker::default());
     let notif_context_usage = context_usage.clone();
     let read_filesystem = filesystem.clone();
@@ -1332,10 +1334,17 @@ where
                     .is_active_session(&notification.session_id)
                     .await
                 {
+                    let terminal_snapshots = notif_terminal_metadata_bridge
+                        .lock()
+                        .await
+                        .observe(&notification.session_id, &notification.update);
                     if let SessionUpdate::UsageUpdate(usage) = &notification.update {
                         notif_context_usage.observe(usage.used);
                     }
                     if !notif_primary_updates_suppressed.load(Ordering::Acquire) {
+                        for snapshot in terminal_snapshots {
+                            let _ = notif_ui_tx.send(UiEvent::TerminalOutput(snapshot));
+                        }
                         for activity in notif_transcript_bridge
                             .lock()
                             .await
@@ -1542,6 +1551,11 @@ async fn drive_session(
 ) -> Result<()> {
     // Advertise the client capabilities backed by handlers registered in
     // `drive_client` above.
+    let mut client_meta = serde_json::Map::new();
+    // codex-acp uses this ACP extension to stream command output through
+    // tool-call metadata instead of terminal/create. Request full snapshots;
+    // the receiver also accepts deltas for older adapters.
+    client_meta.insert("terminal_output".to_string(), serde_json::Value::Bool(true));
     let client_capabilities = ClientCapabilities::new()
         .fs(FileSystemCapabilities::new()
             .read_text_file(true)
@@ -1551,7 +1565,8 @@ async fn drive_session(
             ElicitationCapabilities::new()
                 .form(ElicitationFormCapabilities::new())
                 .url(ElicitationUrlCapabilities::new()),
-        );
+        )
+        .meta(client_meta);
     let init_req = InitializeRequest::new(ProtocolVersion::V1)
         .client_info(client_implementation())
         .client_capabilities(client_capabilities);
@@ -2949,6 +2964,13 @@ impl TerminalOutputBuffer {
         self.truncate_to_limit();
     }
 
+    fn replace(&mut self, text: &str) {
+        self.output.clear();
+        self.output.push_str(text);
+        self.truncated = false;
+        self.truncate_to_limit();
+    }
+
     fn truncate_to_limit(&mut self) {
         if self.output.len() <= self.limit {
             return;
@@ -2965,6 +2987,112 @@ impl TerminalOutputBuffer {
         }
         self.output.drain(..start);
     }
+}
+
+#[derive(Default)]
+struct TerminalMetadataBridge {
+    terminals: HashMap<(String, String), MetadataTerminalState>,
+}
+
+struct MetadataTerminalState {
+    output: TerminalOutputBuffer,
+    exit_status: Option<TerminalExitStatus>,
+}
+
+impl Default for MetadataTerminalState {
+    fn default() -> Self {
+        Self {
+            output: TerminalOutputBuffer::new(DEFAULT_TERMINAL_OUTPUT_LIMIT),
+            exit_status: None,
+        }
+    }
+}
+
+impl TerminalMetadataBridge {
+    fn observe(
+        &mut self,
+        session_id: &SessionId,
+        update: &SessionUpdate,
+    ) -> Vec<TerminalOutputSnapshot> {
+        let meta = match update {
+            SessionUpdate::ToolCall(tool_call) => tool_call.meta.as_ref(),
+            SessionUpdate::ToolCallUpdate(update) => update.meta.as_ref(),
+            _ => None,
+        };
+        let Some(meta) = meta else {
+            return Vec::new();
+        };
+
+        let session_id = session_id.to_string();
+        let mut touched = BTreeSet::new();
+        if let Some((terminal_id, data)) = terminal_metadata_output(meta, "terminal_output") {
+            let state = self
+                .terminals
+                .entry((session_id.clone(), terminal_id.clone()))
+                .or_default();
+            state.output.replace(data);
+            touched.insert(terminal_id);
+        }
+        if let Some((terminal_id, data)) = terminal_metadata_output(meta, "terminal_output_delta") {
+            let state = self
+                .terminals
+                .entry((session_id.clone(), terminal_id.clone()))
+                .or_default();
+            state.output.append(data.as_bytes());
+            touched.insert(terminal_id);
+        }
+        if let Some((terminal_id, exit_status)) = terminal_metadata_exit(meta) {
+            let state = self
+                .terminals
+                .entry((session_id.clone(), terminal_id.clone()))
+                .or_default();
+            state.exit_status = Some(exit_status);
+            touched.insert(terminal_id);
+        }
+
+        touched
+            .into_iter()
+            .filter_map(|terminal_id| {
+                self.terminals
+                    .get(&(session_id.clone(), terminal_id.clone()))
+                    .map(|state| TerminalOutputSnapshot {
+                        terminal_id,
+                        output: state.output.output.clone(),
+                        truncated: state.output.truncated,
+                        exit_status: state.exit_status.clone(),
+                    })
+            })
+            .collect()
+    }
+}
+
+fn terminal_metadata_output<'a>(
+    meta: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<(String, &'a str)> {
+    let value = meta.get(key)?.as_object()?;
+    let terminal_id = value.get("terminal_id")?.as_str()?.to_string();
+    let data = value.get("data")?.as_str()?;
+    Some((terminal_id, data))
+}
+
+fn terminal_metadata_exit(
+    meta: &serde_json::Map<String, serde_json::Value>,
+) -> Option<(String, TerminalExitStatus)> {
+    let value = meta.get("terminal_exit")?.as_object()?;
+    let terminal_id = value.get("terminal_id")?.as_str()?.to_string();
+    let mut status = TerminalExitStatus::new();
+    if let Some(exit_code) = value
+        .get("exit_code")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|code| u32::try_from(code).ok())
+    {
+        status = status.exit_code(exit_code);
+    }
+    if let Some(signal) = value.get("signal").and_then(serde_json::Value::as_str) {
+        status = status.signal(signal.to_string());
+    }
+    Some((terminal_id, status))
 }
 
 impl ManagedTerminals {
@@ -4912,6 +5040,67 @@ mod tests {
         assert!(buffer.output.is_char_boundary(0));
     }
 
+    #[test]
+    fn terminal_metadata_bridge_merges_deltas_and_exit_status() {
+        fn update(meta: serde_json::Value) -> SessionUpdate {
+            SessionUpdate::ToolCallUpdate(
+                ToolCallUpdate::new("tool-1", ToolCallUpdateFields::new())
+                    .meta(meta.as_object().expect("metadata object").clone()),
+            )
+        }
+
+        let session_id = SessionId::new("session-1");
+        let mut bridge = TerminalMetadataBridge::default();
+        let first = bridge.observe(
+            &session_id,
+            &update(serde_json::json!({
+                "terminal_output_delta": {"terminal_id": "tool-1", "data": "hello"}
+            })),
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].output, "hello");
+        assert!(first[0].exit_status.is_none());
+
+        let completed = bridge.observe(
+            &session_id,
+            &update(serde_json::json!({
+                "terminal_output_delta": {"terminal_id": "tool-1", "data": " world"},
+                "terminal_exit": {"terminal_id": "tool-1", "exit_code": 7, "signal": null}
+            })),
+        );
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].output, "hello world");
+        let status = completed[0].exit_status.as_ref().expect("exit status");
+        assert_eq!(status.exit_code, Some(7));
+        assert_eq!(status.signal, None);
+    }
+
+    #[test]
+    fn terminal_metadata_bridge_full_output_replaces_prior_snapshot() {
+        fn update(data: &str) -> SessionUpdate {
+            SessionUpdate::ToolCallUpdate(
+                ToolCallUpdate::new("tool-1", ToolCallUpdateFields::new()).meta(
+                    serde_json::json!({
+                        "terminal_output": {"terminal_id": "tool-1", "data": data}
+                    })
+                    .as_object()
+                    .expect("metadata object")
+                    .clone(),
+                ),
+            )
+        }
+
+        let session_id = SessionId::new("session-1");
+        let mut bridge = TerminalMetadataBridge::default();
+        bridge.observe(&session_id, &update("first"));
+        let snapshots = bridge.observe(&session_id, &update("replacement"));
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].terminal_id, "tool-1");
+        assert_eq!(snapshots[0].output, "replacement");
+        assert!(!snapshots[0].truncated);
+    }
+
     #[tokio::test]
     async fn managed_terminal_runs_command_and_releases() {
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
@@ -5390,6 +5579,13 @@ mod tests {
                     assert!(req.client_capabilities.terminal);
                     assert!(req.client_capabilities.fs.read_text_file);
                     assert!(req.client_capabilities.fs.write_text_file);
+                    assert_eq!(
+                        req.client_capabilities
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.get("terminal_output")),
+                        Some(&serde_json::Value::Bool(true))
+                    );
                     let client_info = req.client_info.expect("clientInfo");
                     assert_eq!(client_info.name, env!("CARGO_PKG_NAME"));
                     assert_eq!(client_info.version, env!("CARGO_PKG_VERSION"));
