@@ -750,10 +750,14 @@ async fn run(
 }
 
 fn with_workspace_receipt(message: &str, delta: &WorkspaceDelta) -> String {
-    format!(
+    let mut result = format!(
         "{message}\n\n<workspace_delta scope=\"eitri-invocation\">\n{}\n</workspace_delta>",
         delta.receipt()
-    )
+    );
+    if delta.changed() {
+        result.push_str("\n\nYou should review Eitri's work now.");
+    }
+    result
 }
 
 fn continuation_prompt(_task: &str, critique: &str, _trajectory: &str) -> String {

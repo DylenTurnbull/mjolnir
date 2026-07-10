@@ -147,9 +147,9 @@ run_case() {
     grep -a "changed by Eitri" "$root/loki.log" >/dev/null
     grep -a 'permission:' "$root/nested.log" >/dev/null
     if [ "$mode" = details ]; then
-      node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); const done=Number(fs.readFileSync(process.argv[2],"utf8").match(/completion:(\d+)/)?.[1]); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || r.response.isError || !text.includes("EITRI_LONG_SUFFIX") || !text.includes("<workspace_delta scope=\"eitri-invocation\">") || !text.includes("eitri-change.txt") || text.includes("seed.txt") || text.includes("diff --git") || !done || r.toolReceivedAt<done) process.exit(1)' "$root/primary-result.json" "$root/nested.log"
+      node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); const done=Number(fs.readFileSync(process.argv[2],"utf8").match(/completion:(\d+)/)?.[1]); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || r.response.isError || !text.includes("EITRI_LONG_SUFFIX") || !text.includes("<workspace_delta scope=\"eitri-invocation\">") || !text.includes("eitri-change.txt") || !text.includes("You should review Eitri\u0027s work now.") || text.includes("seed.txt") || text.includes("diff --git") || !done || r.toolReceivedAt<done) process.exit(1)' "$root/primary-result.json" "$root/nested.log"
     else
-      node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); const done=Number(fs.readFileSync(process.argv[2],"utf8").match(/completion:(\d+)/g)?.at(-1)?.split(":")[1]); const text=r.response.content?.map(x=>x.text||"").join(""); const secondNoop=process.argv[3]==="loki-thor"; const badDelta=secondNoop ? !text.includes("No workspace changes.") || text.includes("eitri-change.txt") : !text.includes("eitri-change.txt"); if(r.error || r.unauthorizedStatus!==401 || r.response.isError || !text.startsWith("CODEAGENT_E2E_OK") || !text.includes("<workspace_delta scope=\"eitri-invocation\">") || badDelta || text.includes("seed.txt") || text.includes("diff --git") || !done || r.toolReceivedAt<done) process.exit(1)' "$root/primary-result.json" "$root/nested.log" "$mode"
+      node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); const done=Number(fs.readFileSync(process.argv[2],"utf8").match(/completion:(\d+)/g)?.at(-1)?.split(":")[1]); const text=r.response.content?.map(x=>x.text||"").join(""); const secondNoop=process.argv[3]==="loki-thor"; const review="You should review Eitri\u0027s work now."; const badDelta=secondNoop ? !text.includes("No workspace changes.") || text.includes("eitri-change.txt") || text.includes(review) : !text.includes("eitri-change.txt") || !text.includes(review); if(r.error || r.unauthorizedStatus!==401 || r.response.isError || !text.startsWith("CODEAGENT_E2E_OK") || !text.includes("<workspace_delta scope=\"eitri-invocation\">") || badDelta || text.includes("seed.txt") || text.includes("diff --git") || !done || r.toolReceivedAt<done) process.exit(1)' "$root/primary-result.json" "$root/nested.log" "$mode"
     fi
     grep -a 'eitri-change.txt' "$root/primary.log" >/dev/null
     if grep -a 'seed.txt' "$root/primary.log" >/dev/null; then
@@ -159,14 +159,14 @@ run_case() {
   elif [ "$mode" = failed ]; then
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test -s "$root/primary-result.json"
-    node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || !r.response.isError || !text.includes("fixture Eitri failure") || !text.includes("eitri-partial.txt") || text.includes("seed.txt")) process.exit(1)' "$root/primary-result.json"
+    node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || !r.response.isError || !text.includes("fixture Eitri failure") || !text.includes("eitri-partial.txt") || !text.includes("You should review Eitri\u0027s work now.") || text.includes("seed.txt")) process.exit(1)' "$root/primary-result.json"
   else
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
     test -s "$root/primary-result.json"
     grep -a "Eitri" "$root/transcript.log" >/dev/null
     grep -a "cancel-received" "$root/nested.log" >/dev/null
-    node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || !r.response.isError || !text.includes("eitri-partial.txt") || text.includes("seed.txt")) process.exit(1)' "$root/primary-result.json"
+    node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || !r.response.isError || !text.includes("eitri-partial.txt") || !text.includes("You should review Eitri\u0027s work now.") || text.includes("seed.txt")) process.exit(1)' "$root/primary-result.json"
   fi
   remove_root
   trap - EXIT INT TERM
