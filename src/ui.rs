@@ -435,6 +435,7 @@ fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bo
         | Entry::CodeAgentPlan(_)
         | Entry::ActorActivity(_)
         | Entry::InternalMessage(_) => true,
+        Entry::EphemeralSystem(_) => false,
         Entry::AgentMessage(_)
         | Entry::AgentThought(_)
         | Entry::CodeAgentMessage(_)
@@ -3804,7 +3805,9 @@ fn transcript_export_markdown(state: &AppState) -> String {
                 };
                 push_export_text(&mut out, &heading, &message.text);
             }
-            Entry::System(text) => push_export_text(&mut out, "System", text),
+            Entry::System(text) | Entry::EphemeralSystem(text) => {
+                push_export_text(&mut out, "System", text)
+            }
             Entry::SessionBoundary(text) => push_export_text(&mut out, "Session", text),
             Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
                 let heading = if matches!(entry, Entry::CodeAgentPlan(_)) {
@@ -5380,7 +5383,7 @@ fn render_transcript_entry_range(
                     out.push(Line::from(""));
                 }
             }
-            Entry::System(text) => {
+            Entry::System(text) | Entry::EphemeralSystem(text) => {
                 push_styled_message(&mut out, text, theme.accent, collapse_message, theme);
             }
             Entry::SessionBoundary(text) => {
@@ -5489,7 +5492,7 @@ fn entry_speaker(entry: &Entry) -> Option<String> {
         | Entry::CodeAgentPlan(_) => Some("Eitri".to_string()),
         Entry::ActorActivity(activity) => Some(actor_role_name(actor_for_activity(activity))),
         Entry::InternalMessage(message) => Some(message.source.clone()),
-        Entry::System(_) | Entry::SessionBoundary(_) => None,
+        Entry::System(_) | Entry::EphemeralSystem(_) | Entry::SessionBoundary(_) => None,
     }
 }
 
@@ -12241,6 +12244,30 @@ mod tests {
     }
 
     #[test]
+    fn transcript_sink_waits_for_ephemeral_connection_message_to_finalize() {
+        let mut state = AppState::new();
+        let mut sink = TranscriptSink::default();
+        state.set_primary_acp_name("Claude Code");
+
+        state.announce_waiting_for_primary();
+        assert!(sink.pending_lines(&state, 80).is_empty());
+
+        state.apply_event(UiEvent::Connected {
+            agent_name: Some("claude-agent-acp".into()),
+            agent_version: Some("1.0".into()),
+            prompt_images_supported: false,
+            session_fork_supported: false,
+        });
+        let connected: Vec<String> = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(connected, vec!["Connected to Claude Code", ""]);
+        assert!(sink.pending_lines(&state, 80).is_empty());
+    }
+
+    #[test]
     fn transcript_sink_can_resync_after_resize_replay() {
         let mut state = AppState::new();
         let mut sink = TranscriptSink::default();
@@ -16144,10 +16171,10 @@ mod tests {
         assert_eq!(state.image_attachments.len(), 1);
         let status = state.status_line.expect("status");
         assert_eq!(status.kind, StatusKind::Info);
-        assert_eq!(status.text, "waiting for Codex");
+        assert_eq!(status.text, "Waiting for Codex");
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::System(text)] if text == "waiting for Codex"
+            [Entry::EphemeralSystem(text)] if text == "Waiting for Codex"
         ));
     }
 

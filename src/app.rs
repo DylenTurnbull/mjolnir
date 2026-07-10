@@ -151,6 +151,8 @@ pub enum Entry {
     InternalMessage(InternalMessage),
     /// System-level note (errors, warnings, mode changes).
     System(String),
+    /// Live system note that becomes durable once its text is finalized.
+    EphemeralSystem(String),
     /// Visual separator inserted at local session boundaries so a freshly
     /// started session is not confused with the previous transcript.
     SessionBoundary(String),
@@ -611,7 +613,7 @@ pub struct AppState {
     /// Human-readable ACP adapter backing the primary model, such as Codex or
     /// Claude Code. Kept separate from the role/model label in the header.
     primary_acp_name: String,
-    primary_waiting_announced: bool,
+    primary_connection_announcement: Option<usize>,
     primary_connected_announced: bool,
     /// Registry `source_id` of the launched agent (e.g. `claude-acp`,
     /// `opencode`, `custom:foo`, `anvil`). Distinct from `agent_label`,
@@ -971,7 +973,7 @@ impl AppState {
             session_cwd: PathBuf::from("."),
             agent_label: String::new(),
             primary_acp_name: "ACP server".to_string(),
-            primary_waiting_announced: false,
+            primary_connection_announcement: None,
             primary_connected_announced: false,
             agent_source_id: String::new(),
             active_agent_launch: None,
@@ -1375,6 +1377,7 @@ impl AppState {
             | Entry::ActorActivity(_)
             | Entry::InternalMessage(_)
             | Entry::System(_)
+            | Entry::EphemeralSystem(_)
             | Entry::SessionBoundary(_) => None,
         })
     }
@@ -1484,20 +1487,27 @@ impl AppState {
     }
 
     pub fn announce_waiting_for_primary(&mut self) {
-        let message = format!("waiting for {}", self.primary_acp_name);
+        if self.primary_connected_announced {
+            return;
+        }
+        let message = format!("Waiting for {}", self.primary_acp_name);
         self.set_status_line(StatusKind::Info, message.clone());
-        if !self.primary_waiting_announced {
-            self.primary_waiting_announced = true;
-            self.push_system_message(message);
+        if self.primary_connection_announcement.is_none() {
+            self.primary_connection_announcement = Some(self.transcript.len());
+            self.transcript.push(Entry::EphemeralSystem(message));
+            self.bump_transcript_revision();
         }
     }
 
     fn announce_connected_to_primary(&mut self) {
         let message = format!("Connected to {}", self.primary_acp_name);
         self.set_status_line(StatusKind::Info, message.clone());
-        if self.primary_waiting_announced && !self.primary_connected_announced {
-            self.primary_connected_announced = true;
-            self.push_system_message(message);
+        self.primary_connected_announced = true;
+        if let Some(index) = self.primary_connection_announcement.take()
+            && let Some(entry @ Entry::EphemeralSystem(_)) = self.transcript.get_mut(index)
+        {
+            *entry = Entry::System(message);
+            self.bump_transcript_revision();
         }
     }
 
@@ -4327,7 +4337,7 @@ mod tests {
         state.announce_waiting_for_primary();
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::System(text)] if text == "waiting for Claude Code"
+            [Entry::EphemeralSystem(text)] if text == "Waiting for Claude Code"
         ));
         assert_eq!(
             state.status_line.as_ref().expect("waiting status").kind,
@@ -4340,12 +4350,11 @@ mod tests {
             prompt_images_supported: false,
             session_fork_supported: false,
         });
+        state.announce_waiting_for_primary();
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::System(waiting), Entry::System(connected)]
-                if waiting == "waiting for Claude Code"
-                    && connected == "Connected to Claude Code"
+            [Entry::System(connected)] if connected == "Connected to Claude Code"
         ));
         let status = state.status_line.as_ref().expect("connected status");
         assert_eq!(status.kind, StatusKind::Info);
