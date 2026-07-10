@@ -248,46 +248,24 @@ impl RuntimeSessionState {
     }
 }
 
-/// ACP does not expose a dedicated compaction notification. A decrease in the
-/// reported number of tokens currently in context is the portable signal that
-/// the agent replaced its history with a compacted one.
-#[derive(Default)]
-struct ContextUsageTracker {
-    last_used: AtomicU64,
-    directive_needed: AtomicBool,
+#[derive(Debug)]
+struct PrimaryPolicyState {
+    append_to_next_prompt: bool,
 }
 
-impl ContextUsageTracker {
-    fn observe(&self, used: u64) {
-        let previous = self.last_used.swap(used, Ordering::AcqRel);
-        if previous > 0 && used < previous {
-            self.directive_needed.store(true, Ordering::Release);
+impl PrimaryPolicyState {
+    fn new(code_agent_enabled: bool, resumed: bool) -> Self {
+        Self {
+            append_to_next_prompt: code_agent_enabled && !resumed,
         }
     }
 
-    fn mark_directive_sent(&self) {
-        self.directive_needed.store(false, Ordering::Release);
+    fn take_for_prompt(&mut self) -> bool {
+        std::mem::take(&mut self.append_to_next_prompt)
     }
 
-    fn reset_for_session(&self) {
-        self.last_used.store(0, Ordering::Release);
-        self.mark_directive_sent();
-    }
-
-    fn take_directive_needed(&self) -> bool {
-        self.directive_needed.swap(false, Ordering::AcqRel)
-    }
-
-    fn mark_directive_needed(&self) {
-        self.directive_needed.store(true, Ordering::Release);
-    }
-}
-
-struct PrimaryUpdateSuppression<'a>(&'a AtomicBool);
-
-impl Drop for PrimaryUpdateSuppression<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+    fn loaded_existing_session(&mut self) {
+        self.append_to_next_prompt = false;
     }
 }
 
@@ -1304,12 +1282,8 @@ where
     let perm_session_state = session_state.clone();
     let notif_ui_tx = ui_tx.clone();
     let notif_session_state = session_state.clone();
-    let primary_updates_suppressed = Arc::new(AtomicBool::new(false));
-    let notif_primary_updates_suppressed = primary_updates_suppressed.clone();
     let terminal_metadata_bridge = Arc::new(Mutex::new(TerminalMetadataBridge::default()));
     let notif_terminal_metadata_bridge = terminal_metadata_bridge.clone();
-    let context_usage = Arc::new(ContextUsageTracker::default());
-    let notif_context_usage = context_usage.clone();
     let read_filesystem = filesystem.clone();
     let write_filesystem = filesystem.clone();
     let create_terminals = terminals.clone();
@@ -1332,15 +1306,10 @@ where
                         .lock()
                         .await
                         .observe(&notification.session_id, &notification.update);
-                    if let SessionUpdate::UsageUpdate(usage) = &notification.update {
-                        notif_context_usage.observe(usage.used);
+                    for snapshot in terminal_snapshots {
+                        let _ = notif_ui_tx.send(UiEvent::TerminalOutput(snapshot));
                     }
-                    if !notif_primary_updates_suppressed.load(Ordering::Acquire) {
-                        for snapshot in terminal_snapshots {
-                            let _ = notif_ui_tx.send(UiEvent::TerminalOutput(snapshot));
-                        }
-                        let _ = notif_ui_tx.send(UiEvent::SessionUpdate(notification.update));
-                    }
+                    let _ = notif_ui_tx.send(UiEvent::SessionUpdate(notification.update));
                 }
                 Ok(())
             },
@@ -1491,8 +1460,6 @@ where
                 role_config,
                 code_agent,
                 drive_code_agent_controller,
-                primary_updates_suppressed,
-                context_usage,
             )
             .await
             {
@@ -1533,8 +1500,6 @@ async fn drive_session(
     role_config: Option<RuntimeRoleConfig>,
     code_agent: Option<code_agent::Config>,
     code_agent_controller: code_agent::Controller,
-    primary_updates_suppressed: Arc<AtomicBool>,
-    context_usage: Arc<ContextUsageTracker>,
 ) -> Result<()> {
     // Advertise the client capabilities backed by handlers registered in
     // `drive_client` above.
@@ -1744,16 +1709,9 @@ async fn drive_session(
         emit_fatal(ui_tx, &fatal_emitted, text.clone());
         return Err(anyhow::anyhow!(text));
     }
-    if code_agent_http.is_some() {
-        context_usage.reset_for_session();
-        if let Err(error) =
-            send_primary_session_directive(&conn, &session_id, &primary_updates_suppressed).await
-        {
-            let text = format!("primary agent rejected the code-agent session directive: {error}");
-            emit_fatal(ui_tx, &fatal_emitted, text.clone());
-            return Err(anyhow::anyhow!(text));
-        }
-    }
+    // A new Thor session receives its policy as a suffix on the first real
+    // user message. A resumed/loaded session is never modified implicitly.
+    let mut primary_policy = PrimaryPolicyState::new(code_agent_http.is_some(), resumed);
     if !resumed && !saved_session_config.is_empty() {
         apply_saved_session_config(
             &conn,
@@ -1784,24 +1742,7 @@ async fn drive_session(
         match cmd {
             UiCommand::SendPrompt { text, images } => {
                 session_state.clear_permissions_cancelled(&session_id).await;
-                if code_agent_http.is_some()
-                    && context_usage.take_directive_needed()
-                    && let Err(error) = send_primary_session_directive(
-                        &conn,
-                        &session_id,
-                        &primary_updates_suppressed,
-                    )
-                    .await
-                {
-                    context_usage.mark_directive_needed();
-                    let _ = ui_tx.send(UiEvent::PromptFailed {
-                        message: format!(
-                            "could not restore code-agent policy after context compaction: {error}"
-                        ),
-                    });
-                    continue;
-                }
-                let prompt = prompt_content_blocks(text, images);
+                let prompt = prompt_content_blocks(text, images, primary_policy.take_for_prompt());
                 let req = PromptRequest::new(session_id.clone(), prompt);
                 if !drive_prompt_turn(
                     &conn,
@@ -1863,21 +1804,6 @@ async fn drive_session(
                 {
                     break;
                 }
-                if code_agent_http.is_some() {
-                    context_usage.reset_for_session();
-                    if let Err(error) = send_primary_session_directive(
-                        &conn,
-                        &session_id,
-                        &primary_updates_suppressed,
-                    )
-                    .await
-                    {
-                        context_usage.mark_directive_needed();
-                        let _ = ui_tx.send(UiEvent::Warning(format!(
-                            "could not install code-agent policy in forked session: {error}"
-                        )));
-                    }
-                }
             }
             UiCommand::LoadSession {
                 session_id: requested_session_id,
@@ -1915,6 +1841,7 @@ async fn drive_session(
                         ));
                     }
                     let _ = responder.send(LoadSessionResult::Switched);
+                    primary_policy.loaded_existing_session();
                     continue;
                 }
                 if init_resp
@@ -1951,21 +1878,7 @@ async fn drive_session(
                 {
                     Ok(switched_session_id) => {
                         session_id = switched_session_id;
-                        if code_agent_http.is_some() {
-                            context_usage.reset_for_session();
-                            if let Err(error) = send_primary_session_directive(
-                                &conn,
-                                &session_id,
-                                &primary_updates_suppressed,
-                            )
-                            .await
-                            {
-                                context_usage.mark_directive_needed();
-                                let _ = ui_tx.send(UiEvent::Warning(format!(
-                                    "could not install code-agent policy in loaded session: {error}"
-                                )));
-                            }
-                        }
+                        primary_policy.loaded_existing_session();
                         let _ = responder.send(LoadSessionResult::Switched);
                     }
                     Err(launch_err) => {
@@ -3989,22 +3902,6 @@ struct PromptTurnDiffConfig<'a> {
     turn_id: u64,
 }
 
-async fn send_primary_session_directive(
-    conn: &ConnectionTo<Agent>,
-    session_id: &SessionId,
-    updates_suppressed: &AtomicBool,
-) -> std::result::Result<(), agent_client_protocol::Error> {
-    updates_suppressed.store(true, Ordering::Release);
-    let _suppression = PrimaryUpdateSuppression(updates_suppressed);
-    let request = PromptRequest::new(
-        session_id.clone(),
-        vec![ContentBlock::Text(TextContent::new(
-            code_agent::PRIMARY_SESSION_DIRECTIVE,
-        ))],
-    );
-    conn.send_request(request).block_task().await.map(|_| ())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn drive_prompt_turn(
     conn: &ConnectionTo<Agent>,
@@ -4369,7 +4266,16 @@ fn git_head_object_spec(rel_path: &Path) -> Option<String> {
     Some(format!("HEAD:{path}"))
 }
 
-fn prompt_content_blocks(text: String, images: Vec<PromptImage>) -> Vec<ContentBlock> {
+fn prompt_content_blocks(
+    mut text: String,
+    images: Vec<PromptImage>,
+    append_primary_policy: bool,
+) -> Vec<ContentBlock> {
+    let policy_after_images = append_primary_policy && text.is_empty();
+    if append_primary_policy && !text.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(code_agent::PRIMARY_SESSION_DIRECTIVE);
+    }
     let mut content = Vec::new();
     if !text.is_empty() {
         content.push(ContentBlock::Text(TextContent::new(text)));
@@ -4379,6 +4285,11 @@ fn prompt_content_blocks(text: String, images: Vec<PromptImage>) -> Vec<ContentB
             ContentBlock::Image(ImageContent::new(image.data_base64, image.mime_type))
         }),
     );
+    if policy_after_images {
+        content.push(ContentBlock::Text(TextContent::new(
+            code_agent::PRIMARY_SESSION_DIRECTIVE,
+        )));
+    }
     content
 }
 
@@ -4405,28 +4316,26 @@ mod tests {
     use tokio::io::split;
 
     #[test]
-    fn context_usage_drop_requests_session_directive_reinjection() {
-        let usage = ContextUsageTracker::default();
+    fn primary_policy_is_appended_once_for_a_new_session() {
+        let mut policy = PrimaryPolicyState::new(true, false);
 
-        usage.observe(20_000);
-        usage.observe(24_000);
-        assert!(!usage.take_directive_needed());
-
-        usage.observe(7_000);
-        assert!(usage.take_directive_needed());
-        assert!(!usage.take_directive_needed());
+        assert!(policy.take_for_prompt());
+        assert!(!policy.take_for_prompt());
     }
 
     #[test]
-    fn context_usage_reset_does_not_treat_new_session_as_compaction() {
-        let usage = ContextUsageTracker::default();
-        usage.observe(20_000);
-        usage.observe(7_000);
-        assert!(usage.take_directive_needed());
+    fn primary_policy_is_not_appended_when_resuming() {
+        let mut policy = PrimaryPolicyState::new(true, true);
 
-        usage.reset_for_session();
-        usage.observe(2_000);
-        assert!(!usage.take_directive_needed());
+        assert!(!policy.take_for_prompt());
+    }
+
+    #[test]
+    fn loading_an_existing_session_clears_a_pending_policy() {
+        let mut policy = PrimaryPolicyState::new(true, false);
+
+        policy.loaded_existing_session();
+        assert!(!policy.take_for_prompt());
     }
 
     #[test]
@@ -4515,6 +4424,7 @@ mod tests {
                 width: 640,
                 height: 480,
             }],
+            false,
         );
 
         assert_eq!(blocks.len(), 2);
@@ -4529,6 +4439,42 @@ mod tests {
             }
             other => panic!("unexpected image block: {other:?}"),
         }
+    }
+
+    #[test]
+    fn first_prompt_appends_primary_policy_after_user_text() {
+        let blocks = prompt_content_blocks("build the thing".to_string(), Vec::new(), true);
+
+        assert_eq!(blocks.len(), 1);
+        let ContentBlock::Text(text) = &blocks[0] else {
+            panic!("expected text block");
+        };
+        assert!(
+            text.text
+                .starts_with("build the thing\n\n<mj-code-agent-policy>")
+        );
+        assert!(text.text.ends_with("</mj-code-agent-policy>"));
+        assert!(!text.text.contains("MJ_CODE_AGENT_POLICY_READY"));
+    }
+
+    #[test]
+    fn image_only_first_prompt_puts_primary_policy_last() {
+        let blocks = prompt_content_blocks(
+            String::new(),
+            vec![PromptImage {
+                data_base64: "aW1hZ2U=".to_string(),
+                mime_type: "image/png".to_string(),
+                width: 1,
+                height: 1,
+            }],
+            true,
+        );
+
+        assert!(matches!(blocks[0], ContentBlock::Image(_)));
+        let ContentBlock::Text(policy) = &blocks[1] else {
+            panic!("expected policy text after image");
+        };
+        assert!(policy.text.starts_with("<mj-code-agent-policy>"));
     }
 
     #[test]

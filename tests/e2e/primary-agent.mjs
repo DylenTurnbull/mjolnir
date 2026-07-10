@@ -240,16 +240,11 @@ input.on("line", (line) => {
     if (prompt.length === 1 && prompt[0]?.text?.includes("<mj-code-agent-policy>")) {
       directiveCount += 1;
       appendLog(`session-directive:${directiveCount}`);
-      send({
-        method: "session/update",
-        params: {
-          sessionId: "primary-session",
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "MJ_CODE_AGENT_POLICY_READY" },
-          },
-        },
-      });
+      if (!prompt[0].text.startsWith("write a hello world program in Python\n\n<mj-code-agent-policy>")) {
+        writeResult({ error: `policy was not appended to first user prompt: ${JSON.stringify(prompt)}` });
+        finishPrimary("PRIMARY FAILED: misplaced session coordinator directive");
+        return;
+      }
       if (directiveCount === 1) {
         send({
           method: "session/update",
@@ -265,13 +260,9 @@ input.on("line", (line) => {
             update: { sessionUpdate: "usage_update", used: 2000, size: 128000 },
           },
         });
-        setTimeout(() => send({ id: message.id, result: { stopReason: "end_turn" } }), 50);
-      } else {
-        send({ id: message.id, result: { stopReason: "end_turn" } });
       }
-      return;
     }
-    if (directiveCount !== 2 || prompt.length !== 1 || prompt[0]?.text !== "write a hello world program in Python") {
+    if (directiveCount !== 1 || prompt.length !== 1 || !prompt[0]?.text?.startsWith("write a hello world program in Python\n\n<mj-code-agent-policy>")) {
       writeResult({ error: `missing session coordinator directive: ${JSON.stringify(prompt)}` });
       finishPrimary("PRIMARY FAILED: missing session coordinator directive");
       return;

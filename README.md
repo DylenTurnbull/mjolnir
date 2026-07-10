@@ -94,11 +94,12 @@ reported as unavailable.
 
 ## Delegation and review
 
-Thor receives a session-level coordinator directive. It should use direct tools
-for small, tightly coupled edits and delegate self-contained implementation
-tasks with clear inputs and acceptance criteria to `code_agent`. It uses
-`explore_agent` for open-ended, multi-file research where locations or execution
-flow are not yet known.
+Mjolnir appends Thor's session-level coordinator policy to the first user
+message of a new session. It is not sent as a standalone turn or injected into
+resumed or compacted sessions. Thor should use direct tools for small, tightly
+coupled edits and delegate self-contained implementation tasks with clear inputs
+and acceptance criteria to `code_agent`. It uses `explore_agent` for open-ended,
+multi-file research where locations or execution flow are not yet known.
 
 During a handoff, Thor's foreground ACP lane is detached and Eitri's fresh ACP
 session streams directly through the normal Mjolnir UI. Ctrl-C cancels the

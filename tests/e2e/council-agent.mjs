@@ -223,13 +223,17 @@ input.on("line", (line) => {
     if (text.includes("<mj-code-agent-policy>")) {
       if (process.env.MJ_E2E_PRIMARY_PID) fs.writeFileSync(process.env.MJ_E2E_PRIMARY_PID, String(process.pid));
       directiveCount += 1; append(primaryLog, `session-directive:${directiveCount}`);
-      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "MJ_CODE_AGENT_POLICY_READY" } });
+      const policyOffset = text.indexOf("\n\n<mj-code-agent-policy>");
+      if (policyOffset <= 0 || !text.endsWith("</mj-code-agent-policy>")) {
+        send({ id: message.id, error: { code: -32602, message: "policy was not appended to the first user prompt" } });
+        return;
+      }
       if (directiveCount === 1) {
         update({ sessionUpdate: "usage_update", used: 12000, size: 128000 });
         update({ sessionUpdate: "usage_update", used: 2000, size: 128000 });
       }
-      send({ id: message.id, result: { stopReason: "end_turn" } });
-    } else if (isEitri()) {
+    }
+    if (isEitri()) {
       startEitriTurn(text);
     } else if (isLoki()) {
       void runLokiTurn(text).catch((error) => {

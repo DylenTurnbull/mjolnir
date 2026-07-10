@@ -128,7 +128,7 @@ run_case() {
   elif [ "$mode" = explore ]; then
     grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
-    test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
+    test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 1
     test -s "$root/primary-result.json"
     grep -a 'Thor.*Eitri.*explore' "$root/transcript.log" >/dev/null
     grep -a 'search fixture architecture' "$root/transcript.log" >/dev/null
@@ -146,7 +146,7 @@ run_case() {
   elif [ "$mode" = explore-cancel ]; then
     grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
-    test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
+    test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 1
     test -s "$root/primary-result.json"
     grep -a 'search fixture architecture' "$root/transcript.log" >/dev/null
     grep -a 'cancel-received' "$root/nested.log" >/dev/null
@@ -157,7 +157,7 @@ run_case() {
   elif [ "$mode" = complete ] || [ "$mode" = loki-eitri ] || [ "$mode" = loki-thor ] || [ "$mode" = thor-review ] || [ "$mode" = details ]; then
     grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
-    test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
+    test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 1
     test -s "$root/primary-result.json"
     grep -a "Eitri" "$root/transcript.log" >/dev/null
     if [ "$mode" = details ]; then
@@ -210,7 +210,7 @@ run_case() {
   else
     grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
-    test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
+    test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 1
     test -s "$root/primary-result.json"
     grep -a "Eitri" "$root/transcript.log" >/dev/null
     grep -a "cancel-received" "$root/nested.log" >/dev/null
