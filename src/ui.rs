@@ -5066,10 +5066,12 @@ fn render_transcript_entry_range(
                 }
             }
             Entry::System(text) => {
-                out.push(Line::from(Span::styled(
-                    text.clone(),
-                    Style::default().fg(theme.accent),
-                )));
+                for line in text.split('\n') {
+                    out.push(Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(theme.accent),
+                    )));
+                }
                 out.push(Line::from(""));
             }
             Entry::SessionBoundary(text) => {
@@ -13027,6 +13029,31 @@ mod tests {
         assert!(rendered.iter().any(|line| line == "- bold item"));
         assert!(rendered.iter().any(|line| line == "code rs"));
         assert!(rendered.iter().any(|line| line == "  let x = 1;"));
+    }
+
+    #[test]
+    fn multiline_system_messages_preserve_logical_lines() {
+        let mut state = AppState::new();
+        state.transcript.push(Entry::System(
+            "Council models\n\nConfigured\n  Thor   auto\n  Loki   auto".to_string(),
+        ));
+
+        let rendered: Vec<String> = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "Council models",
+                "",
+                "Configured",
+                "  Thor   auto",
+                "  Loki   auto",
+                "",
+            ]
+        );
     }
 
     #[test]

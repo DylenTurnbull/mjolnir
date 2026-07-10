@@ -1045,23 +1045,20 @@ impl AppState {
 
     pub fn council_summary(&self) -> String {
         let mut text = format!(
-            "Council models (change with /council <thor|loki|eitri> <auto|model-id>)\nThor: {}\nLoki: {}\nEitri: {}\n\nAuto (DeepSWE)\n",
+            "Council models\n\nChange with: /council <thor|loki|eitri> <auto|model-id>\n\nConfigured\n  Thor   {}\n  Loki   {}\n  Eitri  {}\n\nAuto selection · DeepSWE\n  Loki chooses the best launchable model from a provider other than Thor's.\n\nAvailable models\n",
             self.council_models.thor, self.council_models.loki, self.council_models.eitri
-        );
-        text.push_str(
-            "Loki Auto chooses the best launchable model from a provider other than Thor's.\n",
         );
         for choice in &self.council_choices {
             if choice.available {
                 text.push_str(&format!(
-                    "✓ {} · Pass@1 {:.1}% · ${:.2}\n",
+                    "  ✓ {} · Pass@1 {:.1}% · ${:.2}\n",
                     choice.model,
                     choice.pass_at_1 * 100.0,
                     choice.mean_cost_usd
                 ));
             } else {
                 text.push_str(&format!(
-                    "× {} · {}\n",
+                    "  × {} · {}\n",
                     choice.model,
                     choice.disabled_reason.as_deref().unwrap_or("unavailable")
                 ));
