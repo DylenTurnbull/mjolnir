@@ -172,28 +172,74 @@ struct TranscriptCache {
 #[derive(Debug, Default)]
 struct TranscriptSink {
     emitted_entries: usize,
+    /// A tool call was flushed while it was the last transcript entry, so its
+    /// trailing separator blank is held back until we know what follows. The
+    /// tool *content* still flushes immediately (streaming promptness); only
+    /// the one blank row waits, so a following tool call can abut instead of
+    /// being pushed off by a separator that scrollback can never retract.
+    deferred_tool_separator: bool,
 }
 
 impl TranscriptSink {
     fn pending_lines(&mut self, state: &AppState, width: u16) -> Vec<Line<'static>> {
-        let stable_entries = stable_transcript_entry_count(state);
-        if stable_entries <= self.emitted_entries {
-            return Vec::new();
+        let mut out = Vec::new();
+
+        // Resolve a separator held back from an earlier flush now that we can
+        // see (or wait for) what follows the trailing tool call.
+        if self.deferred_tool_separator {
+            let successor = state.transcript.get(self.emitted_entries);
+            let successor_is_tool_call = successor.is_some_and(
+                |entry| matches!(entry, Entry::ToolCall(id) if state.tool_calls.contains_key(id)),
+            );
+            if successor_is_tool_call {
+                // The next entry is a tool call: let the rails abut.
+                self.deferred_tool_separator = false;
+            } else if successor.is_some() || !state.is_streaming() {
+                // A non-tool entry follows, or the turn ended with nothing
+                // after the tool call — the separator is owed now.
+                out.push(Line::from(""));
+                self.deferred_tool_separator = false;
+            }
+            // Otherwise still streaming with nothing new yet: keep holding it.
         }
-        let lines = render_transcript_entry_range(
-            state,
-            width,
-            self.emitted_entries..stable_entries,
-            transcript_collapse_limit(state),
-            state.theme,
-        );
-        self.emitted_entries = stable_entries;
-        lines
+
+        let stable_entries = stable_transcript_entry_count(state);
+        if stable_entries > self.emitted_entries {
+            let mut lines = render_transcript_entry_range(
+                state,
+                width,
+                self.emitted_entries..stable_entries,
+                transcript_collapse_limit(state),
+                state.theme,
+            );
+            // If the batch ends on a tool call that is (for now) the last
+            // transcript entry, its successor is unknown, so hold its trailing
+            // blank back rather than commit a separator we can't take back.
+            if state.is_streaming()
+                && stable_entries == state.transcript.len()
+                && matches!(state.transcript.last(), Some(Entry::ToolCall(_)))
+                && lines.last().is_some_and(is_blank_line)
+            {
+                lines.pop();
+                self.deferred_tool_separator = true;
+            }
+            out.append(&mut lines);
+            self.emitted_entries = stable_entries;
+        }
+
+        out
     }
 
     fn mark_emitted(&mut self, entries: usize) {
         self.emitted_entries = entries;
+        // The resize rebuild re-renders the whole stable range in one pass,
+        // trailing blank included, so nothing is owed afterward.
+        self.deferred_tool_separator = false;
     }
+}
+
+fn is_blank_line(line: &Line<'static>) -> bool {
+    line.spans.iter().all(|span| span.content.trim().is_empty())
 }
 
 #[derive(Debug, Default)]
@@ -4774,14 +4820,26 @@ fn render_transcript_entry_range(
     theme: TerminalTheme,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
-    for entry in state.transcript[entry_range].iter() {
+    for (offset, entry) in state.transcript[entry_range.clone()].iter().enumerate() {
+        let idx = entry_range.start + offset;
         match entry {
-            Entry::UserPrompt(text) => push_plain_block(&mut out, "you", theme.user, text.clone()),
+            Entry::UserPrompt(text) => {
+                let mut body = Vec::new();
+                push_plain_lines(&mut body, text.clone(), 0);
+                push_role_block(&mut out, USER_GLYPH, theme.user, body, width);
+            }
             Entry::AgentMessage(text) => {
-                push_markdown_block(&mut out, "agent", theme.agent, text.clone(), theme)
+                let mut body = Vec::new();
+                push_markdown_lines(&mut body, text.clone(), 0, theme);
+                push_role_block(&mut out, AGENT_GLYPH, theme.agent, body, width);
             }
             Entry::AgentThought(text) => {
-                push_markdown_block(&mut out, "thought", theme.thought, text.clone(), theme)
+                let mut body = Vec::new();
+                push_markdown_lines(&mut body, text.clone(), 0, theme);
+                // Without the old "thought:" label line, the body color is
+                // what tells reasoning apart from the real reply.
+                dim_lines(&mut body, theme.thought);
+                push_role_block(&mut out, THOUGHT_GLYPH, theme.thought, body, width);
             }
             Entry::Plan(entries) => {
                 out.push(Line::from(Span::styled(
@@ -4859,7 +4917,15 @@ fn render_transcript_entry_range(
                             out.push(with_tool_gutter(row, color));
                         }
                     }
-                    out.push(Line::from(""));
+                    // Consecutive tool calls read as one activity run: let
+                    // their rails abut instead of separating every call with
+                    // a blank row.
+                    let next_is_tool_call = state.transcript.get(idx + 1).is_some_and(|next| {
+                        matches!(next, Entry::ToolCall(next_id) if state.tool_calls.contains_key(next_id))
+                    });
+                    if !next_is_tool_call {
+                        out.push(Line::from(""));
+                    }
                 }
             }
             Entry::System(text) => {
@@ -4898,28 +4964,76 @@ fn session_boundary_line(text: &str, width: u16, theme: TerminalTheme) -> Line<'
     ])
 }
 
-fn push_markdown_block(
+/// Role glyphs shown in the two-cell gutter that opens every prose block:
+/// `❯` for the user's prompt, `●` for the agent's reply, `○` for reasoning.
+/// They replace the old full-width `you:`/`agent:`/`thought:` label lines,
+/// which cost one row per block and made turn-heavy transcripts read as a
+/// stack of headers.
+const USER_GLYPH: &str = "❯";
+const AGENT_GLYPH: &str = "●";
+const THOUGHT_GLYPH: &str = "○";
+const ROLE_GUTTER_WIDTH: u16 = 2;
+
+/// Frame a prose block (user prompt, agent message, thought) with a role
+/// gutter: a colored glyph on the first visual row and a two-space hanging
+/// indent on every continuation row. Wrapping happens here — as with tool
+/// blocks — so the hanging indent survives on wrapped rows; a glyph prepended
+/// to one logical line would leave continuation rows flush-left.
+fn push_role_block(
     out: &mut Vec<Line<'static>>,
-    label: &str,
+    glyph: &str,
     color: Color,
-    text: String,
-    theme: TerminalTheme,
+    body: Vec<Line<'static>>,
+    width: u16,
 ) {
-    out.push(Line::from(Span::styled(
-        format!("{label}:"),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )));
-    push_markdown_lines(out, text, 0, theme);
+    debug_assert_eq!(
+        glyph.width() + 1,
+        ROLE_GUTTER_WIDTH as usize,
+        "role glyph marker must be exactly ROLE_GUTTER_WIDTH cells wide"
+    );
+    let content_width = usize::from(width.saturating_sub(ROLE_GUTTER_WIDTH)).max(1);
+    let mut glyph_pending = true;
+    for line in body {
+        for row in wrap_tool_line(line, content_width) {
+            let row_is_empty = row.spans.iter().all(|span| span.content.trim().is_empty());
+            if row_is_empty {
+                // Leading blanks (before the glyph is placed) and interior
+                // paragraph breaks both render as truly empty rows; the glyph
+                // waits for the first row that carries content so it never
+                // lands on an empty line with the text detached below it.
+                out.push(Line::from(""));
+                continue;
+            }
+            let marker = if glyph_pending {
+                format!("{glyph} ")
+            } else {
+                " ".repeat(ROLE_GUTTER_WIDTH as usize)
+            };
+            glyph_pending = false;
+            let mut spans = vec![Span::styled(
+                marker,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )];
+            spans.extend(row.spans);
+            out.push(Line::from(spans));
+        }
+    }
     out.push(Line::from(""));
 }
 
-fn push_plain_block(out: &mut Vec<Line<'static>>, label: &str, color: Color, text: String) {
-    out.push(Line::from(Span::styled(
-        format!("{label}:"),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )));
-    push_plain_lines(out, text, 0);
-    out.push(Line::from(""));
+/// Re-tint every span in a thought body to the reasoning color so it reads
+/// uniformly as secondary text. This used to skip explicitly-colored spans, but
+/// markdown headings carry `theme.text` — the very primary color a real reply
+/// uses — so a heading inside reasoning rendered identically to a reply heading
+/// (and inline/fenced code kept its own color too). Flattening the whole body
+/// to the thought color is what actually keeps reasoning distinct from the
+/// answer; structure still reads from the indent and list/heading markers.
+fn dim_lines(lines: &mut [Line<'static>], color: Color) {
+    for line in lines {
+        for span in &mut line.spans {
+            span.style.fg = Some(color);
+        }
+    }
 }
 
 fn push_plain_lines(out: &mut Vec<Line<'static>>, text: String, indent: usize) {
@@ -4960,11 +5074,22 @@ fn push_markdown_lines_limited_inner(
     let mut in_code_block = false;
     let mut code_lang = String::new();
     let lines: Vec<&str> = text.split('\n').collect();
-    let (visible_count, hidden) = match collapse_limit {
-        Some(limit) if lines.len() > limit => (limit, lines.len() - limit),
-        _ => (lines.len(), 0),
-    };
-    for raw in &lines[..visible_count] {
+    // Collapse keeps the *tail*: for tool output the end is where the signal
+    // lives (the error, the test summary, the exit status), so hiding the head
+    // keeps exactly the lines the user wanted. The hint sits on top, standing
+    // in for the elided head.
+    let hidden = collapsed_head_len(lines.len(), collapse_limit);
+    // Replay fence toggles across the hidden head so a tail that starts
+    // inside a code block still renders as code.
+    for raw in &lines[..hidden] {
+        if raw.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+        }
+    }
+    if hidden > 0 {
+        push_collapse_hint(out, indent, hidden, theme);
+    }
+    for raw in &lines[hidden..] {
         let trimmed = raw.trim_start();
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
@@ -5060,9 +5185,6 @@ fn push_markdown_lines_limited_inner(
         let mut spans = vec![Span::styled(prefix.clone(), base_style)];
         spans.extend(inline_markdown_spans_with_style(raw, theme, base_style));
         out.push(Line::from(spans));
-    }
-    if hidden > 0 {
-        push_collapse_hint(out, indent, hidden, theme);
     }
 }
 
@@ -5429,25 +5551,34 @@ fn push_tool_text_lines(
 ) {
     let prefix = " ".repeat(indent);
     let lines: Vec<&str> = text.split('\n').collect();
-    let (visible_count, hidden) = match collapse_limit {
-        Some(limit) if lines.len() > limit => (limit, lines.len() - limit),
-        _ => (lines.len(), 0),
-    };
-    for raw in &lines[..visible_count] {
+    // Keep the tail, not the head — see push_markdown_lines_limited_inner.
+    let hidden = collapsed_head_len(lines.len(), collapse_limit);
+    if hidden > 0 {
+        push_collapse_hint(out, indent, hidden, theme);
+    }
+    for raw in &lines[hidden..] {
         let line = format!("{prefix}{raw}");
         out.push(Line::from(Span::styled(
             line,
             tool_output_line_style(raw, theme),
         )));
     }
-    if hidden > 0 {
-        push_collapse_hint(out, indent, hidden, theme);
+}
+
+/// Number of leading lines to hide so a collapsed block keeps its last `limit`
+/// lines — the tail, where errors, summaries, and exit status live. Returns `0`
+/// when there is no limit or the block already fits.
+fn collapsed_head_len(total_lines: usize, collapse_limit: Option<usize>) -> usize {
+    match collapse_limit {
+        Some(limit) if total_lines > limit => total_lines - limit,
+        _ => 0,
     }
 }
 
-/// Trailing "K more lines hidden" hint shown under collapsed tool outputs
-/// so the user can tell something was elided rather than assuming the
-/// output just ended.
+/// Leading "K earlier lines hidden" hint shown above collapsed tool outputs
+/// so the user can tell the head was elided rather than assuming the output
+/// started there. "Show all" is accurate in both modes: fullscreen Ctrl-T
+/// expands outputs in place, inline Ctrl-T opens the full-transcript reader.
 fn push_collapse_hint(
     out: &mut Vec<Line<'static>>,
     indent: usize,
@@ -5456,7 +5587,7 @@ fn push_collapse_hint(
 ) {
     let prefix = " ".repeat(indent);
     out.push(Line::from(Span::styled(
-        format!("{prefix}... {hidden} more lines hidden (Ctrl-T to expand)"),
+        format!("{prefix}... {hidden} earlier lines hidden (Ctrl-T to show all)"),
         Style::default()
             .fg(theme.muted)
             .add_modifier(Modifier::ITALIC),
@@ -11517,6 +11648,80 @@ mod tests {
     }
 
     #[test]
+    fn transcript_sink_abuts_sequential_tool_calls_like_full_render() {
+        // Regression: the streaming scrollback used to commit a trailing blank
+        // after a completed tool call before the next one existed, so two
+        // sequentially-run tool calls got a permanent blank between their rails
+        // — the opposite of the abutment the full render produces.
+        fn push_completed_tool_call(state: &mut AppState, id: &str, title: &str) {
+            state.tool_calls.insert(
+                id.to_string(),
+                crate::app::ToolCallView {
+                    title: title.to_string(),
+                    kind: ToolKind::Execute,
+                    status: ToolCallStatus::Completed,
+                    body: Vec::new(),
+                },
+            );
+            state.transcript.push(Entry::ToolCall(id.to_string()));
+        }
+
+        let mut state = AppState::new();
+        let mut sink = TranscriptSink::default();
+        state.record_user_prompt("go".to_string()); // turn in flight (streaming)
+
+        let mut emitted: Vec<String> = Vec::new();
+
+        // First tool call completes while it is still the last entry: its
+        // content flushes right away (promptness), but its trailing separator
+        // is held back until we know a following tool call could abut it.
+        push_completed_tool_call(&mut state, "call-1", "first");
+        emitted.extend(sink.pending_lines(&state, 80).iter().map(line_text));
+        assert!(
+            emitted.iter().any(|l| l.contains("first")),
+            "tool output must flush promptly, not wait for the next entry: {emitted:?}"
+        );
+        assert_ne!(
+            emitted.last().map(String::as_str),
+            Some(""),
+            "the trailing separator must be held back: {emitted:?}"
+        );
+
+        // Second tool call arrives; now call-1's held separator is dropped so
+        // the rails abut.
+        push_completed_tool_call(&mut state, "call-2", "second");
+        emitted.extend(sink.pending_lines(&state, 80).iter().map(line_text));
+
+        // Turn ends; the final held separator is emitted.
+        state.set_connection_state(ConnectionState::Ready);
+        emitted.extend(sink.pending_lines(&state, 80).iter().map(line_text));
+
+        // The incremental scrollback must match a single full render.
+        let full: Vec<String> = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(
+            emitted, full,
+            "incremental flush diverged from full render: {emitted:?} vs {full:?}"
+        );
+
+        let first = emitted
+            .iter()
+            .position(|l| l.contains("first"))
+            .expect("first tool row");
+        let second = emitted
+            .iter()
+            .position(|l| l.contains("second"))
+            .expect("second tool row");
+        assert_eq!(
+            second,
+            first + 1,
+            "sequential tool calls must abut in scrollback: {emitted:?}"
+        );
+    }
+
+    #[test]
     fn inline_resize_reflow_debounces_until_terminal_size_settles() {
         let mut reflow = InlineResizeReflow::default();
         let start = Instant::now();
@@ -11577,7 +11782,7 @@ mod tests {
         assert_eq!(snapshot.actual_height, 4);
         assert_eq!(snapshot.stable_entries, 1);
         let replayed: Vec<String> = snapshot.lines.iter().map(line_text).collect();
-        assert_eq!(replayed, vec!["you:", "hello from the resize test", ""]);
+        assert_eq!(replayed, vec!["❯ hello from", "  the resize", "  test", ""]);
     }
 
     #[test]
@@ -11618,7 +11823,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(prompt, vec!["you:", "hello", ""]);
+        assert_eq!(prompt, vec!["❯ hello", ""]);
         assert!(sink.pending_lines(&state, 80).is_empty());
 
         state.apply_event(UiEvent::PromptDone {
@@ -11630,7 +11835,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(rendered, vec!["agent:", "world", ""]);
+        assert_eq!(rendered, vec!["● world", ""]);
         assert!(sink.pending_lines(&state, 80).is_empty());
     }
 
@@ -11656,20 +11861,33 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(prompt, vec!["you:", "run tests", ""]);
+        assert_eq!(prompt, vec!["❯ run tests", ""]);
         assert!(sink.pending_lines(&state, 80).is_empty());
 
         let view = state.tool_calls.get_mut("call-1").expect("tool call");
         view.status = ToolCallStatus::Completed;
         view.body = vec![ToolCallOutput::Text("ok".to_string())];
 
+        // The tool content flushes immediately (streaming promptness); its
+        // trailing separator is held back until the successor is known so a
+        // following tool call could abut it.
         let rendered: Vec<String> = sink
             .pending_lines(&state, 80)
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(rendered, vec!["│ tool exec cargo test", "│   ok", ""]);
+        assert_eq!(rendered, vec!["│ tool exec cargo test", "│   ok"]);
         assert!(sink.pending_lines(&state, 80).is_empty());
+
+        // When the turn ends with nothing after the tool call, the held
+        // separator is finally emitted.
+        state.set_connection_state(ConnectionState::Ready);
+        let separator: Vec<String> = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(separator, vec![""]);
     }
 
     #[test]
@@ -11699,7 +11917,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(prompt, vec!["you:", "run tests", ""]);
+        assert_eq!(prompt, vec!["❯ run tests", ""]);
         assert!(
             sink.pending_lines(&state, 80).is_empty(),
             "completed terminal tool call must not flush before terminal exit status arrives"
@@ -11712,6 +11930,8 @@ mod tests {
             exit_status: Some(TerminalExitStatus::new().exit_code(0)),
         }));
 
+        // Content flushes on the exit snapshot; the trailing separator is
+        // held back (streaming) until the successor is known.
         let rendered: Vec<String> = sink
             .pending_lines(&state, 80)
             .iter()
@@ -11725,7 +11945,6 @@ mod tests {
                 "│     ok",
                 "│     ",
                 "│     exit code 0",
-                ""
             ]
         );
     }
@@ -11752,7 +11971,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(first_prompt, vec!["you:", "run tests", ""]);
+        assert_eq!(first_prompt, vec!["❯ run tests", ""]);
 
         state.apply_event(UiEvent::PromptDone {
             stop_reason: StopReason::Cancelled,
@@ -11779,7 +11998,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(next_prompt, vec!["you:", "next prompt", ""]);
+        assert_eq!(next_prompt, vec!["❯ next prompt", ""]);
     }
 
     #[test]
@@ -12173,7 +12392,7 @@ mod tests {
         assert!(rendered.contains("line 1"), "rendered:\n{rendered}");
         assert!(rendered.contains("line 20"), "rendered:\n{rendered}");
         assert!(
-            !rendered.contains("more lines hidden"),
+            !rendered.contains("lines hidden"),
             "reader must not collapse output, rendered:\n{rendered}"
         );
         assert!(rendered.contains("transcript"), "rendered:\n{rendered}");
@@ -12236,27 +12455,25 @@ mod tests {
             .map(line_text)
             .collect();
 
-        // First TOOL_OUTPUT_COLLAPSED_LINES lines are visible (framed by the
-        // tool gutter).
-        assert!(rendered.iter().any(|line| line == "│   line 1"));
-        assert!(
-            rendered
-                .iter()
-                .any(|line| line == &format!("│   line {}", TOOL_OUTPUT_COLLAPSED_LINES))
-        );
-        // Everything past the budget is hidden.
-        assert!(
-            !rendered
-                .iter()
-                .any(|line| line == &format!("│   line {}", TOOL_OUTPUT_COLLAPSED_LINES + 1))
-        );
-        // And a hint tells the user the rest exists.
+        // The last TOOL_OUTPUT_COLLAPSED_LINES lines are visible (framed by
+        // the tool gutter) — the tail is where errors and summaries live.
         let hidden = 20 - TOOL_OUTPUT_COLLAPSED_LINES;
         assert!(
             rendered
                 .iter()
-                .any(|line| line
-                    == &format!("│   ... {hidden} more lines hidden (Ctrl-T to expand)")),
+                .any(|line| line == &format!("│   line {}", hidden + 1))
+        );
+        assert!(rendered.iter().any(|line| line == "│   line 20"));
+        // Everything before the tail is hidden.
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line == &format!("│   line {hidden}"))
+        );
+        // And a leading hint tells the user the head was elided.
+        assert!(
+            rendered.iter().any(|line| line
+                == &format!("│   ... {hidden} earlier lines hidden (Ctrl-T to show all)")),
             "missing collapse hint, got: {rendered:?}"
         );
 
@@ -12266,12 +12483,9 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
+        assert!(expanded.iter().any(|line| line == "│   line 1"));
         assert!(expanded.iter().any(|line| line == "│   line 20"));
-        assert!(
-            !expanded
-                .iter()
-                .any(|line| line.contains("more lines hidden"))
-        );
+        assert!(!expanded.iter().any(|line| line.contains("lines hidden")));
     }
 
     #[test]
@@ -12805,11 +13019,10 @@ mod tests {
             .map(line_text)
             .collect();
 
-        assert!(rendered.iter().any(|line| line == "agent:"));
-        assert!(rendered.iter().any(|line| line == "# Result"));
-        assert!(rendered.iter().any(|line| line == "- bold item"));
-        assert!(rendered.iter().any(|line| line == "code rs"));
-        assert!(rendered.iter().any(|line| line == "  let x = 1;"));
+        assert!(rendered.iter().any(|line| line == "● # Result"));
+        assert!(rendered.iter().any(|line| line == "  - bold item"));
+        assert!(rendered.iter().any(|line| line == "  code rs"));
+        assert!(rendered.iter().any(|line| line == "    let x = 1;"));
     }
 
     #[test]
@@ -13070,10 +13283,9 @@ mod tests {
             assert_eq!(line.spans[0].style.fg, Some(theme.success));
         }
 
-        // The agent message stays flush-left with no rail; that contrast is
-        // the fix for issue #257.
-        assert!(lines.iter().any(|l| line_text(l) == "agent:"));
-        assert!(lines.iter().any(|l| line_text(l) == "hi there"));
+        // The agent message carries the role glyph, not the tool rail; that
+        // contrast is the fix for issue #257.
+        assert!(lines.iter().any(|l| line_text(l) == "● hi there"));
         assert!(
             !lines
                 .iter()
@@ -13147,10 +13359,165 @@ mod tests {
             .map(line_text)
             .collect();
 
-        assert!(rendered.iter().any(|line| line == "# literal"));
-        assert!(rendered.iter().any(|line| line == "`code` and **bold**"));
+        assert!(rendered.iter().any(|line| line == "❯ # literal"));
+        assert!(rendered.iter().any(|line| line == "  `code` and **bold**"));
         assert!(rendered.iter().any(|line| line == "│   # stdout"));
         assert!(rendered.iter().any(|line| line == "│   ok and bold"));
+    }
+
+    #[test]
+    fn consecutive_tool_calls_render_without_blank_row_between() {
+        let mut state = AppState::new();
+        for (id, title) in [("call-1", "first"), ("call-2", "second")] {
+            state.tool_calls.insert(
+                id.to_string(),
+                crate::app::ToolCallView {
+                    title: title.to_string(),
+                    kind: ToolKind::Execute,
+                    status: ToolCallStatus::Completed,
+                    body: Vec::new(),
+                },
+            );
+            state.transcript.push(Entry::ToolCall(id.to_string()));
+        }
+
+        let rendered: Vec<String> = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        let first = rendered
+            .iter()
+            .position(|line| line.contains("first"))
+            .expect("first tool row");
+        let second = rendered
+            .iter()
+            .position(|line| line.contains("second"))
+            .expect("second tool row");
+        assert_eq!(
+            second,
+            first + 1,
+            "consecutive tool rails should abut, got {rendered:?}"
+        );
+        // The run still ends with a separator row before whatever follows.
+        assert_eq!(rendered.last().map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn thought_blocks_render_dimmed_with_role_glyph() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state
+            .transcript
+            .push(Entry::AgentThought("weighing the options".to_string()));
+
+        let lines = render_transcript_lines(&state, 80);
+        let row = lines
+            .iter()
+            .find(|l| line_text(l).contains("weighing"))
+            .expect("thought row");
+        assert!(line_text(row).starts_with(THOUGHT_GLYPH));
+        for span in &row.spans {
+            assert_eq!(
+                span.style.fg,
+                Some(theme.thought),
+                "thought body must read as secondary text: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thought_markdown_heading_is_dimmed_not_left_at_reply_contrast() {
+        // A heading carries theme.text (the primary reply color); inside a
+        // thought it must still read as dimmed reasoning, not like a real
+        // reply heading.
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state
+            .transcript
+            .push(Entry::AgentThought("# Plan\nthen do it".to_string()));
+
+        let lines = render_transcript_lines(&state, 80);
+        let heading = lines
+            .iter()
+            .find(|l| line_text(l).contains("Plan"))
+            .expect("heading row");
+        // Before the fix the heading kept theme.text (White in the default
+        // Dark theme, != theme.thought DarkGray), so this catches the regress.
+        assert!(
+            heading
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme.thought)),
+            "thought heading must be dimmed, not left at reply contrast: {heading:?}"
+        );
+    }
+
+    #[test]
+    fn role_block_defers_glyph_past_a_leading_blank_line() {
+        // A body that begins with a blank line must not strand the glyph on an
+        // empty row while the first real content renders as a gutter-less
+        // continuation; the glyph belongs on the first line that has content.
+        let mut state = AppState::new();
+        state
+            .transcript
+            .push(Entry::AgentMessage("\nhello".to_string()));
+
+        let rendered: Vec<String> = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        assert!(
+            rendered.iter().any(|line| line == "● hello"),
+            "glyph must sit on the first content row: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.trim() == AGENT_GLYPH),
+            "glyph must never sit alone on a blank row: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn collapsed_tool_markdown_tail_keeps_code_fence_state() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        // The opening fence lands in the hidden head: 3 intro lines + the
+        // fence + 6 code lines, with a budget of 6, hides "intro"s and "```".
+        let mut text: Vec<String> = (1..=3).map(|n| format!("intro {n}")).collect();
+        text.push("```rs".to_string());
+        text.extend((1..=6).map(|n| format!("code line {n}")));
+        state.tool_calls.insert(
+            "call-1".to_string(),
+            crate::app::ToolCallView {
+                title: "log".to_string(),
+                kind: ToolKind::Execute,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Text(text.join("\n"))],
+            },
+        );
+        state.transcript.push(Entry::ToolCall("call-1".to_string()));
+
+        let lines = render_transcript_lines(&state, 80);
+        let hint_idx = lines
+            .iter()
+            .position(|l| line_text(l).contains("4 earlier lines hidden"))
+            .expect("collapse hint above the tail");
+        let code_idx = lines
+            .iter()
+            .position(|l| line_text(l).contains("code line 1"))
+            .expect("code row");
+        assert!(hint_idx < code_idx, "hint must lead the visible tail");
+        let code_row = &lines[code_idx];
+        // The tail starts inside the fence, so it still renders as code.
+        assert!(
+            code_row
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(theme.quote)
+                    && span.content.contains("code line 1")),
+            "tail must keep the code-block style: {code_row:?}"
+        );
     }
 
     #[test]
