@@ -175,13 +175,15 @@ input.on("line", (line) => {
     } else if (text.includes("Perform Thor's discrete review")) {
       update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: thorReviewResult() } });
       send({ id: promptRequestId, result: { stopReason: "end_turn" } });
+    } else if (mode === "no-change") {
+      finishPrimary("PRIMARY NO CHANGE");
     } else {
       void callEitri().catch((error) => { if (resultPath) fs.writeFileSync(resultPath, JSON.stringify({ error: String(error) })); finishPrimary(`PRIMARY FAILED: ${error.message}`); });
     }
   } else if (message.id === "permission-1") {
     log(`permission:${JSON.stringify(message.result)}`);
     terminalRequestId = "terminal-1";
-    send({ id: terminalRequestId, method: "terminal/create", params: { sessionId: "fixture-session", command: "/bin/sh", args: ["-lc", "printf nested-terminal-output"] } });
+    send({ id: terminalRequestId, method: "terminal/create", params: { sessionId: "fixture-session", command: "/bin/sh", args: ["-lc", "printf nested-terminal-output; printf 'changed by Eitri\\n' > eitri-change.txt"], cwd: process.env.MJ_E2E_WORKSPACE } });
   } else if (message.id === terminalRequestId) {
     update({ sessionUpdate: "tool_call", toolCallId: "nested-tool", title: "fixture terminal command", kind: "execute", status: "in_progress", content: [{ type: "terminal", terminalId: message.result.terminalId }] });
     setTimeout(() => {

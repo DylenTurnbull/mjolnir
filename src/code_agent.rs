@@ -536,12 +536,15 @@ async fn run(
                 if let Some(boundary) = boundary
                     && !interrupting
                     && !(target_completed && intervention.is_pending())
-                    && let Some(id) = loki.as_ref().and_then(|reviewer| reviewer.observe(
-                        epoch,
-                        loki::Target::Eitri,
-                        boundary,
-                        tracker.trajectory(),
-                    ))
+                    && let Some(reviewer) = loki.as_ref()
+                    && let Some(id) = reviewer
+                        .observe(
+                            epoch,
+                            loki::Target::Eitri,
+                            boundary,
+                            tracker.trajectory(),
+                        )
+                        .await
                 {
                     pending_reviews.insert(id);
                 }

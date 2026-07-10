@@ -1691,10 +1691,13 @@ async fn run_session(
 
     let event_tracker = remote_tracker.clone();
     let review_commands = runtime_cmd_tx.clone();
-    let turn_state = std::sync::Arc::new(tokio::sync::Mutex::new((0_u64, String::new())));
+    let turn_state = std::sync::Arc::new(tokio::sync::Mutex::new((
+        0_u64,
+        String::new(),
+        None::<acp::WorkspaceTurnSnapshot>,
+    )));
     let event_turn_state = turn_state.clone();
     let event_loki = loki_handle.clone();
-    let review_cwd = cwd.clone();
     let event_proxy = tokio::spawn(async move {
         let mut runtime_event_rx = runtime_event_rx;
         let mut decisions = event_loki.as_ref().map(loki::Handle::subscribe);
@@ -1710,7 +1713,7 @@ async fn run_session(
                     // Intercept before rendering: permission prompts get their
                     // responder wrapped so remote viewers can answer them.
                     let event = event_tracker.intercept_event(event);
-                    let (epoch, task) = event_turn_state.lock().await.clone();
+                    let (epoch, task, _) = event_turn_state.lock().await.clone();
                     let boundary = (epoch > 0).then(|| trajectory.observe(&event)).flatten();
                     let boundary_observed = boundary.is_some();
                     let target_completed = council_target_completed(&event);
@@ -1726,12 +1729,15 @@ async fn run_session(
                     if let Some(boundary) = boundary
                         && !interrupting
                         && !(target_completed && intervention.is_pending())
-                        && let Some(id) = event_loki.as_ref().and_then(|reviewer| reviewer.observe(
-                            epoch,
-                            loki::Target::Thor,
-                            boundary,
-                            trajectory.trajectory(),
-                        ))
+                        && let Some(reviewer) = event_loki.as_ref()
+                        && let Some(id) = reviewer
+                            .observe(
+                                epoch,
+                                loki::Target::Thor,
+                                boundary,
+                                trajectory.trajectory(),
+                            )
+                            .await
                     {
                         pending.insert(id);
                     }
@@ -1820,7 +1826,7 @@ async fn run_session(
                     }
                 } => {
                     let Some(decision) = decision else { continue; };
-                    let (epoch, task) = event_turn_state.lock().await.clone();
+                    let (epoch, task, _) = event_turn_state.lock().await.clone();
                     if decision.epoch != epoch || decision.target != loki::Target::Thor || !pending.remove(&decision.id) {
                         continue;
                     }
@@ -1861,13 +1867,13 @@ async fn run_session(
 
             if held_completion.is_some() && pending.is_empty() && !intervention.is_pending() {
                 if thor_config.discrete_review && !discrete_review_started {
-                    let (epoch, task) = event_turn_state.lock().await.clone();
+                    let (epoch, task, snapshot) = event_turn_state.lock().await.clone();
                     if epoch == 0 {
                         continue;
                     }
                     let initial_result = trajectory.final_message();
                     let context =
-                        discrete_review_context(&review_cwd, trajectory.trajectory()).await;
+                        discrete_review_context(snapshot.as_ref(), trajectory.trajectory()).await;
                     held_completion = None;
                     trajectory.reset_attempt();
                     discrete_review_started = true;
@@ -1907,16 +1913,24 @@ async fn run_session(
     let cmd_tracker = remote_tracker.clone();
     let cmd_loki = loki_handle.clone();
     let cmd_turn_state = turn_state.clone();
+    let mut cmd_workspace_roots =
+        Vec::with_capacity(1 + runtime_options.additional_directories.len());
+    cmd_workspace_roots.push(cwd.clone());
+    cmd_workspace_roots.extend(runtime_options.additional_directories.iter().cloned());
+    let cmd_max_text_bytes = runtime_options.fs_max_text_bytes;
     let cmd_proxy = tokio::spawn(async move {
         let mut local_epoch = 0_u64;
         while let Some(command) = ui_cmd_rx.recv().await {
             cmd_tracker.observe_command(&command);
             if let UiCommand::SendPrompt { text, .. } = &command {
                 local_epoch = local_epoch.saturating_add(1);
-                let epoch = cmd_loki
-                    .as_ref()
-                    .map_or(local_epoch, |reviewer| reviewer.begin_turn(text.clone()));
-                *cmd_turn_state.lock().await = (epoch, text.clone());
+                let snapshot =
+                    acp::WorkspaceTurnSnapshot::capture(&cmd_workspace_roots, cmd_max_text_bytes)
+                        .await;
+                let epoch = cmd_loki.as_ref().map_or(local_epoch, |reviewer| {
+                    reviewer.begin_turn(text.clone(), snapshot.clone())
+                });
+                *cmd_turn_state.lock().await = (epoch, text.clone(), Some(snapshot));
             }
             if matches!(command, UiCommand::CancelPrompt)
                 && let Some(reviewer) = cmd_loki.as_ref()
@@ -2204,16 +2218,17 @@ fn thor_discrete_review_prompt(task: &str, initial_result: &str, context: &str) 
     )
 }
 
-async fn discrete_review_context(cwd: &Path, trajectory: String) -> String {
-    let diff = tokio::process::Command::new("git")
-        .args(["diff", "--no-ext-diff", "--"])
-        .current_dir(cwd)
-        .output()
-        .await
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_else(|| "[workspace diff unavailable]".to_string());
+async fn discrete_review_context(
+    snapshot: Option<&acp::WorkspaceTurnSnapshot>,
+    trajectory: String,
+) -> String {
+    let diff = match snapshot {
+        Some(snapshot) => snapshot
+            .complete_diff()
+            .await
+            .unwrap_or_else(|| "[no workspace changes attributable to this user turn]".to_string()),
+        None => "[workspace turn snapshot unavailable]".to_string(),
+    };
     let mut context = format!("Trajectory:\n{trajectory}\n\nWorkspace diff:\n{diff}");
     const LIMIT: usize = 128 * 1024;
     if context.len() > LIMIT {

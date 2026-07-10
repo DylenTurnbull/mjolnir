@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::acp::{RuntimeAccessMode, RuntimeRoleConfig};
+use crate::acp::{RuntimeAccessMode, RuntimeRoleConfig, WorkspaceTurnSnapshot};
 use crate::council::ResolvedRole;
 use crate::event::{ActorActivity, ActorIdentity, UiEvent};
 use crate::ragnarok::{AgentHandle, Launch, TurnEvent};
@@ -256,6 +256,7 @@ enum Request {
         id: u64,
         epoch: u64,
         target: Target,
+        workspace_diff: String,
         boundary: String,
         trajectory: String,
     },
@@ -270,6 +271,7 @@ pub struct Handle {
     epochs: Arc<AtomicU64>,
     abort: watch::Sender<bool>,
     finished: watch::Receiver<bool>,
+    turn_snapshot: Arc<RwLock<Option<(u64, WorkspaceTurnSnapshot)>>>,
     pub streaming_enabled: bool,
 }
 
@@ -292,6 +294,7 @@ impl Handle {
             epochs: Arc::new(AtomicU64::new(1)),
             abort,
             finished,
+            turn_snapshot: Arc::new(RwLock::new(None)),
             streaming_enabled,
         };
         tokio::spawn(worker(
@@ -311,9 +314,12 @@ impl Handle {
         self.decisions.subscribe()
     }
 
-    pub fn begin_turn(&self, task: String) -> u64 {
+    pub fn begin_turn(&self, task: String, snapshot: WorkspaceTurnSnapshot) -> u64 {
         let _ = self.abort.send(false);
         let epoch = self.epochs.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut current) = self.turn_snapshot.write() {
+            *current = Some((epoch, snapshot));
+        }
         let _ = self.requests.send(Request::Begin { epoch, task });
         epoch
     }
@@ -326,23 +332,40 @@ impl Handle {
         let _ = self.abort.send(true);
     }
 
-    pub fn observe(
+    pub async fn observe(
         &self,
         epoch: u64,
         target: Target,
         boundary: String,
         trajectory: String,
     ) -> Option<u64> {
-        self.streaming_enabled
-            .then(|| self.submit(epoch, target, boundary, trajectory))
+        if !self.streaming_enabled {
+            return None;
+        }
+        let snapshot = self
+            .turn_snapshot
+            .read()
+            .ok()
+            .and_then(|current| current.as_ref().filter(|(turn, _)| *turn == epoch).cloned())
+            .map(|(_, snapshot)| snapshot)?;
+        let workspace_diff = snapshot.complete_diff().await?;
+        Some(self.submit(epoch, target, workspace_diff, boundary, trajectory))
     }
 
-    fn submit(&self, epoch: u64, target: Target, boundary: String, trajectory: String) -> u64 {
+    fn submit(
+        &self,
+        epoch: u64,
+        target: Target,
+        workspace_diff: String,
+        boundary: String,
+        trajectory: String,
+    ) -> u64 {
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
         let _ = self.requests.send(Request::Review {
             id,
             epoch,
             target,
+            workspace_diff,
             boundary: bounded(boundary),
             trajectory: bounded(trajectory),
         });
@@ -427,6 +450,7 @@ async fn worker(
                 id,
                 epoch: request_epoch,
                 target,
+                workspace_diff,
                 boundary,
                 trajectory,
             } if request_epoch == epoch => {
@@ -455,7 +479,7 @@ async fn worker(
                         }
                     }
                 }
-                let prompt = review_prompt(&task, target, &boundary, &trajectory);
+                let prompt = review_prompt(&task, target, &workspace_diff, &boundary, &trajectory);
                 let result = session
                     .as_mut()
                     .expect("connected")
@@ -565,9 +589,15 @@ async fn connect(
     .await
 }
 
-fn review_prompt(task: &str, target: Target, boundary: &str, trajectory: &str) -> String {
+fn review_prompt(
+    task: &str,
+    target: Target,
+    workspace_diff: &str,
+    boundary: &str,
+    trajectory: &str,
+) -> String {
     format!(
-        "You are Loki, a read-only streaming reviewer of {actor}. Any intervention you issue is queued until the target's next safe step boundary, then Mjolnir interrupts normal continuation and re-prompts it with your critique. Intervene only for a material correctness, safety, scope, or strategy problem. Do not intervene for style, optional improvements, or mere uncertainty. Return exactly one JSON object and no markdown: {{\"decision\":\"no_intervention\"}} or {{\"decision\":\"intervention\",\"critique\":\"specific actionable critique\"}}.\n\nOriginal task:\n{task}\n\nReview kind: streaming boundary review\nBoundary:\n{boundary}\n\nBounded trajectory and workspace context:\n{trajectory}",
+        "You are Loki, a read-only streaming reviewer of {actor}. Any intervention you issue is queued until the target's next safe step boundary, then Mjolnir interrupts normal continuation and re-prompts it with your critique. Intervene only for a material correctness, safety, scope, or strategy problem. Do not intervene for style, optional improvements, or mere uncertainty. Return exactly one JSON object and no markdown: {{\"decision\":\"no_intervention\"}} or {{\"decision\":\"intervention\",\"critique\":\"specific actionable critique\"}}.\n\nOriginal task:\n{task}\n\nComplete workspace diff since this user prompt began (starting point for review):\n{workspace_diff}\n\nReview kind: streaming boundary review\nBoundary:\n{boundary}\n\nBounded trajectory:\n{trajectory}",
         actor = target.label(),
     )
 }
@@ -601,6 +631,42 @@ fn emit_warning(ui_tx: &mpsc::UnboundedSender<UiEvent>, role: &ResolvedRole, mes
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall, ToolCallStatus};
+
+    fn run_git(root: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn test_handle(
+        epoch: u64,
+        snapshot: WorkspaceTurnSnapshot,
+    ) -> (Handle, mpsc::UnboundedReceiver<Request>) {
+        let (requests, request_rx) = mpsc::unbounded_channel();
+        let (decisions, _) = broadcast::channel(8);
+        let (abort, _) = watch::channel(false);
+        let (_, finished) = watch::channel(false);
+        (
+            Handle {
+                requests,
+                decisions,
+                ids: Arc::new(AtomicU64::new(1)),
+                epochs: Arc::new(AtomicU64::new(epoch.saturating_add(1))),
+                abort,
+                finished,
+                turn_snapshot: Arc::new(RwLock::new(Some((epoch, snapshot)))),
+                streaming_enabled: true,
+            },
+            request_rx,
+        )
+    }
 
     #[test]
     fn strict_decisions_require_material_critique() {
@@ -676,5 +742,82 @@ mod tests {
         assert!(tracker.observe(&tool(ToolCallStatus::InProgress)).is_none());
         assert!(tracker.observe(&tool(ToolCallStatus::Completed)).is_some());
         assert!(tracker.observe(&tool(ToolCallStatus::Failed)).is_some());
+    }
+
+    #[tokio::test]
+    async fn auto_review_requires_attributable_changes_and_starts_with_complete_diff() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        run_git(temp.path(), &["init", "-q"]);
+        run_git(
+            temp.path(),
+            &["config", "user.email", "mjolnir@example.test"],
+        );
+        run_git(temp.path(), &["config", "user.name", "Mjolnir Tests"]);
+        let path = temp.path().join("notes.txt");
+        tokio::fs::write(&path, "committed\n")
+            .await
+            .expect("seed file");
+        run_git(temp.path(), &["add", "notes.txt"]);
+        run_git(temp.path(), &["commit", "-qm", "seed"]);
+        tokio::fs::write(&path, "dirty before user prompt\n")
+            .await
+            .expect("preexisting dirty state");
+
+        let root = tokio::fs::canonicalize(temp.path()).await.expect("root");
+        let snapshot =
+            WorkspaceTurnSnapshot::capture(&[root], crate::acp::DEFAULT_FS_TEXT_BYTES).await;
+        let (handle, mut requests) = test_handle(7, snapshot);
+
+        assert!(
+            handle
+                .observe(
+                    7,
+                    Target::Thor,
+                    "planning boundary".to_string(),
+                    "planning only".to_string(),
+                )
+                .await
+                .is_none()
+        );
+        assert!(requests.try_recv().is_err());
+
+        tokio::fs::write(&path, "changed by this user prompt\n")
+            .await
+            .expect("turn change");
+        assert!(
+            handle
+                .observe(
+                    7,
+                    Target::Eitri,
+                    "edit boundary".to_string(),
+                    "implementation trajectory".to_string(),
+                )
+                .await
+                .is_some()
+        );
+
+        let Request::Review {
+            workspace_diff,
+            boundary,
+            trajectory,
+            ..
+        } = requests.try_recv().expect("review request")
+        else {
+            panic!("expected review request");
+        };
+        assert!(workspace_diff.contains("dirty before user prompt"));
+        assert!(workspace_diff.contains("changed by this user prompt"));
+        assert!(!workspace_diff.contains("--- before\ncommitted\n"));
+        let prompt = review_prompt(
+            "change notes",
+            Target::Eitri,
+            &workspace_diff,
+            &boundary,
+            &trajectory,
+        );
+        assert!(
+            prompt.find(&workspace_diff).expect("diff")
+                < prompt.find("Boundary:\nedit boundary").expect("boundary")
+        );
     }
 }
