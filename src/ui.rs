@@ -5380,7 +5380,15 @@ fn render_transcript_entry_range(
                             out.push(with_tool_gutter(row, color));
                         }
                     }
-                    out.push(Line::from(""));
+                    // Consecutive tool calls read as one activity run: let
+                    // their rails abut instead of separating every call with
+                    // a blank row.
+                    let next_is_tool_call = state.transcript.get(entry_index + 1).is_some_and(|next| {
+                        matches!(next, Entry::ToolCall(next_id) if state.tool_calls.contains_key(next_id))
+                    });
+                    if !next_is_tool_call {
+                        out.push(Line::from(""));
+                    }
                 }
             }
             Entry::System(text) | Entry::EphemeralSystem(text) => {
@@ -5696,10 +5704,16 @@ fn push_tool_markdown_lines_limited(
     collapse_limit: Option<usize>,
     theme: TerminalTheme,
 ) {
-    let (preview, hidden) = tool_output_preview(&text, collapse_limit);
-    push_markdown_lines_limited_inner(out, preview, indent, None, theme, true);
-    if let Some(hidden) = hidden {
-        push_tool_collapse_hint(out, indent, hidden, theme);
+    let line_count = text.split('\n').count();
+    if collapse_limit.is_some_and(|limit| line_count > limit) {
+        push_markdown_lines_limited_inner(out, text, indent, collapse_limit, theme, true);
+    } else {
+        // Preserve the character budget for a single huge logical line.
+        let (preview, hidden) = tool_output_preview(&text, collapse_limit);
+        push_markdown_lines_limited_inner(out, preview, indent, None, theme, true);
+        if let Some(hidden) = hidden {
+            push_tool_collapse_hint(out, indent, hidden, theme);
+        }
     }
 }
 
@@ -5763,11 +5777,22 @@ fn push_markdown_lines_limited_inner(
     let mut in_code_block = false;
     let mut code_lang = String::new();
     let lines: Vec<&str> = text.split('\n').collect();
-    let (visible_count, hidden) = match collapse_limit {
-        Some(limit) if lines.len() > limit => (limit, lines.len() - limit),
-        _ => (lines.len(), 0),
-    };
-    for raw in &lines[..visible_count] {
+    // Collapse keeps the *tail*: for tool output the end is where the signal
+    // lives (the error, the test summary, the exit status), so hiding the head
+    // keeps exactly the lines the user wanted. The hint sits on top, standing
+    // in for the elided head.
+    let hidden = collapsed_head_len(lines.len(), collapse_limit);
+    // Replay fence toggles across the hidden head so a tail that starts
+    // inside a code block still renders as code.
+    for raw in &lines[..hidden] {
+        if raw.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+        }
+    }
+    if hidden > 0 {
+        push_collapse_hint(out, indent, hidden, theme);
+    }
+    for raw in &lines[hidden..] {
         let trimmed = raw.trim_start();
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
@@ -5864,8 +5889,14 @@ fn push_markdown_lines_limited_inner(
         spans.extend(inline_markdown_spans_with_style(raw, theme, base_style));
         out.push(Line::from(spans));
     }
-    if hidden > 0 {
-        push_collapse_hint(out, indent, hidden, theme);
+}
+
+/// Number of leading lines to hide so a collapsed block keeps its last `limit`
+/// lines, where errors, summaries, and exit status usually appear.
+fn collapsed_head_len(total_lines: usize, collapse_limit: Option<usize>) -> usize {
+    match collapse_limit {
+        Some(limit) if total_lines > limit => total_lines - limit,
+        _ => 0,
     }
 }
 
@@ -6224,8 +6255,24 @@ fn push_tool_text_lines(
     collapse_limit: Option<usize>,
     theme: TerminalTheme,
 ) {
-    let (preview, hidden) = tool_output_preview(&text, collapse_limit);
     let prefix = " ".repeat(indent);
+    let lines: Vec<&str> = text.split('\n').collect();
+    let hidden = collapsed_head_len(lines.len(), collapse_limit);
+    if hidden > 0 {
+        push_collapse_hint(out, indent, hidden, theme);
+        for raw in &lines[hidden..] {
+            let line = format!("{prefix}{raw}");
+            out.push(Line::from(Span::styled(
+                line,
+                tool_output_line_style(raw, theme),
+            )));
+        }
+        return;
+    }
+
+    // A single logical line can still be enormous (for example JSON output),
+    // so retain the character budget when no line-based head was elided.
+    let (preview, hidden_details) = tool_output_preview(&text, collapse_limit);
     for raw in preview.split('\n') {
         let line = format!("{prefix}{raw}");
         out.push(Line::from(Span::styled(
@@ -6233,8 +6280,8 @@ fn push_tool_text_lines(
             tool_output_line_style(raw, theme),
         )));
     }
-    if let Some(hidden) = hidden {
-        push_tool_collapse_hint(out, indent, hidden, theme);
+    if let Some(hidden_details) = hidden_details {
+        push_tool_collapse_hint(out, indent, hidden_details, theme);
     }
 }
 
@@ -6258,9 +6305,10 @@ fn push_tool_collapse_hint(
     }
 }
 
-/// Trailing "K more lines hidden" hint shown under collapsed tool outputs
-/// so the user can tell something was elided rather than assuming the
-/// output just ended.
+/// Leading "K earlier lines hidden" hint shown above collapsed tool outputs
+/// so the user can tell the head was elided rather than assuming the output
+/// started there. "Show all" is accurate in both modes: fullscreen Ctrl-T
+/// expands outputs in place, inline Ctrl-T opens the full-transcript reader.
 fn push_collapse_hint(
     out: &mut Vec<Line<'static>>,
     indent: usize,
@@ -6269,7 +6317,7 @@ fn push_collapse_hint(
 ) {
     let prefix = " ".repeat(indent);
     out.push(Line::from(Span::styled(
-        format!("{prefix}... {hidden} more lines hidden (Ctrl-T to expand)"),
+        format!("{prefix}... {hidden} earlier lines hidden (Ctrl-T to show all)"),
         Style::default()
             .fg(theme.muted)
             .add_modifier(Modifier::ITALIC),
@@ -13267,7 +13315,7 @@ mod tests {
         assert!(rendered.contains("line 1"), "rendered:\n{rendered}");
         assert!(rendered.contains("line 20"), "rendered:\n{rendered}");
         assert!(
-            !rendered.contains("more lines hidden"),
+            !rendered.contains("lines hidden"),
             "reader must not collapse output, rendered:\n{rendered}"
         );
         assert!(rendered.contains("transcript"), "rendered:\n{rendered}");
@@ -13488,27 +13536,25 @@ mod tests {
             .map(line_text)
             .collect();
 
-        // First TOOL_OUTPUT_COLLAPSED_LINES lines are visible (framed by the
-        // tool gutter).
-        assert!(rendered.iter().any(|line| line == "│   line 1"));
-        assert!(
-            rendered
-                .iter()
-                .any(|line| line == &format!("│   line {}", TOOL_OUTPUT_COLLAPSED_LINES))
-        );
-        // Everything past the budget is hidden.
-        assert!(
-            !rendered
-                .iter()
-                .any(|line| line == &format!("│   line {}", TOOL_OUTPUT_COLLAPSED_LINES + 1))
-        );
-        // And a hint tells the user the rest exists.
+        // The last TOOL_OUTPUT_COLLAPSED_LINES lines are visible (framed by
+        // the tool gutter) — the tail is where errors and summaries live.
         let hidden = 20 - TOOL_OUTPUT_COLLAPSED_LINES;
         assert!(
             rendered
                 .iter()
-                .any(|line| line
-                    == &format!("│   ... {hidden} more lines hidden (Ctrl-T to expand)")),
+                .any(|line| line == &format!("│   line {}", hidden + 1))
+        );
+        assert!(rendered.iter().any(|line| line == "│   line 20"));
+        // Everything before the tail is hidden.
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line == &format!("│   line {hidden}"))
+        );
+        // And a leading hint tells the user the head was elided.
+        assert!(
+            rendered.iter().any(|line| line
+                == &format!("│   ... {hidden} earlier lines hidden (Ctrl-T to show all)")),
             "missing collapse hint, got: {rendered:?}"
         );
 
@@ -13518,12 +13564,9 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
+        assert!(expanded.iter().any(|line| line == "│   line 1"));
         assert!(expanded.iter().any(|line| line == "│   line 20"));
-        assert!(
-            !expanded
-                .iter()
-                .any(|line| line.contains("more lines hidden"))
-        );
+        assert!(!expanded.iter().any(|line| line.contains("lines hidden")));
     }
 
     #[test]
@@ -14585,10 +14628,159 @@ mod tests {
             .map(line_text)
             .collect();
 
+        assert!(rendered.iter().any(|line| line == "You"));
         assert!(rendered.iter().any(|line| line == "# literal"));
         assert!(rendered.iter().any(|line| line == "`code` and **bold**"));
         assert!(rendered.iter().any(|line| line == "│   # stdout"));
         assert!(rendered.iter().any(|line| line == "│   ok and bold"));
+    }
+
+    #[test]
+    fn consecutive_tool_calls_render_without_blank_row_between() {
+        let mut state = AppState::new();
+        for (id, title) in [("call-1", "first"), ("call-2", "second")] {
+            state.tool_calls.insert(
+                id.to_string(),
+                crate::app::ToolCallView {
+                    title: title.to_string(),
+                    kind: ToolKind::Execute,
+                    status: ToolCallStatus::Completed,
+                    body: Vec::new(),
+                },
+            );
+            state.transcript.push(Entry::ToolCall(id.to_string()));
+        }
+
+        let rendered: Vec<String> = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        let first = rendered
+            .iter()
+            .position(|line| line.contains("first"))
+            .expect("first tool row");
+        let second = rendered
+            .iter()
+            .position(|line| line.contains("second"))
+            .expect("second tool row");
+        assert_eq!(
+            second,
+            first + 1,
+            "consecutive tool rails should abut, got {rendered:?}"
+        );
+        // The run still ends with a separator row before whatever follows.
+        assert_eq!(rendered.last().map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn thought_blocks_render_dimmed_with_role_glyph() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state
+            .transcript
+            .push(Entry::AgentThought("weighing the options".to_string()));
+
+        let lines = render_transcript_lines(&state, 80);
+        let row = lines
+            .iter()
+            .find(|l| line_text(l).contains("weighing"))
+            .expect("thought row");
+        assert_eq!(line_text(row), "weighing the options");
+        for span in &row.spans {
+            assert_eq!(
+                span.style.fg,
+                Some(theme.thought),
+                "thought body must read as secondary text: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thought_markdown_heading_is_dimmed_not_left_at_reply_contrast() {
+        // A heading carries theme.text (the primary reply color); inside a
+        // thought it must still read as dimmed reasoning, not like a real
+        // reply heading.
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state
+            .transcript
+            .push(Entry::AgentThought("# Plan\nthen do it".to_string()));
+
+        let lines = render_transcript_lines(&state, 80);
+        let heading = lines
+            .iter()
+            .find(|l| line_text(l).contains("Plan"))
+            .expect("heading row");
+        // Before the fix the heading kept theme.text (White in the default
+        // Dark theme, != theme.thought DarkGray), so this catches the regress.
+        assert!(
+            heading
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme.thought)),
+            "thought heading must be dimmed, not left at reply contrast: {heading:?}"
+        );
+    }
+
+    #[test]
+    fn agent_message_preserves_content_after_a_leading_blank_line() {
+        let mut state = AppState::new();
+        state
+            .transcript
+            .push(Entry::AgentMessage("\nhello".to_string()));
+
+        let rendered: Vec<String> = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        assert!(
+            rendered.iter().any(|line| line == "hello"),
+            "message content must remain visible after the leading blank: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn collapsed_tool_markdown_tail_keeps_code_fence_state() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        // The opening fence lands in the hidden head: 3 intro lines + the
+        // fence + 6 code lines, with a budget of 6, hides "intro"s and "```".
+        let mut text: Vec<String> = (1..=3).map(|n| format!("intro {n}")).collect();
+        text.push("```rs".to_string());
+        text.extend((1..=6).map(|n| format!("code line {n}")));
+        state.tool_calls.insert(
+            "call-1".to_string(),
+            crate::app::ToolCallView {
+                title: "log".to_string(),
+                kind: ToolKind::Execute,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Text(text.join("\n"))],
+            },
+        );
+        state.transcript.push(Entry::ToolCall("call-1".to_string()));
+
+        let lines = render_transcript_lines(&state, 80);
+        let hint_idx = lines
+            .iter()
+            .position(|l| line_text(l).contains("4 earlier lines hidden"))
+            .expect("collapse hint above the tail");
+        let code_idx = lines
+            .iter()
+            .position(|l| line_text(l).contains("code line 1"))
+            .expect("code row");
+        assert!(hint_idx < code_idx, "hint must lead the visible tail");
+        let code_row = &lines[code_idx];
+        // The tail starts inside the fence, so it still renders as code.
+        assert!(
+            code_row
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(theme.quote)
+                    && span.content.contains("code line 1")),
+            "tail must keep the code-block style: {code_row:?}"
+        );
     }
 
     #[test]
