@@ -3638,6 +3638,22 @@ struct PromptTurnDiffConfig<'a> {
     turn_id: u64,
 }
 
+fn anvil_turn_failure_message(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let failure = meta?.get("anvil")?.get("turnFailure")?.as_object()?;
+    let message = failure.get("message")?.as_str()?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let retryable = failure
+        .get("retryable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let class = if retryable { "retryable" } else { "fatal" };
+    Some(format!("agent turn failed ({class}): {message}"))
+}
+
 async fn drive_prompt_turn(
     conn: &ConnectionTo<Agent>,
     session_id: &SessionId,
@@ -3661,10 +3677,14 @@ async fn drive_prompt_turn(
                         turn_diff_tracker
                             .emit_if_changed(ui_tx, diff_config.turn_id)
                             .await;
-                        let _ = ui_tx.send(UiEvent::PromptDone {
-                            stop_reason: resp.stop_reason,
-                            usage: resp.usage,
-                        });
+                        if let Some(message) = anvil_turn_failure_message(resp.meta.as_ref()) {
+                            let _ = ui_tx.send(UiEvent::PromptFailed { message });
+                        } else {
+                            let _ = ui_tx.send(UiEvent::PromptDone {
+                                stop_reason: resp.stop_reason,
+                                usage: resp.usage,
+                            });
+                        }
                     }
                     Err(e) => {
                         turn_diff_tracker
@@ -4029,6 +4049,24 @@ mod tests {
     };
     use std::time::Duration;
     use tokio::io::split;
+
+    #[test]
+    fn anvil_failure_metadata_becomes_prompt_error() {
+        let meta = serde_json::json!({
+            "anvil": {
+                "turnFailure": {
+                    "message": "stream read error",
+                    "retryable": true
+                }
+            }
+        });
+        let meta = meta.as_object().expect("metadata object");
+
+        assert_eq!(
+            anvil_turn_failure_message(Some(meta)).as_deref(),
+            Some("agent turn failed (retryable): stream read error")
+        );
+    }
 
     #[test]
     fn resolve_no_install_returns_none_for_missing_program() {
