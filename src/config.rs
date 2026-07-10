@@ -35,7 +35,10 @@ pub struct Config {
     /// Model-first council role selection. ACP adapters are resolved internally.
     #[serde(default, skip_serializing_if = "ModelsConfig::is_default")]
     pub models: ModelsConfig,
-    /// Optional Loki review behavior.
+    /// Thor's coordination and review behavior.
+    #[serde(default, skip_serializing_if = "ThorConfig::is_default")]
+    pub thor: ThorConfig,
+    /// Loki's streaming review behavior.
     #[serde(default, skip_serializing_if = "LokiConfig::is_default")]
     pub loki: LokiConfig,
     /// Model strength score (LMArena Elo) display in the picker.
@@ -76,17 +79,43 @@ impl ModelsConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ThorConfig {
+    #[serde(default = "default_true")]
+    pub discrete_review: bool,
+}
+
+impl Default for ThorConfig {
+    fn default() -> Self {
+        Self {
+            discrete_review: true,
+        }
+    }
+}
+
+impl ThorConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LokiConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub streaming_review: bool,
-    #[serde(default)]
-    pub final_review: bool,
+}
+
+impl Default for LokiConfig {
+    fn default() -> Self {
+        Self {
+            streaming_review: true,
+        }
+    }
 }
 
 impl LokiConfig {
     fn is_default(&self) -> bool {
-        !self.streaming_review && !self.final_review
+        *self == Self::default()
     }
 }
 
@@ -404,6 +433,30 @@ mod tests {
         let cfg = Config::load(&path).expect("load");
         assert!(cfg.agent.is_none());
         assert_eq!(cfg.theme, TerminalThemeKind::Dark);
+        assert!(cfg.thor.discrete_review);
+        assert!(cfg.loki.streaming_review);
+    }
+
+    #[test]
+    fn council_reviews_default_on_and_can_be_disabled_independently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[thor]\ndiscrete_review = false\n\n[loki]\nstreaming_review = false\n",
+        )
+        .expect("write config");
+
+        let cfg = Config::load(&path).expect("load config");
+        assert!(!cfg.thor.discrete_review);
+        assert!(!cfg.loki.streaming_review);
+
+        cfg.save(&path).expect("save config");
+        let saved = std::fs::read_to_string(&path).expect("read saved config");
+        assert!(saved.contains("[thor]"), "saved: {saved}");
+        assert!(saved.contains("discrete_review = false"), "saved: {saved}");
+        assert!(saved.contains("[loki]"), "saved: {saved}");
+        assert!(saved.contains("streaming_review = false"), "saved: {saved}");
     }
 
     #[test]
@@ -412,6 +465,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         let cfg = Config {
             models: ModelsConfig::default(),
+            thor: ThorConfig::default(),
             loki: LokiConfig::default(),
             theme: TerminalThemeKind::Light,
             spinner: SpinnerStyle::default(),
@@ -444,6 +498,7 @@ mod tests {
         let path = dir.path().join("nested").join("deep").join("config.toml");
         let cfg = Config {
             models: ModelsConfig::default(),
+            thor: ThorConfig::default(),
             loki: LokiConfig::default(),
             theme: TerminalThemeKind::Dark,
             spinner: SpinnerStyle::default(),
@@ -532,6 +587,7 @@ args = ["--config", "$HOME/.config/agent.toml", "${HOME}/literal"]
         let path = dir.path().join("config.toml");
         let cfg = Config {
             models: ModelsConfig::default(),
+            thor: ThorConfig::default(),
             loki: LokiConfig::default(),
             theme: TerminalThemeKind::AnsiDark,
             spinner: SpinnerStyle::default(),

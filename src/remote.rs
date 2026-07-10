@@ -873,6 +873,7 @@ impl TrackerState {
             | UiEvent::ElicitationRequest(_)
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::ActorActivity(_)
+            | UiEvent::InternalMessage(_)
             | UiEvent::CodeAgent(_)
             | UiEvent::Info(_)
             | UiEvent::Warning(_) => {}

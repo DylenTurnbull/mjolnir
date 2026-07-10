@@ -280,6 +280,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             UiEvent::RemotePermissionDecision { .. } => {}
             UiEvent::CodeAgent(_) => {}
             UiEvent::ActorActivity(_) => {}
+            UiEvent::InternalMessage(_) => {}
             UiEvent::ElicitationRequest(prompt) => {
                 // Headless runs have no interactive modal to render a form or
                 // URL, so we cannot collect the user's answer. Decline so the

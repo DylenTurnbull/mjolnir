@@ -23,8 +23,8 @@ use crate::clipboard::ClipboardLease;
 
 use crate::event::{
     ActorActivity, CodeAgentEvent, CodeAgentOutcome, ElicitationOutcome, ElicitationPrompt,
-    PermissionDecision, PermissionPrompt, PromptImage, SessionConfigTarget, TerminalOutputSnapshot,
-    UiEvent, content_block_text,
+    InternalMessage, PermissionDecision, PermissionPrompt, PromptImage, SessionConfigTarget,
+    TerminalOutputSnapshot, UiEvent, content_block_text,
 };
 use crate::palette::TerminalTheme;
 use crate::ragnarok;
@@ -135,8 +135,6 @@ pub enum Entry {
     AgentMessage(String),
     /// Streaming agent reasoning ("thoughts").
     AgentThought(String),
-    /// Instructions delegated by the primary ACP server to the nested agent.
-    CodeAgentPrompt(String),
     /// Nested agent response and reasoning, kept visually distinct from the primary.
     CodeAgentMessage(String),
     CodeAgentThought(String),
@@ -149,6 +147,8 @@ pub enum Entry {
     CodeAgentPlan(Vec<PlanEntry>),
     /// Role/model-attributed activity projected from structured MCP progress.
     ActorActivity(Box<ActorActivity>),
+    /// Council coordination prompt retained in full but normally rendered compactly.
+    InternalMessage(InternalMessage),
     /// System-level note (errors, warnings, mode changes).
     System(String),
     /// Visual separator inserted at local session boundaries so a freshly
@@ -627,14 +627,12 @@ pub struct AppState {
     /// Scroll offset measured in rendered lines from the bottom of the
     /// transcript. `0` keeps the view pinned to the newest line.
     pub scroll_offset: usize,
-    /// When false, tool-call outputs are truncated to a small line budget
-    /// in the transcript so streaming bursts don't push the conversation
-    /// off-screen. In the fullscreen TUI, Ctrl-T flips this for the whole
-    /// session.
-    pub expand_tool_outputs: bool,
+    /// When false, stable long messages and tool-call outputs are compacted in
+    /// the transcript. In the fullscreen TUI, Ctrl-T flips this globally.
+    pub expand_transcript_details: bool,
     /// When true (inline mode only), the compact chat view is replaced by a
     /// full-height, scrollable reader showing the entire transcript with
-    /// tool outputs fully expanded. Inline scrollback is immutable once
+    /// messages and tool outputs fully expanded. Inline scrollback is immutable once
     /// flushed, so this reader is how users re-read earlier output in full.
     pub transcript_viewer: bool,
     pub exit_reason: Option<UiExitReason>,
@@ -931,7 +929,7 @@ impl AppState {
             elicitation_queue: VecDeque::new(),
             config_picker: None,
             scroll_offset: 0,
-            expand_tool_outputs: false,
+            expand_transcript_details: false,
             transcript_viewer: false,
             exit_reason: None,
             runtime_closed: false,
@@ -1256,11 +1254,11 @@ impl AppState {
         }
     }
 
-    /// Flip the global tool-output collapse setting. Bumps the transcript
+    /// Flip the global transcript-detail collapse setting. Bumps the transcript
     /// revision so the renderer rebuilds its cached `Vec<Line>` with the
     /// new line budget.
-    pub fn toggle_expand_tool_outputs(&mut self) {
-        self.expand_tool_outputs = !self.expand_tool_outputs;
+    pub fn toggle_expand_transcript_details(&mut self) {
+        self.expand_transcript_details = !self.expand_transcript_details;
         self.bump_transcript_revision();
     }
 
@@ -1285,7 +1283,6 @@ impl AppState {
             Entry::AgentMessage(text) => Some(text.clone()),
             Entry::UserPrompt(_)
             | Entry::AgentThought(_)
-            | Entry::CodeAgentPrompt(_)
             | Entry::CodeAgentMessage(_)
             | Entry::CodeAgentThought(_)
             | Entry::ToolCall(_)
@@ -1293,6 +1290,7 @@ impl AppState {
             | Entry::Plan(_)
             | Entry::CodeAgentPlan(_)
             | Entry::ActorActivity(_)
+            | Entry::InternalMessage(_)
             | Entry::System(_)
             | Entry::SessionBoundary(_) => None,
         })
@@ -1909,6 +1907,18 @@ impl AppState {
     }
 
     pub fn apply_event(&mut self, event: UiEvent) {
+        let is_thinking_update = matches!(
+            &event,
+            UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(_))
+                | UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+                    SessionUpdate::AgentThoughtChunk(_)
+                ))
+                | UiEvent::ActorActivity(ActorActivity::Thought { .. })
+        );
+        if !is_thinking_update && remove_trailing_thinking(&mut self.transcript) {
+            self.bump_transcript_revision();
+        }
+
         match event {
             UiEvent::Connected {
                 prompt_images_supported,
@@ -1944,6 +1954,10 @@ impl AppState {
                 self.apply_session_config_options(options, targets);
             }
             UiEvent::ActorActivity(activity) => self.apply_actor_activity(activity),
+            UiEvent::InternalMessage(message) => {
+                self.transcript.push(Entry::InternalMessage(message));
+                self.bump_transcript_revision();
+            }
             UiEvent::PermissionRequest(prompt) => {
                 // Append to the queue rather than replacing the current
                 // pending prompt: overwriting would drop the prior
@@ -1988,6 +2002,9 @@ impl AppState {
                 self.resolve_permission_remotely(&request_id, &option_id);
             }
             UiEvent::PromptDone { stop_reason, usage } => {
+                if remove_trailing_thinking(&mut self.transcript) {
+                    self.bump_transcript_revision();
+                }
                 self.finish_prompt_turn(matches!(stop_reason, StopReason::Cancelled));
                 if let Some(usage) = usage {
                     self.token_usage.apply_prompt_usage(usage);
@@ -2005,6 +2022,9 @@ impl AppState {
                 self.claude_usage = Some(report);
             }
             UiEvent::PromptFailed { message } => {
+                if remove_trailing_thinking(&mut self.transcript) {
+                    self.bump_transcript_revision();
+                }
                 self.finish_prompt_turn(true);
                 // Drop queued prompts: finish_prompt_turn flips back to
                 // Ready, which the next drain pass would otherwise read as
@@ -2046,25 +2066,25 @@ impl AppState {
     fn apply_code_agent_event(&mut self, event: CodeAgentEvent) {
         const PREFIX: &str = "codeagent:";
         match event {
-            CodeAgentEvent::Started {
-                label,
-                instructions,
-            } => {
+            CodeAgentEvent::Started { label } => {
                 self.code_agent_active = true;
                 self.code_agent_label = Some(label.clone());
-                self.push_session_boundary(label.clone());
-                self.transcript.push(Entry::CodeAgentPrompt(instructions));
-                self.bump_transcript_revision();
                 self.set_status_line(StatusKind::Info, label);
             }
             CodeAgentEvent::SessionUpdate(update) => self.apply_code_agent_update(update),
             CodeAgentEvent::TerminalOutput(mut snapshot) => {
+                if remove_trailing_thinking(&mut self.transcript) {
+                    self.bump_transcript_revision();
+                }
                 snapshot.terminal_id = format!("{PREFIX}{}", snapshot.terminal_id);
                 self.terminal_outputs
                     .insert(snapshot.terminal_id.clone(), snapshot);
                 self.apply_known_terminal_outputs();
             }
             CodeAgentEvent::PermissionRequest(prompt) => {
+                if remove_trailing_thinking(&mut self.transcript) {
+                    self.bump_transcript_revision();
+                }
                 self.help_overlay = false;
                 self.permission_queue.push_back(PendingPermission {
                     prompt,
@@ -2077,6 +2097,9 @@ impl AppState {
                 self.update_autocomplete();
             }
             CodeAgentEvent::ElicitationRequest(prompt) => {
+                if remove_trailing_thinking(&mut self.transcript) {
+                    self.bump_transcript_revision();
+                }
                 self.help_overlay = false;
                 self.elicitation_queue.push_back(PendingElicitation {
                     prompt,
@@ -2092,24 +2115,32 @@ impl AppState {
                 self.mark_code_agent_tools_failed("tool call cancelled");
             }
             CodeAgentEvent::Status(message) => {
-                self.push_system_message(format!("Eitri: {message}"));
+                remove_trailing_thinking(&mut self.transcript);
+                self.push_system_message(format!("Eitri · {message}"));
             }
             CodeAgentEvent::Finished { outcome } => {
+                if remove_trailing_thinking(&mut self.transcript) {
+                    self.bump_transcript_revision();
+                }
                 self.code_agent_active = false;
                 self.code_agent_label = None;
                 self.cancel_code_agent_prompts();
-                let label = match outcome {
-                    CodeAgentOutcome::Completed => "Eitri · complete".to_string(),
+                match outcome {
+                    CodeAgentOutcome::Completed => {
+                        self.set_status_line(StatusKind::Info, "Eitri complete")
+                    }
                     CodeAgentOutcome::Cancelled => {
                         self.mark_code_agent_tools_failed("tool call cancelled");
-                        "Eitri · cancelled".to_string()
+                        self.set_status_line(StatusKind::Info, "Eitri cancelled");
                     }
                     CodeAgentOutcome::Failed(message) => {
                         self.mark_code_agent_tools_failed("tool call failed");
-                        format!("Eitri · failed · {message}")
+                        self.record_status_message(
+                            StatusKind::Warning,
+                            format!("Eitri failed · {message}"),
+                        );
                     }
-                };
-                self.push_session_boundary(label);
+                }
             }
         }
     }
@@ -2119,6 +2150,7 @@ impl AppState {
         match update {
             SessionUpdate::UserMessageChunk(_) => {}
             SessionUpdate::AgentMessageChunk(chunk) => {
+                remove_trailing_thinking(&mut self.transcript);
                 append_or_start(
                     &mut self.transcript,
                     EntryKind::CodeAgent,
@@ -2127,7 +2159,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::AgentThoughtChunk(chunk) => {
-                append_or_start(
+                replace_thinking(
                     &mut self.transcript,
                     EntryKind::CodeAgentThought,
                     content_block_text(&chunk.content),
@@ -2135,6 +2167,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCall(tool_call) => {
+                remove_trailing_thinking(&mut self.transcript);
                 let key = format!("{PREFIX}{}", tool_call.tool_call_id);
                 let mut view = ToolCallView::from_tool_call(&tool_call);
                 view.namespace_terminal_ids(PREFIX);
@@ -2143,6 +2176,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCallUpdate(update) => {
+                remove_trailing_thinking(&mut self.transcript);
                 let key = format!("{PREFIX}{}", update.tool_call_id);
                 if let Some(view) = self.tool_calls.get_mut(&key) {
                     view.apply_update(&update);
@@ -2168,6 +2202,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::Plan(Plan { entries, .. }) => {
+                remove_trailing_thinking(&mut self.transcript);
                 if let Some(Entry::CodeAgentPlan(existing)) = self
                     .transcript
                     .iter_mut()
@@ -2186,6 +2221,25 @@ impl AppState {
     }
 
     fn apply_actor_activity(&mut self, activity: ActorActivity) {
+        if let ActorActivity::Thought { actor, text } = &activity {
+            if let Some(Entry::ActorActivity(previous)) = self.transcript.last_mut()
+                && let ActorActivity::Thought {
+                    actor: previous_actor,
+                    text: previous_text,
+                } = previous.as_mut()
+                && actor.connection_id == previous_actor.connection_id
+            {
+                *previous_text = text.clone();
+                self.bump_transcript_revision();
+                return;
+            }
+            remove_trailing_thinking(&mut self.transcript);
+            self.transcript
+                .push(Entry::ActorActivity(Box::new(activity)));
+            self.bump_transcript_revision();
+            return;
+        }
+        remove_trailing_thinking(&mut self.transcript);
         if let ActorActivity::Tool { actor, tool_id, .. } = &activity {
             let key = format!("{}:{tool_id}", actor.connection_id);
             if let Some(&index) = self.actor_tool_entries.get(&key)
@@ -2209,17 +2263,6 @@ impl AppState {
                 (
                     ActorActivity::Message { actor, text },
                     ActorActivity::Message {
-                        actor: previous_actor,
-                        text: previous_text,
-                    },
-                ) if actor.connection_id == previous_actor.connection_id => {
-                    previous_text.push_str(text);
-                    self.bump_transcript_revision();
-                    return;
-                }
-                (
-                    ActorActivity::Thought { actor, text },
-                    ActorActivity::Thought {
                         actor: previous_actor,
                         text: previous_text,
                     },
@@ -2344,16 +2387,18 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::AgentMessageChunk(c) => {
+                remove_trailing_thinking(&mut self.transcript);
                 let text = content_block_text(&c.content);
                 append_or_start(&mut self.transcript, EntryKind::Agent, text);
                 self.bump_transcript_revision();
             }
             SessionUpdate::AgentThoughtChunk(c) => {
                 let text = content_block_text(&c.content);
-                append_or_start(&mut self.transcript, EntryKind::Thought, text);
+                replace_thinking(&mut self.transcript, EntryKind::Thought, text);
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCall(tc) => {
+                remove_trailing_thinking(&mut self.transcript);
                 let id = tc.tool_call_id.to_string();
                 self.tool_calls
                     .insert(id.clone(), ToolCallView::from_tool_call(&tc));
@@ -2361,6 +2406,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCallUpdate(u) => {
+                remove_trailing_thinking(&mut self.transcript);
                 let id = u.tool_call_id.to_string();
                 if let Some(view) = self.tool_calls.get_mut(&id) {
                     view.apply_update(&u);
@@ -2381,6 +2427,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::Plan(Plan { entries, .. }) => {
+                remove_trailing_thinking(&mut self.transcript);
                 // Replace the most recent Plan entry if present, else push.
                 if let Some(Entry::Plan(existing)) = self
                     .transcript
@@ -2553,9 +2600,7 @@ fn append_or_start(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) {
         match (&kind, last) {
             (EntryKind::User, Entry::UserPrompt(s))
             | (EntryKind::Agent, Entry::AgentMessage(s))
-            | (EntryKind::Thought, Entry::AgentThought(s))
-            | (EntryKind::CodeAgent, Entry::CodeAgentMessage(s))
-            | (EntryKind::CodeAgentThought, Entry::CodeAgentThought(s)) => {
+            | (EntryKind::CodeAgent, Entry::CodeAgentMessage(s)) => {
                 s.push_str(&text);
                 return;
             }
@@ -2569,6 +2614,40 @@ fn append_or_start(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) {
         EntryKind::CodeAgent => Entry::CodeAgentMessage(text),
         EntryKind::CodeAgentThought => Entry::CodeAgentThought(text),
     });
+}
+
+fn replace_thinking(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) {
+    match (kind, transcript.last_mut()) {
+        (EntryKind::Thought, Some(Entry::AgentThought(existing)))
+        | (EntryKind::CodeAgentThought, Some(Entry::CodeAgentThought(existing))) => {
+            *existing = text;
+        }
+        (EntryKind::Thought, _) => {
+            remove_trailing_thinking(transcript);
+            transcript.push(Entry::AgentThought(text));
+        }
+        (EntryKind::CodeAgentThought, _) => {
+            remove_trailing_thinking(transcript);
+            transcript.push(Entry::CodeAgentThought(text));
+        }
+        _ => unreachable!("replace_thinking requires a thought entry kind"),
+    }
+}
+
+fn remove_trailing_thinking(transcript: &mut Vec<Entry>) -> bool {
+    let thinking = match transcript.last() {
+        Some(Entry::AgentThought(_) | Entry::CodeAgentThought(_)) => true,
+        Some(Entry::ActorActivity(activity)) => {
+            matches!(activity.as_ref(), ActorActivity::Thought { .. })
+        }
+        _ => false,
+    };
+    if thinking {
+        transcript.pop();
+        true
+    } else {
+        false
+    }
 }
 
 /// Return the current value identifier for a select-style session config option.
@@ -3255,6 +3334,86 @@ mod tests {
     }
 
     #[test]
+    fn thinking_updates_replace_and_non_thinking_activity_removes_them() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk("first thought"),
+        )));
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk("replacement thought"),
+        )));
+
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::AgentThought(text)] if text == "replacement thought"
+        ));
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(
+            ToolCall::new("call-1", "work"),
+        )));
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::ToolCall(id)] if id == "call-1"
+        ));
+    }
+
+    #[test]
+    fn code_agent_handoff_has_no_transcript_boundary_or_prompt_block() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "Eitri · builder".to_string(),
+        }));
+        assert!(state.transcript.is_empty());
+
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentThoughtChunk(text_chunk("forging")),
+        )));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentMessageChunk(text_chunk("done")),
+        )));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
+            outcome: CodeAgentOutcome::Completed,
+        }));
+
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::CodeAgentMessage(text)] if text == "done"
+        ));
+    }
+
+    #[test]
+    fn internal_coordination_stays_inline_in_transcript_order() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::InternalMessage(InternalMessage {
+            source: "Thor".to_string(),
+            target: "Eitri".to_string(),
+            kind: crate::event::InternalMessageKind::Delegation,
+            text: "implementation brief".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "Eitri · builder".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentMessageChunk(text_chunk("working")),
+        )));
+
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::InternalMessage(message), Entry::CodeAgentMessage(text)]
+                if message.source == "Thor"
+                    && message.target == "Eitri"
+                    && message.text == "implementation brief"
+                    && text == "working"
+        ));
+        assert!(
+            !state
+                .transcript
+                .iter()
+                .any(|entry| matches!(entry, Entry::SessionBoundary(_)))
+        );
+    }
+
+    #[test]
     fn tool_call_update_merges() {
         let mut s = AppState::new();
         let tc = ToolCall::new("call-1", "running ls");
@@ -3278,7 +3437,6 @@ mod tests {
         )));
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
             label: "codex".to_string(),
-            instructions: "work".to_string(),
         }));
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
             SessionUpdate::ToolCall(ToolCall::new("shared-id", "nested tool")),
@@ -3304,7 +3462,6 @@ mod tests {
         state.record_user_prompt("delegate".to_string());
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
             label: "codex".to_string(),
-            instructions: "work".to_string(),
         }));
         state.mark_cancelling();
         assert_eq!(state.connection_state, ConnectionState::Streaming);

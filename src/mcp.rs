@@ -476,6 +476,7 @@ impl ConnState {
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::ClaudeUsage(_)
             | UiEvent::ActorActivity(_)
+            | UiEvent::InternalMessage(_)
             | UiEvent::CodeAgent(_) => {}
         }
     }

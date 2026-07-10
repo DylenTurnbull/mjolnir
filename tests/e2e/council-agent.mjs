@@ -8,8 +8,11 @@ import readline from "node:readline";
 const resultPath = process.env.MJ_E2E_PRIMARY_RESULT;
 const primaryLog = process.env.MJ_E2E_PRIMARY_LOG;
 const nestedLog = process.env.MJ_E2E_NESTED_LOG;
-const instructions = process.env.MJ_E2E_CODE_AGENT_INSTRUCTIONS ?? "Return CODEAGENT_E2E_OK";
 const mode = process.env.MJ_E2E_MODE ?? "complete";
+const longMessage = (prefix, fill, suffix) => `${prefix} ${fill.repeat(720)} ${suffix}`;
+const instructions = mode === "details"
+  ? longMessage("DELEGATION_LONG_PREFIX", "d", "DELEGATION_LONG_SUFFIX")
+  : process.env.MJ_E2E_CODE_AGENT_INSTRUCTIONS ?? "Return CODEAGENT_E2E_OK";
 let selectedModel = "gpt-5.6-sol";
 let reasoning = "medium";
 let mcpServer = null;
@@ -84,6 +87,18 @@ function finishPrimary(text) {
   send({ id: promptRequestId, result: { stopReason: "end_turn" } });
 }
 
+function eitriResult() {
+  return mode === "details"
+    ? longMessage("EITRI_LONG_PREFIX", "e", "EITRI_LONG_SUFFIX")
+    : "CODEAGENT_E2E_OK";
+}
+
+function thorReviewResult() {
+  return mode === "details"
+    ? longMessage("THOR_LONG_PREFIX", "t", "THOR_LONG_SUFFIX")
+    : "PRIMARY FINAL REVIEWED";
+}
+
 async function callEitri() {
   const unauthorizedStatus = await mcpReady;
   const toolSentAt = Date.now();
@@ -111,6 +126,7 @@ function requestEitriPermission() {
 }
 
 function runLokiTurn(text) {
+  append(process.env.MJ_E2E_LOKI_LOG, `prompt:${text}`);
   let decision = { decision: "no_intervention" };
   if (!lokiIntervened && mode === "loki-eitri" && text.includes("Eitri")) {
     lokiIntervened = true;
@@ -156,8 +172,8 @@ input.on("line", (line) => {
       startEitriTurn();
     } else if (isLoki()) {
       runLokiTurn(text);
-    } else if (text.includes("required final hidden council follow-up")) {
-      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "PRIMARY FINAL REVIEWED" } });
+    } else if (text.includes("Perform Thor's discrete review")) {
+      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: thorReviewResult() } });
       send({ id: promptRequestId, result: { stopReason: "end_turn" } });
     } else {
       void callEitri().catch((error) => { if (resultPath) fs.writeFileSync(resultPath, JSON.stringify({ error: String(error) })); finishPrimary(`PRIMARY FAILED: ${error.message}`); });
@@ -170,7 +186,7 @@ input.on("line", (line) => {
     update({ sessionUpdate: "tool_call", toolCallId: "nested-tool", title: "fixture terminal command", kind: "execute", status: "in_progress", content: [{ type: "terminal", terminalId: message.result.terminalId }] });
     setTimeout(() => {
       update({ sessionUpdate: "tool_call_update", toolCallId: "nested-tool", status: "completed" });
-      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "CODEAGENT_E2E_OK" } });
+      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: eitriResult() } });
       log(`completion:${Date.now()}`); send({ id: promptRequestId, result: { stopReason: "end_turn" } });
     }, 250);
   } else if (message.method === "session/cancel") {

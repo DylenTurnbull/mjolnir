@@ -2,7 +2,7 @@
 //! user turn; observations are serialized through it and decisions are
 //! delivered mechanically to the active Thor or Eitri driver.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -21,6 +21,68 @@ use crate::ragnarok::{AgentHandle, Launch, TurnEvent};
 
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_CONTEXT_BYTES: usize = 96 * 1024;
+
+/// Loki critiques waiting to be delivered to a target at a safe step boundary.
+///
+/// Review decisions arrive asynchronously, often after the target has already
+/// started its next operation. Keep them ordered by review id and request at
+/// most one cancellation when the next boundary is observed.
+#[derive(Default)]
+pub struct DeferredIntervention {
+    critiques: BTreeMap<u64, String>,
+    cancel_requested: bool,
+}
+
+impl DeferredIntervention {
+    pub fn push(&mut self, id: u64, critique: String) {
+        self.critiques.insert(id, critique);
+    }
+
+    pub fn is_pending(&self) -> bool {
+        !self.critiques.is_empty()
+    }
+
+    /// Mark the next observed non-terminal step boundary for interruption.
+    pub fn interrupt_at_boundary(&mut self) -> bool {
+        if self.critiques.is_empty() || self.cancel_requested {
+            return false;
+        }
+        self.cancel_requested = true;
+        true
+    }
+
+    pub fn cancellation_was_requested(&self) -> bool {
+        self.cancel_requested
+    }
+
+    /// Drain queued critiques in observation order for one continuation prompt.
+    pub fn take(&mut self) -> Option<String> {
+        if self.critiques.is_empty() {
+            return None;
+        }
+        self.cancel_requested = false;
+        let critiques = std::mem::take(&mut self.critiques);
+        Some(
+            critiques
+                .into_values()
+                .enumerate()
+                .map(|(index, critique)| {
+                    if index == 0 {
+                        critique
+                    } else {
+                        format!("Additional Loki critique: {critique}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+    }
+
+    pub fn clear(&mut self) {
+        self.critiques.clear();
+        self.cancel_requested = false;
+    }
+}
 
 #[derive(Default)]
 pub struct BoundaryTracker {
@@ -182,7 +244,6 @@ pub struct Decision {
     pub id: u64,
     pub epoch: u64,
     pub target: Target,
-    pub final_review: bool,
     pub verdict: Verdict,
 }
 
@@ -197,7 +258,6 @@ enum Request {
         target: Target,
         boundary: String,
         trajectory: String,
-        final_review: bool,
     },
     Shutdown,
 }
@@ -211,7 +271,6 @@ pub struct Handle {
     abort: watch::Sender<bool>,
     finished: watch::Receiver<bool>,
     pub streaming_enabled: bool,
-    pub final_enabled: bool,
 }
 
 impl Handle {
@@ -221,7 +280,6 @@ impl Handle {
         additional_directories: Vec<PathBuf>,
         ui_tx: mpsc::UnboundedSender<UiEvent>,
         streaming_enabled: bool,
-        final_enabled: bool,
     ) -> Self {
         let (requests, rx) = mpsc::unbounded_channel();
         let (decisions, _) = broadcast::channel(512);
@@ -235,7 +293,6 @@ impl Handle {
             abort,
             finished,
             streaming_enabled,
-            final_enabled,
         };
         tokio::spawn(worker(
             role,
@@ -277,34 +334,10 @@ impl Handle {
         trajectory: String,
     ) -> Option<u64> {
         self.streaming_enabled
-            .then(|| self.submit(epoch, target, boundary, trajectory, false))
+            .then(|| self.submit(epoch, target, boundary, trajectory))
     }
 
-    pub fn final_review(
-        &self,
-        epoch: u64,
-        result: String,
-        trajectory_and_diff: String,
-    ) -> Option<u64> {
-        self.final_enabled.then(|| {
-            self.submit(
-                epoch,
-                Target::Thor,
-                format!("Thor completed its initial answer:\n{result}"),
-                trajectory_and_diff,
-                true,
-            )
-        })
-    }
-
-    fn submit(
-        &self,
-        epoch: u64,
-        target: Target,
-        boundary: String,
-        trajectory: String,
-        final_review: bool,
-    ) -> u64 {
+    fn submit(&self, epoch: u64, target: Target, boundary: String, trajectory: String) -> u64 {
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
         let _ = self.requests.send(Request::Review {
             id,
@@ -312,7 +345,6 @@ impl Handle {
             target,
             boundary: bounded(boundary),
             trajectory: bounded(trajectory),
-            final_review,
         });
         id
     }
@@ -397,7 +429,6 @@ async fn worker(
                 target,
                 boundary,
                 trajectory,
-                final_review,
             } if request_epoch == epoch => {
                 if session.is_none() {
                     match connect(&role, &cwd, &additional_directories, abort_rx.clone()).await {
@@ -418,14 +449,13 @@ async fn worker(
                                 id,
                                 epoch,
                                 target,
-                                final_review,
                                 verdict: Verdict::Failed(message),
                             });
                             continue;
                         }
                     }
                 }
-                let prompt = review_prompt(&task, target, &boundary, &trajectory, final_review);
+                let prompt = review_prompt(&task, target, &boundary, &trajectory);
                 let result = session
                     .as_mut()
                     .expect("connected")
@@ -495,7 +525,6 @@ async fn worker(
                     id,
                     epoch,
                     target,
-                    final_review,
                     verdict,
                 });
             }
@@ -536,21 +565,10 @@ async fn connect(
     .await
 }
 
-fn review_prompt(
-    task: &str,
-    target: Target,
-    boundary: &str,
-    trajectory: &str,
-    final_review: bool,
-) -> String {
+fn review_prompt(task: &str, target: Target, boundary: &str, trajectory: &str) -> String {
     format!(
-        "You are Loki, a read-only reviewer of {actor}. Any intervention you issue forces Mjolnir to cancel the active request and re-prompt it, which is expensive and discards in-flight work. Intervene only for a material correctness, safety, scope, or strategy problem. Do not intervene for style, optional improvements, or mere uncertainty. Return exactly one JSON object and no markdown: {{\"decision\":\"no_intervention\"}} or {{\"decision\":\"intervention\",\"critique\":\"specific actionable critique\"}}.\n\nOriginal task:\n{task}\n\nReview kind: {kind}\nBoundary:\n{boundary}\n\nBounded trajectory and workspace context:\n{trajectory}",
+        "You are Loki, a read-only streaming reviewer of {actor}. Any intervention you issue is queued until the target's next safe step boundary, then Mjolnir interrupts normal continuation and re-prompts it with your critique. Intervene only for a material correctness, safety, scope, or strategy problem. Do not intervene for style, optional improvements, or mere uncertainty. Return exactly one JSON object and no markdown: {{\"decision\":\"no_intervention\"}} or {{\"decision\":\"intervention\",\"critique\":\"specific actionable critique\"}}.\n\nOriginal task:\n{task}\n\nReview kind: streaming boundary review\nBoundary:\n{boundary}\n\nBounded trajectory and workspace context:\n{trajectory}",
         actor = target.label(),
-        kind = if final_review {
-            "discrete final review"
-        } else {
-            "streaming boundary review"
-        },
     )
 }
 
@@ -595,6 +613,54 @@ mod tests {
             parse_decision(r#"{"decision":"intervention","critique":"wrong file"}"#).unwrap(),
             Verdict::Intervention(_)
         ));
+    }
+
+    #[test]
+    fn intervention_waits_for_boundary_and_requests_one_cancellation() {
+        let mut intervention = DeferredIntervention::default();
+
+        intervention.push(7, "inspect the generated config".to_string());
+
+        assert!(intervention.is_pending());
+        assert!(!intervention.cancellation_was_requested());
+        assert!(intervention.interrupt_at_boundary());
+        assert!(intervention.cancellation_was_requested());
+        assert!(!intervention.interrupt_at_boundary());
+        assert_eq!(
+            intervention.take().as_deref(),
+            Some("inspect the generated config")
+        );
+        assert!(!intervention.is_pending());
+        assert!(!intervention.cancellation_was_requested());
+    }
+
+    #[test]
+    fn completed_target_can_be_reprompted_without_cancellation() {
+        let mut intervention = DeferredIntervention::default();
+        intervention.push(3, "fix the final answer".to_string());
+
+        assert_eq!(intervention.take().as_deref(), Some("fix the final answer"));
+        assert!(!intervention.cancellation_was_requested());
+    }
+
+    #[test]
+    fn queued_critiques_are_ordered_and_clear_resets_boundary_state() {
+        let mut intervention = DeferredIntervention::default();
+        intervention.push(20, "second observed review".to_string());
+        intervention.push(10, "first observed review".to_string());
+        assert!(intervention.interrupt_at_boundary());
+
+        assert_eq!(
+            intervention.take().as_deref(),
+            Some("first observed review\n\nAdditional Loki critique: second observed review")
+        );
+
+        intervention.push(30, "stale review".to_string());
+        assert!(intervention.interrupt_at_boundary());
+        intervention.clear();
+        assert!(!intervention.is_pending());
+        assert!(!intervention.cancellation_was_requested());
+        assert!(!intervention.interrupt_at_boundary());
     }
 
     #[test]

@@ -73,6 +73,23 @@ pub enum ActorActivity {
     },
 }
 
+/// A council coordination prompt shown as ordinary transcript prose while
+/// retaining its complete text for expansion and export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalMessage {
+    pub source: String,
+    pub target: String,
+    pub kind: InternalMessageKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InternalMessageKind {
+    Delegation,
+    DiscreteReview,
+    Continuation,
+}
+
 /// Events flowing from the ACP runtime into the UI task.
 #[derive(Debug)]
 pub enum UiEvent {
@@ -103,6 +120,8 @@ pub enum UiEvent {
     },
     /// Structured nested-agent activity projected from an MCP tool result.
     ActorActivity(ActorActivity),
+    /// Hidden council coordination made inspectable in the shared transcript.
+    InternalMessage(InternalMessage),
     /// `session/request_permission` from the agent. The UI is expected to
     /// render a modal and answer through `responder` exactly once.
     PermissionRequest(PermissionPrompt),
@@ -152,7 +171,7 @@ pub enum UiEvent {
 
 #[derive(Debug)]
 pub enum CodeAgentEvent {
-    Started { label: String, instructions: String },
+    Started { label: String },
     SessionUpdate(SessionUpdate),
     TerminalOutput(TerminalOutputSnapshot),
     PermissionRequest(PermissionPrompt),

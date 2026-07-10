@@ -70,7 +70,7 @@ const TRANSCRIPT_SCROLL_WHEEL_STEP: usize = 3;
 const PROMPT_SIDE_PADDING: u16 = 1;
 pub const INLINE_CHAT_HEIGHT: u16 = 8;
 const INLINE_EXPANDED_MAX_HEIGHT: u16 = 20;
-const INLINE_LIVE_TRANSCRIPT_MAX_ROWS: usize = 12;
+const INLINE_TRANSCRIPT_TAIL_MAX_ROWS: usize = 12;
 const INLINE_HELP_HEIGHT: u16 = 18;
 /// Inline viewport height for the `/mjconfig` overlay (border + two sections).
 const INLINE_MJCONFIG_HEIGHT: u16 = 15;
@@ -247,12 +247,12 @@ fn stable_transcript_entry_count(state: &AppState) -> usize {
 fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bool {
     match entry {
         Entry::UserPrompt(_)
-        | Entry::CodeAgentPrompt(_)
         | Entry::System(_)
         | Entry::SessionBoundary(_)
         | Entry::Plan(_)
         | Entry::CodeAgentPlan(_)
-        | Entry::ActorActivity(_) => true,
+        | Entry::ActorActivity(_)
+        | Entry::InternalMessage(_) => true,
         Entry::AgentMessage(_)
         | Entry::AgentThought(_)
         | Entry::CodeAgentMessage(_)
@@ -541,6 +541,7 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::RemotePermissionDecision { .. }
         | UiEvent::Warning(_)
         | UiEvent::Info(_)
+        | UiEvent::InternalMessage(_)
         | UiEvent::Fatal(_)
         | UiEvent::CodeAgent(_) => RedrawCause::Interactive,
     }
@@ -560,10 +561,12 @@ const INLINE_PERMISSION_REPAIR_WINDOW: Duration = Duration::from_secs(2);
 const INLINE_PERMISSION_REPAIR_ATTEMPTS: usize = 3;
 
 /// Maximum number of lines we render from each tool-output entry when
-/// `expand_tool_outputs` is false. Picked to keep the head of long
+/// transcript details are collapsed. Picked to keep the head of long
 /// stdout / diff dumps visible without flushing the surrounding
 /// conversation out of the viewport while a turn is streaming.
 const TOOL_OUTPUT_COLLAPSED_LINES: usize = 6;
+const MESSAGE_COLLAPSED_LINES: usize = 6;
+const MESSAGE_COLLAPSED_CHARS: usize = 600;
 
 async fn ui_loop(
     terminal: &mut Terminal<TrackedBackend<Stdout>>,
@@ -987,7 +990,7 @@ fn notification_message_for_event(
         )),
         UiEvent::PermissionRequest(prompt) => Some(permission_request_notification(prompt)),
         UiEvent::CodeAgent(crate::event::CodeAgentEvent::PermissionRequest(prompt)) => Some(
-            format!("Eitri: {}", permission_request_notification(prompt)),
+            format!("Eitri · {}", permission_request_notification(prompt)),
         ),
         _ => None,
     }
@@ -1573,7 +1576,7 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
         usize::from(INLINE_CHAT_HEIGHT)
             + usize::from(queued_prompt_row_count(state))
             + usize::from(state.claude_usage.is_some())
-            + inline_live_transcript_row_count(state, width)
+            + inline_transcript_tail_row_count(state, width)
     };
 
     (desired.min(usize::from(u16::MAX)) as u16).clamp(INLINE_CHAT_HEIGHT, max_height)
@@ -2949,15 +2952,14 @@ fn scroll_to_bottom(state: &mut AppState) {
     state.scroll_offset = 0;
 }
 
-/// Ctrl-T behaviour. The fullscreen TUI re-renders the whole transcript every
-/// frame, so toggling the collapse setting applies retroactively there. Inline
-/// scrollback is immutable once flushed, so the toggle could never reach
-/// already-printed output; instead Ctrl-T opens the full-transcript reader.
+/// Ctrl-T behaviour. The fullscreen TUI can retroactively toggle all compacted
+/// transcript details. Inline scrollback is immutable once flushed, so Ctrl-T
+/// opens a full reader with every message and tool output expanded.
 fn toggle_transcript_expansion(state: &mut AppState, mode: UiMode) {
     if mode == UiMode::InlineChat {
         state.open_transcript_viewer();
     } else {
-        state.toggle_expand_tool_outputs();
+        state.toggle_expand_transcript_details();
     }
 }
 
@@ -3592,7 +3594,6 @@ fn transcript_export_markdown(state: &AppState) -> String {
             Entry::UserPrompt(text) => push_export_text(&mut out, "You", text),
             Entry::AgentMessage(text) => push_export_text(&mut out, "Agent", text),
             Entry::AgentThought(text) => push_export_text(&mut out, "Thought", text),
-            Entry::CodeAgentPrompt(text) => push_export_text(&mut out, "Thor → Eitri", text),
             Entry::CodeAgentMessage(text) => push_export_text(&mut out, "Eitri", text),
             Entry::CodeAgentThought(text) => push_export_text(&mut out, "Eitri Thought", text),
             Entry::ActorActivity(activity) => push_export_text(
@@ -3600,6 +3601,20 @@ fn transcript_export_markdown(state: &AppState) -> String {
                 &actor_activity_label(activity),
                 &actor_activity_text(activity),
             ),
+            Entry::InternalMessage(message) => {
+                let heading = match message.kind {
+                    crate::event::InternalMessageKind::Delegation => {
+                        format!("{} → {} delegation", message.source, message.target)
+                    }
+                    crate::event::InternalMessageKind::DiscreteReview => {
+                        format!("{} discrete review", message.source)
+                    }
+                    crate::event::InternalMessageKind::Continuation => {
+                        format!("{} → {} continuation", message.source, message.target)
+                    }
+                };
+                push_export_text(&mut out, &heading, &message.text);
+            }
             Entry::System(text) => push_export_text(&mut out, "System", text),
             Entry::SessionBoundary(text) => push_export_text(&mut out, "Session", text),
             Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
@@ -4363,8 +4378,8 @@ fn draw(
     }
 }
 
-fn inline_live_transcript_lines(state: &AppState, width: u16) -> Vec<Line<'static>> {
-    if !state.code_agent_active || width == 0 {
+fn inline_transcript_tail_lines(state: &AppState, width: u16) -> Vec<Line<'static>> {
+    if width == 0 {
         return Vec::new();
     }
     let stable_entries = stable_transcript_entry_count(state);
@@ -4377,22 +4392,22 @@ fn inline_live_transcript_lines(state: &AppState, width: u16) -> Vec<Line<'stati
     )
 }
 
-fn inline_live_transcript_row_count(state: &AppState, width: u16) -> usize {
-    let lines = inline_live_transcript_lines(state, width);
+fn inline_transcript_tail_row_count(state: &AppState, width: u16) -> usize {
+    let lines = inline_transcript_tail_lines(state, width);
     if lines.is_empty() {
         return 0;
     }
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .line_count(width)
-        .min(INLINE_LIVE_TRANSCRIPT_MAX_ROWS)
+        .min(INLINE_TRANSCRIPT_TAIL_MAX_ROWS)
 }
 
-fn draw_inline_live_transcript(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+fn draw_inline_transcript_tail(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let lines = inline_live_transcript_lines(state, area.width);
+    let lines = inline_transcript_tail_lines(state, area.width);
     if lines.is_empty() {
         return;
     }
@@ -4456,7 +4471,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
     let has_config_options = !state.selectable_config_options().is_empty();
     let has_usage_quota = state.claude_usage.is_some();
     let queued_row = queued_prompt_row_count(state);
-    let live_rows = inline_live_transcript_row_count(state, f.area().width)
+    let live_rows = inline_transcript_tail_row_count(state, f.area().width)
         .min(usize::from(f.area().height)) as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -4470,7 +4485,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
         ])
         .split(f.area());
 
-    draw_inline_live_transcript(f, chunks[0], state);
+    draw_inline_transcript_tail(f, chunks[0], state);
     draw_header(f, chunks[1], state);
     draw_queued_prompt_row(f, chunks[2], state);
     draw_input(f, chunks[3], state, UiMode::InlineChat);
@@ -4642,7 +4657,7 @@ fn draw_inline_config_value_picker(f: &mut ratatui::Frame, area: Rect, state: &A
     );
 }
 
-/// Full-screen inline reader for the entire transcript with tool outputs
+/// Full-screen inline reader for the entire transcript with all details
 /// expanded. `scroll_offset` is the index of the top visible line and is
 /// clamped here so End / PageDown can never scroll past the final screen.
 fn draw_inline_transcript_viewer(f: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
@@ -4654,7 +4669,7 @@ fn draw_inline_transcript_viewer(f: &mut ratatui::Frame, area: Rect, state: &mut
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" transcript — full history ")
+        .title(" transcript — full history · details expanded ")
         .style(Style::default().fg(state.theme.agent));
     let inner = block.inner(layout[0]);
     f.render_widget(block, layout[0]);
@@ -4676,7 +4691,9 @@ fn draw_inline_transcript_viewer(f: &mut ratatui::Frame, area: Rect, state: &mut
     }
 
     f.render_widget(
-        Paragraph::new("Up/Down PgUp/PgDn scroll · Home/End top/bottom · Esc or Ctrl-T to close")
+        Paragraph::new(
+            "All details expanded · Up/Down PgUp/PgDn scroll · Home/End top/bottom · Esc or Ctrl-T to close",
+        )
             .style(Style::default().fg(state.theme.muted)),
         layout[1],
     );
@@ -4939,7 +4956,7 @@ fn draw_transcript(
 /// Block title for the transcript pane. Adds a scroll indicator when
 /// `scroll_offset > 0` so the user knows they're no longer following the
 /// stream and can press End / scroll down to re-attach. The expand
-/// state for tool outputs is appended so Ctrl-T's effect is visible.
+/// state for compacted transcript details is appended so Ctrl-T's effect is visible.
 fn transcript_block_title(state: &AppState) -> String {
     let mut title = String::from(" transcript ");
     if state.scroll_offset > 0 {
@@ -4948,8 +4965,8 @@ fn transcript_block_title(state: &AppState) -> String {
             state.scroll_offset
         ));
     }
-    if state.expand_tool_outputs {
-        title.push_str("[tool output: expanded | Ctrl-T] ");
+    if state.expand_transcript_details {
+        title.push_str("[details: expanded | Ctrl-T] ");
     }
     title
 }
@@ -4964,18 +4981,16 @@ fn render_transcript_lines(state: &AppState, width: u16) -> Vec<Line<'static>> {
     )
 }
 
-/// Render the whole transcript with every tool output fully expanded,
-/// regardless of the session collapse setting. Used by the inline
-/// full-transcript reader so users can re-read truncated output in full.
+/// Render the whole transcript with every message and tool output expanded,
+/// regardless of the session collapse setting. Used by the inline reader.
 fn render_full_transcript_lines(state: &AppState, width: u16) -> Vec<Line<'static>> {
     render_transcript_entry_range(state, width, 0..state.transcript.len(), None, state.theme)
 }
 
-/// Line budget per tool-output entry for the streaming transcript: `None`
-/// (no limit) when the user expanded outputs, otherwise the collapsed
-/// default that keeps long dumps from flushing the conversation off-screen.
+/// Detail budget for the transcript: `None` when expanded, otherwise the
+/// collapsed default for stable long prose and tool output.
 fn transcript_collapse_limit(state: &AppState) -> Option<usize> {
-    if state.expand_tool_outputs {
+    if state.expand_transcript_details {
         None
     } else {
         Some(TOOL_OUTPUT_COLLAPSED_LINES)
@@ -4990,81 +5005,82 @@ fn render_transcript_entry_range(
     theme: TerminalTheme,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
-    for entry in state.transcript[entry_range].iter() {
+    let mut speaker = state.transcript[..entry_range.start]
+        .iter()
+        .filter_map(entry_speaker)
+        .next_back();
+    for (offset, entry) in state.transcript[entry_range.clone()].iter().enumerate() {
+        let entry_index = entry_range.start + offset;
+        let collapse_message =
+            collapse_limit.is_some() && transcript_entry_is_stable(state, entry_index, entry);
+        if let Some(next) = entry_speaker(entry)
+            && speaker.as_deref() != Some(next.as_str())
+        {
+            push_speaker_name(&mut out, &next, theme);
+            speaker = Some(next);
+        }
         match entry {
-            Entry::UserPrompt(text) => push_plain_block(&mut out, "you", theme.user, text.clone()),
-            Entry::AgentMessage(text) => push_markdown_block(
-                &mut out,
-                "Thor",
-                god_name_color("Thor", theme),
-                text.clone(),
-                theme,
-            ),
-            Entry::AgentThought(text) => {
-                push_role_thought(&mut out, "Thor", god_name_color("Thor", theme), text, theme)
+            Entry::UserPrompt(text) => push_plain_message(&mut out, text, collapse_message, theme),
+            Entry::AgentMessage(text) | Entry::CodeAgentMessage(text) => {
+                push_markdown_message(&mut out, text, collapse_message, theme)
             }
-            Entry::CodeAgentPrompt(text) => {
-                push_plain_block(&mut out, "Thor → Eitri", theme.user, text.clone())
+            Entry::AgentThought(text) | Entry::CodeAgentThought(text) => {
+                push_thinking(&mut out, text, theme)
             }
-            Entry::CodeAgentMessage(text) => push_markdown_block(
-                &mut out,
-                "Eitri",
-                god_name_color("Eitri", theme),
-                text.clone(),
-                theme,
-            ),
-            Entry::CodeAgentThought(text) => push_role_thought(
-                &mut out,
-                "Eitri",
-                god_name_color("Eitri", theme),
-                text,
-                theme,
-            ),
             Entry::ActorActivity(activity) => {
-                let label = actor_activity_label(activity);
                 let text = actor_activity_text(activity);
                 match activity.as_ref() {
-                    ActorActivity::Message { actor, .. } => {
-                        let role = actor_role_name(actor);
-                        push_markdown_block(
-                            &mut out,
-                            &role,
-                            god_name_color(&role, theme),
-                            text,
-                            theme,
-                        )
+                    ActorActivity::Message { .. } => {
+                        push_markdown_message(&mut out, &text, collapse_message, theme)
                     }
-                    ActorActivity::Thought { actor, .. } => {
-                        let role = actor_role_name(actor);
-                        push_role_thought(
-                            &mut out,
-                            &role,
-                            god_name_color(&role, theme),
-                            &text,
-                            theme,
-                        )
+                    ActorActivity::Thought { .. } => push_thinking(&mut out, &text, theme),
+                    ActorActivity::Warning { .. } => {
+                        push_styled_message(&mut out, &text, theme.warning, collapse_message, theme)
                     }
-                    ActorActivity::Warning { .. } | ActorActivity::PermissionRequested { .. } => {
-                        push_plain_block(&mut out, &label, theme.warning, text)
+                    ActorActivity::PermissionRequested { .. } => {
+                        push_styled_content(&mut out, text, theme.warning)
                     }
-                    ActorActivity::Tool { .. } => {
-                        push_plain_block(&mut out, &label, theme.tool, text)
+                    ActorActivity::Tool { .. } => push_styled_content(&mut out, text, theme.tool),
+                    ActorActivity::Connected { .. } | ActorActivity::Status { .. } => {
+                        push_styled_message(&mut out, &text, theme.muted, collapse_message, theme)
                     }
-                    ActorActivity::Connected { .. }
-                    | ActorActivity::Status { .. }
-                    | ActorActivity::Info { .. } => {
-                        push_plain_block(&mut out, &label, theme.muted, text)
+                    ActorActivity::Info { .. } => {
+                        push_styled_message(&mut out, &text, theme.muted, collapse_message, theme)
                     }
                 }
             }
-            Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
-                let label = if matches!(entry, Entry::CodeAgentPlan(_)) {
-                    "Eitri plan"
-                } else {
-                    "plan"
+            Entry::InternalMessage(message) => {
+                let chars = message.text.chars().count();
+                let title = match message.kind {
+                    crate::event::InternalMessageKind::Delegation => {
+                        format!(
+                            "delegated to {} · {}",
+                            message.target,
+                            message_size_label(chars)
+                        )
+                    }
+                    crate::event::InternalMessageKind::DiscreteReview => {
+                        format!("discrete review brief · {}", message_size_label(chars))
+                    }
+                    crate::event::InternalMessageKind::Continuation => {
+                        format!(
+                            "continuation for {} · {}",
+                            message.target,
+                            message_size_label(chars)
+                        )
+                    }
                 };
                 out.push(Line::from(Span::styled(
-                    label,
+                    title,
+                    Style::default()
+                        .fg(theme.muted)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                push_markdown_message(&mut out, &message.text, collapse_message, theme);
+            }
+            Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
+                out.push(Line::from(Span::styled(
+                    "plan",
                     Style::default().fg(theme.tool).add_modifier(Modifier::BOLD),
                 )));
                 for e in entries {
@@ -5090,16 +5106,11 @@ fn render_transcript_entry_range(
                     // Successful calls don't need a status marker — the output
                     // already implies success. Only annotate non-completed states
                     // (pending/running/failed/interrupted) so they stand out.
-                    let tool_label = if matches!(entry, Entry::CodeAgentToolCall(_)) {
-                        "Eitri tool"
-                    } else {
-                        "tool"
-                    };
                     let prefix = match view.status {
                         agent_client_protocol::schema::v1::ToolCallStatus::Completed => {
-                            format!("{tool_label} ")
+                            "tool ".to_string()
                         }
-                        _ => format!("{tool_label} [{}] ", tool_status_label(view.status)),
+                        _ => format!("tool [{}] ", tool_status_label(view.status)),
                     };
                     let mut spans = vec![
                         Span::styled(
@@ -5147,22 +5158,47 @@ fn render_transcript_entry_range(
                 }
             }
             Entry::System(text) => {
-                for line in text.split('\n') {
-                    out.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(theme.accent),
-                    )));
-                }
-                out.push(Line::from(""));
+                push_styled_message(&mut out, text, theme.accent, collapse_message, theme);
             }
             Entry::SessionBoundary(text) => {
-                out.push(Line::from(""));
-                out.push(session_boundary_line(text, width, theme));
-                out.push(Line::from(""));
+                if !text.starts_with("Eitri ·") {
+                    out.push(Line::from(""));
+                    out.push(session_boundary_line(text, width, theme));
+                    out.push(Line::from(""));
+                }
             }
         }
     }
     out
+}
+
+fn actor_for_activity(activity: &ActorActivity) -> &ActorIdentity {
+    match activity {
+        ActorActivity::Connected { actor }
+        | ActorActivity::Status { actor, .. }
+        | ActorActivity::Message { actor, .. }
+        | ActorActivity::Thought { actor, .. }
+        | ActorActivity::Tool { actor, .. }
+        | ActorActivity::PermissionRequested { actor, .. }
+        | ActorActivity::Warning { actor, .. }
+        | ActorActivity::Info { actor, .. } => actor,
+    }
+}
+
+fn entry_speaker(entry: &Entry) -> Option<String> {
+    match entry {
+        Entry::UserPrompt(_) => Some("You".to_string()),
+        Entry::AgentMessage(_) | Entry::AgentThought(_) | Entry::ToolCall(_) | Entry::Plan(_) => {
+            Some("Thor".to_string())
+        }
+        Entry::CodeAgentMessage(_)
+        | Entry::CodeAgentThought(_)
+        | Entry::CodeAgentToolCall(_)
+        | Entry::CodeAgentPlan(_) => Some("Eitri".to_string()),
+        Entry::ActorActivity(activity) => Some(actor_role_name(actor_for_activity(activity))),
+        Entry::InternalMessage(message) => Some(message.source.clone()),
+        Entry::System(_) | Entry::SessionBoundary(_) => None,
+    }
 }
 
 fn session_boundary_line(text: &str, width: u16, theme: TerminalTheme) -> Line<'static> {
@@ -5184,23 +5220,19 @@ fn session_boundary_line(text: &str, width: u16, theme: TerminalTheme) -> Line<'
     ])
 }
 
-fn push_markdown_block(
-    out: &mut Vec<Line<'static>>,
-    label: &str,
-    color: Color,
-    text: String,
-    theme: TerminalTheme,
-) {
+fn push_speaker_name(out: &mut Vec<Line<'static>>, name: &str, theme: TerminalTheme) {
     out.push(Line::from(Span::styled(
-        format!("{label}:"),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
+        name.to_string(),
+        Style::default()
+            .fg(god_name_color(name, theme))
+            .add_modifier(Modifier::BOLD),
     )));
-    push_markdown_lines(out, text, 0, theme);
-    out.push(Line::from(""));
 }
 
 fn god_name_color(role: &str, theme: TerminalTheme) -> Color {
-    if role.eq_ignore_ascii_case("Thor") {
+    if role.eq_ignore_ascii_case("You") {
+        theme.user
+    } else if role.eq_ignore_ascii_case("Thor") {
         theme.primary
     } else if role.eq_ignore_ascii_case("Loki") {
         theme.secondary
@@ -5211,13 +5243,7 @@ fn god_name_color(role: &str, theme: TerminalTheme) -> Color {
     }
 }
 
-fn push_role_thought(
-    out: &mut Vec<Line<'static>>,
-    role: &str,
-    role_color: Color,
-    text: &str,
-    theme: TerminalTheme,
-) {
+fn push_thinking(out: &mut Vec<Line<'static>>, text: &str, theme: TerminalTheme) {
     let text = text
         .replace("<!-- -->", " ")
         .replace("<!---->", " ")
@@ -5228,31 +5254,122 @@ fn push_role_thought(
         return;
     }
     let thought_style = Style::default().fg(theme.thought);
-    let mut spans = vec![Span::styled(
-        format!("{role}: "),
-        Style::default().fg(role_color).add_modifier(Modifier::BOLD),
-    )];
-    spans.extend(inline_markdown_spans_with_style(
+    out.push(Line::from(inline_markdown_spans_with_style(
         &text,
         theme,
         thought_style,
-    ));
-    out.push(Line::from(spans));
+    )));
 }
 
-fn push_plain_block(out: &mut Vec<Line<'static>>, label: &str, color: Color, text: String) {
-    out.push(Line::from(Span::styled(
-        format!("{label}:"),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )));
-    push_plain_lines(out, text, 0);
+fn push_plain_message(
+    out: &mut Vec<Line<'static>>,
+    text: &str,
+    collapse: bool,
+    theme: TerminalTheme,
+) {
+    let (preview, collapsed) = message_preview(text, collapse);
+    for raw in preview.split('\n') {
+        out.push(Line::from(raw.to_string()));
+    }
+    if collapsed {
+        push_message_collapse_hint(out, theme);
+    }
     out.push(Line::from(""));
 }
 
-fn push_plain_lines(out: &mut Vec<Line<'static>>, text: String, indent: usize) {
-    let prefix = " ".repeat(indent);
+fn push_styled_content(out: &mut Vec<Line<'static>>, text: String, color: Color) {
     for raw in text.split('\n') {
-        out.push(Line::from(format!("{prefix}{raw}")));
+        out.push(Line::from(Span::styled(
+            raw.to_string(),
+            Style::default().fg(color),
+        )));
+    }
+    out.push(Line::from(""));
+}
+
+fn push_styled_message(
+    out: &mut Vec<Line<'static>>,
+    text: &str,
+    color: Color,
+    collapse: bool,
+    theme: TerminalTheme,
+) {
+    let (preview, collapsed) = message_preview(text, collapse);
+    for raw in preview.split('\n') {
+        out.push(Line::from(Span::styled(
+            raw.to_string(),
+            Style::default().fg(color),
+        )));
+    }
+    if collapsed {
+        push_message_collapse_hint(out, theme);
+    }
+    out.push(Line::from(""));
+}
+
+fn push_markdown_message(
+    out: &mut Vec<Line<'static>>,
+    text: &str,
+    collapse: bool,
+    theme: TerminalTheme,
+) {
+    let (preview, collapsed) = message_preview(text, collapse);
+    push_markdown_lines(out, preview, 0, theme);
+    if collapsed {
+        push_message_collapse_hint(out, theme);
+    }
+    out.push(Line::from(""));
+}
+
+fn message_preview(text: &str, collapse: bool) -> (String, bool) {
+    let total_chars = text.chars().count();
+    let total_lines = text.split('\n').count();
+    let collapsed = collapse
+        && (total_chars > MESSAGE_COLLAPSED_CHARS || total_lines > MESSAGE_COLLAPSED_LINES);
+    if !collapsed {
+        return (text.to_string(), false);
+    }
+
+    let mut preview = String::new();
+    let mut remaining = MESSAGE_COLLAPSED_CHARS;
+    for (index, line) in text.split('\n').take(MESSAGE_COLLAPSED_LINES).enumerate() {
+        if index > 0 {
+            if remaining == 0 {
+                break;
+            }
+            preview.push('\n');
+            remaining -= 1;
+        }
+        if remaining == 0 {
+            break;
+        }
+        let mut taken = 0;
+        for ch in line.chars().take(remaining) {
+            preview.push(ch);
+            taken += 1;
+        }
+        remaining -= taken;
+        if taken < line.chars().count() {
+            break;
+        }
+    }
+    (preview, true)
+}
+
+fn push_message_collapse_hint(out: &mut Vec<Line<'static>>, theme: TerminalTheme) {
+    out.push(Line::from(Span::styled(
+        "… details hidden (Ctrl-T to expand)",
+        Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::ITALIC),
+    )));
+}
+
+fn message_size_label(chars: usize) -> String {
+    if chars >= 1_000 {
+        format!("{:.1}k chars", chars as f64 / 1_000.0)
+    } else {
+        format!("{chars} chars")
     }
 }
 
@@ -11921,7 +12038,7 @@ mod tests {
         assert_eq!(snapshot.actual_height, 4);
         assert_eq!(snapshot.stable_entries, 1);
         let replayed: Vec<String> = snapshot.lines.iter().map(line_text).collect();
-        assert_eq!(replayed, vec!["you:", "hello from the resize test", ""]);
+        assert_eq!(replayed, vec!["You", "hello from the resize test", ""]);
     }
 
     #[test]
@@ -11962,7 +12079,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(prompt, vec!["you:", "hello", ""]);
+        assert_eq!(prompt, vec!["You", "hello", ""]);
         assert!(sink.pending_lines(&state, 80).is_empty());
 
         state.apply_event(UiEvent::PromptDone {
@@ -11974,29 +12091,37 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(rendered, vec!["Thor:", "world", ""]);
+        assert_eq!(rendered, vec!["Thor", "world", ""]);
         assert!(sink.pending_lines(&state, 80).is_empty());
     }
 
     #[test]
-    fn inline_chat_shows_live_eitri_tail_and_swaps_active_header() {
+    fn inline_chat_streams_thor_and_eitri_through_one_transcript_tail() {
         let mut state = AppState::new();
         state.agent_label = "Thor · gpt-primary".to_string();
         state.record_user_prompt("delegate this".to_string());
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk("planning the handoff"),
+        )));
+        let thor_tail = inline_transcript_tail_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert_eq!(thor_tail, vec!["Thor", "planning the handoff"]);
+
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
             label: "Eitri · gpt-builder".to_string(),
-            instructions: "implement it".to_string(),
         }));
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
             SessionUpdate::AgentThoughtChunk(text_chunk("working now")),
         )));
 
-        let live = inline_live_transcript_lines(&state, 80)
+        let live = inline_transcript_tail_lines(&state, 80)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>();
-        assert_eq!(live, vec!["Eitri: working now"]);
-        assert!(inline_live_transcript_row_count(&state, 80) > 0);
+        assert_eq!(live, vec!["Eitri", "working now"]);
+        assert!(inline_transcript_tail_row_count(&state, 80) > 0);
         assert!(
             desired_inline_height(
                 &state,
@@ -12019,7 +12144,7 @@ mod tests {
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
             outcome: CodeAgentOutcome::Completed,
         }));
-        assert!(inline_live_transcript_lines(&state, 80).is_empty());
+        assert!(inline_transcript_tail_lines(&state, 80).is_empty());
         terminal
             .draw(|frame| draw_header(frame, frame.area(), &state))
             .expect("draw restored header");
@@ -12049,7 +12174,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(prompt, vec!["you:", "run tests", ""]);
+        assert_eq!(prompt, vec!["You", "run tests", ""]);
         assert!(sink.pending_lines(&state, 80).is_empty());
 
         let view = state.tool_calls.get_mut("call-1").expect("tool call");
@@ -12061,7 +12186,10 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(rendered, vec!["│ tool exec cargo test", "│   ok", ""]);
+        assert_eq!(
+            rendered,
+            vec!["Thor", "│ tool exec cargo test", "│   ok", ""]
+        );
         assert!(sink.pending_lines(&state, 80).is_empty());
     }
 
@@ -12092,7 +12220,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(prompt, vec!["you:", "run tests", ""]);
+        assert_eq!(prompt, vec!["You", "run tests", ""]);
         assert!(
             sink.pending_lines(&state, 80).is_empty(),
             "completed terminal tool call must not flush before terminal exit status arrives"
@@ -12113,6 +12241,7 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
+                "Thor",
                 "│ tool exec cargo test",
                 "│   terminal output",
                 "│     ok",
@@ -12145,7 +12274,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(first_prompt, vec!["you:", "run tests", ""]);
+        assert_eq!(first_prompt, vec!["You", "run tests", ""]);
 
         state.apply_event(UiEvent::PromptDone {
             stop_reason: StopReason::Cancelled,
@@ -12159,6 +12288,7 @@ mod tests {
         assert_eq!(
             cancelled_tool,
             vec![
+                "Thor",
                 "│ tool [failed] exec cargo test",
                 "│   running",
                 "│   [tool call ended before completion]",
@@ -12172,7 +12302,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(next_prompt, vec!["you:", "next prompt", ""]);
+        assert_eq!(next_prompt, vec!["You", "next prompt", ""]);
     }
 
     #[test]
@@ -12395,7 +12525,7 @@ mod tests {
     #[test]
     fn ctrl_t_toggles_tool_output_expansion() {
         let mut state = AppState::new();
-        assert!(!state.expand_tool_outputs);
+        assert!(!state.expand_transcript_details);
         let starting_revision = state.transcript_revision();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
@@ -12405,7 +12535,7 @@ mod tests {
             key_with_modifiers(KeyCode::Char('t'), KeyModifiers::CONTROL),
         );
 
-        assert!(state.expand_tool_outputs);
+        assert!(state.expand_transcript_details);
         assert_ne!(
             state.transcript_revision(),
             starting_revision,
@@ -12419,13 +12549,13 @@ mod tests {
             &cmd_tx,
             key_with_modifiers(KeyCode::Char('t'), KeyModifiers::CONTROL),
         );
-        assert!(!state.expand_tool_outputs);
+        assert!(!state.expand_transcript_details);
     }
 
     #[test]
     fn ctrl_shift_t_also_toggles_tool_output_expansion() {
         let mut state = AppState::new();
-        assert!(!state.expand_tool_outputs);
+        assert!(!state.expand_transcript_details);
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         handle_crossterm(
@@ -12437,7 +12567,7 @@ mod tests {
             ),
         );
 
-        assert!(state.expand_tool_outputs);
+        assert!(state.expand_transcript_details);
         assert!(state.input.is_empty());
     }
 
@@ -12454,7 +12584,7 @@ mod tests {
 
         assert!(state.transcript_viewer, "inline Ctrl-T opens the reader");
         assert!(
-            !state.expand_tool_outputs,
+            !state.expand_transcript_details,
             "inline Ctrl-T must not flip the collapse setting"
         );
         assert!(state.input.is_empty(), "'t' must not leak into the prompt");
@@ -12552,7 +12682,7 @@ mod tests {
         );
         state.transcript.push(Entry::ToolCall("call-1".to_string()));
         // The session is still in collapsed mode...
-        assert!(!state.expand_tool_outputs);
+        assert!(!state.expand_transcript_details);
         state.open_transcript_viewer();
 
         let backend = TestBackend::new(100, 40);
@@ -12607,6 +12737,164 @@ mod tests {
     }
 
     #[test]
+    fn stable_long_prose_entries_share_one_collapse_policy() {
+        let mut state = AppState::new();
+        let long = (1..=7)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let actor = ActorIdentity {
+            role: "Loki".to_string(),
+            connection_id: "loki".to_string(),
+            source_id: None,
+            model_name: None,
+            model_value: None,
+        };
+        state.transcript.extend([
+            Entry::UserPrompt(long.clone()),
+            Entry::AgentMessage(long.clone()),
+            Entry::CodeAgentMessage(long.clone()),
+            Entry::ActorActivity(Box::new(ActorActivity::Message {
+                actor: actor.clone(),
+                text: long.clone(),
+            })),
+            Entry::ActorActivity(Box::new(ActorActivity::Warning {
+                actor: actor.clone(),
+                message: long.clone(),
+            })),
+            Entry::ActorActivity(Box::new(ActorActivity::Info {
+                actor,
+                message: long.clone(),
+            })),
+            Entry::System(long.clone()),
+            Entry::InternalMessage(crate::event::InternalMessage {
+                source: "Thor".to_string(),
+                target: "Eitri".to_string(),
+                kind: crate::event::InternalMessageKind::Delegation,
+                text: long,
+            }),
+        ]);
+
+        let rendered = render_transcript_lines(&state, 100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.as_str() == "… details hidden (Ctrl-T to expand)")
+                .count(),
+            8,
+            "rendered: {rendered:?}"
+        );
+        assert!(!rendered.iter().any(|line| line == "line 7"));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.starts_with("delegated to Eitri ·"))
+        );
+    }
+
+    #[test]
+    fn message_collapse_thresholds_are_unicode_safe_and_preserve_markdown() {
+        let exact_chars = "λ".repeat(MESSAGE_COLLAPSED_CHARS);
+        assert_eq!(message_preview(&exact_chars, true), (exact_chars, false));
+
+        let over_chars = format!("**important** {}TAIL", "🦀".repeat(MESSAGE_COLLAPSED_CHARS));
+        let (preview, collapsed) = message_preview(&over_chars, true);
+        assert!(collapsed);
+        assert_eq!(preview.chars().count(), MESSAGE_COLLAPSED_CHARS);
+        assert!(!preview.contains("TAIL"));
+
+        let mut state = AppState::new();
+        state.transcript.push(Entry::AgentMessage(over_chars));
+        let rendered = render_transcript_lines(&state, 100);
+        let content = rendered
+            .iter()
+            .find(|line| line_text(line).starts_with("important"))
+            .expect("markdown preview");
+        assert!(
+            content
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
+        );
+
+        let six_lines = (1..=MESSAGE_COLLAPSED_LINES)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!message_preview(&six_lines, true).1);
+        assert!(message_preview(&format!("{six_lines}\nline 7"), true).1);
+    }
+
+    #[test]
+    fn active_streaming_message_stays_expanded_until_stable() {
+        let mut state = AppState::new();
+        state.record_user_prompt("start".to_string());
+        let long = format!("{}STREAMING_TAIL", "x".repeat(MESSAGE_COLLAPSED_CHARS));
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk(&long),
+        )));
+
+        let streaming = render_transcript_lines(&state, 100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(streaming.iter().any(|line| line.contains("STREAMING_TAIL")));
+        assert!(!streaming.iter().any(|line| line.contains("details hidden")));
+
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        let stable = render_transcript_lines(&state, 100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(!stable.iter().any(|line| line.contains("STREAMING_TAIL")));
+        assert!(stable.iter().any(|line| line.contains("details hidden")));
+    }
+
+    #[test]
+    fn ctrl_t_reader_and_export_reveal_complete_internal_message() {
+        let mut state = AppState::new();
+        let full = format!("{}INTERNAL_EXACT_SUFFIX", "brief ".repeat(150));
+        state
+            .transcript
+            .push(Entry::InternalMessage(crate::event::InternalMessage {
+                source: "Thor".to_string(),
+                target: "Eitri".to_string(),
+                kind: crate::event::InternalMessageKind::Delegation,
+                text: full.clone(),
+            }));
+
+        let compact = render_transcript_lines(&state, 100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(
+            !compact
+                .iter()
+                .any(|line| line.contains("INTERNAL_EXACT_SUFFIX"))
+        );
+
+        let expanded = render_full_transcript_lines(&state, 100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(
+            expanded
+                .iter()
+                .any(|line| line.contains("INTERNAL_EXACT_SUFFIX"))
+        );
+
+        let exported = transcript_export_markdown(&state);
+        assert!(exported.contains("## Thor → Eitri delegation"));
+        assert!(exported.contains("INTERNAL\\_EXACT\\_SUFFIX"));
+    }
+
+    #[test]
     fn tool_output_collapses_long_text_with_hint_by_default() {
         let mut state = AppState::new();
         let long = (1..=20)
@@ -12654,7 +12942,7 @@ mod tests {
         );
 
         // After expanding, every line is rendered and the hint disappears.
-        state.expand_tool_outputs = true;
+        state.expand_transcript_details = true;
         let expanded: Vec<String> = render_transcript_lines(&state, 80)
             .iter()
             .map(line_text)
@@ -12677,8 +12965,8 @@ mod tests {
         assert!(transcript_block_title(&state).contains("End to follow"));
 
         state.scroll_offset = 0;
-        state.expand_tool_outputs = true;
-        assert!(transcript_block_title(&state).contains("tool output: expanded"));
+        state.expand_transcript_details = true;
+        assert!(transcript_block_title(&state).contains("details: expanded"));
     }
 
     #[test]
@@ -13198,7 +13486,7 @@ mod tests {
             .map(line_text)
             .collect();
 
-        assert!(rendered.iter().any(|line| line == "Thor:"));
+        assert!(rendered.iter().any(|line| line == "Thor"));
         assert!(rendered.iter().any(|line| line == "# Result"));
         assert!(rendered.iter().any(|line| line == "- bold item"));
         assert!(rendered.iter().any(|line| line == "code rs"));
@@ -13231,7 +13519,7 @@ mod tests {
     }
 
     #[test]
-    fn thoughts_are_compact_role_prefixed_paragraphs_with_distinct_name_colors() {
+    fn thinking_is_compact_and_speaker_names_have_distinct_colors() {
         let mut state = AppState::new();
         let theme = state.theme;
         state.transcript.push(Entry::AgentThought(
@@ -13258,16 +13546,84 @@ mod tests {
         assert_eq!(
             text,
             vec![
-                "Thor: Planning initial code_agent invocation",
-                "Eitri: Checking the implementation",
-                "Loki: Reviewing the boundary",
+                "Thor",
+                "Planning initial code_agent invocation",
+                "Eitri",
+                "Checking the implementation",
+                "Loki",
+                "Reviewing the boundary",
             ]
         );
         assert_eq!(rendered[0].spans[0].style.fg, Some(theme.primary));
-        assert_eq!(rendered[1].spans[0].style.fg, Some(theme.code));
-        assert_eq!(rendered[2].spans[0].style.fg, Some(theme.secondary));
-        for line in &rendered {
-            assert_eq!(line.spans[1].style.fg, Some(theme.thought));
+        assert_eq!(rendered[2].spans[0].style.fg, Some(theme.code));
+        assert_eq!(rendered[4].spans[0].style.fg, Some(theme.secondary));
+        for line in [&rendered[1], &rendered[3], &rendered[5]] {
+            assert_eq!(line.spans[0].style.fg, Some(theme.thought));
+        }
+    }
+
+    #[test]
+    fn speaker_name_is_only_rendered_when_the_speaker_changes() {
+        let mut state = AppState::new();
+        state
+            .transcript
+            .push(Entry::UserPrompt("build it".to_string()));
+        state
+            .transcript
+            .push(Entry::AgentMessage("delegating".to_string()));
+        state.tool_calls.insert(
+            "thor-tool".to_string(),
+            crate::app::ToolCallView {
+                title: "call Eitri".to_string(),
+                kind: ToolKind::Other,
+                status: ToolCallStatus::Completed,
+                body: Vec::new(),
+            },
+        );
+        state
+            .transcript
+            .push(Entry::ToolCall("thor-tool".to_string()));
+        state
+            .transcript
+            .push(Entry::AgentMessage("handoff accepted".to_string()));
+        state
+            .transcript
+            .push(Entry::CodeAgentMessage("forging".to_string()));
+        state.tool_calls.insert(
+            "eitri-tool".to_string(),
+            crate::app::ToolCallView {
+                title: "edit file".to_string(),
+                kind: ToolKind::Edit,
+                status: ToolCallStatus::Completed,
+                body: Vec::new(),
+            },
+        );
+        state
+            .transcript
+            .push(Entry::CodeAgentToolCall("eitri-tool".to_string()));
+        state
+            .transcript
+            .push(Entry::CodeAgentMessage("finished".to_string()));
+        state
+            .transcript
+            .push(Entry::AgentMessage("here is the result".to_string()));
+
+        let rendered = render_transcript_lines(&state, 80);
+        let speaker_lines = rendered
+            .iter()
+            .filter(|line| matches!(line_text(line).as_str(), "You" | "Thor" | "Eitri"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            speaker_lines
+                .iter()
+                .map(|line| line_text(line))
+                .collect::<Vec<_>>(),
+            vec!["You", "Thor", "Eitri", "Thor"]
+        );
+        for line in speaker_lines {
+            assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+            assert!(!line_text(line).ends_with(':'));
         }
     }
 
@@ -13531,7 +13887,7 @@ mod tests {
 
         // The agent message stays flush-left with no rail; that contrast is
         // the fix for issue #257.
-        assert!(lines.iter().any(|l| line_text(l) == "Thor:"));
+        assert!(lines.iter().any(|l| line_text(l) == "Thor"));
         assert!(lines.iter().any(|l| line_text(l) == "hi there"));
         assert!(
             !lines
@@ -13564,7 +13920,11 @@ mod tests {
         // wrapped continuation rows never read as flush-left agent prose) and
         // must fit inside the render width (so the transcript Paragraph does
         // not re-wrap it and strip the rail). See issue #257.
-        let block_rows: Vec<&String> = rendered.iter().filter(|l| !l.is_empty()).collect();
+        assert_eq!(rendered.first().map(String::as_str), Some("Thor"));
+        let block_rows: Vec<&String> = rendered
+            .iter()
+            .filter(|line| !line.is_empty() && line.as_str() != "Thor")
+            .collect();
         assert!(
             block_rows.len() > 2,
             "expected the long line to wrap into several rows, got {rendered:?}"
