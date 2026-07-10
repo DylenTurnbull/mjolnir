@@ -173,6 +173,16 @@ pub struct ToolCallView {
     pub body: Vec<ToolCallOutput>,
 }
 
+/// Durable facts about one locally submitted prompt turn.  Entries remain the
+/// source-of-truth transcript; this only records lifecycle data which would
+/// otherwise be lost once a later turn starts.
+#[derive(Debug, Clone, Copy)]
+struct PromptTurn {
+    prompt_index: usize,
+    elapsed: Option<Duration>,
+    completed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCallOutput {
     Text(String),
@@ -714,6 +724,8 @@ pub struct AppState {
     /// Timing for the active or most recently completed prompt turn.
     turn_started_at: Option<Instant>,
     last_turn_elapsed: Option<Duration>,
+    prompt_turns: Vec<PromptTurn>,
+    active_prompt_turn: Option<usize>,
     /// Time since the current connection lifecycle state was entered.
     connection_state_started_at: Instant,
     /// Last token/context usage reported by the agent.
@@ -1006,6 +1018,8 @@ impl AppState {
             voice_input_level: None,
             turn_started_at: None,
             last_turn_elapsed: None,
+            prompt_turns: Vec::new(),
+            active_prompt_turn: None,
             connection_state_started_at: now,
             token_usage: TokenUsage::default(),
             claude_usage: None,
@@ -1397,6 +1411,33 @@ impl AppState {
         self.last_turn_elapsed
     }
 
+    /// Whether the locally submitted prompt at `prompt_index` has received a
+    /// terminal prompt result. Replayed transcript prompts intentionally have
+    /// no such lifecycle fact and are therefore not considered complete.
+    pub fn prompt_turn_completed(&self, prompt_index: usize) -> bool {
+        self.prompt_turns
+            .iter()
+            .find(|turn| turn.prompt_index == prompt_index)
+            .is_some_and(|turn| turn.completed)
+    }
+
+    /// Whether `prompt_index` belongs to a locally submitted prompt whose
+    /// lifecycle is tracked by this UI instance. Replayed prompts deliberately
+    /// have no record here.
+    pub fn has_prompt_turn(&self, prompt_index: usize) -> bool {
+        self.prompt_turns
+            .iter()
+            .any(|turn| turn.prompt_index == prompt_index)
+    }
+
+    /// Recorded elapsed time for a completed locally submitted prompt turn.
+    pub fn prompt_turn_elapsed(&self, prompt_index: usize) -> Option<Duration> {
+        self.prompt_turns
+            .iter()
+            .find(|turn| turn.prompt_index == prompt_index)
+            .and_then(|turn| turn.elapsed)
+    }
+
     pub fn connection_state_elapsed(&self) -> Duration {
         self.connection_state_started_at.elapsed()
     }
@@ -1524,6 +1565,7 @@ impl AppState {
         self.set_connection_state(ConnectionState::Forking);
         self.turn_started_at = Some(Instant::now());
         self.last_turn_elapsed = None;
+        self.active_prompt_turn = None;
         self.autocomplete = Autocomplete::default();
     }
 
@@ -1729,7 +1771,14 @@ impl AppState {
     /// Push a user prompt into the transcript immediately, before the
     /// command reaches the runtime. Keeps the UI responsive.
     pub fn record_user_prompt(&mut self, text: String) {
+        let prompt_index = self.transcript.len();
         self.transcript.push(Entry::UserPrompt(text.clone()));
+        self.prompt_turns.push(PromptTurn {
+            prompt_index,
+            elapsed: None,
+            completed: false,
+        });
+        self.active_prompt_turn = Some(prompt_index);
         self.record_prompt_history(text);
         self.bump_transcript_revision();
         self.set_connection_state(ConnectionState::Streaming);
@@ -2423,6 +2472,9 @@ impl AppState {
         ) {
             self.set_connection_state(ConnectionState::Ready);
         }
+        // Completion changes the derived turn projection even when no entry
+        // or tool body changed, so invalidate the transcript render cache.
+        self.bump_transcript_revision();
     }
 
     fn fail_unfinished_tool_calls(&mut self) {
@@ -2451,7 +2503,17 @@ impl AppState {
 
     fn finish_turn_timer(&mut self) {
         if let Some(started_at) = self.turn_started_at.take() {
-            self.last_turn_elapsed = Some(started_at.elapsed());
+            let elapsed = started_at.elapsed();
+            self.last_turn_elapsed = Some(elapsed);
+            if let Some(prompt_index) = self.active_prompt_turn.take()
+                && let Some(turn) = self
+                    .prompt_turns
+                    .iter_mut()
+                    .find(|turn| turn.prompt_index == prompt_index)
+            {
+                turn.elapsed = Some(elapsed);
+                turn.completed = true;
+            }
         }
     }
 

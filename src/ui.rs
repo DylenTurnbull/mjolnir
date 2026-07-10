@@ -5,6 +5,7 @@
 //! into `AppState`, redraws on every tick, and emits `UiCommand`s back
 //! to the runtime when the user submits prompts or cancels.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::io::{self, Stdout, Write};
 use std::ops::Range;
@@ -190,6 +191,7 @@ impl TranscriptSink {
             self.emitted_entries..stable_entries,
             transcript_collapse_limit(state),
             state.theme,
+            true,
         );
         self.emitted_entries = stable_entries;
         lines
@@ -233,15 +235,195 @@ impl InlineResizeReflow {
 }
 
 fn stable_transcript_entry_count(state: &AppState) -> usize {
+    let turns = transcript_turns(state);
     let mut stable = 0;
-    for (idx, entry) in state.transcript.iter().enumerate() {
+    let mut idx = 0;
+    while idx < state.transcript.len() {
+        if let Some(turn) = turns.iter().find(|turn| turn.prompt_index == idx) {
+            if turn.is_flushable {
+                stable = turn.end;
+                idx = turn.end;
+                continue;
+            }
+            break;
+        }
+        let entry = &state.transcript[idx];
         if transcript_entry_is_stable(state, idx, entry) {
             stable = idx + 1;
+            idx += 1;
         } else {
             break;
         }
     }
     stable
+}
+
+/// A derived prompt-bounded view of the source transcript. It deliberately
+/// contains indexes rather than copied entries so the full reader and export
+/// can always render the original ordered activity without reconstruction.
+#[derive(Debug, Clone)]
+struct TranscriptTurn {
+    prompt_index: usize,
+    end: usize,
+    is_compactable: bool,
+    is_flushable: bool,
+    elapsed: Option<Duration>,
+    tool_summary: Option<TurnToolSummary>,
+    final_response_index: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct TurnToolSummary {
+    tools: usize,
+    failures: usize,
+    changed_paths: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorToolDisposition {
+    Successful,
+    Failed,
+    Visible,
+}
+
+fn transcript_turns(state: &AppState) -> Vec<TranscriptTurn> {
+    let prompt_indexes = state
+        .transcript
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| matches!(entry, Entry::UserPrompt(_)).then_some(index))
+        .collect::<Vec<_>>();
+
+    prompt_indexes
+        .iter()
+        .enumerate()
+        .map(|(position, &prompt_index)| {
+            let end = prompt_indexes
+                .get(position + 1)
+                .copied()
+                .unwrap_or(state.transcript.len());
+            let entries_stable =
+                state.transcript[prompt_index..end]
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, entry)| {
+                        transcript_entry_is_stable(state, prompt_index + offset, entry)
+                    });
+            let has_lifecycle = state.has_prompt_turn(prompt_index);
+            let is_compactable =
+                has_lifecycle && state.prompt_turn_completed(prompt_index) && entries_stable;
+            // Replayed prompts have no local PromptDone event or recorded
+            // duration. They still need to enter inline scrollback once their
+            // entries are stable, but remain unbundled so no historic activity
+            // is silently inferred to be a completed local turn.
+            let is_flushable = if has_lifecycle {
+                is_compactable
+            } else {
+                entries_stable
+            };
+            let tool_summary = is_compactable
+                .then(|| turn_tool_summary(state, prompt_index, end))
+                .flatten();
+            let final_response_index = is_compactable
+                .then(|| turn_final_response_index(state, prompt_index, end))
+                .flatten();
+            TranscriptTurn {
+                prompt_index,
+                end,
+                is_compactable,
+                is_flushable,
+                elapsed: state.prompt_turn_elapsed(prompt_index),
+                tool_summary,
+                final_response_index,
+            }
+        })
+        .collect()
+}
+
+fn turn_final_response_index(state: &AppState, start: usize, end: usize) -> Option<usize> {
+    // The primary agent's last response is the canonical turn conclusion. A
+    // nested actor can report after it, but should not steal this marker.
+    (start..end)
+        .rev()
+        .find(|&index| matches!(state.transcript[index], Entry::AgentMessage(_)))
+        .or_else(|| {
+            (start..end).rev().find(|&index| {
+                matches!(&state.transcript[index], Entry::CodeAgentMessage(_))
+                    || matches!(
+                        &state.transcript[index],
+                        Entry::ActorActivity(activity)
+                            if matches!(activity.as_ref(), ActorActivity::Message { .. })
+                    )
+            })
+        })
+}
+
+fn actor_tool_disposition(status: Option<&str>) -> ActorToolDisposition {
+    let status = status.map(str::trim).filter(|status| !status.is_empty());
+    match status.map(|status| status.to_ascii_lowercase()) {
+        Some(status) if matches!(status.as_str(), "completed" | "success" | "succeeded") => {
+            ActorToolDisposition::Successful
+        }
+        Some(status)
+            if matches!(
+                status.as_str(),
+                "failed"
+                    | "failure"
+                    | "error"
+                    | "interrupted"
+                    | "cancelled"
+                    | "canceled"
+                    | "blocked"
+                    | "denied"
+            ) =>
+        {
+            ActorToolDisposition::Failed
+        }
+        // A structured actor snapshot is stable, but non-terminal or unknown
+        // status is still important context and must remain individually shown.
+        _ => ActorToolDisposition::Visible,
+    }
+}
+
+fn turn_tool_summary(state: &AppState, start: usize, end: usize) -> Option<TurnToolSummary> {
+    let mut summary = TurnToolSummary {
+        tools: 0,
+        failures: 0,
+        changed_paths: BTreeSet::new(),
+    };
+    for entry in &state.transcript[start..end] {
+        match entry {
+            Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
+                // Count each source entry exactly once, even if a malformed
+                // transcript no longer has its associated live view.
+                summary.tools += 1;
+                if let Some(view) = state.tool_calls.get(id) {
+                    if view.status == ToolCallStatus::Failed {
+                        summary.failures += 1;
+                    }
+                    // A failed call can include a diff-shaped payload, but it
+                    // is not evidence that a file was successfully changed.
+                    if view.status == ToolCallStatus::Completed {
+                        for output in &view.body {
+                            if let ToolCallOutput::Diff { path, .. } = output {
+                                summary.changed_paths.insert(path.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Entry::ActorActivity(activity) => {
+                if let ActorActivity::Tool { status, .. } = activity.as_ref() {
+                    summary.tools += 1;
+                    if actor_tool_disposition(status.as_deref()) == ActorToolDisposition::Failed {
+                        summary.failures += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (summary.tools > 0).then_some(summary)
 }
 
 fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bool {
@@ -1333,6 +1515,7 @@ fn inline_resize_reflow_snapshot(
         0..stable_entries,
         transcript_collapse_limit(state),
         state.theme,
+        true,
     );
 
     Some(InlineResizeReflowSnapshot {
@@ -4384,7 +4567,7 @@ fn draw(
 }
 
 fn inline_transcript_tail_lines(state: &AppState, width: u16) -> Vec<Line<'static>> {
-    if width == 0 {
+    if width == 0 || state.help_overlay {
         return Vec::new();
     }
     let stable_entries = stable_transcript_entry_count(state);
@@ -4394,6 +4577,7 @@ fn inline_transcript_tail_lines(state: &AppState, width: u16) -> Vec<Line<'stati
         stable_entries..state.transcript.len(),
         transcript_collapse_limit(state),
         state.theme,
+        true,
     )
 }
 
@@ -4983,13 +5167,21 @@ fn render_transcript_lines(state: &AppState, width: u16) -> Vec<Line<'static>> {
         0..state.transcript.len(),
         transcript_collapse_limit(state),
         state.theme,
+        true,
     )
 }
 
 /// Render the whole transcript with every message and tool output expanded,
 /// regardless of the session collapse setting. Used by the inline reader.
 fn render_full_transcript_lines(state: &AppState, width: u16) -> Vec<Line<'static>> {
-    render_transcript_entry_range(state, width, 0..state.transcript.len(), None, state.theme)
+    render_transcript_entry_range(
+        state,
+        width,
+        0..state.transcript.len(),
+        None,
+        state.theme,
+        false,
+    )
 }
 
 /// Detail budget for the transcript: `None` when expanded, otherwise the
@@ -5008,14 +5200,35 @@ fn render_transcript_entry_range(
     entry_range: Range<usize>,
     collapse_limit: Option<usize>,
     theme: TerminalTheme,
+    compact_completed_turns: bool,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
+    let turns = compact_completed_turns.then(|| transcript_turns(state));
     let mut speaker = state.transcript[..entry_range.start]
         .iter()
         .filter_map(entry_speaker)
         .next_back();
     for (offset, entry) in state.transcript[entry_range.clone()].iter().enumerate() {
         let entry_index = entry_range.start + offset;
+        let compact_turn = turns.as_ref().and_then(|turns| {
+            turns.iter().find(|turn| {
+                turn.is_compactable && (turn.prompt_index..turn.end).contains(&entry_index)
+            })
+        });
+        // Completed successful tools are represented by the turn summary.
+        // Do this before speaker grouping so a nested actor with only compacted
+        // tool activity cannot leave behind an empty attribution header.
+        if matches!(entry, Entry::ToolCall(_) | Entry::CodeAgentToolCall(_))
+            && compact_turn.is_some()
+            && tool_entry_is_successful(state, entry)
+        {
+            continue;
+        }
+        if matches!(entry, Entry::ActorActivity(activity) if actor_tool_is_successful(activity))
+            && compact_turn.is_some()
+        {
+            continue;
+        }
         let collapse_message =
             collapse_limit.is_some() && transcript_entry_is_stable(state, entry_index, entry);
         if let Some(next) = entry_speaker(entry)
@@ -5024,8 +5237,26 @@ fn render_transcript_entry_range(
             push_speaker_name(&mut out, &next, theme);
             speaker = Some(next);
         }
+        if compact_turn
+            .and_then(|turn| turn.final_response_index)
+            .is_some_and(|index| index == entry_index)
+        {
+            push_turn_final_response_label(&mut out, theme);
+        }
         match entry {
-            Entry::UserPrompt(text) => push_plain_message(&mut out, text, collapse_message, theme),
+            Entry::UserPrompt(text) => {
+                push_plain_message(&mut out, text, collapse_message, theme);
+                if let Some(turn) = compact_turn {
+                    push_turn_header(&mut out, turn.elapsed, theme);
+                    if let Some(summary) = &turn.tool_summary {
+                        push_turn_tool_summary(&mut out, summary, theme);
+                    }
+                    // The turn header is the primary-agent grouping anchor.
+                    // Nested actors still replace it when their visible activity
+                    // appears below.
+                    speaker = Some("Thor".to_string());
+                }
+            }
             Entry::AgentMessage(text) | Entry::CodeAgentMessage(text) => {
                 push_markdown_message(&mut out, text, collapse_message, theme)
             }
@@ -5175,6 +5406,75 @@ fn render_transcript_entry_range(
         }
     }
     out
+}
+
+fn tool_entry_is_successful(state: &AppState, entry: &Entry) -> bool {
+    let (Entry::ToolCall(id) | Entry::CodeAgentToolCall(id)) = entry else {
+        return false;
+    };
+    state
+        .tool_calls
+        .get(id)
+        .is_some_and(|view| view.status == ToolCallStatus::Completed)
+}
+
+fn actor_tool_is_successful(activity: &ActorActivity) -> bool {
+    matches!(
+        activity,
+        ActorActivity::Tool { status, .. }
+            if actor_tool_disposition(status.as_deref()) == ActorToolDisposition::Successful
+    )
+}
+
+fn push_turn_header(out: &mut Vec<Line<'static>>, elapsed: Option<Duration>, theme: TerminalTheme) {
+    let label = elapsed
+        .map(|elapsed| format!("Thor · {}", format_duration(elapsed)))
+        .unwrap_or_else(|| "Thor".to_string());
+    out.push(Line::from(Span::styled(
+        label,
+        Style::default()
+            .fg(theme.primary)
+            .add_modifier(Modifier::BOLD),
+    )));
+}
+
+fn push_turn_tool_summary(
+    out: &mut Vec<Line<'static>>,
+    summary: &TurnToolSummary,
+    theme: TerminalTheme,
+) {
+    let mut facts = vec![format!(
+        "{} {}",
+        summary.tools,
+        if summary.tools == 1 { "tool" } else { "tools" }
+    )];
+    if !summary.changed_paths.is_empty() {
+        facts.push(format!(
+            "{} {} changed",
+            summary.changed_paths.len(),
+            if summary.changed_paths.len() == 1 {
+                "file"
+            } else {
+                "files"
+            }
+        ));
+    }
+    if summary.failures > 0 {
+        facts.push(format!("{} failed", summary.failures));
+    }
+    out.push(Line::from(Span::styled(
+        format!("│ {}", facts.join(" · ")),
+        Style::default().fg(theme.muted),
+    )));
+}
+
+fn push_turn_final_response_label(out: &mut Vec<Line<'static>>, theme: TerminalTheme) {
+    out.push(Line::from(Span::styled(
+        "└─ final response",
+        Style::default()
+            .fg(theme.primary)
+            .add_modifier(Modifier::BOLD),
+    )));
 }
 
 fn actor_for_activity(activity: &ActorActivity) -> &ActorIdentity {
@@ -12041,9 +12341,9 @@ mod tests {
         .expect("snapshot");
 
         assert_eq!(snapshot.actual_height, 4);
-        assert_eq!(snapshot.stable_entries, 1);
+        assert_eq!(snapshot.stable_entries, 0);
         let replayed: Vec<String> = snapshot.lines.iter().map(line_text).collect();
-        assert_eq!(replayed, vec!["You", "hello from the resize test", ""]);
+        assert!(replayed.is_empty());
     }
 
     #[test]
@@ -12079,13 +12379,12 @@ mod tests {
             text_chunk("world"),
         )));
 
-        let prompt: Vec<String> = sink
+        let pending: Vec<String> = sink
             .pending_lines(&state, 80)
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(prompt, vec!["You", "hello", ""]);
-        assert!(sink.pending_lines(&state, 80).is_empty());
+        assert!(pending.is_empty());
 
         state.apply_event(UiEvent::PromptDone {
             stop_reason: StopReason::EndTurn,
@@ -12096,8 +12395,201 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(rendered, vec!["Thor", "world", ""]);
+        assert_eq!(
+            rendered,
+            vec![
+                "You",
+                "hello",
+                "",
+                "Thor · 0s",
+                "└─ final response",
+                "world",
+                ""
+            ]
+        );
         assert!(sink.pending_lines(&state, 80).is_empty());
+    }
+
+    #[test]
+    fn replayed_turns_flush_normally_before_a_local_turn_compacts() {
+        let mut state = AppState::new();
+        let mut sink = TranscriptSink::default();
+
+        // Session replay uses UserMessageChunk while idle, so it has no local
+        // PromptTurn metadata and must not become an inline flush barrier.
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UserMessageChunk(
+            text_chunk("replayed prompt"),
+        )));
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk("replayed answer"),
+        )));
+        assert_eq!(
+            stable_transcript_entry_count(&state),
+            state.transcript.len()
+        );
+        let replayed = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replayed,
+            vec!["You", "replayed prompt", "", "Thor", "replayed answer", ""]
+        );
+
+        state.record_user_prompt("local prompt".to_string());
+        state.tool_calls.insert(
+            "local-tool".to_string(),
+            crate::app::ToolCallView {
+                title: "write src/lib.rs".to_string(),
+                kind: ToolKind::Edit,
+                status: ToolCallStatus::Completed,
+                body: Vec::new(),
+            },
+        );
+        state
+            .transcript
+            .push(Entry::ToolCall("local-tool".to_string()));
+        assert_eq!(stable_transcript_entry_count(&state), 2);
+
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        let compacted = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            compacted,
+            vec!["You", "local prompt", "", "Thor · 0s", "│ 1 tool"]
+        );
+
+        let snapshot = inline_resize_reflow_snapshot(
+            &state,
+            Size {
+                width: 20,
+                height: 4,
+            },
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot.stable_entries, state.transcript.len());
+        let reflowed = snapshot
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(reflowed.contains("replayed answer"), "{reflowed}");
+        assert!(reflowed.contains("│ 1 tool"), "{reflowed}");
+    }
+
+    #[test]
+    fn finalized_turn_summarizes_successes_but_keeps_failures_and_full_reader_data() {
+        let mut state = AppState::new();
+        state.record_user_prompt("make the change".to_string());
+        state.tool_calls.insert(
+            "write-lib".to_string(),
+            crate::app::ToolCallView {
+                title: "write src/lib.rs".to_string(),
+                kind: ToolKind::Edit,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Diff {
+                    path: "src/lib.rs".to_string(),
+                    old_text: Some("old".to_string()),
+                    new_text: "new".to_string(),
+                }],
+            },
+        );
+        state
+            .transcript
+            .push(Entry::ToolCall("write-lib".to_string()));
+        state.tool_calls.insert(
+            "nested-write".to_string(),
+            crate::app::ToolCallView {
+                title: "write src/main.rs".to_string(),
+                kind: ToolKind::Edit,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Diff {
+                    path: "src/main.rs".to_string(),
+                    old_text: None,
+                    new_text: "fn main() {}".to_string(),
+                }],
+            },
+        );
+        state
+            .transcript
+            .push(Entry::CodeAgentToolCall("nested-write".to_string()));
+        state.tool_calls.insert(
+            "failed-test".to_string(),
+            crate::app::ToolCallView {
+                title: "cargo test -p mjolnir".to_string(),
+                kind: ToolKind::Execute,
+                status: ToolCallStatus::Failed,
+                body: vec![ToolCallOutput::Text("error: regression".to_string())],
+            },
+        );
+        state
+            .transcript
+            .push(Entry::ToolCall("failed-test".to_string()));
+        state
+            .transcript
+            .push(Entry::AgentMessage("Here is what I changed.".to_string()));
+
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+
+        let compact = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            compact.contains("3 tools · 2 files changed · 1 failed"),
+            "{compact}"
+        );
+        assert!(compact.contains("cargo test -p mjolnir"), "{compact}");
+        assert!(compact.contains("error: regression"), "{compact}");
+        assert!(compact.contains("└─ final response"), "{compact}");
+        assert!(!compact.contains("write src/lib.rs"), "{compact}");
+        assert!(!compact.contains("write src/main.rs"), "{compact}");
+
+        let narrow = render_transcript_lines(&state, 18)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(
+            narrow.iter().any(|line| line.contains("cargo test")),
+            "{narrow:?}"
+        );
+        assert!(
+            narrow.iter().any(|line| line.contains("mjolnir")),
+            "{narrow:?}"
+        );
+        assert!(
+            narrow.iter().any(|line| line.contains("regression")),
+            "{narrow:?}"
+        );
+
+        let full = render_full_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(full.contains("write src/lib.rs"), "{full}");
+        assert!(full.contains("write src/main.rs"), "{full}");
+        assert!(full.contains("src/lib.rs"), "{full}");
+        assert!(full.contains("src/main.rs"), "{full}");
+        assert!(full.contains("Eitri"), "{full}");
+
+        let markdown = transcript_export_markdown(&state);
+        assert!(markdown.contains("write src/lib\\.rs"));
+        assert!(markdown.contains("write src/main\\.rs"));
+        assert!(markdown.contains("src/lib\\.rs"));
+        assert!(markdown.contains("src/main\\.rs"));
     }
 
     #[test]
@@ -12111,7 +12603,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(initial, vec!["You", "delegate this", ""]);
+        assert!(initial.is_empty());
 
         let bridge = ToolCall::new("bridge-call", "mcp.mj-code-agent.code_agent")
             .status(ToolCallStatus::InProgress)
@@ -12145,21 +12637,16 @@ mod tests {
                 .status,
             ToolCallStatus::InProgress
         );
-        assert_eq!(
-            stable_transcript_entry_count(&state),
-            state.transcript.len()
-        );
-        assert!(inline_transcript_tail_lines(&state, 80).is_empty());
+        assert_eq!(stable_transcript_entry_count(&state), 0);
 
-        let emitted = sink
-            .pending_lines(&state, 80)
+        let live = inline_transcript_tail_lines(&state, 80)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(emitted.contains("forge the change"), "{emitted}");
-        assert!(emitted.contains("completed nested command"), "{emitted}");
-        assert!(!emitted.contains("mcp.mj-code-agent"), "{emitted}");
+        assert!(live.contains("forge the change"), "{live}");
+        assert!(live.contains("completed nested command"), "{live}");
+        assert!(!live.contains("mcp.mj-code-agent"), "{live}");
     }
 
     #[test]
@@ -12174,7 +12661,10 @@ mod tests {
             .iter()
             .map(line_text)
             .collect::<Vec<_>>();
-        assert_eq!(thor_tail, vec!["Thor", "planning the handoff"]);
+        assert_eq!(
+            thor_tail,
+            vec!["You", "delegate this", "", "Thor", "planning the handoff"]
+        );
 
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
             label: "Eitri · gpt-builder".to_string(),
@@ -12187,7 +12677,10 @@ mod tests {
             .iter()
             .map(line_text)
             .collect::<Vec<_>>();
-        assert_eq!(live, vec!["Eitri", "working now"]);
+        assert_eq!(
+            live,
+            vec!["You", "delegate this", "", "Eitri", "working now"]
+        );
         assert!(inline_transcript_tail_row_count(&state, 80) > 0);
         assert!(
             desired_inline_height(
@@ -12211,7 +12704,7 @@ mod tests {
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
             outcome: CodeAgentOutcome::Completed,
         }));
-        assert!(inline_transcript_tail_lines(&state, 80).is_empty());
+        assert!(!inline_transcript_tail_lines(&state, 80).is_empty());
         terminal
             .draw(|frame| draw_header(frame, frame.area(), &state))
             .expect("draw restored header");
@@ -12241,13 +12734,18 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(prompt, vec!["You", "run tests", ""]);
+        assert!(prompt.is_empty());
         assert!(sink.pending_lines(&state, 80).is_empty());
 
         let view = state.tool_calls.get_mut("call-1").expect("tool call");
         view.status = ToolCallStatus::Completed;
         view.body = vec![ToolCallOutput::Text("ok".to_string())];
 
+        assert!(sink.pending_lines(&state, 80).is_empty());
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
         let rendered: Vec<String> = sink
             .pending_lines(&state, 80)
             .iter()
@@ -12255,7 +12753,7 @@ mod tests {
             .collect();
         assert_eq!(
             rendered,
-            vec!["Thor", "│ tool exec cargo test", "│   ok", ""]
+            vec!["You", "run tests", "", "Thor · 0s", "│ 1 tool"]
         );
         assert!(sink.pending_lines(&state, 80).is_empty());
     }
@@ -12287,7 +12785,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(prompt, vec!["You", "run tests", ""]);
+        assert!(prompt.is_empty());
         assert!(
             sink.pending_lines(&state, 80).is_empty(),
             "completed terminal tool call must not flush before terminal exit status arrives"
@@ -12300,6 +12798,11 @@ mod tests {
             exit_status: Some(TerminalExitStatus::new().exit_code(0)),
         }));
 
+        assert!(sink.pending_lines(&state, 80).is_empty());
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
         let rendered: Vec<String> = sink
             .pending_lines(&state, 80)
             .iter()
@@ -12307,15 +12810,7 @@ mod tests {
             .collect();
         assert_eq!(
             rendered,
-            vec![
-                "Thor",
-                "│ tool exec cargo test",
-                "│   terminal output",
-                "│     ok",
-                "│     ",
-                "│     exit code 0",
-                ""
-            ]
+            vec!["You", "run tests", "", "Thor · 0s", "│ 1 tool"]
         );
     }
 
@@ -12341,7 +12836,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(first_prompt, vec!["You", "run tests", ""]);
+        assert!(first_prompt.is_empty());
 
         state.apply_event(UiEvent::PromptDone {
             stop_reason: StopReason::Cancelled,
@@ -12355,7 +12850,11 @@ mod tests {
         assert_eq!(
             cancelled_tool,
             vec![
-                "Thor",
+                "You",
+                "run tests",
+                "",
+                "Thor · 0s",
+                "│ 1 tool · 1 failed",
                 "│ tool [failed] exec cargo test",
                 "│   running",
                 "│   [tool call ended before completion]",
@@ -12369,7 +12868,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(next_prompt, vec!["You", "next prompt", ""]);
+        assert!(next_prompt.is_empty());
     }
 
     #[test]
