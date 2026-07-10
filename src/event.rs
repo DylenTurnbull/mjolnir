@@ -86,6 +86,7 @@ pub struct InternalMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InternalMessageKind {
     Delegation,
+    Exploration,
     DiscreteReview,
     Continuation,
 }

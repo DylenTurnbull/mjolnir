@@ -99,6 +99,10 @@ run_case() {
     echo "parent code-agent transport tool leaked into the transcript" >&2
     exit 1
   fi
+  if grep -a 'mcp.mj-code-agent.explore_agent' "$root/transcript.log" >/dev/null; then
+    echo "parent explore-agent transport tool leaked into the transcript" >&2
+    exit 1
+  fi
   grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
 
   if [ "$mode" = unsupported ]; then
@@ -118,6 +122,33 @@ run_case() {
     grep -a 'Thor session update' "$root/loki.log" >/dev/null
     grep -a 'no-advice' "$root/loki.log" >/dev/null
     grep -a "PRIMARY.*NO.*CHANGE" "$root/transcript.log" >/dev/null
+  elif [ "$mode" = explore ]; then
+    grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
+    test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
+    test -s "$root/primary-result.json"
+    grep -a 'Thor.*Eitri.*explore' "$root/transcript.log" >/dev/null
+    grep -a 'search fixture architecture' "$root/transcript.log" >/dev/null
+    grep -a 'EXPLORE_E2E_OK' "$root/transcript.log" >/dev/null
+    grep -a 'explore-runtime:read-only=true:mcp-servers=0' "$root/nested.log" >/dev/null
+    grep -a 'Thoroughness level: very thorough' "$root/nested.log" >/dev/null
+    grep -a 'config:reasoning=high' "$root/nested.log" >/dev/null
+    node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); const done=Number(fs.readFileSync(process.argv[2],"utf8").match(/completion:(\d+)/)?.[1]); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || r.response.isError || text!=="EXPLORE_E2E_OK" || text.includes("workspace_delta") || text.includes("review Eitri") || !done || r.toolReceivedAt<done) process.exit(1)' "$root/primary-result.json" "$root/nested.log"
+    test ! -e "$workspace/eitri-change.txt"
+    test ! -e "$workspace/eitri-partial.txt"
+    if grep -a 'discrete-review:' "$root/primary.log" >/dev/null; then
+      echo "exploration incorrectly triggered Thor's workspace review" >&2
+      exit 1
+    fi
+  elif [ "$mode" = explore-cancel ]; then
+    grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
+    test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
+    test -s "$root/primary-result.json"
+    grep -a 'search fixture architecture' "$root/transcript.log" >/dev/null
+    grep -a 'cancel-received' "$root/nested.log" >/dev/null
+    grep -a 'explore-runtime:read-only=true:mcp-servers=0' "$root/nested.log" >/dev/null
+    node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || !r.response.isError || !text.includes("Eitri cancelled") || text.includes("workspace_delta") || text.includes("review Eitri")) process.exit(1)' "$root/primary-result.json"
+    test ! -e "$workspace/eitri-change.txt"
+    test ! -e "$workspace/eitri-partial.txt"
   elif [ "$mode" = complete ] || [ "$mode" = loki-eitri ] || [ "$mode" = loki-thor ] || [ "$mode" = thor-review ] || [ "$mode" = details ]; then
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
@@ -183,8 +214,10 @@ case ${MJ_E2E_CASE:-both} in
   loki-thor) run_case loki-thor ;;
   thor-review) run_case thor-review ;;
   details) run_case details ;;
+  explore) run_case explore ;;
+  explore-cancel) run_case explore-cancel ;;
   both) run_case complete; run_case cancel; run_case unsupported ;;
-  council) run_case complete; run_case no-change; run_case inline-stream; run_case cancel; run_case failed; run_case unsupported; run_case loki-eitri; run_case loki-thor; run_case thor-review; run_case details ;;
-  *) echo "MJ_E2E_CASE must be complete, no-change, inline-stream, cancel, failed, unsupported, loki-eitri, loki-thor, thor-review, details, both, or council" >&2; exit 2 ;;
+  council) run_case complete; run_case no-change; run_case inline-stream; run_case cancel; run_case failed; run_case unsupported; run_case loki-eitri; run_case loki-thor; run_case thor-review; run_case details; run_case explore; run_case explore-cancel ;;
+  *) echo "MJ_E2E_CASE must be complete, no-change, inline-stream, cancel, failed, unsupported, loki-eitri, loki-thor, thor-review, details, explore, explore-cancel, both, or council" >&2; exit 2 ;;
 esac
 echo "deterministic code-agent PTY E2E passed"

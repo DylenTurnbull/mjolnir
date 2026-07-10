@@ -10,6 +10,7 @@ const resultPath = process.env.MJ_E2E_PRIMARY_RESULT;
 const primaryLog = process.env.MJ_E2E_PRIMARY_LOG;
 const nestedLog = process.env.MJ_E2E_NESTED_LOG;
 const mode = process.env.MJ_E2E_MODE ?? "complete";
+const exploreMode = mode === "explore" || mode === "explore-cancel";
 const longMessage = (prefix, fill, suffix) => `${prefix} ${fill.repeat(720)} ${suffix}`;
 const instructions = mode === "details"
   ? longMessage("DELEGATION_LONG_PREFIX", "d", "DELEGATION_LONG_SUFFIX")
@@ -24,6 +25,8 @@ let promptRequestId = null;
 let terminalRequestId = null;
 let directiveCount = 0;
 let lokiIntervened = false;
+let clientCapabilities = null;
+let sessionMcpServers = [];
 
 const modelOptions = [
   ["gpt-5.6-sol", "GPT-5.6-Sol"],
@@ -104,7 +107,11 @@ function thorReviewResult() {
 async function callEitri() {
   const unauthorizedStatus = await mcpReady;
   const toolSentAt = Date.now();
-  const called = await postMcp({ jsonrpc: "2.0", id: "call", method: "tools/call", params: { name: "code_agent", arguments: { instructions } } });
+  const name = exploreMode ? "explore_agent" : "code_agent";
+  const arguments_ = exploreMode
+    ? { prompt: "very thorough: trace the deterministic fixture architecture" }
+    : { instructions };
+  const called = await postMcp({ jsonrpc: "2.0", id: "call", method: "tools/call", params: { name, arguments: arguments_ } });
   const toolReceivedAt = Date.now();
   const response = called.message?.result;
   if (resultPath) fs.writeFileSync(resultPath, JSON.stringify({ response, toolSentAt, toolReceivedAt, unauthorizedStatus }));
@@ -112,9 +119,34 @@ async function callEitri() {
   finishPrimary(response?.isError ? `PRIMARY CANCELLED: ${text}` : `PRIMARY RECEIVED: ${text}`);
 }
 
-function startEitriTurn() {
+function startEitriTurn(prompt) {
   if (process.env.MJ_E2E_NESTED_PID) fs.writeFileSync(process.env.MJ_E2E_NESTED_PID, String(process.pid));
   log("prompt-started");
+  if (exploreMode) {
+    const fsCapabilities = clientCapabilities?.fs ?? {};
+    const readOnly = clientCapabilities?.terminal === false
+      && fsCapabilities.readTextFile === true
+      && fsCapabilities.writeTextFile === false;
+    log(`explore-runtime:read-only=${readOnly}:mcp-servers=${sessionMcpServers.length}`);
+    log(`explore-prompt:${prompt}`);
+    if (!readOnly || sessionMcpServers.length !== 0
+        || !prompt.includes("READ-ONLY EXPLORATION")
+        || !prompt.includes("Thoroughness level: very thorough")
+        || !prompt.includes("trace the deterministic fixture architecture")) {
+      send({ id: promptRequestId, error: { code: -32602, message: "invalid explore runtime contract" } });
+      return;
+    }
+    update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "fixture exploration reasoning" } });
+    update({ sessionUpdate: "tool_call", toolCallId: "explore-search", title: "search fixture architecture", kind: "search", status: "in_progress" });
+    update({ sessionUpdate: "tool_call_update", toolCallId: "explore-search", status: "completed", content: [{ type: "content", content: { type: "text", text: "/fixture/entry.mjs" } }] });
+    if (mode === "explore-cancel") return;
+    setTimeout(() => {
+      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "EXPLORE_E2E_OK" } });
+      log(`completion:${Date.now()}`);
+      send({ id: promptRequestId, result: { stopReason: "end_turn" } });
+    }, 250);
+    return;
+  }
   update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "fixture reasoning" } });
   if (mode === "cancel" || mode === "inline-stream" || mode === "failed") {
     fs.writeFileSync(
@@ -162,10 +194,12 @@ input.on("close", () => process.exit(0));
 input.on("line", (line) => {
   const message = JSON.parse(line);
   if (message.method === "initialize") {
+    clientCapabilities = message.params?.clientCapabilities ?? null;
     send({ id: message.id, result: { protocolVersion: 1, agentCapabilities: { mcpCapabilities: { http: process.env.MJ_E2E_HTTP_UNSUPPORTED !== "1", sse: false } }, agentInfo: { name: "council-fixture", version: "1" } } });
   } else if (message.method === "session/new") {
-    mcpServer = (message.params?.mcpServers ?? []).find((server) => server.name === "mj-code-agent" || server.name === "mj-loki-advisor");
-    mcpToolName = mcpServer?.name === "mj-loki-advisor" ? "advise" : "code_agent";
+    sessionMcpServers = message.params?.mcpServers ?? [];
+    mcpServer = sessionMcpServers.find((server) => server.name === "mj-code-agent" || server.name === "mj-loki-advisor");
+    mcpToolName = mcpServer?.name === "mj-loki-advisor" ? "advise" : (exploreMode ? "explore_agent" : "code_agent");
     send({ id: message.id, result: { sessionId: "fixture-session", configOptions: configOptions() } });
     if (mcpServer) mcpReady = prepareMcp();
   } else if (message.method === "session/set_config_option") {
@@ -187,7 +221,7 @@ input.on("line", (line) => {
       }
       send({ id: message.id, result: { stopReason: "end_turn" } });
     } else if (isEitri()) {
-      startEitriTurn();
+      startEitriTurn(text);
     } else if (isLoki()) {
       void runLokiTurn(text).catch((error) => {
         append(process.env.MJ_E2E_LOKI_LOG, `error:${error.stack ?? error}`);

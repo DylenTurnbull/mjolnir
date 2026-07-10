@@ -130,11 +130,18 @@ async function prepareMcp() {
   );
   const tools = listed.message?.result?.tools ?? [];
   const tool = tools.find((candidate) => candidate.name === "code_agent");
+  const explore = tools.find((candidate) => candidate.name === "explore_agent");
   if (!tool
       || !tool.description?.includes("IMPLEMENTATION DELEGATE")
       || !tool.description?.includes("small local changes")
       || !tool.description?.includes("fresh ACP process/session")) {
     throw new Error(`code_agent tool missing or weakly described: ${JSON.stringify(tools)}`);
+  }
+  if (!explore
+      || !explore.description?.includes("READ-ONLY EXPLORATION DELEGATE")
+      || !explore.description?.includes("known path")
+      || !explore.description?.includes("quick, medium, or very thorough")) {
+    throw new Error(`explore_agent tool missing or weakly described: ${JSON.stringify(tools)}`);
   }
   return { unauthorizedStatus: unauthorized.status };
 }

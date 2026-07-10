@@ -46,10 +46,71 @@ use crate::workspace_snapshot::{WorkspaceDelta, WorkspaceSnapshot};
 
 pub const LABEL: &str = "Eitri";
 pub const MCP_SERVER_NAME: &str = "mj-code-agent";
-pub const PRIMARY_SESSION_DIRECTIVE: &str = "<mj-code-agent-policy>\nYou are Thor, the primary coordinator and owner of the user's outcome. You are responsible for understanding the request, doing necessary research and context gathering, forming the plan, coordinating implementation, reviewing and verifying the result, and delivering the final answer. You are not a thin handoff between the user and Eitri. Eitri is the implementation agent exposed as the code_agent MCP tool. This policy applies to every subsequent user request in this ACP session. Delegate substantial implementation chunks to Eitri after you have investigated and planned enough to give useful direction. You may personally make small, local code changes when describing and delegating them would take more effort than simply doing them; use judgment rather than delegating mechanically. Eitri starts a brand-new ACP process and session for every code_agent call. Eitri has no conversation context and no memory of the user's request, your research, or any previous Eitri call—even the immediately preceding call. Every invocation must therefore contain complete standalone instructions with the task, relevant findings, your plan, current workspace state, and acceptance criteria. After Eitri returns, independently review its result, inspect or verify the work as needed, and delegate a substantial corrective follow-up if implementation changes remain. If a request requires no code changes, handle it yourself. Do not call any tool now. Acknowledge this policy with exactly MJ_CODE_AGENT_POLICY_READY.\n</mj-code-agent-policy>";
+pub const PRIMARY_SESSION_DIRECTIVE: &str = "<mj-code-agent-policy>\nYou are Thor, the primary coordinator and owner of the user's outcome. You are responsible for understanding the request, doing necessary research and context gathering, forming the plan, coordinating implementation, reviewing and verifying the result, and delivering the final answer. You are not a thin handoff between the user and Eitri. This policy applies to every subsequent user request in this ACP session.\n\nEitri is available through two MCP tools. Use explore_agent for open-ended, multi-step codebase research when locations are unknown, the question crosses multiple areas, or tracing architecture or execution flow requires several files or search strategies. Do not use explore_agent to read a known path, find a known symbol or exact definition, inspect code confined to roughly two or three known files, or perform a trivial single-step lookup; use your direct tools for those. The explore_agent prompt must be a complete standalone research brief and should state quick, medium, or very thorough.\n\nUse code_agent for substantial implementation chunks after you have investigated and planned enough to give useful direction. You may personally make small, local code changes when describing and delegating them would take more effort than simply doing them; use judgment rather than delegating mechanically. Pass code_agent complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. After Eitri returns, independently review its result, inspect or verify the work as needed, and delegate a substantial corrective follow-up if implementation changes remain. If a request requires no code changes and no open-ended exploration, handle it yourself.\n\nEvery Eitri call starts a brand-new ACP process and session. Eitri has no conversation context and no memory of the user's request or any earlier Eitri call, including an immediately preceding call. Do not call either tool now. Acknowledge this policy with exactly MJ_CODE_AGENT_POLICY_READY.\n</mj-code-agent-policy>";
 
-const FRESH_CONTEXT_PREAMBLE: &str = "You are Eitri, the implementation agent. This is a fresh ACP process and session. You have no memory of the user conversation or of any earlier Eitri call, including an immediately preceding call. Treat the standalone instructions below and the current workspace as your only task context.\n\n";
+const CODE_PREAMBLE: &str = "You are Eitri, the implementation agent. This is a fresh ACP process and session. You have no memory of the user conversation or of any earlier Eitri call, including an immediately preceding call. Treat the standalone instructions below and the current workspace as your only task context.\n\n";
+const EXPLORE_PREAMBLE: &str = "You are Eitri, a file-search specialist. This is a fresh ACP process and session with no memory of the user conversation or any earlier Eitri call. Your role is exclusively to search and analyze existing code and report findings.\n\nREAD-ONLY EXPLORATION: Never create, modify, delete, move, or copy files. Never install dependencies, change configuration, create commits, or run commands that modify system or workspace state. Do not create a report file; return the report as your final message. Use efficient file-pattern searches, regex/text searches, and targeted reads. Start broad and narrow down, try multiple naming conventions when needed, and parallelize independent searches or reads when supported. Use shell only for read-only operations if it is available. Return relevant file paths as absolute paths. Include code snippets only when the exact text is load-bearing. Be concise but match the requested thoroughness.\n\n";
 const MCP_PATH: &str = "/mcp";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EitriPurpose {
+    Code,
+    Explore,
+}
+
+impl EitriPurpose {
+    fn marks_implementation_delegation(self) -> bool {
+        self == Self::Code
+    }
+
+    fn internal_message_kind(self) -> InternalMessageKind {
+        match self {
+            Self::Code => InternalMessageKind::Delegation,
+            Self::Explore => InternalMessageKind::Exploration,
+        }
+    }
+
+    fn access_mode(self, configured: RuntimeAccessMode) -> RuntimeAccessMode {
+        match self {
+            Self::Code => configured,
+            Self::Explore => RuntimeAccessMode::ReadOnly,
+        }
+    }
+
+    fn standalone_prompt(self, task: &str) -> String {
+        match self {
+            Self::Code => format!("{CODE_PREAMBLE}{task}"),
+            Self::Explore => {
+                let thoroughness = exploration_thoroughness(task);
+                format!(
+                    "{EXPLORE_PREAMBLE}Thoroughness level: {thoroughness}.\n\nSearch request:\n{task}"
+                )
+            }
+        }
+    }
+
+    fn loki_context(self, task: &str) -> String {
+        match self {
+            Self::Code => {
+                format!("Eitri received this standalone implementation delegation:\n{task}")
+            }
+            Self::Explore => {
+                format!("Eitri received this standalone read-only exploration request:\n{task}")
+            }
+        }
+    }
+}
+
+fn exploration_thoroughness(prompt: &str) -> &'static str {
+    let prompt = prompt.to_ascii_lowercase();
+    if prompt.contains("very thorough") {
+        "very thorough"
+    } else if prompt.contains("quick") {
+        "quick"
+    } else {
+        "medium"
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -127,6 +188,13 @@ pub struct CodeAgentArgs {
     pub instructions: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExploreAgentArgs {
+    /// Complete, standalone read-only research request for the delegated agent.
+    pub prompt: String,
+}
+
 #[derive(Clone)]
 struct McpHandler {
     config: Config,
@@ -172,7 +240,7 @@ impl McpHandler {
         }
         if !self.controller.begin().await {
             return Ok(CallToolResult::error(vec![Content::text(
-                "a code agent run is already active",
+                "an Eitri run is already active",
             )]));
         }
 
@@ -180,19 +248,57 @@ impl McpHandler {
             self.config.clone(),
             self.context.clone(),
             args.instructions,
+            EitriPurpose::Code,
+            self.ui_tx.clone(),
+            self.controller.clone(),
+        )
+        .await;
+        let workspace_delta = result
+            .workspace_delta
+            .as_ref()
+            .expect("code_agent always captures a workspace delta");
+        Ok(match result.outcome {
+            Ok(message) => CallToolResult::success(vec![Content::text(with_workspace_receipt(
+                &message,
+                workspace_delta,
+            ))]),
+            Err(error) => CallToolResult::error(vec![Content::text(with_workspace_receipt(
+                &error.to_string(),
+                workspace_delta,
+            ))]),
+        })
+    }
+
+    #[tool(
+        name = "explore_agent",
+        description = "READ-ONLY EXPLORATION DELEGATE (EITRI). Use this for open-ended, multi-step codebase research: finding files when locations are unknown, searching across multiple areas or naming conventions, tracing architecture or execution flow, or answering questions that require several files or search strategies. Do NOT use it to read a known path, find a known symbol or exact definition, inspect code confined to roughly 2-3 known files, or perform a trivial single-step lookup; use your direct tools instead. The prompt must be a complete standalone research brief and should state the desired thoroughness: quick, medium, or very thorough. Every call starts a fresh ACP process/session with zero conversation or prior-call memory and returns one final research report."
+    )]
+    async fn explore_agent(
+        &self,
+        Parameters(args): Parameters<ExploreAgentArgs>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let prompt = args.prompt.trim();
+        if prompt.is_empty() {
+            return Err(McpError::invalid_params("prompt must not be empty", None));
+        }
+        if !self.controller.begin().await {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "an Eitri run is already active",
+            )]));
+        }
+
+        let result = run_boxed(
+            self.config.clone(),
+            self.context.clone(),
+            prompt.to_string(),
+            EitriPurpose::Explore,
             self.ui_tx.clone(),
             self.controller.clone(),
         )
         .await;
         Ok(match result.outcome {
-            Ok(message) => CallToolResult::success(vec![Content::text(with_workspace_receipt(
-                &message,
-                &result.workspace_delta,
-            ))]),
-            Err(error) => CallToolResult::error(vec![Content::text(with_workspace_receipt(
-                &error.to_string(),
-                &result.workspace_delta,
-            ))]),
+            Ok(message) => CallToolResult::success(vec![Content::text(message)]),
+            Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
         })
     }
 }
@@ -202,7 +308,7 @@ impl ServerHandler for McpHandler {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("mj-code-agent", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "DELEGATION POLICY: Thor owns research, planning, coordination, review, verification, and the final answer. Delegate substantial implementation chunks to Eitri; Thor may directly make small local changes when delegation would cost more effort. Every code_agent call is a fresh ACP process/session with zero conversation or prior-call memory, so every invocation needs complete standalone instructions.",
+                "EITRI DELEGATION POLICY: Use explore_agent only for open-ended, multi-step codebase research across unknown or multiple locations; use direct tools for known paths, known symbols, roughly 2-3 known files, and trivial lookups. Use code_agent for substantial implementation chunks while Thor retains planning, coordination, review, verification, and the final answer. Every Eitri call is a fresh ACP process/session and needs a complete standalone prompt.",
             )
     }
 
@@ -304,7 +410,7 @@ impl HttpServer {
         }
         tokio::time::timeout(timeout, tools_listed.changed())
             .await
-            .map_err(|_| anyhow!("primary agent timed out loading the code_agent MCP tool"))?
+            .map_err(|_| anyhow!("primary agent timed out loading the Eitri MCP tools"))?
             .map_err(|_| anyhow!("code-agent MCP server closed before tools/list"))?;
         Ok(())
     }
@@ -457,53 +563,61 @@ impl AgentMessageCollector {
 
     fn finish(&self) -> Result<String> {
         if self.last.trim().is_empty() {
-            bail!("code agent completed without a final message");
+            bail!("Eitri completed without a final message");
         }
         Ok(self.last.clone())
     }
 }
 
-struct CodeAgentRunResult {
+struct EitriRunResult {
     outcome: Result<String>,
-    workspace_delta: WorkspaceDelta,
+    workspace_delta: Option<WorkspaceDelta>,
 }
 
 fn run_boxed(
     config: Config,
     context: RunContext,
-    instructions: String,
+    task: String,
+    purpose: EitriPurpose,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     controller: Controller,
-) -> futures::future::BoxFuture<'static, CodeAgentRunResult> {
-    Box::pin(run(config, context, instructions, ui_tx, controller))
+) -> futures::future::BoxFuture<'static, EitriRunResult> {
+    Box::pin(run(config, context, task, purpose, ui_tx, controller))
 }
 
 async fn run(
     config: Config,
     context: RunContext,
-    instructions: String,
+    task: String,
+    purpose: EitriPurpose,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     controller: Controller,
-) -> CodeAgentRunResult {
-    if let Some(observer) = config.delegation_observer.as_ref() {
+) -> EitriRunResult {
+    if purpose.marks_implementation_delegation()
+        && let Some(observer) = config.delegation_observer.as_ref()
+    {
         observer.store(true, Ordering::Release);
     }
-    let standalone_prompt = format!("{FRESH_CONTEXT_PREAMBLE}{instructions}");
+    let standalone_prompt = purpose.standalone_prompt(&task);
     let display_label = config.display_label.clone();
     let _ = ui_tx.send(UiEvent::InternalMessage(InternalMessage {
         source: "Thor".to_string(),
         target: LABEL.to_string(),
-        kind: InternalMessageKind::Delegation,
-        text: instructions.clone(),
+        kind: purpose.internal_message_kind(),
+        text: task.clone(),
     }));
     let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::Started {
         label: display_label,
     }));
 
-    let mut workspace_roots = Vec::with_capacity(1 + context.additional_directories.len());
-    workspace_roots.push(context.cwd.clone());
-    workspace_roots.extend(context.additional_directories.iter().cloned());
-    let invocation_snapshot = WorkspaceSnapshot::capture(&workspace_roots).await;
+    let invocation_snapshot = if purpose.marks_implementation_delegation() {
+        let mut workspace_roots = Vec::with_capacity(1 + context.additional_directories.len());
+        workspace_roots.push(context.cwd.clone());
+        workspace_roots.extend(context.additional_directories.iter().cloned());
+        Some(WorkspaceSnapshot::capture(&workspace_roots).await)
+    } else {
+        None
+    };
 
     let (nested_event_tx, mut nested_event_rx) = mpsc::unbounded_channel();
     let (nested_cmd_tx, nested_cmd_rx) = mpsc::unbounded_channel();
@@ -520,7 +634,7 @@ async fn run(
         env: config.env,
         agent_stderr: config.agent_stderr,
         fs_max_text_bytes: context.fs_max_text_bytes,
-        access_mode: context.access_mode,
+        access_mode: purpose.access_mode(context.access_mode),
         agent_source_id: None,
         config_path: None,
         saved_session_config: HashMap::new(),
@@ -535,7 +649,7 @@ async fn run(
     if epoch > 0
         && let Some(reviewer) = loki.as_ref()
     {
-        reviewer.begin_eitri(epoch, instructions.clone());
+        reviewer.begin_eitri(epoch, purpose.loki_context(&task));
     }
     let mut decisions = loki.as_ref().map(loki::Handle::subscribe);
     let mut tracker = loki::BoundaryTracker::default();
@@ -546,14 +660,14 @@ async fn run(
         tokio::select! {
             joined = &mut runtime => {
                 break match joined {
-                    Ok(Ok(())) => Err(anyhow!("code agent runtime closed before completing")),
-                    Ok(Err(error)) => Err(error).context("code agent runtime"),
-                    Err(error) => Err(anyhow!("code agent task failed: {error}")),
+                    Ok(Ok(())) => Err(anyhow!("Eitri runtime closed before completing")),
+                    Ok(Err(error)) => Err(error).context("Eitri runtime"),
+                    Err(error) => Err(anyhow!("Eitri task failed: {error}")),
                 };
             }
             event = nested_event_rx.recv() => {
                 let Some(event) = event else {
-                    break Err(anyhow!("code agent event stream closed before completing"));
+                    break Err(anyhow!("Eitri event stream closed before completing"));
                 };
                 let boundary = (epoch > 0).then(|| tracker.observe(&event)).flatten();
                 let boundary_observed = boundary.is_some();
@@ -591,7 +705,7 @@ async fn run(
                             })
                             .is_err()
                         {
-                            break Err(anyhow!("send instructions to code agent"));
+                            break Err(anyhow!("send prompt to Eitri"));
                         }
                     }
                     UiEvent::SessionStarted { .. } | UiEvent::SessionConfigOptions { .. } => {}
@@ -623,28 +737,28 @@ async fn run(
                                 // reached the deferred interruption boundary.
                                 intervention.clear();
                                 pending_reviews.clear();
-                                break Err(anyhow!("code agent cancelled"));
+                                break Err(anyhow!("Eitri cancelled"));
                             }
                             if let Some(critique) = intervention.take() {
                                 collector = AgentMessageCollector::new();
                                 tracker.reset_attempt();
                                 pending_reviews.clear();
                                 completed = None;
-                                let continuation = continuation_prompt(&instructions, &critique, &tracker.trajectory());
+                                let continuation = continuation_prompt(purpose, &critique);
                                 emit_continuation(&ui_tx, &critique);
                                 if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
                                     break Err(anyhow!("re-prompt Eitri after Loki intervention"));
                                 }
                                 continue;
                             }
-                            break Err(anyhow!("code agent cancelled"));
+                            break Err(anyhow!("Eitri cancelled"));
                         }
                         if let Some(critique) = intervention.take() {
                             collector = AgentMessageCollector::new();
                             tracker.reset_attempt();
                             pending_reviews.clear();
                             completed = None;
-                            let continuation = continuation_prompt(&instructions, &critique, &tracker.trajectory());
+                            let continuation = continuation_prompt(purpose, &critique);
                             emit_continuation(&ui_tx, &critique);
                             if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
                                 break Err(anyhow!("re-prompt Eitri after Loki intervention"));
@@ -664,7 +778,7 @@ async fn run(
                             tracker.reset_attempt();
                             pending_reviews.clear();
                             completed = None;
-                            let continuation = continuation_prompt(&instructions, &critique, &tracker.trajectory());
+                            let continuation = continuation_prompt(purpose, &critique);
                             emit_continuation(&ui_tx, &critique);
                             if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
                                 break Err(anyhow!("re-prompt Eitri after Loki intervention"));
@@ -681,7 +795,7 @@ async fn run(
                     | UiEvent::ActorActivity(_)
                     | UiEvent::InternalMessage(_) => {}
                     UiEvent::CodeAgent(_) => {
-                        break Err(anyhow!("nested code agent attempted recursive delegation"));
+                        break Err(anyhow!("Eitri attempted recursive delegation"));
                     }
                 }
             }
@@ -704,7 +818,7 @@ async fn run(
                             tracker.reset_attempt();
                             pending_reviews.clear();
                             let critique = intervention.take().expect("intervention queued");
-                            let continuation = continuation_prompt(&instructions, &critique, &tracker.trajectory());
+                            let continuation = continuation_prompt(purpose, &critique);
                             emit_continuation(&ui_tx, &critique);
                             if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
                                 break Err(anyhow!("re-prompt Eitri after Loki intervention"));
@@ -735,7 +849,10 @@ async fn run(
         let _ = runtime.await;
     }
     controller.finish().await;
-    let workspace_delta = invocation_snapshot.delta().await;
+    let workspace_delta = match invocation_snapshot {
+        Some(snapshot) => Some(snapshot.delta().await),
+        None => None,
+    };
 
     let outcome = match &result {
         Ok(_) => CodeAgentOutcome::Completed,
@@ -743,7 +860,7 @@ async fn run(
         Err(error) => CodeAgentOutcome::Failed(error.to_string()),
     };
     let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::Finished { outcome }));
-    CodeAgentRunResult {
+    EitriRunResult {
         outcome: result,
         workspace_delta,
     }
@@ -760,9 +877,13 @@ fn with_workspace_receipt(message: &str, delta: &WorkspaceDelta) -> String {
     result
 }
 
-fn continuation_prompt(_task: &str, critique: &str, _trajectory: &str) -> String {
+fn continuation_prompt(purpose: EitriPurpose, critique: &str) -> String {
+    let activity = match purpose {
+        EitriPurpose::Code => "implementation",
+        EitriPurpose::Explore => "read-only exploration",
+    };
     format!(
-        "<advisory guidance=\"weigh, don't blindly obey\">\n{critique}\n</advisory>\n\nContinue the interrupted implementation turn. Address the material advice, then finish the existing task."
+        "<advisory guidance=\"weigh, don't blindly obey\">\n{critique}\n</advisory>\n\nContinue the interrupted {activity} turn. Address the material advice, then finish the existing task."
     )
 }
 
@@ -848,13 +969,29 @@ mod tests {
                 .is_err()
         );
         assert!(serde_json::from_str::<CodeAgentArgs>("{}").is_err());
+
+        let parsed: ExploreAgentArgs =
+            serde_json::from_str(r#"{"prompt":"very thorough: trace it"}"#)
+                .expect("valid explore arguments");
+        assert_eq!(parsed.prompt, "very thorough: trace it");
+        assert!(
+            serde_json::from_str::<ExploreAgentArgs>(
+                r#"{"prompt":"trace it","instructions":"wrong field"}"#
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_str::<ExploreAgentArgs>("{}").is_err());
     }
 
     #[test]
-    fn tool_is_model_visible_and_directs_coding_delegation() {
+    fn tools_are_model_visible_and_direct_each_eitri_purpose() {
         let tools = test_handler().tool_router.list_all();
-        assert_eq!(tools.len(), 1);
-        let tool = serde_json::to_value(&tools[0]).expect("serialize tool");
+        assert_eq!(tools.len(), 2);
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "code_agent")
+            .map(|tool| serde_json::to_value(tool).expect("serialize tool"))
+            .expect("code_agent");
         assert_eq!(tool["name"], "code_agent");
         let description = tool["description"].as_str().expect("description");
         assert!(description.contains("IMPLEMENTATION DELEGATE"));
@@ -868,6 +1005,24 @@ mod tests {
             tool["inputSchema"]["required"],
             serde_json::json!(["instructions"])
         );
+
+        let explore = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "explore_agent")
+            .map(|tool| serde_json::to_value(tool).expect("serialize tool"))
+            .expect("explore_agent");
+        let description = explore["description"].as_str().expect("description");
+        assert!(description.contains("READ-ONLY EXPLORATION DELEGATE"));
+        assert!(description.contains("open-ended, multi-step"));
+        assert!(description.contains("Do NOT use it to read a known path"));
+        assert!(description.contains("known symbol"));
+        assert!(description.contains("2-3 known files"));
+        assert!(description.contains("trivial single-step lookup"));
+        assert!(description.contains("quick, medium, or very thorough"));
+        assert_eq!(
+            explore["inputSchema"]["required"],
+            serde_json::json!(["prompt"])
+        );
     }
 
     #[test]
@@ -876,20 +1031,58 @@ mod tests {
         assert!(PRIMARY_SESSION_DIRECTIVE.contains("research and context gathering"));
         assert!(PRIMARY_SESSION_DIRECTIVE.contains("forming the plan"));
         assert!(PRIMARY_SESSION_DIRECTIVE.contains("independently review its result"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("Delegate substantial implementation chunks"));
+        assert!(
+            PRIMARY_SESSION_DIRECTIVE.contains("code_agent for substantial implementation chunks")
+        );
         assert!(PRIMARY_SESSION_DIRECTIVE.contains("small, local code changes"));
         assert!(PRIMARY_SESSION_DIRECTIVE.contains("would take more effort"));
         assert!(PRIMARY_SESSION_DIRECTIVE.contains("brand-new ACP process and session"));
         assert!(PRIMARY_SESSION_DIRECTIVE.contains("immediately preceding call"));
         assert!(PRIMARY_SESSION_DIRECTIVE.contains("complete standalone instructions"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("Use explore_agent for open-ended, multi-step"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("known path"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("known symbol"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("two or three known files"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("trivial single-step lookup"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("quick, medium, or very thorough"));
         assert!(!PRIMARY_SESSION_DIRECTIVE.contains("before using any other tool"));
     }
 
     #[test]
-    fn eitri_preamble_explicitly_declares_fresh_context() {
-        assert!(FRESH_CONTEXT_PREAMBLE.contains("fresh ACP process and session"));
-        assert!(FRESH_CONTEXT_PREAMBLE.contains("no memory of the user conversation"));
-        assert!(FRESH_CONTEXT_PREAMBLE.contains("immediately preceding call"));
-        assert!(FRESH_CONTEXT_PREAMBLE.contains("current workspace"));
+    fn eitri_preambles_define_distinct_code_and_explore_contracts() {
+        assert!(CODE_PREAMBLE.contains("fresh ACP process and session"));
+        assert!(CODE_PREAMBLE.contains("no memory of the user conversation"));
+        assert!(CODE_PREAMBLE.contains("immediately preceding call"));
+        assert!(CODE_PREAMBLE.contains("current workspace"));
+        assert!(EXPLORE_PREAMBLE.contains("file-search specialist"));
+        assert!(EXPLORE_PREAMBLE.contains("READ-ONLY EXPLORATION"));
+        assert!(EXPLORE_PREAMBLE.contains("Never create, modify, delete"));
+        assert!(EXPLORE_PREAMBLE.contains("absolute paths"));
+        assert!(EXPLORE_PREAMBLE.contains("parallelize independent searches"));
+    }
+
+    #[test]
+    fn explore_defaults_to_medium_and_forces_read_only_without_marking_delegation() {
+        assert_eq!(exploration_thoroughness("trace the flow"), "medium");
+        assert_eq!(exploration_thoroughness("Quick: find callers"), "quick");
+        assert_eq!(
+            exploration_thoroughness("Very thorough: trace the flow"),
+            "very thorough"
+        );
+        assert_eq!(
+            EitriPurpose::Explore.access_mode(RuntimeAccessMode::Full),
+            RuntimeAccessMode::ReadOnly
+        );
+        assert_eq!(
+            EitriPurpose::Code.access_mode(RuntimeAccessMode::Full),
+            RuntimeAccessMode::Full
+        );
+        assert!(!EitriPurpose::Explore.marks_implementation_delegation());
+        assert!(EitriPurpose::Code.marks_implementation_delegation());
+        assert!(
+            EitriPurpose::Explore
+                .standalone_prompt("trace it")
+                .contains("Thoroughness level: medium")
+        );
     }
 }

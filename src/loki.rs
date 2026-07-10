@@ -615,11 +615,11 @@ impl Handle {
         epoch
     }
 
-    pub fn begin_eitri(&self, epoch: u64, instructions: String) {
+    pub fn begin_eitri(&self, epoch: u64, context: String) {
         let _ = self.requests.send(Request::TargetContext {
             epoch,
             target: Target::Eitri,
-            text: format!("Eitri received this standalone delegation:\n{instructions}"),
+            text: context,
         });
     }
 

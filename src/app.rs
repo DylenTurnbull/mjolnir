@@ -326,12 +326,13 @@ fn code_agent_identity_from_raw_input(raw_input: Option<&serde_json::Value>) -> 
         && object
             .get("tool")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|tool| tool == "code_agent")
+            .is_some_and(|tool| matches!(tool, "code_agent" | "explore_agent"))
 }
 
 fn code_agent_identity_from_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    name.contains("mj-code-agent") && name.contains("code_agent")
+    name.contains("mj-code-agent")
+        && (name.contains("code_agent") || name.contains("explore_agent"))
 }
 
 fn code_agent_identity_from_meta(
@@ -3648,6 +3649,23 @@ mod tests {
             state.tool_calls.get("bridge-call").expect("bridge").status,
             ToolCallStatus::Completed
         );
+        assert!(state.transcript.is_empty());
+    }
+
+    #[test]
+    fn primary_explore_agent_transport_call_is_tracked_but_not_transcribed() {
+        let mut state = AppState::new();
+        let call = ToolCall::new("explore-bridge", "mcp.mj-code-agent.explore_agent")
+            .status(ToolCallStatus::InProgress)
+            .raw_input(serde_json::json!({
+                "server": "mj-code-agent",
+                "tool": "explore_agent",
+                "arguments": { "prompt": "very thorough: trace startup" }
+            }));
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)));
+
+        assert!(state.tool_calls.contains_key("explore-bridge"));
         assert!(state.transcript.is_empty());
     }
 

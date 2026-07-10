@@ -3773,6 +3773,9 @@ fn transcript_export_markdown(state: &AppState) -> String {
                     crate::event::InternalMessageKind::Delegation => {
                         format!("{} → {} delegation", message.source, message.target)
                     }
+                    crate::event::InternalMessageKind::Exploration => {
+                        format!("{} → {} · explore", message.source, message.target)
+                    }
                     crate::event::InternalMessageKind::DiscreteReview => {
                         format!("{} discrete review", message.source)
                     }
@@ -5275,6 +5278,9 @@ fn render_transcript_entry_range(
                             message.target,
                             message_size_label(chars)
                         )
+                    }
+                    crate::event::InternalMessageKind::Exploration => {
+                        format!("{} → {} · explore", message.source, message.target)
                     }
                     crate::event::InternalMessageKind::DiscreteReview => {
                         format!("discrete review brief · {}", message_size_label(chars))
@@ -12623,6 +12629,63 @@ mod tests {
         assert!(streamed.contains("completed nested command"), "{streamed}");
         assert!(!streamed.contains("mcp.mj-code-agent"), "{streamed}");
         assert!(inline_transcript_tail_lines(&state, 80).is_empty());
+    }
+
+    #[test]
+    fn foreground_exploration_has_a_distinct_handoff_and_live_eitri_activity() {
+        let mut state = AppState::new();
+        let mut sink = TranscriptSink::default();
+
+        state.record_user_prompt("trace startup".to_string());
+        let _ = sink.pending_lines(&state, 80);
+        state.apply_event(UiEvent::InternalMessage(InternalMessage {
+            source: "Thor".to_string(),
+            target: "Eitri".to_string(),
+            kind: crate::event::InternalMessageKind::Exploration,
+            text: "very thorough: trace startup".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "Eitri · explorer".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentThoughtChunk(text_chunk("searching entry points")),
+        )));
+
+        let streamed = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(streamed.contains("Thor → Eitri · explore"), "{streamed}");
+        let live = inline_transcript_tail_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(live.contains("searching entry points"), "{live}");
+        state.apply_event(UiEvent::ActorActivity(ActorActivity::Warning {
+            actor: ActorIdentity {
+                role: "Loki".to_string(),
+                connection_id: "explore-review".to_string(),
+                source_id: None,
+                model_name: Some("reviewer".to_string()),
+                model_value: None,
+            },
+            message: "trace the fallback path too".to_string(),
+        }));
+        let interjection = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(interjection.contains("Loki"), "{interjection}");
+        assert!(
+            interjection.contains("trace the fallback path too"),
+            "{interjection}"
+        );
+        assert!(transcript_export_markdown(&state).contains("Thor → Eitri · explore"));
     }
 
     #[test]
