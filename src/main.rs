@@ -1974,6 +1974,7 @@ async fn run_session(
                 council_models: config::Config::load(&config_path)
                     .map(|config| config.models)
                     .unwrap_or_default(),
+                primary_acp_name: council.thor.launch.kind.display_name().to_string(),
             },
         )
         .await;

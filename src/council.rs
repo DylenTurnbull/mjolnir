@@ -22,6 +22,16 @@ pub enum AdapterKind {
     Anvil,
 }
 
+impl AdapterKind {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+            Self::Anvil => "Anvil",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AdapterLaunch {
     pub kind: AdapterKind,
@@ -391,6 +401,13 @@ mod tests {
         assert_eq!(adapter_kind("claude-sonnet-5"), AdapterKind::Claude);
         assert_eq!(adapter_kind("gemini-3-5-flash"), AdapterKind::Anvil);
         assert_eq!(adapter_kind("glm-5-2"), AdapterKind::Anvil);
+    }
+
+    #[test]
+    fn adapter_display_names_match_the_primary_acp_products() {
+        assert_eq!(AdapterKind::Codex.display_name(), "Codex");
+        assert_eq!(AdapterKind::Claude.display_name(), "Claude Code");
+        assert_eq!(AdapterKind::Anvil.display_name(), "Anvil");
     }
 
     #[test]

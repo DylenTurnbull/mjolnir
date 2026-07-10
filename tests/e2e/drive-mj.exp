@@ -24,12 +24,22 @@ if {$mode eq "inline-stream" || $mode eq "details"} {
     }
 }
 
+expect {
+    -re {waiting for Codex} {}
+    timeout { exit 36 }
+}
+
 if {$mode eq "unsupported"} {
     expect {
         -re {does not support HTTP MCP servers required for code-agent delegation} { after 500 }
         timeout { exit 18 }
     }
     exit 0
+}
+
+expect {
+    -re {Connected to Codex} {}
+    timeout { exit 37 }
 }
 
 set user_prompt "write a hello world program in Python"

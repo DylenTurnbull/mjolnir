@@ -598,6 +598,11 @@ pub struct AppState {
     /// directory's git project.
     pub session_cwd: PathBuf,
     pub agent_label: String,
+    /// Human-readable ACP adapter backing the primary model, such as Codex or
+    /// Claude Code. Kept separate from the role/model label in the header.
+    primary_acp_name: String,
+    primary_waiting_announced: bool,
+    primary_connected_announced: bool,
     /// Registry `source_id` of the launched agent (e.g. `claude-acp`,
     /// `opencode`, `custom:foo`, `anvil`). Distinct from `agent_label`,
     /// which is a *display* string; this is the stable id the model-score
@@ -950,6 +955,9 @@ impl AppState {
             ragnarok_launch: None,
             session_cwd: PathBuf::from("."),
             agent_label: String::new(),
+            primary_acp_name: "ACP server".to_string(),
+            primary_waiting_announced: false,
+            primary_connected_announced: false,
             agent_source_id: String::new(),
             active_agent_launch: None,
             score_store: crate::scores::ScoreStore::default(),
@@ -1415,6 +1423,28 @@ impl AppState {
         if self.connection_state != state {
             self.connection_state = state;
             self.connection_state_started_at = Instant::now();
+        }
+    }
+
+    pub fn set_primary_acp_name(&mut self, name: impl Into<String>) {
+        self.primary_acp_name = name.into();
+    }
+
+    pub fn announce_waiting_for_primary(&mut self) {
+        let message = format!("waiting for {}", self.primary_acp_name);
+        self.set_status_line(StatusKind::Info, message.clone());
+        if !self.primary_waiting_announced {
+            self.primary_waiting_announced = true;
+            self.push_system_message(message);
+        }
+    }
+
+    fn announce_connected_to_primary(&mut self) {
+        let message = format!("Connected to {}", self.primary_acp_name);
+        self.set_status_line(StatusKind::Info, message.clone());
+        if self.primary_waiting_announced && !self.primary_connected_announced {
+            self.primary_connected_announced = true;
+            self.push_system_message(message);
         }
     }
 
@@ -1990,6 +2020,7 @@ impl AppState {
                 self.session_fork_supported = session_fork_supported;
                 install_builtin_commands(&mut self.available_commands, session_fork_supported);
                 self.set_connection_state(ConnectionState::Initializing);
+                self.announce_connected_to_primary();
             }
             UiEvent::SessionStarted { session_id, .. } => {
                 if self.connection_state == ConnectionState::Forking {
@@ -4207,6 +4238,40 @@ mod tests {
         });
         assert_eq!(s.connection_state, ConnectionState::Ready);
         assert!(!s.is_streaming());
+    }
+
+    #[test]
+    fn primary_acp_connection_lifecycle_is_named_and_announced_once() {
+        let mut state = AppState::new();
+        state.set_primary_acp_name("Claude Code");
+
+        state.announce_waiting_for_primary();
+        state.announce_waiting_for_primary();
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::System(text)] if text == "waiting for Claude Code"
+        ));
+        assert_eq!(
+            state.status_line.as_ref().expect("waiting status").kind,
+            StatusKind::Info
+        );
+
+        state.apply_event(UiEvent::Connected {
+            agent_name: Some("claude-agent-acp".into()),
+            agent_version: Some("1.0".into()),
+            prompt_images_supported: false,
+            session_fork_supported: false,
+        });
+
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::System(waiting), Entry::System(connected)]
+                if waiting == "waiting for Claude Code"
+                    && connected == "Connected to Claude Code"
+        ));
+        let status = state.status_line.as_ref().expect("connected status");
+        assert_eq!(status.kind, StatusKind::Info);
+        assert_eq!(status.text, "Connected to Claude Code");
     }
 
     #[test]

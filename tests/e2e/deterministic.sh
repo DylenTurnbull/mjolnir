@@ -98,19 +98,26 @@ run_case() {
     echo "parent code-agent transport tool leaked into the transcript" >&2
     exit 1
   fi
+  grep -a 'waiting for Codex' "$root/transcript.log" >/dev/null
 
   if [ "$mode" = unsupported ]; then
     test ! -e "$root/primary-result.json"
     grep -a "does not support HTTP MCP servers required for code-agent delegation" "$root/transcript.log" >/dev/null
+    if grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null; then
+      echo "failed ACP initialization claimed a successful connection" >&2
+      exit 1
+    fi
     if grep -a '"method":"session/new"' "$root/primary.log" >/dev/null; then
       echo "unsupported primary received session/new" >&2
       exit 1
     fi
   elif [ "$mode" = no-change ]; then
+    grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test ! -e "$root/primary-result.json"
     test ! -s "$root/loki.log"
     grep -a "FINAL" "$root/transcript.log" >/dev/null
   elif [ "$mode" = complete ] || [ "$mode" = loki-eitri ] || [ "$mode" = loki-thor ] || [ "$mode" = thor-review ] || [ "$mode" = details ]; then
+    grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
     test -s "$root/primary-result.json"
     grep -a "Eitri" "$root/transcript.log" >/dev/null
@@ -143,6 +150,7 @@ run_case() {
       node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); const done=Number(fs.readFileSync(process.argv[2],"utf8").match(/completion:(\d+)/)?.[1]); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || r.response.isError || text!=="CODEAGENT_E2E_OK" || !done || r.toolReceivedAt<done) process.exit(1)' "$root/primary-result.json" "$root/nested.log"
     fi
   else
+    grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
     test -s "$root/primary-result.json"
     grep -a "Eitri" "$root/transcript.log" >/dev/null

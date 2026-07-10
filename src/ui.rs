@@ -327,6 +327,7 @@ pub struct UiRunOptions<'a> {
     pub session_cwd: PathBuf,
     pub council_choices: Vec<crate::council::ModelChoice>,
     pub council_models: crate::config::ModelsConfig,
+    pub primary_acp_name: String,
 }
 
 pub struct UiRunResult {
@@ -352,6 +353,7 @@ struct UiInitialState {
     session_cwd: PathBuf,
     council_choices: Vec<crate::council::ModelChoice>,
     council_models: crate::config::ModelsConfig,
+    primary_acp_name: String,
 }
 
 /// Internal result of [`ui_loop`]. `run` unpacks it into the public
@@ -408,6 +410,7 @@ pub async fn run(
             session_cwd: options.session_cwd,
             council_choices: options.council_choices,
             council_models: options.council_models,
+            primary_acp_name: options.primary_acp_name,
         },
         options.mode,
     )
@@ -594,6 +597,7 @@ async fn ui_loop(
     state.session_cwd = initial.session_cwd;
     state.council_choices = initial.council_choices;
     state.council_models = initial.council_models;
+    state.set_primary_acp_name(initial.primary_acp_name);
     state.transcript_export_dir = initial.transcript_export_dir;
     state.set_theme(initial.theme_kind);
     state.set_spinner_style(initial.spinner_style);
@@ -601,6 +605,7 @@ async fn ui_loop(
     if let Some(boundary) = initial.session_boundary {
         state.push_session_boundary(boundary);
     }
+    state.announce_waiting_for_primary();
     let mut transcript_scroll = TranscriptScrollState::default();
     let mut transcript_sink = TranscriptSink::default();
     let mut inline_resize_reflow = InlineResizeReflow::default();
@@ -3186,7 +3191,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
                 "acp runtime closed; type /clear for the same agent, /new for the picker, or Ctrl-C to quit",
             );
         } else if state.session_id.is_none() {
-            state.record_status_message(StatusKind::Warning, "waiting for session...");
+            state.announce_waiting_for_primary();
         } else if !state.session_fork_supported {
             state.record_status_message(
                 StatusKind::Warning,
@@ -3249,7 +3254,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
     if state.session_id.is_none() {
-        state.record_status_message(StatusKind::Warning, "waiting for session...");
+        state.announce_waiting_for_primary();
         return;
     }
 
@@ -4061,7 +4066,7 @@ fn open_config_value_picker_for_shortcut(
         return true;
     }
     if state.session_id.is_none() {
-        state.record_status_message(StatusKind::Warning, "waiting for session...");
+        state.announce_waiting_for_primary();
         return true;
     }
 
@@ -15600,6 +15605,7 @@ mod tests {
     #[test]
     fn submit_preserves_text_and_images_when_session_is_not_ready() {
         let mut state = AppState::new();
+        state.set_primary_acp_name("Codex");
         state
             .image_attachments
             .push(test_image_attachment_with_id(1));
@@ -15612,8 +15618,12 @@ mod tests {
         assert_eq!(state.input, "describe this");
         assert_eq!(state.image_attachments.len(), 1);
         let status = state.status_line.expect("status");
-        assert_eq!(status.kind, StatusKind::Warning);
-        assert_eq!(status.text, "waiting for session...");
+        assert_eq!(status.kind, StatusKind::Info);
+        assert_eq!(status.text, "waiting for Codex");
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::System(text)] if text == "waiting for Codex"
+        ));
     }
 
     #[test]
