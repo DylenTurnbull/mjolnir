@@ -883,7 +883,7 @@ fn continuation_prompt(purpose: EitriPurpose, critique: &str) -> String {
         EitriPurpose::Explore => "read-only exploration",
     };
     format!(
-        "<advisory guidance=\"weigh, don't blindly obey\">\n{critique}\n</advisory>\n\nContinue the interrupted {activity} turn. Address the material advice, then finish the existing task."
+        "<advisory guidance=\"weigh, don't blindly obey\">\n{critique}\n</advisory>\n\nContinue the interrupted {activity} turn. Address the material advice, then finish the existing task. Please continue from where you left off."
     )
 }
 
@@ -1114,6 +1114,27 @@ mod tests {
             EitriPurpose::Explore
                 .standalone_prompt("trace it")
                 .contains("Thoroughness level: medium")
+        );
+    }
+
+    #[test]
+    fn loki_continuation_prompt_keeps_extra_resume_instruction_hidden() {
+        let critique = "Would it be better to verify the fallback first?";
+        let prompt = continuation_prompt(EitriPurpose::Code, critique);
+        assert!(prompt.contains(critique));
+        assert!(prompt.contains("Please continue from where you left off."));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        emit_continuation(&tx, critique);
+        let event = rx.try_recv().expect("continuation event");
+        let UiEvent::InternalMessage(message) = event else {
+            panic!("expected internal message");
+        };
+        assert_eq!(message.text, critique);
+        assert!(
+            !message
+                .text
+                .contains("Please continue from where you left off.")
         );
     }
 }

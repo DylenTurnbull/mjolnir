@@ -2029,7 +2029,7 @@ fn isolated_council_role(
 
 fn council_continuation_prompt(_task: &str, critique: &str, _trajectory: &str) -> String {
     format!(
-        "<advisory guidance=\"weigh, don't blindly obey\">\n{critique}\n</advisory>\n\nContinue the interrupted turn. Address the material advice, then finish the existing task."
+        "<advisory guidance=\"weigh, don't blindly obey\">\n{critique}\n</advisory>\n\nContinue the interrupted turn. Address the material advice, then finish the existing task. Please continue from where you left off."
     )
 }
 
@@ -2255,6 +2255,7 @@ mod tests {
         assert!(!intervention.is_pending());
         assert!(continuation.contains("<advisory"));
         assert!(continuation.contains("retry with the corrected result"));
+        assert!(continuation.contains("Please continue from where you left off."));
         assert!(!continuation.contains("current user turn"));
         assert!(!continuation.contains("Bounded prior trajectory"));
     }

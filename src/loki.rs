@@ -52,7 +52,7 @@ const MCP_SERVER_NAME: &str = "mj-loki-advisor";
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct AdviseArgs {
-    /// One concrete, material, actionable correction for the watched agent.
+    /// One concrete, material, actionable suggestion for the watched agent.
     note: String,
 }
 
@@ -130,7 +130,7 @@ impl McpHandler {
 
     #[tool(
         name = "advise",
-        description = "Send one material correction to the agent you are currently reviewing. Calling this tool forces Mjolnir to cancel that agent at the next safe step boundary and re-prompt it with your note. Use it only for a material correctness, safety, scope, or strategy problem; otherwise do not call it."
+        description = "Send one material advisory suggestion to the agent you are currently watching. Calling this tool forces Mjolnir to cancel that agent at the next safe step boundary and re-prompt it with your note. Use it only for a material correctness, safety, scope, or strategy concern; otherwise do not call it. Phrase most notes as questions, such as 'Would it be better to...' or 'Have you thought about...?'"
     )]
     async fn advise(
         &self,
@@ -160,7 +160,7 @@ impl ServerHandler for McpHandler {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "You are a pure advisor. The advise tool is your only channel back to the watched agent. Any call forces cancellation and re-prompting, so stay silent unless a material correction is necessary.",
+                "You are a pure advisor. The advise tool is your only channel back to the watched agent. Any call forces cancellation and re-prompting, so stay silent unless a material suggestion is necessary. Prefer advice framed as questions rather than corrections.",
             )
     }
 
@@ -955,7 +955,7 @@ fn review_prompt(
 ) -> String {
     let mut prompt = String::new();
     if include_contract {
-        prompt.push_str("You are Loki, Mjolnir's persistent pure advisor. You observe Thor and Eitri through incremental transcript updates. Your own messages are hidden. The advise MCP tool is your only channel back to the watched agent, and calling it forces Mjolnir to cancel that agent at the next safe step boundary and re-prompt it. Call advise at most once per update and only for a material correctness, safety, scope, or strategy problem. Stay silent for style, optional improvements, uncertainty, facts already visible to the target, and any update that is on track. Never implement changes yourself.\n\n");
+        prompt.push_str("You are Loki, Mjolnir's persistent pure advisor. You observe Thor and Eitri through incremental transcript updates. Your own messages are hidden. The advise MCP tool is your only channel back to the watched agent, and calling it forces Mjolnir to cancel that agent at the next safe step boundary and re-prompt it. Call advise at most once per update and only for a material correctness, safety, scope, or strategy concern. Your role is to make suggestions, not to issue review corrections. Phrase most advice as a question, such as \"Would it be better to...?\" or \"Have you thought about...?\" Stay silent for style, optional improvements, uncertainty, facts already visible to the target, and any update that is on track. Never implement changes yourself.\n\n");
     }
     if let Some(context) = context {
         prompt.push_str(context);
@@ -965,7 +965,7 @@ fn review_prompt(
     prompt.push_str(target.label());
     prompt.push_str(" session update\n\n");
     prompt.push_str(delta);
-    prompt.push_str("\n\nReview only this new update in light of your existing context. Use advise only if intervention is materially necessary; otherwise finish without commentary.");
+    prompt.push_str("\n\nConsider only this new update in light of your existing context. Use advise only if an advisory intervention is materially necessary; otherwise finish without commentary.");
     bounded(prompt)
 }
 
@@ -1129,6 +1129,8 @@ mod tests {
             true,
         );
         assert!(first.contains("persistent pure advisor"));
+        assert!(first.contains("suggestions, not to issue review corrections"));
+        assert!(first.contains("Phrase most advice as a question"));
         assert!(first.contains("New outer user request"));
         assert!(first.contains("### Thor session update"));
         let later = review_prompt(Target::Eitri, None, "thinking:\nchecking", false);
