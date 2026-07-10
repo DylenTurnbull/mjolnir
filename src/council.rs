@@ -276,6 +276,22 @@ fn choose_eitri<'a>(rows: &[Row], available: &'a [ResolvedRole]) -> Option<&'a R
         })
 }
 
+fn provider_key(model: &str) -> &str {
+    let provider = deepswe::model_provider(model);
+    if provider.is_empty() {
+        model.split_once('-').map_or(model, |(prefix, _)| prefix)
+    } else {
+        provider
+    }
+}
+
+fn choose_loki<'a>(thor: &ResolvedRole, available: &'a [ResolvedRole]) -> Option<&'a ResolvedRole> {
+    let thor_provider = provider_key(&thor.model.model);
+    available
+        .iter()
+        .find(|candidate| provider_key(&candidate.model.model) != thor_provider)
+}
+
 pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
     let leaderboard = deepswe::load(
         &deepswe::default_cache_path(),
@@ -323,9 +339,7 @@ pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
         )?
     };
     let loki = if config.models.loki == "auto" {
-        available
-            .iter()
-            .find(|candidate| candidate.model.model != thor.model.model)
+        choose_loki(thor, &available)
     } else {
         Some(explicit(
             "Loki",
@@ -363,6 +377,19 @@ pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn role(model: &str, pass_at_1: f64) -> ResolvedRole {
+        ResolvedRole {
+            model: Row {
+                model: model.to_string(),
+                reasoning_effort: Some("high".to_string()),
+                pass_at_1,
+                mean_cost_usd: 1.0,
+            },
+            model_value: model.to_string(),
+            launch: launch_for(adapter_kind(model)),
+        }
+    }
 
     #[test]
     fn provider_routes_are_model_first() {
@@ -409,5 +436,30 @@ mod tests {
                 .to_string()
                 .contains("codex executable not found on PATH")
         );
+    }
+
+    #[test]
+    fn auto_loki_chooses_best_model_from_a_different_provider() {
+        let available = vec![
+            role("gpt-5-6-sol", 0.70),
+            role("gpt-5-5", 0.65),
+            role("claude-fable-5", 0.64),
+            role("gemini-3-1-pro-preview", 0.60),
+        ];
+
+        assert_eq!(
+            choose_loki(&available[0], &available)
+                .expect("cross-provider Loki")
+                .model
+                .model,
+            "claude-fable-5"
+        );
+    }
+
+    #[test]
+    fn auto_loki_is_unavailable_when_only_thors_provider_is_launchable() {
+        let available = vec![role("gpt-5-6-sol", 0.70), role("gpt-5-5", 0.65)];
+
+        assert!(choose_loki(&available[0], &available).is_none());
     }
 }

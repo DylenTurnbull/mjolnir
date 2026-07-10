@@ -1048,6 +1048,9 @@ impl AppState {
             "Council models (change with /council <thor|loki|eitri> <auto|model-id>)\nThor: {}\nLoki: {}\nEitri: {}\n\nAuto (DeepSWE)\n",
             self.council_models.thor, self.council_models.loki, self.council_models.eitri
         );
+        text.push_str(
+            "Loki Auto chooses the best launchable model from a provider other than Thor's.\n",
+        );
         for choice in &self.council_choices {
             if choice.available {
                 text.push_str(&format!(

@@ -1587,7 +1587,7 @@ async fn run_session(
     };
     if (loki_config.streaming_review || loki_config.final_review) && loki_handle.is_none() {
         let _ = ui_event_tx.send(crate::event::UiEvent::Warning(
-            "Loki review is enabled, but no distinct launchable reviewer model is available"
+            "Loki review is enabled, but no launchable model from a provider other than Thor's is available"
                 .to_string(),
         ));
     }

@@ -25,6 +25,7 @@ const modelOptions = [
   ["gpt-5.5", "GPT-5.5"],
   ["gpt-5.6-terra", "GPT-5.6-Terra"],
   ["gpt-5.6-luna", "GPT-5.6-Luna"],
+  ["fable", "Fable 5"],
   ["opus[1m]", "Opus 4.8"],
   ["sonnet", "Sonnet 5"],
 ];
@@ -42,7 +43,7 @@ function send(message) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0"
 function append(path, value) { if (path) fs.appendFileSync(path, `${value}\n`); }
 function update(update) { send({ method: "session/update", params: { sessionId: "fixture-session", update } }); }
 function isEitri() { return selectedModel === "gpt-5.6-luna"; }
-function isLoki() { return selectedModel === "gpt-5.5"; }
+function isLoki() { return selectedModel === "fable"; }
 function log(value) { append(isEitri() ? nestedLog : primaryLog, value); }
 
 function mcpHeaders(includeAuth = true, sessionId = null) {
