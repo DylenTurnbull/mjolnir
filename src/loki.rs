@@ -1,26 +1,284 @@
-//! Optional read-only council reviewer. One ACP session is kept for each outer
-//! user turn; observations are serialized through it and decisions are
-//! delivered mechanically to the active Thor or Eitri driver.
+//! Persistent read-only council advisor. Thor and Eitri stream hidden transcript
+//! deltas into one Loki ACP session; only calls to Loki's `advise` MCP tool are
+//! projected back into the visible transcript and steering machinery.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, RwLock,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
 
+use agent_client_protocol::schema::v1::{HttpHeader, McpServer, McpServerHttp};
 use anyhow::{Context, Result, anyhow};
+use axum::extract::{Request as HttpRequest, State};
+use axum::http::{StatusCode, header::AUTHORIZATION};
+use axum::middleware::Next;
+use axum::response::Response;
+use base64::Engine;
+use rmcp::{
+    ErrorData as McpError, RoleServer, ServerHandler,
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
+    model::{
+        CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    },
+    service::RequestContext,
+    tool, tool_router,
+    transport::{
+        StreamableHttpServerConfig, StreamableHttpService,
+        streamable_http_server::session::local::LocalSessionManager,
+    },
+};
+use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
-use crate::acp::{RuntimeAccessMode, RuntimeRoleConfig, WorkspaceTurnSnapshot};
+use crate::acp::{RuntimeAccessMode, RuntimeRoleConfig};
 use crate::council::ResolvedRole;
 use crate::event::{ActorActivity, ActorIdentity, UiEvent};
 use crate::ragnarok::{AgentHandle, Launch, TurnEvent};
 
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_CONTEXT_BYTES: usize = 96 * 1024;
+const MAX_DELTA_ITEM_BYTES: usize = 16 * 1024;
+const MCP_PATH: &str = "/mcp";
+const MCP_SERVER_NAME: &str = "mj-loki-advisor";
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AdviseArgs {
+    /// One concrete, material, actionable correction for the watched agent.
+    note: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveAdvice {
+    id: u64,
+    epoch: u64,
+    target: Target,
+    accepted: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AdviceSlot {
+    active: Arc<Mutex<Option<ActiveAdvice>>>,
+}
+
+impl AdviceSlot {
+    async fn begin(&self, id: u64, epoch: u64, target: Target) {
+        *self.active.lock().await = Some(ActiveAdvice {
+            id,
+            epoch,
+            target,
+            accepted: false,
+        });
+    }
+
+    async fn accept(&self, note: String) -> std::result::Result<Decision, &'static str> {
+        let mut active = self.active.lock().await;
+        let Some(active) = active.as_mut() else {
+            return Err("no advisor update is active");
+        };
+        if active.accepted {
+            return Err("only one advice note is allowed per advisor update");
+        }
+        active.accepted = true;
+        Ok(Decision {
+            id: active.id,
+            epoch: active.epoch,
+            target: active.target,
+            verdict: Verdict::Intervention(note),
+        })
+    }
+
+    async fn finish(&self, id: u64) -> bool {
+        let mut active = self.active.lock().await;
+        if active.as_ref().is_some_and(|active| active.id == id) {
+            return active.take().is_some_and(|active| active.accepted);
+        }
+        false
+    }
+}
+
+#[derive(Clone)]
+struct McpHandler {
+    advice: AdviceSlot,
+    decisions: broadcast::Sender<Decision>,
+    tools_listed: watch::Sender<bool>,
+    tool_router: ToolRouter<Self>,
+}
+
+#[tool_router(router = tool_router)]
+impl McpHandler {
+    fn new(
+        advice: AdviceSlot,
+        decisions: broadcast::Sender<Decision>,
+        tools_listed: watch::Sender<bool>,
+    ) -> Self {
+        Self {
+            advice,
+            decisions,
+            tools_listed,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    #[tool(
+        name = "advise",
+        description = "Send one material correction to the agent you are currently reviewing. Calling this tool forces Mjolnir to cancel that agent at the next safe step boundary and re-prompt it with your note. Use it only for a material correctness, safety, scope, or strategy problem; otherwise do not call it."
+    )]
+    async fn advise(
+        &self,
+        Parameters(args): Parameters<AdviseArgs>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let note = args.note.trim();
+        if note.is_empty() {
+            return Err(McpError::invalid_params("note must not be empty", None));
+        }
+        match self.advice.accept(note.to_string()).await {
+            Ok(decision) => {
+                let _ = self.decisions.send(decision);
+                Ok(CallToolResult::success(vec![Content::text(
+                    "Advice queued for the watched agent.",
+                )]))
+            }
+            Err(message) => Ok(CallToolResult::error(vec![Content::text(message)])),
+        }
+    }
+}
+
+impl ServerHandler for McpHandler {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "mj-loki-advisor",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "You are a pure advisor. The advise tool is your only channel back to the watched agent. Any call forces cancellation and re-prompting, so stay silent unless a material correction is necessary.",
+            )
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = std::result::Result<ListToolsResult, McpError>> + Send + '_ {
+        let _ = self.tools_listed.send(true);
+        std::future::ready(Ok(ListToolsResult::with_all_items(
+            self.tool_router.list_all(),
+        )))
+    }
+
+    fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = std::result::Result<CallToolResult, McpError>> + Send + '_ {
+        self.tool_router
+            .call(ToolCallContext::new(self, request, context))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned()
+    }
+}
+
+struct HttpServer {
+    advertised: McpServer,
+    tools_listed: watch::Receiver<bool>,
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl HttpServer {
+    async fn start(advice: AdviceSlot, decisions: broadcast::Sender<Decision>) -> Result<Self> {
+        let mut token_bytes = [0_u8; 32];
+        getrandom::fill(&mut token_bytes)
+            .map_err(|error| anyhow!("generate Loki advisor MCP bearer token: {error}"))?;
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
+        let authorization = format!("Bearer {token}");
+        let (tools_listed_tx, tools_listed) = watch::channel(false);
+        let handler = McpHandler::new(advice, decisions, tools_listed_tx);
+        let cancellation = CancellationToken::new();
+        let mut config = StreamableHttpServerConfig::default();
+        config.cancellation_token = cancellation.clone();
+        let service = StreamableHttpService::new(
+            move || Ok(handler.clone()),
+            Arc::new(LocalSessionManager::default()),
+            config,
+        );
+        let protected = axum::Router::new().nest_service(MCP_PATH, service).layer(
+            axum::middleware::from_fn_with_state(authorization.clone(), require_bearer),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("bind Loki advisor MCP listener")?;
+        let addr = listener
+            .local_addr()
+            .context("read Loki advisor MCP listener address")?;
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, protected)
+                .with_graceful_shutdown(task_cancellation.cancelled_owned())
+                .await
+            {
+                tracing::warn!("Loki advisor MCP listener stopped: {error}");
+            }
+        });
+        let advertised = McpServer::Http(
+            McpServerHttp::new(MCP_SERVER_NAME, format!("http://{addr}{MCP_PATH}"))
+                .headers(vec![HttpHeader::new("Authorization", authorization)]),
+        );
+        Ok(Self {
+            advertised,
+            tools_listed,
+            cancellation,
+            task,
+        })
+    }
+
+    async fn wait_until_tools_listed(&self) -> Result<()> {
+        let mut listed = self.tools_listed.clone();
+        if *listed.borrow() {
+            return Ok(());
+        }
+        tokio::time::timeout(Duration::from_secs(30), listed.changed())
+            .await
+            .map_err(|_| anyhow!("Loki timed out loading the advise MCP tool"))?
+            .map_err(|_| anyhow!("Loki advisor MCP server closed before tools/list"))?;
+        Ok(())
+    }
+}
+
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.task.abort();
+    }
+}
+
+async fn require_bearer(
+    State(expected): State<String>,
+    request: HttpRequest,
+    next: Next,
+) -> std::result::Result<Response, (StatusCode, &'static str)> {
+    let authorized = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.as_bytes() == expected.as_bytes());
+    if authorized {
+        Ok(next.run(request).await)
+    } else {
+        Err((StatusCode::UNAUTHORIZED, "unauthorized"))
+    }
+}
 
 /// Loki critiques waiting to be delivered to a target at a safe step boundary.
 ///
@@ -90,6 +348,7 @@ pub struct BoundaryTracker {
     final_message: String,
     segment: String,
     lane: Option<SegmentLane>,
+    tools: HashMap<String, agent_client_protocol::schema::v1::ToolCall>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -100,7 +359,7 @@ enum SegmentLane {
 
 impl BoundaryTracker {
     pub fn observe(&mut self, event: &UiEvent) -> Option<String> {
-        use agent_client_protocol::schema::v1::SessionUpdate;
+        use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall, ToolCallStatus};
         let flush = |this: &mut Self| {
             let lane = this.lane.take()?;
             if this.segment.trim().is_empty() {
@@ -108,10 +367,10 @@ impl BoundaryTracker {
                 return None;
             }
             let kind = match lane {
-                SegmentLane::Message => "completed message segment",
-                SegmentLane::Thought => "completed thought segment",
+                SegmentLane::Message => "message",
+                SegmentLane::Thought => "thinking",
             };
-            Some(format!("{kind}: {}", std::mem::take(&mut this.segment)))
+            Some(format!("{kind}:\n{}", std::mem::take(&mut this.segment)))
         };
         let boundary = match event {
             UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(chunk)) => {
@@ -133,60 +392,60 @@ impl BoundaryTracker {
                     .push_str(&crate::event::content_block_text(&chunk.content));
                 previous
             }
-            UiEvent::SessionUpdate(SessionUpdate::ToolCall(call))
-                if matches!(
+            UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)) => {
+                let complete = matches!(
                     call.status,
-                    agent_client_protocol::schema::v1::ToolCallStatus::Completed
-                        | agent_client_protocol::schema::v1::ToolCallStatus::Failed
-                ) =>
-            {
-                self.final_message.clear();
-                Some(join_boundary(
-                    flush(self),
-                    format!("tool call: {} [{:?}]", call.title, call.status),
-                ))
+                    ToolCallStatus::Completed | ToolCallStatus::Failed
+                );
+                self.tools
+                    .insert(call.tool_call_id.to_string(), call.clone());
+                complete.then(|| {
+                    self.final_message.clear();
+                    join_boundary(flush(self), render_tool_delta(call))
+                })
             }
-            UiEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(update))
-                if matches!(
+            UiEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(update)) => {
+                let id = update.tool_call_id.to_string();
+                let completed = matches!(
                     update.fields.status,
-                    Some(
-                        agent_client_protocol::schema::v1::ToolCallStatus::Completed
-                            | agent_client_protocol::schema::v1::ToolCallStatus::Failed
-                    )
-                ) =>
-            {
-                self.final_message.clear();
-                Some(join_boundary(
-                    flush(self),
-                    format!(
-                        "tool boundary: {} [{:?}]",
-                        update.tool_call_id, update.fields.status
-                    ),
-                ))
+                    Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
+                );
+                let rendered = {
+                    let tool = self
+                        .tools
+                        .entry(id.clone())
+                        .or_insert_with(|| ToolCall::new(id, "tool"));
+                    tool.update(update.fields.clone());
+                    completed.then(|| render_tool_delta(tool))
+                };
+                rendered.map(|rendered| {
+                    self.final_message.clear();
+                    join_boundary(flush(self), rendered)
+                })
             }
             UiEvent::SessionUpdate(SessionUpdate::Plan(plan)) => {
                 self.final_message.clear();
                 Some(join_boundary(
                     flush(self),
-                    format!("plan transition: {plan:?}"),
+                    bounded_item(format!("plan:\n{plan:?}")),
                 ))
             }
             UiEvent::TerminalOutput(snapshot) if snapshot.exit_status.is_some() => {
                 Some(join_boundary(
                     flush(self),
-                    format!(
-                        "terminal boundary: {} {:?}",
-                        snapshot.terminal_id, snapshot.exit_status
-                    ),
+                    bounded_item(format!(
+                        "terminal {} [{:?}]:\n{}",
+                        snapshot.terminal_id, snapshot.exit_status, snapshot.output
+                    )),
                 ))
             }
             UiEvent::PromptDone { stop_reason, .. } => Some(join_boundary(
                 flush(self),
-                format!("turn boundary: {stop_reason:?}"),
+                format!("turn finished: {stop_reason:?}"),
             )),
             UiEvent::PromptFailed { message } => Some(join_boundary(
                 flush(self),
-                format!("failed turn boundary: {message}"),
+                format!("turn failed: {message}"),
             )),
             _ => None,
         };
@@ -210,14 +469,48 @@ impl BoundaryTracker {
         self.final_message.clear();
         self.segment.clear();
         self.lane = None;
+        self.tools.clear();
     }
+}
+
+fn render_tool_delta(tool: &agent_client_protocol::schema::v1::ToolCall) -> String {
+    let mut text = format!("tool: {} [{:?}]", tool.title, tool.status);
+    if let Some(input) = tool.raw_input.as_ref() {
+        append_json_section(&mut text, "input", input);
+    }
+    if !tool.content.is_empty()
+        && let Ok(content) = serde_json::to_value(&tool.content)
+    {
+        append_json_section(&mut text, "content", &content);
+    }
+    if let Some(output) = tool.raw_output.as_ref() {
+        append_json_section(&mut text, "output", output);
+    }
+    bounded_item(text)
+}
+
+fn append_json_section(text: &mut String, label: &str, value: &serde_json::Value) {
+    text.push('\n');
+    text.push_str(label);
+    text.push_str(":\n");
+    text.push_str(&serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()));
+}
+
+fn bounded_item(mut text: String) -> String {
+    if text.len() <= MAX_DELTA_ITEM_BYTES {
+        return text;
+    }
+    let split = text.floor_char_boundary(MAX_DELTA_ITEM_BYTES);
+    text.truncate(split);
+    text.push_str("\n…[item truncated]");
+    text
 }
 
 fn join_boundary(previous: Option<String>, current: String) -> String {
     previous.map_or(current.clone(), |previous| format!("{previous}\n{current}"))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Target {
     Thor,
     Eitri,
@@ -252,13 +545,16 @@ enum Request {
         epoch: u64,
         task: String,
     },
+    TargetContext {
+        epoch: u64,
+        target: Target,
+        text: String,
+    },
     Review {
         id: u64,
         epoch: u64,
         target: Target,
-        workspace_diff: String,
-        boundary: String,
-        trajectory: String,
+        delta: String,
     },
     Shutdown,
 }
@@ -271,7 +567,6 @@ pub struct Handle {
     epochs: Arc<AtomicU64>,
     abort: watch::Sender<bool>,
     finished: watch::Receiver<bool>,
-    turn_snapshot: Arc<RwLock<Option<(u64, WorkspaceTurnSnapshot)>>>,
     pub streaming_enabled: bool,
 }
 
@@ -294,7 +589,6 @@ impl Handle {
             epochs: Arc::new(AtomicU64::new(1)),
             abort,
             finished,
-            turn_snapshot: Arc::new(RwLock::new(None)),
             streaming_enabled,
         };
         tokio::spawn(worker(
@@ -314,14 +608,19 @@ impl Handle {
         self.decisions.subscribe()
     }
 
-    pub fn begin_turn(&self, task: String, snapshot: WorkspaceTurnSnapshot) -> u64 {
+    pub fn begin_turn(&self, task: String) -> u64 {
         let _ = self.abort.send(false);
         let epoch = self.epochs.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut current) = self.turn_snapshot.write() {
-            *current = Some((epoch, snapshot));
-        }
         let _ = self.requests.send(Request::Begin { epoch, task });
         epoch
+    }
+
+    pub fn begin_eitri(&self, epoch: u64, instructions: String) {
+        let _ = self.requests.send(Request::TargetContext {
+            epoch,
+            target: Target::Eitri,
+            text: format!("Eitri received this standalone delegation:\n{instructions}"),
+        });
     }
 
     pub fn current_epoch(&self) -> u64 {
@@ -332,42 +631,20 @@ impl Handle {
         let _ = self.abort.send(true);
     }
 
-    pub async fn observe(
-        &self,
-        epoch: u64,
-        target: Target,
-        boundary: String,
-        trajectory: String,
-    ) -> Option<u64> {
+    pub async fn observe(&self, epoch: u64, target: Target, delta: String) -> Option<u64> {
         if !self.streaming_enabled {
             return None;
         }
-        let snapshot = self
-            .turn_snapshot
-            .read()
-            .ok()
-            .and_then(|current| current.as_ref().filter(|(turn, _)| *turn == epoch).cloned())
-            .map(|(_, snapshot)| snapshot)?;
-        let workspace_diff = snapshot.complete_diff().await?;
-        Some(self.submit(epoch, target, workspace_diff, boundary, trajectory))
+        Some(self.submit(epoch, target, delta))
     }
 
-    fn submit(
-        &self,
-        epoch: u64,
-        target: Target,
-        workspace_diff: String,
-        boundary: String,
-        trajectory: String,
-    ) -> u64 {
+    fn submit(&self, epoch: u64, target: Target, delta: String) -> u64 {
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
         let _ = self.requests.send(Request::Review {
             id,
             epoch,
             target,
-            workspace_diff,
-            boundary: bounded(boundary),
-            trajectory: bounded(trajectory),
+            delta: bounded(delta),
         });
         id
     }
@@ -392,34 +669,6 @@ fn bounded(mut text: String) -> String {
     text
 }
 
-#[derive(Deserialize)]
-struct WireDecision {
-    decision: String,
-    #[serde(default)]
-    critique: Option<String>,
-}
-
-fn parse_decision(text: &str) -> Result<Verdict> {
-    let trimmed = text.trim();
-    let json = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed)
-        .strip_suffix("```")
-        .unwrap_or(trimmed)
-        .trim();
-    let parsed: WireDecision = serde_json::from_str(json).context("parse Loki decision JSON")?;
-    match parsed.decision.as_str() {
-        "no_intervention" => Ok(Verdict::NoIntervention),
-        "intervention" => parsed
-            .critique
-            .filter(|critique| !critique.trim().is_empty())
-            .map(Verdict::Intervention)
-            .ok_or_else(|| anyhow!("Loki intervention omitted critique")),
-        other => Err(anyhow!("unknown Loki decision '{other}'")),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn worker(
     role: ResolvedRole,
@@ -432,90 +681,173 @@ async fn worker(
     finished: watch::Sender<bool>,
 ) {
     let mut epoch = 0;
-    let mut task = String::new();
+    let mut pending_context: HashMap<Target, String> = HashMap::new();
+    let mut deferred = VecDeque::new();
     let mut session: Option<AgentHandle> = None;
-    while let Some(request) = requests.recv().await {
+    let advice = AdviceSlot::default();
+    let server = match HttpServer::start(advice.clone(), decisions.clone()).await {
+        Ok(server) => Some(server),
+        Err(error) => {
+            emit_warning(
+                &ui_tx,
+                &role,
+                format!("Loki advisor tool could not start: {error:#}"),
+            );
+            None
+        }
+    };
+    let mut primed = false;
+    loop {
+        let request = match deferred.pop_front() {
+            Some(request) => request,
+            None => match requests.recv().await {
+                Some(request) => request,
+                None => break,
+            },
+        };
         match request {
             Request::Begin {
                 epoch: next,
                 task: next_task,
             } => {
-                if let Some(old) = session.take() {
-                    old.dismiss().await;
-                }
                 epoch = next;
-                task = next_task;
+                pending_context.clear();
+                pending_context.insert(
+                    Target::Thor,
+                    format!("New outer user request:\n{next_task}"),
+                );
+            }
+            Request::TargetContext {
+                epoch: request_epoch,
+                target,
+                text,
+            } if request_epoch == epoch => {
+                pending_context
+                    .entry(target)
+                    .and_modify(|pending| {
+                        pending.push_str("\n\n");
+                        pending.push_str(&text);
+                    })
+                    .or_insert(text);
             }
             Request::Review {
                 id,
                 epoch: request_epoch,
                 target,
-                workspace_diff,
-                boundary,
-                trajectory,
+                mut delta,
             } if request_epoch == epoch => {
+                let mut review_ids = vec![id];
+                while let Ok(next) = requests.try_recv() {
+                    match next {
+                        Request::Review {
+                            id: next_id,
+                            epoch: next_epoch,
+                            target: next_target,
+                            delta: next_delta,
+                        } if next_epoch == request_epoch && next_target == target => {
+                            review_ids.push(next_id);
+                            delta.push_str("\n\n--- next completed step ---\n\n");
+                            delta.push_str(&next_delta);
+                            delta = bounded(delta);
+                        }
+                        other => {
+                            deferred.push_back(other);
+                            break;
+                        }
+                    }
+                }
+                if *abort_rx.borrow() {
+                    for id in review_ids {
+                        let _ = decisions.send(Decision {
+                            id,
+                            epoch,
+                            target,
+                            verdict: Verdict::NoIntervention,
+                        });
+                    }
+                    continue;
+                }
+                let Some(server) = server.as_ref() else {
+                    for id in review_ids {
+                        let _ = decisions.send(Decision {
+                            id,
+                            epoch,
+                            target,
+                            verdict: Verdict::Failed(
+                                "Loki advisor tool is unavailable".to_string(),
+                            ),
+                        });
+                    }
+                    continue;
+                };
                 if session.is_none() {
-                    match connect(&role, &cwd, &additional_directories, abort_rx.clone()).await {
+                    match connect(
+                        &role,
+                        &cwd,
+                        &additional_directories,
+                        abort_rx.clone(),
+                        server.advertised.clone(),
+                    )
+                    .await
+                    {
                         Ok(agent) => {
-                            emit(
-                                &ui_tx,
-                                &role,
-                                ActorActivity::Connected {
-                                    actor: identity(&role),
-                                },
-                            );
                             session = Some(agent);
+                            if let Err(error) = server.wait_until_tools_listed().await {
+                                emit_warning(
+                                    &ui_tx,
+                                    &role,
+                                    format!("Loki could not load advise: {error:#}"),
+                                );
+                                if let Some(old) = session.take() {
+                                    old.dismiss().await;
+                                }
+                            }
                         }
                         Err(error) => {
+                            if *abort_rx.borrow() {
+                                for id in review_ids {
+                                    let _ = decisions.send(Decision {
+                                        id,
+                                        epoch,
+                                        target,
+                                        verdict: Verdict::NoIntervention,
+                                    });
+                                }
+                                continue;
+                            }
                             let message = format!("Loki could not start: {error:#}");
                             emit_warning(&ui_tx, &role, message.clone());
-                            let _ = decisions.send(Decision {
-                                id,
-                                epoch,
-                                target,
-                                verdict: Verdict::Failed(message),
-                            });
+                            for id in review_ids {
+                                let _ = decisions.send(Decision {
+                                    id,
+                                    epoch,
+                                    target,
+                                    verdict: Verdict::Failed(message.clone()),
+                                });
+                            }
                             continue;
                         }
                     }
                 }
-                let prompt = review_prompt(&task, target, &workspace_diff, &boundary, &trajectory);
-                let result = session
-                    .as_mut()
-                    .expect("connected")
+                let Some(agent) = session.as_mut() else {
+                    for id in review_ids {
+                        let _ = decisions.send(Decision {
+                            id,
+                            epoch,
+                            target,
+                            verdict: Verdict::Failed(
+                                "Loki could not load the advise tool".to_string(),
+                            ),
+                        });
+                    }
+                    continue;
+                };
+                let context = pending_context.remove(&target);
+                let prompt = review_prompt(target, context.as_deref(), &delta, !primed);
+                primed = true;
+                advice.begin(id, epoch, target).await;
+                let result = agent
                     .prompt(prompt, REVIEW_TIMEOUT, |event| match event {
-                        TurnEvent::Thought(text) => emit(
-                            &ui_tx,
-                            &role,
-                            ActorActivity::Thought {
-                                actor: identity(&role),
-                                text,
-                            },
-                        ),
-                        TurnEvent::Tool {
-                            title,
-                            kind,
-                            status,
-                            ..
-                        } => emit(
-                            &ui_tx,
-                            &role,
-                            ActorActivity::Tool {
-                                actor: identity(&role),
-                                tool_id: format!("loki:{id}:{title}"),
-                                title,
-                                kind: kind.map(|value| format!("{value:?}")),
-                                status: status.map(|value| format!("{value:?}")),
-                            },
-                        ),
-                        TurnEvent::Note(message) => emit(
-                            &ui_tx,
-                            &role,
-                            ActorActivity::Info {
-                                actor: identity(&role),
-                                message,
-                            },
-                        ),
                         TurnEvent::Permission {
                             prompt,
                             access_mode,
@@ -526,33 +858,53 @@ async fn worker(
                             );
                             let _ = prompt.responder.send(decision);
                         }
-                        TurnEvent::Message(_) => {}
+                        TurnEvent::Message(_)
+                        | TurnEvent::Thought(_)
+                        | TurnEvent::Tool { .. }
+                        | TurnEvent::Note(_) => {}
                     })
                     .await;
-                let verdict = match result {
-                    Ok(outcome) => parse_decision(&outcome.text)
-                        .unwrap_or_else(|error| Verdict::Failed(error.to_string())),
-                    Err(error) => Verdict::Failed(error.to_string()),
-                };
-                match &verdict {
-                    Verdict::Intervention(critique) => emit_warning(
-                        &ui_tx,
-                        &role,
-                        format!("Loki intervenes against {}: {critique}", target.label()),
-                    ),
-                    Verdict::Failed(message) => {
-                        emit_warning(&ui_tx, &role, format!("Loki review failed open: {message}"))
+                let advised = advice.finish(id).await;
+                if !advised {
+                    let verdict = match result {
+                        Ok(_) => Verdict::NoIntervention,
+                        Err(_) if *abort_rx.borrow() => Verdict::NoIntervention,
+                        Err(error) => {
+                            let message = error.to_string();
+                            emit_warning(
+                                &ui_tx,
+                                &role,
+                                format!("Loki review failed open: {message}"),
+                            );
+                            primed = false;
+                            Verdict::Failed(message)
+                        }
+                    };
+                    for id in review_ids {
+                        let _ = decisions.send(Decision {
+                            id,
+                            epoch,
+                            target,
+                            verdict: verdict.clone(),
+                        });
                     }
-                    Verdict::NoIntervention => {}
+                    if matches!(verdict, Verdict::Failed(_))
+                        && let Some(old) = session.take()
+                    {
+                        old.dismiss().await;
+                    }
+                } else {
+                    for id in review_ids.into_iter().skip(1) {
+                        let _ = decisions.send(Decision {
+                            id,
+                            epoch,
+                            target,
+                            verdict: Verdict::NoIntervention,
+                        });
+                    }
                 }
-                let _ = decisions.send(Decision {
-                    id,
-                    epoch,
-                    target,
-                    verdict,
-                });
             }
-            Request::Review { .. } => {}
+            Request::TargetContext { .. } | Request::Review { .. } => {}
             Request::Shutdown => break,
         }
     }
@@ -567,13 +919,14 @@ async fn connect(
     cwd: &std::path::Path,
     additional_directories: &[PathBuf],
     abort: watch::Receiver<bool>,
+    advise_server: McpServer,
 ) -> Result<AgentHandle> {
     let launch = Launch {
         program: role.launch.command.clone(),
         args: role.launch.args.clone(),
         env: role.launch.env.clone(),
     };
-    AgentHandle::connect_with_role_config(
+    AgentHandle::connect_with_role_config_and_mcp(
         &launch,
         cwd,
         additional_directories,
@@ -585,21 +938,31 @@ async fn connect(
             model_value: role.model_value.clone(),
             force_high_reasoning: true,
         }),
+        vec![advise_server],
     )
     .await
 }
 
 fn review_prompt(
-    task: &str,
     target: Target,
-    workspace_diff: &str,
-    boundary: &str,
-    trajectory: &str,
+    context: Option<&str>,
+    delta: &str,
+    include_contract: bool,
 ) -> String {
-    format!(
-        "You are Loki, a read-only streaming reviewer of {actor}. Any intervention you issue is queued until the target's next safe step boundary, then Mjolnir interrupts normal continuation and re-prompts it with your critique. Intervene only for a material correctness, safety, scope, or strategy problem. Do not intervene for style, optional improvements, or mere uncertainty. Return exactly one JSON object and no markdown: {{\"decision\":\"no_intervention\"}} or {{\"decision\":\"intervention\",\"critique\":\"specific actionable critique\"}}.\n\nOriginal task:\n{task}\n\nComplete workspace diff since this user prompt began (starting point for review):\n{workspace_diff}\n\nReview kind: streaming boundary review\nBoundary:\n{boundary}\n\nBounded trajectory:\n{trajectory}",
-        actor = target.label(),
-    )
+    let mut prompt = String::new();
+    if include_contract {
+        prompt.push_str("You are Loki, Mjolnir's persistent pure advisor. You observe Thor and Eitri through incremental transcript updates. Your own messages are hidden. The advise MCP tool is your only channel back to the watched agent, and calling it forces Mjolnir to cancel that agent at the next safe step boundary and re-prompt it. Call advise at most once per update and only for a material correctness, safety, scope, or strategy problem. Stay silent for style, optional improvements, uncertainty, facts already visible to the target, and any update that is on track. Never implement changes yourself.\n\n");
+    }
+    if let Some(context) = context {
+        prompt.push_str(context);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("### ");
+    prompt.push_str(target.label());
+    prompt.push_str(" session update\n\n");
+    prompt.push_str(delta);
+    prompt.push_str("\n\nReview only this new update in light of your existing context. Use advise only if intervention is materially necessary; otherwise finish without commentary.");
+    bounded(prompt)
 }
 
 fn identity(role: &ResolvedRole) -> ActorIdentity {
@@ -612,19 +975,11 @@ fn identity(role: &ResolvedRole) -> ActorIdentity {
     }
 }
 
-fn emit(ui_tx: &mpsc::UnboundedSender<UiEvent>, _role: &ResolvedRole, activity: ActorActivity) {
-    let _ = ui_tx.send(UiEvent::ActorActivity(activity));
-}
-
 fn emit_warning(ui_tx: &mpsc::UnboundedSender<UiEvent>, role: &ResolvedRole, message: String) {
-    emit(
-        ui_tx,
-        role,
-        ActorActivity::Warning {
-            actor: identity(role),
-            message,
-        },
-    );
+    let _ = ui_tx.send(UiEvent::ActorActivity(ActorActivity::Warning {
+        actor: identity(role),
+        message,
+    }));
 }
 
 #[cfg(test)]
@@ -632,23 +987,7 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall, ToolCallStatus};
 
-    fn run_git(root: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(root)
-            .args(args)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn test_handle(
-        epoch: u64,
-        snapshot: WorkspaceTurnSnapshot,
-    ) -> (Handle, mpsc::UnboundedReceiver<Request>) {
+    fn test_handle(epoch: u64) -> (Handle, mpsc::UnboundedReceiver<Request>) {
         let (requests, request_rx) = mpsc::unbounded_channel();
         let (decisions, _) = broadcast::channel(8);
         let (abort, _) = watch::channel(false);
@@ -661,24 +1000,25 @@ mod tests {
                 epochs: Arc::new(AtomicU64::new(epoch.saturating_add(1))),
                 abort,
                 finished,
-                turn_snapshot: Arc::new(RwLock::new(Some((epoch, snapshot)))),
                 streaming_enabled: true,
             },
             request_rx,
         )
     }
 
-    #[test]
-    fn strict_decisions_require_material_critique() {
-        assert!(matches!(
-            parse_decision(r#"{"decision":"no_intervention"}"#).unwrap(),
-            Verdict::NoIntervention
-        ));
-        assert!(parse_decision(r#"{"decision":"intervention"}"#).is_err());
-        assert!(matches!(
-            parse_decision(r#"{"decision":"intervention","critique":"wrong file"}"#).unwrap(),
-            Verdict::Intervention(_)
-        ));
+    #[tokio::test]
+    async fn advice_tool_slot_accepts_one_material_note_per_update() {
+        let slot = AdviceSlot::default();
+        slot.begin(4, 2, Target::Eitri).await;
+        let decision = slot.accept("fix the race".to_string()).await.unwrap();
+        assert_eq!(decision.id, 4);
+        assert_eq!(decision.epoch, 2);
+        assert_eq!(decision.target, Target::Eitri);
+        assert!(
+            matches!(decision.verdict, Verdict::Intervention(ref note) if note == "fix the race")
+        );
+        assert!(slot.accept("second note".to_string()).await.is_err());
+        assert!(slot.finish(4).await);
     }
 
     #[test]
@@ -744,80 +1084,52 @@ mod tests {
         assert!(tracker.observe(&tool(ToolCallStatus::Failed)).is_some());
     }
 
+    #[test]
+    fn completed_tool_delta_contains_bounded_input_and_output() {
+        let mut tracker = BoundaryTracker::default();
+        let event = UiEvent::SessionUpdate(SessionUpdate::ToolCall(
+            ToolCall::new("tool-1", "run tests")
+                .raw_input(serde_json::json!({"command": "cargo test"}))
+                .raw_output(serde_json::json!({"exit": 1, "stderr": "boom"}))
+                .status(ToolCallStatus::Failed),
+        ));
+        let delta = tracker.observe(&event).expect("completed tool boundary");
+        assert!(delta.contains("tool: run tests [Failed]"));
+        assert!(delta.contains("cargo test"));
+        assert!(delta.contains("boom"));
+    }
+
     #[tokio::test]
-    async fn auto_review_requires_attributable_changes_and_starts_with_complete_diff() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        run_git(temp.path(), &["init", "-q"]);
-        run_git(
-            temp.path(),
-            &["config", "user.email", "mjolnir@example.test"],
-        );
-        run_git(temp.path(), &["config", "user.name", "Mjolnir Tests"]);
-        let path = temp.path().join("notes.txt");
-        tokio::fs::write(&path, "committed\n")
-            .await
-            .expect("seed file");
-        run_git(temp.path(), &["add", "notes.txt"]);
-        run_git(temp.path(), &["commit", "-qm", "seed"]);
-        tokio::fs::write(&path, "dirty before user prompt\n")
-            .await
-            .expect("preexisting dirty state");
-
-        let root = tokio::fs::canonicalize(temp.path()).await.expect("root");
-        let snapshot =
-            WorkspaceTurnSnapshot::capture(&[root], crate::acp::DEFAULT_FS_TEXT_BYTES).await;
-        let (handle, mut requests) = test_handle(7, snapshot);
-
+    async fn every_completed_step_is_submitted_without_a_workspace_change_gate() {
+        let (handle, mut requests) = test_handle(7);
         assert!(
             handle
-                .observe(
-                    7,
-                    Target::Thor,
-                    "planning boundary".to_string(),
-                    "planning only".to_string(),
-                )
-                .await
-                .is_none()
-        );
-        assert!(requests.try_recv().is_err());
-
-        tokio::fs::write(&path, "changed by this user prompt\n")
-            .await
-            .expect("turn change");
-        assert!(
-            handle
-                .observe(
-                    7,
-                    Target::Eitri,
-                    "edit boundary".to_string(),
-                    "implementation trajectory".to_string(),
-                )
+                .observe(7, Target::Thor, "planning only".to_string())
                 .await
                 .is_some()
         );
-
-        let Request::Review {
-            workspace_diff,
-            boundary,
-            trajectory,
-            ..
-        } = requests.try_recv().expect("review request")
+        let Request::Review { target, delta, .. } = requests.try_recv().expect("review request")
         else {
             panic!("expected review request");
         };
-        assert!(workspace_diff.contains("dirty before user prompt"));
-        assert!(workspace_diff.contains("changed by this user prompt"));
-        assert!(!workspace_diff.contains("--- before\ncommitted\n"));
-        let prompt = review_prompt(
-            "change notes",
-            Target::Eitri,
-            &workspace_diff,
-            &boundary,
-            &trajectory,
+        assert_eq!(target, Target::Thor);
+        assert_eq!(delta, "planning only");
+    }
+
+    #[test]
+    fn advisor_prompt_primes_once_and_keeps_updates_hidden_and_incremental() {
+        let first = review_prompt(
+            Target::Thor,
+            Some("New outer user request:\nfix it"),
+            "tool: inspect [Completed]",
+            true,
         );
-        assert!(
-            prompt.find(&workspace_diff).expect("diff")
-                < prompt.find("Boundary:\nedit boundary").expect("boundary")
-        );
+        assert!(first.contains("persistent pure advisor"));
+        assert!(first.contains("New outer user request"));
+        assert!(first.contains("### Thor session update"));
+        let later = review_prompt(Target::Eitri, None, "thinking:\nchecking", false);
+        assert!(!later.contains("persistent pure advisor"));
+        assert!(later.contains("### Eitri session update"));
+        assert!(!later.contains("fix it"));
     }
 }

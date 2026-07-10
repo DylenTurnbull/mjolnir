@@ -1387,6 +1387,30 @@ impl AgentHandle {
         saved_session_config: HashMap<String, String>,
         role_config: Option<acp::RuntimeRoleConfig>,
     ) -> Result<Self> {
+        Self::connect_with_role_config_and_mcp(
+            launch,
+            cwd,
+            additional_directories,
+            abort,
+            access_mode,
+            saved_session_config,
+            role_config,
+            Vec::new(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn connect_with_role_config_and_mcp(
+        launch: &Launch,
+        cwd: &Path,
+        additional_directories: &[PathBuf],
+        abort: watch::Receiver<bool>,
+        access_mode: acp::RuntimeAccessMode,
+        saved_session_config: HashMap<String, String>,
+        role_config: Option<acp::RuntimeRoleConfig>,
+        mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
+    ) -> Result<Self> {
         let (event_tx, events) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let runtime_cfg = acp::AcpRuntimeConfig {
@@ -1394,7 +1418,7 @@ impl AgentHandle {
             args: launch.args.clone(),
             cwd: cwd.to_path_buf(),
             additional_directories: additional_directories.to_vec(),
-            mcp_servers: Vec::new(),
+            mcp_servers,
             resume_session: None,
             env: launch.env.clone(),
             agent_stderr: None,

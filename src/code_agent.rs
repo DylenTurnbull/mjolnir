@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
@@ -58,6 +59,7 @@ pub struct Config {
     pub agent_stderr: Option<PathBuf>,
     pub role_config: Option<acp::RuntimeRoleConfig>,
     pub loki: Option<loki::Handle>,
+    pub delegation_observer: Option<Arc<AtomicBool>>,
 }
 
 impl Config {
@@ -74,6 +76,7 @@ impl Config {
             agent_stderr,
             role_config: None,
             loki: None,
+            delegation_observer: None,
         }
     }
 
@@ -98,7 +101,13 @@ impl Config {
                 force_high_reasoning: true,
             }),
             loki,
+            delegation_observer: None,
         }
+    }
+
+    pub fn with_delegation_observer(mut self, observer: Arc<AtomicBool>) -> Self {
+        self.delegation_observer = Some(observer);
+        self
     }
 }
 
@@ -464,6 +473,9 @@ async fn run(
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     controller: Controller,
 ) -> Result<String> {
+    if let Some(observer) = config.delegation_observer.as_ref() {
+        observer.store(true, Ordering::Release);
+    }
     let standalone_prompt = format!("{FRESH_CONTEXT_PREAMBLE}{instructions}");
     let display_label = config.display_label.clone();
     let _ = ui_tx.send(UiEvent::InternalMessage(InternalMessage {
@@ -503,6 +515,11 @@ async fn run(
     let mut prompt_sent = false;
     let mut collector = AgentMessageCollector::new();
     let epoch = loki.as_ref().map_or(0, loki::Handle::current_epoch);
+    if epoch > 0
+        && let Some(reviewer) = loki.as_ref()
+    {
+        reviewer.begin_eitri(epoch, instructions.clone());
+    }
     let mut decisions = loki.as_ref().map(loki::Handle::subscribe);
     let mut tracker = loki::BoundaryTracker::default();
     let mut pending_reviews = std::collections::HashSet::new();
@@ -541,12 +558,7 @@ async fn run(
                     && !(target_completed && intervention.is_pending())
                     && let Some(reviewer) = loki.as_ref()
                     && let Some(id) = reviewer
-                        .observe(
-                            epoch,
-                            loki::Target::Eitri,
-                            boundary,
-                            tracker.trajectory(),
-                        )
+                        .observe(epoch, loki::Target::Eitri, boundary)
                         .await
                 {
                     pending_reviews.insert(id);
@@ -602,7 +614,7 @@ async fn run(
                                 pending_reviews.clear();
                                 completed = None;
                                 let continuation = continuation_prompt(&instructions, &critique, &tracker.trajectory());
-                                emit_continuation(&ui_tx, &continuation);
+                                emit_continuation(&ui_tx, &critique);
                                 if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
                                     break Err(anyhow!("re-prompt Eitri after Loki intervention"));
                                 }
@@ -616,7 +628,7 @@ async fn run(
                             pending_reviews.clear();
                             completed = None;
                             let continuation = continuation_prompt(&instructions, &critique, &tracker.trajectory());
-                            emit_continuation(&ui_tx, &continuation);
+                            emit_continuation(&ui_tx, &critique);
                             if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
                                 break Err(anyhow!("re-prompt Eitri after Loki intervention"));
                             }
@@ -636,7 +648,7 @@ async fn run(
                             pending_reviews.clear();
                             completed = None;
                             let continuation = continuation_prompt(&instructions, &critique, &tracker.trajectory());
-                            emit_continuation(&ui_tx, &continuation);
+                            emit_continuation(&ui_tx, &critique);
                             if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
                                 break Err(anyhow!("re-prompt Eitri after Loki intervention"));
                             }
@@ -676,13 +688,16 @@ async fn run(
                             pending_reviews.clear();
                             let critique = intervention.take().expect("intervention queued");
                             let continuation = continuation_prompt(&instructions, &critique, &tracker.trajectory());
-                            emit_continuation(&ui_tx, &continuation);
+                            emit_continuation(&ui_tx, &critique);
                             if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
                                 break Err(anyhow!("re-prompt Eitri after Loki intervention"));
                             }
                         }
                     }
-                    loki::Verdict::NoIntervention | loki::Verdict::Failed(_) => {}
+                    loki::Verdict::NoIntervention => {}
+                    loki::Verdict::Failed(message) => {
+                        tracing::debug!("Loki Eitri review failed open: {message}");
+                    }
                 }
                 if pending_reviews.is_empty() && !intervention.is_pending()
                     && let Some(result) = completed.take()
@@ -712,9 +727,9 @@ async fn run(
     result
 }
 
-fn continuation_prompt(task: &str, critique: &str, trajectory: &str) -> String {
+fn continuation_prompt(_task: &str, critique: &str, _trajectory: &str) -> String {
     format!(
-        "Continue the original task after a material Loki review. Correct the issue and finish the implementation.\n\nOriginal task:\n{task}\n\nLoki critique:\n{critique}\n\nBounded prior trajectory:\n{trajectory}"
+        "<advisory guidance=\"weigh, don't blindly obey\">\n{critique}\n</advisory>\n\nContinue the interrupted implementation turn. Address the material advice, then finish the existing task."
     )
 }
 

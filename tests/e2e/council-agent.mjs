@@ -16,6 +16,7 @@ const instructions = mode === "details"
 let selectedModel = "gpt-5.6-sol";
 let reasoning = "medium";
 let mcpServer = null;
+let mcpToolName = null;
 let mcpSessionId = null;
 let mcpReady = null;
 let promptRequestId = null;
@@ -78,7 +79,7 @@ async function prepareMcp() {
   if (initialized.status !== 200 || !mcpSessionId) throw new Error("MCP initialize failed");
   await postMcp({ jsonrpc: "2.0", method: "notifications/initialized", params: {} });
   const listed = await postMcp({ jsonrpc: "2.0", id: "list", method: "tools/list", params: {} });
-  if (!(listed.message?.result?.tools ?? []).some((tool) => tool.name === "code_agent")) throw new Error("code_agent missing");
+  if (!(listed.message?.result?.tools ?? []).some((tool) => tool.name === mcpToolName)) throw new Error(`${mcpToolName} missing`);
   return unauthorized.status;
 }
 
@@ -125,18 +126,24 @@ function requestEitriPermission() {
   }});
 }
 
-function runLokiTurn(text) {
+async function runLokiTurn(text) {
   append(process.env.MJ_E2E_LOKI_LOG, `prompt:${text}`);
-  let decision = { decision: "no_intervention" };
-  if (!lokiIntervened && mode === "loki-eitri" && text.includes("Eitri")) {
+  let critique = null;
+  if (!lokiIntervened && mode === "loki-eitri" && text.includes("### Eitri session update")) {
     lokiIntervened = true;
-    decision = { decision: "intervention", critique: "Eitri must retry after the fixture critique." };
-  } else if (!lokiIntervened && mode === "loki-thor" && text.includes("Thor")) {
+    critique = "Eitri must retry after the fixture critique.";
+  } else if (!lokiIntervened && mode === "loki-thor" && text.includes("### Thor session update")) {
     lokiIntervened = true;
-    decision = { decision: "intervention", critique: "Thor must retry after the fixture critique." };
+    critique = "Thor must retry after the fixture critique.";
   }
-  append(process.env.MJ_E2E_LOKI_LOG, JSON.stringify(decision));
-  update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify(decision) } });
+  if (critique) {
+    await mcpReady;
+    const advised = await postMcp({ jsonrpc: "2.0", id: `advise-${Date.now()}`, method: "tools/call", params: { name: "advise", arguments: { note: critique } } });
+    append(process.env.MJ_E2E_LOKI_LOG, `advise:${critique}:${JSON.stringify(advised.message?.result ?? advised.message)}`);
+  } else {
+    append(process.env.MJ_E2E_LOKI_LOG, "no-advice");
+  }
+  update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "NO_ADVICE" } });
   send({ id: promptRequestId, result: { stopReason: "end_turn" } });
 }
 
@@ -147,7 +154,8 @@ input.on("line", (line) => {
   if (message.method === "initialize") {
     send({ id: message.id, result: { protocolVersion: 1, agentCapabilities: { mcpCapabilities: { http: process.env.MJ_E2E_HTTP_UNSUPPORTED !== "1", sse: false } }, agentInfo: { name: "council-fixture", version: "1" } } });
   } else if (message.method === "session/new") {
-    mcpServer = (message.params?.mcpServers ?? []).find((server) => server.name === "mj-code-agent");
+    mcpServer = (message.params?.mcpServers ?? []).find((server) => server.name === "mj-code-agent" || server.name === "mj-loki-advisor");
+    mcpToolName = mcpServer?.name === "mj-loki-advisor" ? "advise" : "code_agent";
     send({ id: message.id, result: { sessionId: "fixture-session", configOptions: configOptions() } });
     if (mcpServer) mcpReady = prepareMcp();
   } else if (message.method === "session/set_config_option") {
@@ -171,7 +179,10 @@ input.on("line", (line) => {
     } else if (isEitri()) {
       startEitriTurn();
     } else if (isLoki()) {
-      runLokiTurn(text);
+      void runLokiTurn(text).catch((error) => {
+        append(process.env.MJ_E2E_LOKI_LOG, `error:${error.stack ?? error}`);
+        send({ id: promptRequestId, error: { code: -32603, message: error.message } });
+      });
     } else if (text.includes("Perform Thor's discrete review")) {
       update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: thorReviewResult() } });
       send({ id: promptRequestId, result: { stopReason: "end_turn" } });

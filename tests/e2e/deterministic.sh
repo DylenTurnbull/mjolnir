@@ -114,8 +114,9 @@ run_case() {
   elif [ "$mode" = no-change ]; then
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test ! -e "$root/primary-result.json"
-    test ! -s "$root/loki.log"
-    grep -a "FINAL" "$root/transcript.log" >/dev/null
+    grep -a 'Thor session update' "$root/loki.log" >/dev/null
+    grep -a 'no-advice' "$root/loki.log" >/dev/null
+    grep -a "PRIMARY.*NO.*CHANGE" "$root/transcript.log" >/dev/null
   elif [ "$mode" = complete ] || [ "$mode" = loki-eitri ] || [ "$mode" = loki-thor ] || [ "$mode" = thor-review ] || [ "$mode" = details ]; then
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
@@ -131,14 +132,14 @@ run_case() {
       grep -a "FINAL" "$root/transcript.log" >/dev/null
     fi
     if [ "$mode" = thor-review ]; then
-      grep -a 'no_intervention' "$root/loki.log" >/dev/null
+      grep -a 'no-advice' "$root/loki.log" >/dev/null
       grep -a 'PRIMARY FINAL REVIEWED' "$root/loki.log" >/dev/null
     elif [ "$mode" != details ]; then
       grep -a "CODEAGENT_E2E_OK" "$root/transcript.log" >/dev/null
     fi
     if [ "$mode" = loki-eitri ] || [ "$mode" = loki-thor ]; then
-      grep -a '"decision":"intervention"' "$root/loki.log" >/dev/null
-      grep -a "Loki intervenes against" "$root/transcript.log" >/dev/null
+      grep -a '^advise:' "$root/loki.log" >/dev/null
+      grep -a "fixture critique" "$root/transcript.log" >/dev/null
     fi
     grep -a "nested-terminal-output" "$root/transcript.log" >/dev/null
     grep -a "codex-metadata-terminal-output" "$root/transcript.log" >/dev/null

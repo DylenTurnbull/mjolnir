@@ -60,7 +60,7 @@ if {$mode eq "inline-stream"} {
         timeout { exit 26 }
     }
     expect {
-        -re {PRIMARY.*FINAL.*REVIEWED} { after 500; send_ctrl_c }
+        -re {PRIMARY.*CANCELLED} { after 500; send_ctrl_c }
         timeout { exit 27 }
     }
 } elseif {$mode eq "cancel"} {
@@ -69,12 +69,12 @@ if {$mode eq "inline-stream"} {
         timeout { exit 20 }
     }
     expect {
-        -re {PRIMARY.*FINAL.*REVIEWED} { after 500; send_ctrl_c }
+        -re {PRIMARY.*CANCELLED} { after 500; send_ctrl_c }
         timeout { exit 21 }
     }
 } elseif {$mode eq "no-change"} {
     expect {
-        -re {PRIMARY.*FINAL.*REVIEWED} { after 500; send_ctrl_c }
+        -re {PRIMARY.*NO.*CHANGE} { after 500; send_ctrl_c }
         timeout { exit 35 }
     }
 } elseif {$mode eq "details"} {
@@ -107,11 +107,18 @@ if {$mode eq "inline-stream"} {
             timeout { exit 33 }
         }
     }
-    send -- "\033\[6~"
-    expect {
-        -re {EITRI_LONG_SUFFIX} {}
-        timeout { exit 34 }
+    set previous_timeout $timeout
+    set timeout 2
+    set eitri_seen 0
+    for {set page 0} {$page < 12 && !$eitri_seen} {incr page} {
+        send -- "\033\[6~"
+        expect {
+            -re {EITRI_LONG_SUFFIX} { set eitri_seen 1 }
+            timeout {}
+        }
     }
+    set timeout $previous_timeout
+    if {!$eitri_seen} { exit 34 }
     send -- "\024"
     after 500
     send_ctrl_c

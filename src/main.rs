@@ -52,6 +52,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -1562,6 +1566,7 @@ async fn run_session(
     let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
     let (runtime_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel();
+    let delegated_this_turn = Arc::new(AtomicBool::new(false));
     let _ = ui_event_tx.send(crate::event::UiEvent::Info(format!(
         "Council · Thor {} · Loki {} · Eitri {} · {} launchable models",
         council.thor.model.model,
@@ -1642,15 +1647,18 @@ async fn run_session(
             model_value: council.thor.model_value.clone(),
             force_high_reasoning: true,
         }),
-        code_agent: Some(code_agent::Config::council(
-            eitri_role.launch.command.clone(),
-            eitri_role.launch.args.clone(),
-            eitri_role.launch.env.clone(),
-            runtime_options.agent_stderr.clone(),
-            eitri_role.model.model.clone(),
-            eitri_role.model_value.clone(),
-            loki_handle.clone(),
-        )),
+        code_agent: Some(
+            code_agent::Config::council(
+                eitri_role.launch.command.clone(),
+                eitri_role.launch.args.clone(),
+                eitri_role.launch.env.clone(),
+                runtime_options.agent_stderr.clone(),
+                eitri_role.model.model.clone(),
+                eitri_role.model_value.clone(),
+                loki_handle.clone(),
+            )
+            .with_delegation_observer(delegated_this_turn.clone()),
+        ),
     };
 
     // Drive the ACP runtime on its own task so the UI can own the
@@ -1698,6 +1706,7 @@ async fn run_session(
     )));
     let event_turn_state = turn_state.clone();
     let event_loki = loki_handle.clone();
+    let event_delegated = delegated_this_turn.clone();
     let event_proxy = tokio::spawn(async move {
         let mut runtime_event_rx = runtime_event_rx;
         let mut decisions = event_loki.as_ref().map(loki::Handle::subscribe);
@@ -1731,12 +1740,7 @@ async fn run_session(
                         && !(target_completed && intervention.is_pending())
                         && let Some(reviewer) = event_loki.as_ref()
                         && let Some(id) = reviewer
-                            .observe(
-                                epoch,
-                                loki::Target::Thor,
-                                boundary,
-                                trajectory.trajectory(),
-                            )
+                            .observe(epoch, loki::Target::Thor, boundary)
                             .await
                     {
                         pending.insert(id);
@@ -1772,7 +1776,7 @@ async fn run_session(
                                 "Loki",
                                 "Thor",
                                 InternalMessageKind::Continuation,
-                                &continuation,
+                                &critique,
                             );
                             let _ = review_commands.send(UiCommand::SendPrompt {
                                 text: continuation,
@@ -1807,7 +1811,7 @@ async fn run_session(
                             "Loki",
                             "Thor",
                             InternalMessageKind::Continuation,
-                            &continuation,
+                            &critique,
                         );
                         let _ = review_commands.send(UiCommand::SendPrompt {
                             text: continuation,
@@ -1850,7 +1854,7 @@ async fn run_session(
                                 "Loki",
                                 "Thor",
                                 InternalMessageKind::Continuation,
-                                &continuation,
+                                &critique,
                             );
                             let _ = review_commands.send(UiCommand::SendPrompt {
                                 text: continuation,
@@ -1866,7 +1870,24 @@ async fn run_session(
             }
 
             if held_completion.is_some() && pending.is_empty() && !intervention.is_pending() {
-                if thor_config.discrete_review && !discrete_review_started {
+                let workspace_changed = if thor_config.discrete_review
+                    && event_delegated.load(Ordering::Acquire)
+                    && !discrete_review_started
+                {
+                    let (_, _, snapshot) = event_turn_state.lock().await.clone();
+                    match snapshot {
+                        Some(snapshot) => snapshot.complete_diff().await.is_some(),
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                if should_start_discrete_review(
+                    thor_config.discrete_review,
+                    discrete_review_started,
+                    event_delegated.load(Ordering::Acquire),
+                    workspace_changed,
+                ) {
                     let (epoch, task, snapshot) = event_turn_state.lock().await.clone();
                     if epoch == 0 {
                         continue;
@@ -1924,12 +1945,13 @@ async fn run_session(
             cmd_tracker.observe_command(&command);
             if let UiCommand::SendPrompt { text, .. } = &command {
                 local_epoch = local_epoch.saturating_add(1);
+                delegated_this_turn.store(false, Ordering::Release);
                 let snapshot =
                     acp::WorkspaceTurnSnapshot::capture(&cmd_workspace_roots, cmd_max_text_bytes)
                         .await;
-                let epoch = cmd_loki.as_ref().map_or(local_epoch, |reviewer| {
-                    reviewer.begin_turn(text.clone(), snapshot.clone())
-                });
+                let epoch = cmd_loki
+                    .as_ref()
+                    .map_or(local_epoch, |reviewer| reviewer.begin_turn(text.clone()));
                 *cmd_turn_state.lock().await = (epoch, text.clone(), Some(snapshot));
             }
             if matches!(command, UiCommand::CancelPrompt)
@@ -2176,10 +2198,19 @@ fn isolated_council_role(
     Ok((role, Some(isolated)))
 }
 
-fn council_continuation_prompt(task: &str, critique: &str, trajectory: &str) -> String {
+fn council_continuation_prompt(_task: &str, critique: &str, _trajectory: &str) -> String {
     format!(
-        "Continue the same user turn after a material Loki intervention. Correct the issue and finish the task.\n\nOriginal task:\n{task}\n\nLoki critique:\n{critique}\n\nBounded prior trajectory:\n{trajectory}"
+        "<advisory guidance=\"weigh, don't blindly obey\">\n{critique}\n</advisory>\n\nContinue the interrupted turn. Address the material advice, then finish the existing task."
     )
+}
+
+fn should_start_discrete_review(
+    enabled: bool,
+    already_started: bool,
+    delegated_to_eitri: bool,
+    workspace_changed: bool,
+) -> bool {
+    enabled && !already_started && delegated_to_eitri && workspace_changed
 }
 
 fn emit_internal_message(
@@ -2393,8 +2424,10 @@ mod tests {
             council_continuation_prompt("current user turn", &critique, &trajectory.trajectory());
 
         assert!(!intervention.is_pending());
-        assert!(continuation.contains("Original task:\ncurrent user turn"));
-        assert!(continuation.contains("Loki critique:\nretry with the corrected result"));
+        assert!(continuation.contains("<advisory"));
+        assert!(continuation.contains("retry with the corrected result"));
+        assert!(!continuation.contains("current user turn"));
+        assert!(!continuation.contains("Bounded prior trajectory"));
     }
 
     #[test]
@@ -2411,6 +2444,15 @@ mod tests {
         assert!(prompt.contains("delegate them to Eitri with code_agent"));
         assert!(prompt.contains("Initial result:\nEitri says it is complete"));
         assert!(!prompt.contains("Loki verdict"));
+    }
+
+    #[test]
+    fn discrete_review_requires_eitri_and_attributable_workspace_changes() {
+        assert!(should_start_discrete_review(true, false, true, true));
+        assert!(!should_start_discrete_review(true, false, false, true));
+        assert!(!should_start_discrete_review(true, false, true, false));
+        assert!(!should_start_discrete_review(false, false, true, true));
+        assert!(!should_start_discrete_review(true, true, true, true));
     }
 
     #[test]
