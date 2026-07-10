@@ -12,10 +12,13 @@ mod claude_usage;
 mod clipboard;
 mod code_agent;
 mod config;
+mod council;
+mod deepswe;
 mod event;
 mod headless;
 mod install;
 mod labels;
+mod loki;
 mod mcp;
 mod menu;
 mod model_resolve;
@@ -443,7 +446,6 @@ async fn main() -> Result<()> {
     let workspace_roots = validate_workspace_roots(&cwd, &top_level_additional_directories)?;
     let worktree_label = worktree_label(worktree.as_ref());
     let project_label = project_label(&cwd);
-
     let result = run_app(
         cwd,
         RuntimeOptions {
@@ -560,18 +562,12 @@ async fn run_resume(
     let additional_directories = workspace_roots.additional_directories().to_vec();
     let worktree_label = worktree_label(worktree.as_ref());
     let project_label = project_label(&cwd);
+    let cfg = Config::load(&config::default_config_path())?;
+    let resume_council = council::resolve(&cfg, &cwd).await?;
+    let agent = selected_agent_for_role(&resume_council.thor);
 
     // `--list`: headless listing, print and exit.
     if args.list {
-        // Load the configured agent (same as headless mode).
-        let config_path = config::default_config_path();
-        let cfg = Config::load(&config_path)
-            .with_context(|| format!("load {}", config_path.display()))?;
-        let agent = cfg.agent.ok_or_else(|| {
-            anyhow::anyhow!(
-                "no default agent configured; run `mj` once to pick an agent before listing sessions"
-            )
-        })?;
         let sessions = session::list_sessions(&agent, cwd, args.agent_stderr.as_deref()).await?;
         match args.format {
             HeadlessOutputFormat::Json | HeadlessOutputFormat::StreamJson => {
@@ -597,13 +593,6 @@ async fn run_resume(
         }
         return Ok(());
     }
-
-    let agent = pick_agent_for_resume().await;
-    let Some(agent) = agent? else {
-        eprintln!("Cancelled.");
-        let _ = handle_worktree_after_tui(worktree.as_ref(), Some(mode));
-        return Ok(());
-    };
 
     // Direct ID: launch the TUI with the chosen agent and session.
     if let Some(session_id) = args.session_id.clone() {
@@ -727,25 +716,6 @@ async fn run_resume(
             }
         }
     }
-}
-
-async fn pick_agent_for_resume() -> Result<Option<SelectedAgent>> {
-    let config_path = config::default_config_path();
-    let mut cfg =
-        Config::load(&config_path).with_context(|| format!("load {}", config_path.display()))?;
-
-    kick_off_agent_probes(&cfg);
-    let picker_result = run_agent_picker_once(&cfg).await?;
-    apply_picker_preferences(&mut cfg, picker_result.preferences);
-    let selected = picker_result.outcome.map(picker_outcome_to_selected);
-    if cfg.agent.is_none()
-        && let Some(agent) = selected.as_ref()
-    {
-        cfg.agent = Some(agent.clone());
-    }
-    cfg.save(&config_path)
-        .with_context(|| format!("save {}", config_path.display()))?;
-    Ok(selected)
 }
 
 fn read_headless_prompt(prompt_arg: String) -> Result<String> {
@@ -875,10 +845,12 @@ fn prepare_existing_worktree(cwd: &std::path::Path, name_or_path: &str) -> Resul
     Ok(opened)
 }
 
+#[cfg(test)]
 fn should_open_initial_agent_picker(cfg: &Config, initial_agent: Option<&SelectedAgent>) -> bool {
     cfg.agent.is_none() && initial_agent.is_none()
 }
 
+#[cfg(test)]
 fn should_open_first_run_setup(
     config_exists: bool,
     cfg: &Config,
@@ -929,8 +901,9 @@ async fn run_app(
     mode: UiMode,
 ) -> Result<Option<String>> {
     let config_path = config::default_config_path();
-    let config_exists = config_path.exists();
     let mut cfg = Config::load(&config_path)?;
+    let mut council = council::resolve(&cfg, &cwd).await?;
+    let mut council_agent = selected_agent_for_role(&council.thor);
 
     // Validate agents in the background once, up front. Results land in the
     // global probe store; every agent picker shown during this run just pulls
@@ -945,10 +918,9 @@ async fn run_app(
     // the agent chosen by `mj resume` or fall back to the configured default.
     // Consume resume_session and initial_agent on the first iteration only.
     let mut initial_resume = resume_target;
-    let mut initial_agent = initial_agent;
-    let mut first_run_setup =
-        should_open_first_run_setup(config_exists, &cfg, initial_agent.as_ref());
-    let mut pick_agent = should_open_initial_agent_picker(&cfg, initial_agent.as_ref());
+    let mut initial_agent = initial_agent.or_else(|| Some(council_agent.clone()));
+    let mut first_run_setup = false;
+    let mut pick_agent = false;
     let mut pending_new_session_boundary = false;
     loop {
         let resume = initial_resume.take();
@@ -972,11 +944,7 @@ async fn run_app(
                 }
             }
         } else {
-            cfg.agent.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no default agent configured; run `mj` once to pick an agent before resuming sessions"
-                )
-            })?
+            council_agent.clone()
         };
 
         let session_boundary = new_session_boundary_for_agent(
@@ -1000,30 +968,19 @@ async fn run_app(
             cfg.spinner,
             score_store.clone(),
             session_boundary,
+            council.clone(),
+            cfg.loki.clone(),
         )
         .await?;
         apply_session_result_to_config(&mut cfg, &session_result);
         match session_result.reason {
             UiExitReason::Quit => return Ok(session_result.session_id),
             UiExitReason::NewSession => {
-                match run_agent_picker_and_update_config(&mut cfg, &config_path).await? {
-                    Some(selected_agent) => {
-                        initial_agent = Some(selected_agent);
-                        pending_new_session_boundary = true;
-                    }
-                    None => {
-                        cfg.save(&config_path)
-                            .with_context(|| format!("save {}", config_path.display()))?;
-                        let (agent, resume) = resume_target_after_cancelled_new_session(
-                            agent,
-                            session_result.session_id,
-                            session_result.session_title,
-                        );
-                        initial_agent = Some(agent);
-                        initial_resume = resume;
-                        pending_new_session_boundary = false;
-                    }
-                }
+                cfg = Config::load(&config_path)?;
+                council = council::resolve(&cfg, &cwd).await?;
+                council_agent = selected_agent_for_role(&council.thor);
+                initial_agent = Some(council_agent.clone());
+                pending_new_session_boundary = true;
                 continue;
             }
             UiExitReason::ClearSession => {
@@ -1218,6 +1175,7 @@ fn new_session_boundary_for_agent(
         .then(|| format!("new {} session started", agent_header_label(agent)))
 }
 
+#[cfg(test)]
 fn resume_target_after_cancelled_new_session(
     agent: SelectedAgent,
     session_id: Option<String>,
@@ -1564,6 +1522,15 @@ fn agent_header_label(agent: &SelectedAgent) -> String {
     remote::agent_display_label(agent)
 }
 
+fn selected_agent_for_role(role: &council::ResolvedRole) -> SelectedAgent {
+    SelectedAgent {
+        source_id: format!("council:{}", role.model.model),
+        program: role.launch.command.clone(),
+        args: role.launch.args.clone(),
+        env: role.launch.env.clone(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     agent: &SelectedAgent,
@@ -1576,13 +1543,54 @@ async fn run_session(
     mut spinner_style: spinner::SpinnerStyle,
     score_store: scores::ScoreStore,
     mut session_boundary: Option<String>,
+    council: council::ResolvedCouncil,
+    loki_config: config::LokiConfig,
 ) -> Result<RunSessionResult> {
     let mut terminal = SessionTerminal::fresh(mode)?;
+    let (eitri_role, _eitri_codex_home) = isolated_council_role(council.eitri.clone(), "eitri")?;
+    let (loki_role, _loki_codex_home) = match council.loki.clone() {
+        Some(role) => {
+            let (role, guard) = isolated_council_role(role, "loki")?;
+            (Some(role), guard)
+        }
+        None => (None, None),
+    };
 
     let (event_tx, runtime_event_rx) = mpsc::unbounded_channel();
     let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
     let (runtime_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel();
+    let _ = ui_event_tx.send(crate::event::UiEvent::Info(format!(
+        "Council · Thor {} · Loki {} · Eitri {} · {} launchable models",
+        council.thor.model.model,
+        council
+            .loki
+            .as_ref()
+            .map(|role| role.model.model.as_str())
+            .unwrap_or("off"),
+        council.eitri.model.model,
+        council.available.len(),
+    )));
+    let loki_handle = if loki_config.streaming_review || loki_config.final_review {
+        loki_role.map(|role| {
+            loki::Handle::start(
+                role,
+                cwd.clone(),
+                runtime_options.additional_directories.clone(),
+                ui_event_tx.clone(),
+                loki_config.streaming_review,
+                loki_config.final_review,
+            )
+        })
+    } else {
+        None
+    };
+    if (loki_config.streaming_review || loki_config.final_review) && loki_handle.is_none() {
+        let _ = ui_event_tx.send(crate::event::UiEvent::Warning(
+            "Loki review is enabled, but no distinct launchable reviewer model is available"
+                .to_string(),
+        ));
+    }
     let (usage_turn_tx, usage_task) = if agent.source_id == "claude-acp" {
         let (tx, mut rx) = mpsc::unbounded_channel::<()>();
         let usage_ui_tx = ui_event_tx.clone();
@@ -1628,9 +1636,19 @@ async fn run_session(
             .ok()
             .and_then(|cfg| cfg.session_config.get(&agent.source_id).cloned())
             .unwrap_or_default(),
-        code_agent: Some(code_agent::Config::codex(
+        role_config: Some(acp::RuntimeRoleConfig {
+            label: "Thor".to_string(),
+            model_value: council.thor.model_value.clone(),
+            force_high_reasoning: true,
+        }),
+        code_agent: Some(code_agent::Config::council(
+            eitri_role.launch.command.clone(),
+            eitri_role.launch.args.clone(),
+            eitri_role.launch.env.clone(),
             runtime_options.agent_stderr.clone(),
-            agent.env.clone(),
+            eitri_role.model.model.clone(),
+            eitri_role.model_value.clone(),
+            loki_handle.clone(),
         )),
     };
 
@@ -1650,7 +1668,7 @@ async fn run_session(
     // Pre-fill the UI header with the configured agent identity. Registry
     // agents use their source id so the header matches the picker/config,
     // while custom agents show the exact command line being launched.
-    let agent_display_name = Some(agent_header_label(agent));
+    let agent_display_name = Some(format!("Thor · {}", council.thor.model.model));
     // Stable registry id for the model-score resolver (distinct from the
     // display label above, which is a command line for custom agents).
     let agent_source_id = Some(agent.source_id.clone());
@@ -1665,35 +1683,176 @@ async fn run_session(
     let remote_tracker = remote::RemoteSessionTracker::new(
         tracker_project_label,
         tracker_worktree_label,
-        agent_header_label(agent),
+        format!("Thor · {}", council.thor.model.model),
         Some(cmd_tx.clone()),
         Some(ui_event_tx.clone()),
     );
 
     let event_tracker = remote_tracker.clone();
+    let review_commands = runtime_cmd_tx.clone();
+    let turn_state = std::sync::Arc::new(tokio::sync::Mutex::new((0_u64, String::new())));
+    let event_turn_state = turn_state.clone();
+    let event_loki = loki_handle.clone();
+    let review_cwd = cwd.clone();
     let event_proxy = tokio::spawn(async move {
         let mut runtime_event_rx = runtime_event_rx;
-        while let Some(event) = runtime_event_rx.recv().await {
-            // Intercept before observing: permission prompts get their
-            // responder wrapped so remote viewers see (and can answer)
-            // the pending request.
-            let event = event_tracker.intercept_event(event);
-            event_tracker.observe_event(&event);
-            if matches!(event, crate::event::UiEvent::PromptDone { .. })
-                && let Some(tx) = usage_turn_tx.as_ref()
-            {
-                let _ = tx.send(());
+        let mut decisions = event_loki.as_ref().map(loki::Handle::subscribe);
+        let mut trajectory = loki::BoundaryTracker::default();
+        let mut pending = std::collections::HashSet::new();
+        let mut held_completion = None;
+        let mut intervention: Option<String> = None;
+        let mut final_review_requested = false;
+        let mut final_review_done = false;
+        loop {
+            tokio::select! {
+                event = runtime_event_rx.recv() => {
+                    let Some(event) = event else { break; };
+                    // Intercept before rendering: permission prompts get their
+                    // responder wrapped so remote viewers can answer them.
+                    let event = event_tracker.intercept_event(event);
+                    let (epoch, task) = event_turn_state.lock().await.clone();
+                    if epoch > 0
+                        && let Some(boundary) = trajectory.observe(&event)
+                        && let Some(id) = event_loki.as_ref().and_then(|reviewer| reviewer.observe(
+                            epoch,
+                            loki::Target::Thor,
+                            boundary,
+                            trajectory.trajectory(),
+                        ))
+                    {
+                        pending.insert(id);
+                    }
+
+                    if let crate::event::UiEvent::PromptDone { stop_reason, .. } = &event {
+                        if matches!(stop_reason, agent_client_protocol::schema::v1::StopReason::Cancelled)
+                            && let Some(critique) = intervention.take()
+                        {
+                            pending.clear();
+                            held_completion = None;
+                            trajectory.reset_attempt();
+                            let _ = ui_event_tx.send(crate::event::UiEvent::Info(
+                                "Thor · resumed after Loki intervention".to_string(),
+                            ));
+                            let _ = review_commands.send(UiCommand::SendPrompt {
+                                text: council_continuation_prompt(&task, &critique, &trajectory.trajectory()),
+                                images: Vec::new(),
+                            });
+                            continue;
+                        }
+                        held_completion = Some(event);
+                    } else {
+                        event_tracker.observe_event(&event);
+                        if ui_event_tx.send(event).is_err() { break; }
+                    }
+                }
+                decision = async {
+                    match decisions.as_mut() {
+                        Some(rx) => rx.recv().await.ok(),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let Some(decision) = decision else { continue; };
+                    let (epoch, task) = event_turn_state.lock().await.clone();
+                    if decision.epoch != epoch || decision.target != loki::Target::Thor || !pending.remove(&decision.id) {
+                        continue;
+                    }
+                    if decision.final_review {
+                        final_review_done = true;
+                        match decision.verdict {
+                            loki::Verdict::Failed(_) => {}
+                            verdict => {
+                                let verdict_text = match verdict {
+                                    loki::Verdict::NoIntervention => "Loki found no material issue.".to_string(),
+                                    loki::Verdict::Intervention(critique) => format!("Loki found a material issue: {critique}"),
+                                    loki::Verdict::Failed(_) => unreachable!(),
+                                };
+                                held_completion = None;
+                                trajectory.reset_attempt();
+                                let _ = ui_event_tx.send(crate::event::UiEvent::Info(
+                                    "Loki · final verdict delivered to Thor".to_string(),
+                                ));
+                                let _ = review_commands.send(UiCommand::SendPrompt {
+                                    text: format!(
+                                        "This is the required final hidden council follow-up for the same user turn. Review Loki's verdict below, correct the answer if needed, and return the final user-facing response. Do not call code_agent again unless the verdict requires new implementation work.\n\nOriginal task:\n{task}\n\nLoki verdict:\n{verdict_text}"
+                                    ),
+                                    images: Vec::new(),
+                                });
+                            }
+                        }
+                    } else if let loki::Verdict::Intervention(critique) = decision.verdict {
+                        if held_completion.is_some() {
+                            held_completion = None;
+                            pending.clear();
+                            trajectory.reset_attempt();
+                            let _ = ui_event_tx.send(crate::event::UiEvent::Info(
+                                "Thor · re-prompted after Loki intervention".to_string(),
+                            ));
+                            let _ = review_commands.send(UiCommand::SendPrompt {
+                                text: council_continuation_prompt(&task, &critique, &trajectory.trajectory()),
+                                images: Vec::new(),
+                            });
+                        } else if intervention.is_none() {
+                            intervention = Some(critique);
+                            let _ = ui_event_tx.send(crate::event::UiEvent::Info(
+                                "Thor · cancelling for Loki intervention".to_string(),
+                            ));
+                            let _ = review_commands.send(UiCommand::CancelPrompt);
+                        }
+                    }
+                }
             }
-            if ui_event_tx.send(event).is_err() {
-                break;
+
+            if held_completion.is_some() && pending.is_empty() && intervention.is_none() {
+                if !final_review_requested
+                    && !final_review_done
+                    && let Some(reviewer) = event_loki.as_ref()
+                    && reviewer.final_enabled
+                {
+                    let (epoch, _) = event_turn_state.lock().await.clone();
+                    let result = trajectory.final_message();
+                    let context = final_review_context(&review_cwd, trajectory.trajectory()).await;
+                    if let Some(id) = reviewer.final_review(epoch, result, context) {
+                        pending.insert(id);
+                        final_review_requested = true;
+                        continue;
+                    }
+                }
+
+                if final_review_requested && !final_review_done {
+                    continue;
+                }
+                let event = held_completion.take().expect("completion held");
+                event_tracker.observe_event(&event);
+                if let Some(tx) = usage_turn_tx.as_ref() {
+                    let _ = tx.send(());
+                }
+                if ui_event_tx.send(event).is_err() {
+                    break;
+                }
+                final_review_requested = false;
+                final_review_done = false;
+                trajectory = loki::BoundaryTracker::default();
             }
         }
     });
 
     let cmd_tracker = remote_tracker.clone();
+    let cmd_loki = loki_handle.clone();
+    let cmd_turn_state = turn_state.clone();
     let cmd_proxy = tokio::spawn(async move {
         while let Some(command) = ui_cmd_rx.recv().await {
             cmd_tracker.observe_command(&command);
+            if let UiCommand::SendPrompt { text, .. } = &command
+                && let Some(reviewer) = cmd_loki.as_ref()
+            {
+                let epoch = reviewer.begin_turn(text.clone());
+                *cmd_turn_state.lock().await = (epoch, text.clone());
+            }
+            if matches!(command, UiCommand::CancelPrompt)
+                && let Some(reviewer) = cmd_loki.as_ref()
+            {
+                reviewer.cancel_turn();
+            }
             let shutdown = matches!(command, UiCommand::Shutdown);
             if runtime_cmd_tx.send(command).is_err() || shutdown {
                 break;
@@ -1727,6 +1886,10 @@ async fn run_session(
                 }),
                 session_boundary: session_boundary.take(),
                 session_cwd: cwd.clone(),
+                council_choices: council.choices.clone(),
+                council_models: config::Config::load(&config_path)
+                    .map(|config| config.models)
+                    .unwrap_or_default(),
             },
         )
         .await;
@@ -1845,6 +2008,9 @@ async fn run_session(
     //    task. `kill_on_drop(true)` on the `Command` then signals the
     //    child when the `Child` value is dropped during unwind.
     remote_tracker.shutdown().await;
+    if let Some(reviewer) = loki_handle.as_ref() {
+        reviewer.shutdown_and_wait().await;
+    }
 
     let abort_handle = acp_handle.abort_handle();
     match tokio::time::timeout(Duration::from_secs(2), acp_handle).await {
@@ -1882,6 +2048,72 @@ async fn run_session(
     }
 
     ui_result
+}
+
+fn isolated_council_role(
+    mut role: council::ResolvedRole,
+    label: &str,
+) -> Result<(council::ResolvedRole, Option<tempfile::TempDir>)> {
+    if role.launch.kind != council::AdapterKind::Codex {
+        return Ok((role, None));
+    }
+    let source = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .ok_or_else(|| anyhow::anyhow!("could not locate CODEX_HOME for {label}"))?;
+    let isolated = tempfile::Builder::new()
+        .prefix(&format!("mj-{label}-codex-"))
+        .tempdir()
+        .with_context(|| format!("create isolated Codex home for {label}"))?;
+    for name in [
+        "auth.json",
+        "config.toml",
+        "models_cache.json",
+        "version.json",
+    ] {
+        let from = source.join(name);
+        if from.is_file() {
+            std::fs::copy(&from, isolated.path().join(name)).with_context(|| {
+                format!("copy {} into isolated {label} Codex home", from.display())
+            })?;
+        }
+    }
+    if !isolated.path().join("auth.json").exists() {
+        anyhow::bail!(
+            "Codex is available but {} has no auth.json; run `codex login`",
+            source.display()
+        );
+    }
+    role.launch.env.insert(
+        "CODEX_HOME".to_string(),
+        isolated.path().display().to_string(),
+    );
+    Ok((role, Some(isolated)))
+}
+
+fn council_continuation_prompt(task: &str, critique: &str, trajectory: &str) -> String {
+    format!(
+        "Continue the same user turn after a material Loki intervention. Correct the issue and finish the task.\n\nOriginal task:\n{task}\n\nLoki critique:\n{critique}\n\nBounded prior trajectory:\n{trajectory}"
+    )
+}
+
+async fn final_review_context(cwd: &Path, trajectory: String) -> String {
+    let diff = tokio::process::Command::new("git")
+        .args(["diff", "--no-ext-diff", "--"])
+        .current_dir(cwd)
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_else(|| "[workspace diff unavailable]".to_string());
+    let mut context = format!("Trajectory:\n{trajectory}\n\nWorkspace diff:\n{diff}");
+    const LIMIT: usize = 128 * 1024;
+    if context.len() > LIMIT {
+        let split = context.ceil_char_boundary(context.len() - LIMIT);
+        context = format!("…[earlier review context omitted]\n{}", &context[split..]);
+    }
+    context
 }
 
 fn setup_session_terminal(
@@ -2132,6 +2364,8 @@ mod tests {
         assert!(should_open_initial_agent_picker(&Config::default(), None));
         assert!(!should_open_initial_agent_picker(
             &Config {
+                models: config::ModelsConfig::default(),
+                loki: config::LokiConfig::default(),
                 theme: Default::default(),
                 spinner: Default::default(),
                 agent: Some(configured),
@@ -2158,6 +2392,8 @@ mod tests {
         };
         assert!(!should_open_initial_agent_picker(
             &Config {
+                models: config::ModelsConfig::default(),
+                loki: config::LokiConfig::default(),
                 theme: Default::default(),
                 spinner: Default::default(),
                 agent: Some(custom_default),
@@ -2191,6 +2427,8 @@ mod tests {
         assert!(!should_open_first_run_setup(
             false,
             &Config {
+                models: config::ModelsConfig::default(),
+                loki: config::LokiConfig::default(),
                 theme: Default::default(),
                 spinner: Default::default(),
                 agent: Some(configured),
@@ -2290,6 +2528,8 @@ mod tests {
     #[test]
     fn picker_preferences_round_trip_custom_agents() {
         let cfg = Config {
+            models: config::ModelsConfig::default(),
+            loki: config::LokiConfig::default(),
             theme: Default::default(),
             spinner: Default::default(),
             agent: None,
@@ -2318,6 +2558,8 @@ mod tests {
     #[test]
     fn picker_preferences_prune_removed_custom_agent_session_config() {
         let mut cfg = Config {
+            models: config::ModelsConfig::default(),
+            loki: config::LokiConfig::default(),
             theme: Default::default(),
             spinner: Default::default(),
             agent: Some(SelectedAgent {

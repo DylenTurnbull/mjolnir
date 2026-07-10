@@ -76,9 +76,18 @@ pub struct AcpRuntimeConfig {
     pub config_path: Option<PathBuf>,
     /// Values remembered from the last prompt submitted for this agent.
     pub saved_session_config: HashMap<String, String>,
+    /// Council role configuration applied before the first substantive prompt.
+    pub role_config: Option<RuntimeRoleConfig>,
     /// Optional model-visible code-agent MCP service. Interactive TUI sessions
     /// set this; nested and non-interactive runtimes leave it absent.
     pub code_agent: Option<code_agent::Config>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeRoleConfig {
+    pub label: String,
+    pub model_value: String,
+    pub force_high_reasoning: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -696,6 +705,7 @@ pub async fn run(
             cfg.agent_source_id.clone(),
             cfg.config_path.clone(),
             cfg.saved_session_config.clone(),
+            cfg.role_config.clone(),
             cfg.code_agent.clone(),
         );
         tokio::pin!(drive);
@@ -1217,6 +1227,7 @@ where
         None,
         HashMap::new(),
         None,
+        None,
     )
     .await
 }
@@ -1249,6 +1260,7 @@ where
         None,
         HashMap::new(),
         None,
+        None,
     )
     .await
 }
@@ -1268,6 +1280,7 @@ async fn drive_client_with_fs_limit<T>(
     agent_source_id: Option<String>,
     config_path: Option<PathBuf>,
     saved_session_config: HashMap<String, String>,
+    role_config: Option<RuntimeRoleConfig>,
     code_agent: Option<code_agent::Config>,
 ) -> Result<()>
 where
@@ -1479,6 +1492,7 @@ where
                 agent_source_id,
                 config_path,
                 saved_session_config,
+                role_config,
                 code_agent,
                 drive_code_agent_controller,
                 primary_updates_suppressed,
@@ -1520,6 +1534,7 @@ async fn drive_session(
     agent_source_id: Option<String>,
     config_path: Option<PathBuf>,
     saved_session_config: HashMap<String, String>,
+    role_config: Option<RuntimeRoleConfig>,
     code_agent: Option<code_agent::Config>,
     code_agent_controller: code_agent::Controller,
     primary_updates_suppressed: Arc<AtomicBool>,
@@ -1706,6 +1721,18 @@ async fn drive_session(
         },
     };
     let (session_config_options, session_config_targets) = initial_config.unwrap_or_default();
+    let mut session_config = SessionConfigCache {
+        options: session_config_options,
+        targets: session_config_targets,
+    };
+    if let Some(role) = role_config.as_ref()
+        && let Err(error) =
+            apply_runtime_role_config(&conn, &session_id, &mut session_config, role, ui_tx).await
+    {
+        let text = format!("{} configuration failed: {error}", role.label);
+        emit_fatal(ui_tx, &fatal_emitted, text.clone());
+        return Err(anyhow::anyhow!(text));
+    }
     if let Some(server) = &code_agent_http
         && let Err(error) = server
             .wait_until_tools_listed(Duration::from_secs(30))
@@ -1725,10 +1752,6 @@ async fn drive_session(
             return Err(anyhow::anyhow!(text));
         }
     }
-    let mut session_config = SessionConfigCache {
-        options: session_config_options,
-        targets: session_config_targets,
-    };
     if !resumed && !saved_session_config.is_empty() {
         apply_saved_session_config(
             &conn,
@@ -3625,6 +3648,113 @@ async fn apply_saved_session_config(
             }
         }
     }
+}
+
+fn select_option_named(
+    option: &SessionConfigOption,
+    wanted_value: Option<&str>,
+    wanted_name: &str,
+) -> Option<SessionConfigValueId> {
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+    let matches = |choice: &SessionConfigSelectOption| {
+        wanted_value.is_some_and(|wanted| choice.value.to_string() == wanted)
+            || choice.name.eq_ignore_ascii_case(wanted_name)
+            || choice.value.to_string().eq_ignore_ascii_case(wanted_name)
+    };
+    match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => options
+            .iter()
+            .find(|choice| matches(choice))
+            .map(|choice| choice.value.clone()),
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .find(|choice| matches(choice))
+            .map(|choice| choice.value.clone()),
+        _ => None,
+    }
+}
+
+async fn apply_runtime_role_config(
+    conn: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    session_config: &mut SessionConfigCache,
+    role: &RuntimeRoleConfig,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+) -> Result<()> {
+    let model_index = session_config
+        .options
+        .iter()
+        .position(|option| matches!(option.category, Some(SessionConfigOptionCategory::Model)));
+    let Some(model_index) = model_index else {
+        anyhow::bail!("ACP adapter did not advertise a model configuration control");
+    };
+    let model_value = select_option_named(
+        &session_config.options[model_index],
+        Some(&role.model_value),
+        &role.model_value,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "ACP adapter no longer advertises selected model '{}'",
+            role.model_value
+        )
+    })?;
+    let target = session_config.targets[model_index].clone();
+    if config_option_current_value(&session_config.options[model_index]) != Some(&model_value) {
+        match send_config_update(conn, session_id, target.clone(), model_value.clone()).await? {
+            Some(options) => {
+                session_config.targets = config_option_targets(&options);
+                session_config.options = options;
+            }
+            None => set_current_config_value(
+                &mut session_config.options,
+                &session_config.targets,
+                &target,
+                &model_value,
+            ),
+        }
+    }
+
+    if role.force_high_reasoning {
+        let high = session_config
+            .options
+            .iter()
+            .enumerate()
+            .find_map(|(index, option)| {
+                matches!(
+                    option.category,
+                    Some(SessionConfigOptionCategory::ThoughtLevel)
+                )
+                .then(|| select_option_named(option, None, "High").map(|value| (index, value)))
+                .flatten()
+            });
+        if let Some((index, value)) = high {
+            let target = session_config.targets[index].clone();
+            if config_option_current_value(&session_config.options[index]) != Some(&value) {
+                match send_config_update(conn, session_id, target.clone(), value.clone()).await? {
+                    Some(options) => {
+                        session_config.targets = config_option_targets(&options);
+                        session_config.options = options;
+                    }
+                    None => set_current_config_value(
+                        &mut session_config.options,
+                        &session_config.targets,
+                        &target,
+                        &value,
+                    ),
+                }
+            }
+        } else {
+            let _ = ui_tx.send(UiEvent::Warning(format!(
+                "{} · {} does not advertise a High reasoning control; retaining its native setting",
+                role.label, role.model_value
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn config_option_current_value(option: &SessionConfigOption) -> Option<&SessionConfigValueId> {
@@ -7434,6 +7564,7 @@ mod tests {
             agent_source_id: None,
             config_path: None,
             saved_session_config: HashMap::new(),
+            role_config: None,
             code_agent: None,
         };
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
@@ -7492,6 +7623,7 @@ mod tests {
             agent_source_id: None,
             config_path: None,
             saved_session_config: HashMap::new(),
+            role_config: None,
             code_agent: None,
         };
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
@@ -7629,6 +7761,7 @@ mod tests {
             agent_source_id: None,
             config_path: None,
             saved_session_config: HashMap::new(),
+            role_config: None,
             code_agent: None,
         };
         assert_run_reports_agent_exited(cfg).await;
@@ -7656,6 +7789,7 @@ mod tests {
             agent_source_id: None,
             config_path: None,
             saved_session_config: HashMap::new(),
+            role_config: None,
             code_agent: None,
         };
         assert_run_reports_agent_exited(cfg).await;

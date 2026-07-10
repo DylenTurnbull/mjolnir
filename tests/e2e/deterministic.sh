@@ -36,8 +36,16 @@ run_case() {
   }
   trap cleanup_case EXIT INT TERM
   workspace="$root/workspace"
-  mkdir -p "$workspace" "$root/home/.config/mj" "$root/home/Library/Application Support/mj"
-  config="[agent]\nsource_id = \"custom:e2e-primary\"\nprogram = \"$node\"\nargs = [\"$repo/tests/e2e/primary-agent.mjs\"]\n"
+  mkdir -p "$workspace" "$root/home/.config/mj" "$root/home/Library/Application Support/mj" \
+    "$root/home/.cache/mj" "$root/home/Library/Caches/mj" "$root/home/.codex"
+  printf '{}\n' >"$root/home/.codex/auth.json"
+  cp "$repo/src/deepswe_snapshot.json" "$root/home/.cache/mj/deepswe-v1.1.json"
+  cp "$repo/src/deepswe_snapshot.json" "$root/home/Library/Caches/mj/deepswe-v1.1.json"
+  config="[agent]\nsource_id = \"custom:e2e-primary\"\nprogram = \"$node\"\nargs = [\"$repo/tests/e2e/primary-agent.mjs\"]\n\n[models]\neitri = \"gpt-5-6-luna\"\n"
+  case $mode in
+    loki-eitri|loki-thor) config="$config\n[loki]\nstreaming_review = true\n" ;;
+    loki-final) config="$config\n[loki]\nfinal_review = true\n" ;;
+  esac
   printf '%b' "$config" >"$root/home/.config/mj/config.toml"
   printf '%b' "$config" >"$root/home/Library/Application Support/mj/config.toml"
 
@@ -59,6 +67,7 @@ run_case() {
 
   HOME="$root/home" \
   XDG_CONFIG_HOME="$root/home/.config" \
+  XDG_CACHE_HOME="$root/home/.cache" \
   PATH="$repo/tests/e2e/fake-bin:$PATH" \
   MJ_E2E_BIN="$bin" \
   MJ_E2E_MODE="$mode" \
@@ -68,6 +77,7 @@ run_case() {
   MJ_E2E_PRIMARY_PID="$root/primary.pid" \
   MJ_E2E_NESTED_LOG="$root/nested.log" \
   MJ_E2E_NESTED_PID="$root/nested.pid" \
+  MJ_E2E_LOKI_LOG="$root/loki.log" \
   MJ_E2E_TRANSCRIPT="$root/transcript.log" \
   MJ_E2E_DEBUG_LOG="$root/mj.log" \
   MJ_E2E_AGENT_STDERR="$root/agent.stderr" \
@@ -90,18 +100,27 @@ run_case() {
       echo "unsupported primary received session/new" >&2
       exit 1
     fi
-  elif [ "$mode" = complete ]; then
+  elif [ "$mode" = complete ] || [ "$mode" = loki-eitri ] || [ "$mode" = loki-thor ] || [ "$mode" = loki-final ]; then
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
     test -s "$root/primary-result.json"
-    grep -a "code agent" "$root/transcript.log" >/dev/null
-    grep -a "CODEAGENT_E2E_OK" "$root/transcript.log" >/dev/null
+    grep -a "Eitri" "$root/transcript.log" >/dev/null
+    if [ "$mode" = loki-final ]; then
+      grep -a "PRIMARY FINAL REVIEWED" "$root/transcript.log" >/dev/null
+      grep -a 'no_intervention' "$root/loki.log" >/dev/null
+    else
+      grep -a "CODEAGENT_E2E_OK" "$root/transcript.log" >/dev/null
+    fi
+    if [ "$mode" = loki-eitri ] || [ "$mode" = loki-thor ]; then
+      grep -a '"decision":"intervention"' "$root/loki.log" >/dev/null
+      grep -a "Loki intervenes against" "$root/transcript.log" >/dev/null
+    fi
     grep -a "nested-terminal-output" "$root/transcript.log" >/dev/null
     grep -a 'permission:' "$root/nested.log" >/dev/null
     node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); const done=Number(fs.readFileSync(process.argv[2],"utf8").match(/completion:(\d+)/)?.[1]); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || r.response.isError || text!=="CODEAGENT_E2E_OK" || !done || r.toolReceivedAt<done) process.exit(1)' "$root/primary-result.json" "$root/nested.log"
   else
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
     test -s "$root/primary-result.json"
-    grep -a "code agent" "$root/transcript.log" >/dev/null
+    grep -a "Eitri" "$root/transcript.log" >/dev/null
     grep -a "cancel-received" "$root/nested.log" >/dev/null
     node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])); if(r.error || r.unauthorizedStatus!==401 || !r.response.isError) process.exit(1)' "$root/primary-result.json"
   fi
@@ -113,7 +132,11 @@ case ${MJ_E2E_CASE:-both} in
   complete) run_case complete ;;
   cancel) run_case cancel ;;
   unsupported) run_case unsupported ;;
+  loki-eitri) run_case loki-eitri ;;
+  loki-thor) run_case loki-thor ;;
+  loki-final) run_case loki-final ;;
   both) run_case complete; run_case cancel; run_case unsupported ;;
-  *) echo "MJ_E2E_CASE must be complete, cancel, unsupported, or both" >&2; exit 2 ;;
+  council) run_case complete; run_case cancel; run_case unsupported; run_case loki-eitri; run_case loki-thor; run_case loki-final ;;
+  *) echo "MJ_E2E_CASE must be complete, cancel, unsupported, loki-eitri, loki-thor, loki-final, both, or council" >&2; exit 2 ;;
 esac
 echo "deterministic code-agent PTY E2E passed"

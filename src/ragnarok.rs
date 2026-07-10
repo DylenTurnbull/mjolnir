@@ -1366,6 +1366,27 @@ impl AgentHandle {
         access_mode: acp::RuntimeAccessMode,
         saved_session_config: HashMap<String, String>,
     ) -> Result<Self> {
+        Self::connect_with_role_config(
+            launch,
+            cwd,
+            additional_directories,
+            abort,
+            access_mode,
+            saved_session_config,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_with_role_config(
+        launch: &Launch,
+        cwd: &Path,
+        additional_directories: &[PathBuf],
+        abort: watch::Receiver<bool>,
+        access_mode: acp::RuntimeAccessMode,
+        saved_session_config: HashMap<String, String>,
+        role_config: Option<acp::RuntimeRoleConfig>,
+    ) -> Result<Self> {
         let (event_tx, events) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let runtime_cfg = acp::AcpRuntimeConfig {
@@ -1382,6 +1403,7 @@ impl AgentHandle {
             agent_source_id: None,
             config_path: None,
             saved_session_config,
+            role_config,
             code_agent: None,
         };
         let runtime = tokio::spawn(acp::run(runtime_cfg, event_tx, cmd_rx));
@@ -1719,7 +1741,7 @@ fn prompt_rejected_transiently(message: &str) -> bool {
         || message.contains("prompt already in flight")
 }
 
-fn permission_decision_for_access(
+pub(crate) fn permission_decision_for_access(
     access_mode: acp::RuntimeAccessMode,
     prompt: &crate::event::PermissionPrompt,
 ) -> PermissionDecision {

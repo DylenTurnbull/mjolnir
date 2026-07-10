@@ -22,26 +22,44 @@ if {$mode eq "unsupported"} {
 }
 
 expect {
-    -re {F10 help} { after 1500; send -- "write a hello world program in Python\r" }
+    -re {F1 Model} { after 300; send -- "write a hello world program in Python\r" }
     timeout { exit 19 }
 }
 
 if {$mode eq "cancel"} {
     expect {
-        -re {code agent.*codex} { after 500; send_ctrl_c }
+        -re {Eitri.*gpt-5-6-luna} { after 500; send_ctrl_c }
         timeout { exit 20 }
     }
     expect {
-        -re {PRIMARY CANCELLED} {}
+        -re {Eitri.*cancelled} { after 500; send_ctrl_c }
         timeout { exit 21 }
     }
 } else {
-    expect {
-        -re {codex permission} { send -- "\r" }
-        timeout { exit 22 }
-    }
-    expect {
-        -re {PRIMARY RECEIVED:.*CODEAGENT_E2E_OK} {}
-        timeout { exit 23 }
+    if {$mode eq "loki-final"} {
+        expect {
+            -re {Eitri permission} { send -- "\r"; exp_continue }
+            -re {final verdict delivered to Thor} { after 800; send_ctrl_c }
+            timeout { exit 23 }
+        }
+    } elseif {$mode eq "loki-thor"} {
+        expect {
+            -re {Eitri permission} { send -- "\r"; exp_continue }
+            -re {Loki intervenes against Thor} {
+                expect {
+                    -re {Eitri permission} { send -- "\r"; exp_continue }
+                    -re {Eitri.*complete} { after 500; send_ctrl_c }
+                    timeout { exit 24 }
+                }
+            }
+            timeout { exit 23 }
+        }
+    } else {
+        expect {
+            -re {Eitri permission} { send -- "\r"; exp_continue }
+            -re {Eitri.*complete} { after 500; send_ctrl_c }
+            timeout { exit 23 }
+        }
     }
 }
+expect eof

@@ -152,6 +152,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         agent_source_id: Some(agent_source_id),
         config_path: Some(config_path),
         saved_session_config,
+        role_config: None,
         code_agent: None,
     };
 

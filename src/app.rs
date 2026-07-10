@@ -41,6 +41,7 @@ const BUILTIN_LOAD_COMMAND: &str = "load";
 const BUILTIN_FORK_COMMAND: &str = "fork";
 const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
+const BUILTIN_COUNCIL_COMMAND: &str = "council";
 const BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
 
@@ -77,6 +78,13 @@ fn builtin_mjconfig_command() -> AvailableCommand {
     )
 }
 
+fn builtin_council_command() -> AvailableCommand {
+    AvailableCommand::new(
+        BUILTIN_COUNCIL_COMMAND,
+        "show or select Thor/Loki/Eitri models (usage: /council [role model|auto])",
+    )
+}
+
 fn builtin_ragnarok_command() -> AvailableCommand {
     AvailableCommand::new(
         BUILTIN_RAGNAROK_COMMAND,
@@ -92,6 +100,7 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
             && command.name != BUILTIN_FORK_COMMAND
             && command.name != BUILTIN_EXPORT_COMMAND
             && command.name != BUILTIN_MJCONFIG_COMMAND
+            && command.name != BUILTIN_COUNCIL_COMMAND
             && command.name != BUILTIN_RAGNAROK_COMMAND
     });
     if include_fork {
@@ -99,6 +108,7 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
     }
     commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_mjconfig_command());
+    commands.insert(0, builtin_council_command());
     commands.insert(0, builtin_export_command());
     commands.insert(0, builtin_load_command());
     commands.insert(0, builtin_clear_command());
@@ -667,6 +677,9 @@ pub struct AppState {
     pub transcript_export_dir: Option<PathBuf>,
     /// Config file used by local UI-only settings such as `/mjconfig`.
     pub config_path: Option<PathBuf>,
+    /// DeepSWE model catalog and current model-first council selectors.
+    pub council_choices: Vec<crate::council::ModelChoice>,
+    pub council_models: crate::config::ModelsConfig,
     /// Holds the platform clipboard lease so copied text remains available
     /// on Linux/X11 where the owning process must stay alive.
     #[allow(dead_code)]
@@ -938,6 +951,8 @@ impl AppState {
             additional_roots: 0,
             transcript_export_dir: None,
             config_path: None,
+            council_choices: Vec::new(),
+            council_models: crate::config::ModelsConfig::default(),
             clipboard_lease: None,
             queued_prompts: VecDeque::new(),
         }
@@ -1026,6 +1041,73 @@ impl AppState {
             self.set_theme(menu.orig_theme);
             self.set_spinner_style(menu.orig_spinner);
         }
+    }
+
+    pub fn council_summary(&self) -> String {
+        let mut text = format!(
+            "Council models (change with /council <thor|loki|eitri> <auto|model-id>)\nThor: {}\nLoki: {}\nEitri: {}\n\nAuto (DeepSWE)\n",
+            self.council_models.thor, self.council_models.loki, self.council_models.eitri
+        );
+        for choice in &self.council_choices {
+            if choice.available {
+                text.push_str(&format!(
+                    "✓ {} · Pass@1 {:.1}% · ${:.2}\n",
+                    choice.model,
+                    choice.pass_at_1 * 100.0,
+                    choice.mean_cost_usd
+                ));
+            } else {
+                text.push_str(&format!(
+                    "× {} · {}\n",
+                    choice.model,
+                    choice.disabled_reason.as_deref().unwrap_or("unavailable")
+                ));
+            }
+        }
+        text
+    }
+
+    pub fn set_council_model(&mut self, role: &str, model: &str) -> Result<String, String> {
+        if model != "auto" {
+            let choice = self
+                .council_choices
+                .iter()
+                .find(|choice| choice.model == model)
+                .ok_or_else(|| format!("unknown DeepSWE model '{model}'"))?;
+            if !choice.available {
+                return Err(format!(
+                    "model '{model}' is unavailable: {}",
+                    choice
+                        .disabled_reason
+                        .as_deref()
+                        .unwrap_or("not launchable")
+                ));
+            }
+        }
+        let mut next = self.council_models.clone();
+        match role.to_ascii_lowercase().as_str() {
+            "thor" => next.thor = model.to_string(),
+            "loki" => next.loki = model.to_string(),
+            "eitri" => next.eitri = model.to_string(),
+            _ => return Err("role must be thor, loki, or eitri".to_string()),
+        }
+        if next.thor != "auto" && next.loki == next.thor {
+            return Err("Loki must use a model distinct from Thor".to_string());
+        }
+        let path = self
+            .config_path
+            .as_deref()
+            .ok_or_else(|| "config path is unavailable".to_string())?;
+        let mut config =
+            crate::config::Config::load(path).map_err(|error| format!("load config: {error:#}"))?;
+        config.models = next.clone();
+        config
+            .save(path)
+            .map_err(|error| format!("save config: {error:#}"))?;
+        self.council_models = next;
+        Ok(format!(
+            "{role} model set to {model}; starts with the next session"
+        ))
     }
 
     /// Stage a prompt to fire when the current turn completes.
@@ -1966,10 +2048,10 @@ impl AppState {
                 instructions,
             } => {
                 self.code_agent_active = true;
-                self.push_session_boundary(format!("code agent · {label}"));
+                self.push_session_boundary(label.clone());
                 self.transcript.push(Entry::CodeAgentPrompt(instructions));
                 self.bump_transcript_revision();
-                self.set_status_line(StatusKind::Info, format!("code agent · {label}"));
+                self.set_status_line(StatusKind::Info, label);
             }
             CodeAgentEvent::SessionUpdate(update) => self.apply_code_agent_update(update),
             CodeAgentEvent::TerminalOutput(mut snapshot) => {
@@ -2006,20 +2088,20 @@ impl AppState {
                 self.mark_code_agent_tools_failed("tool call cancelled");
             }
             CodeAgentEvent::Status(message) => {
-                self.push_system_message(format!("codex: {message}"));
+                self.push_system_message(format!("Eitri: {message}"));
             }
             CodeAgentEvent::Finished { outcome } => {
                 self.code_agent_active = false;
                 self.cancel_code_agent_prompts();
                 let label = match outcome {
-                    CodeAgentOutcome::Completed => "code agent complete".to_string(),
+                    CodeAgentOutcome::Completed => "Eitri · complete".to_string(),
                     CodeAgentOutcome::Cancelled => {
                         self.mark_code_agent_tools_failed("tool call cancelled");
-                        "code agent cancelled".to_string()
+                        "Eitri · cancelled".to_string()
                     }
                     CodeAgentOutcome::Failed(message) => {
                         self.mark_code_agent_tools_failed("tool call failed");
-                        format!("code agent failed · {message}")
+                        format!("Eitri · failed · {message}")
                     }
                 };
                 self.push_session_boundary(label);
@@ -4946,7 +5028,9 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "clear", "load", "export", "mjconfig", "ragnarok"]
+            vec![
+                "new", "clear", "load", "export", "council", "mjconfig", "ragnarok"
+            ]
         );
     }
 
@@ -4972,7 +5056,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "load", "export", "mjconfig", "ragnarok", "fork"
+                "new", "clear", "load", "export", "council", "mjconfig", "ragnarok", "fork"
             ]
         );
     }
@@ -5008,6 +5092,7 @@ mod tests {
                 "clear",
                 "load",
                 "export",
+                "council",
                 "mjconfig",
                 "ragnarok",
                 "fork",
@@ -5029,10 +5114,10 @@ mod tests {
         );
         assert_eq!(
             s.available_commands[4].description,
-            "open the mj config menu (theme + spinner)"
+            "show or select Thor/Loki/Eitri models (usage: /council [role model|auto])"
         );
         assert_eq!(
-            s.available_commands[6].description,
+            s.available_commands[7].description,
             "fork the current session (unstable ACP extension)"
         );
     }
@@ -5059,6 +5144,7 @@ mod tests {
                 "clear",
                 "load",
                 "export",
+                "council",
                 "mjconfig",
                 "ragnarok",
                 "review_pr"
@@ -5749,4 +5835,40 @@ mod tests {
         arena.scroll_feed(-99);
         assert_eq!(arena.feed_scroll_for_rows(2), 0);
     }
+}
+#[cfg(test)]
+#[test]
+fn council_model_selection_persists_and_rejects_disabled_choice() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    crate::config::Config::default().save(&path).expect("save");
+    let mut state = AppState::new();
+    state.config_path = Some(path.clone());
+    state.council_choices = vec![
+        crate::council::ModelChoice {
+            model: "gpt-test".to_string(),
+            pass_at_1: 0.5,
+            mean_cost_usd: 1.0,
+            available: true,
+            disabled_reason: None,
+        },
+        crate::council::ModelChoice {
+            model: "claude-disabled".to_string(),
+            pass_at_1: 0.4,
+            mean_cost_usd: 2.0,
+            available: false,
+            disabled_reason: Some("claude executable not found on PATH".to_string()),
+        },
+    ];
+
+    state.set_council_model("thor", "gpt-test").expect("select");
+    assert_eq!(
+        crate::config::Config::load(&path).unwrap().models.thor,
+        "gpt-test"
+    );
+    let error = state
+        .set_council_model("eitri", "claude-disabled")
+        .expect_err("disabled model");
+    assert!(error.contains("claude executable not found on PATH"));
+    assert!(state.council_summary().contains("× claude-disabled"));
 }

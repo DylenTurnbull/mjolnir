@@ -1968,6 +1968,7 @@ fn start_server_agent_session(
         agent_source_id: Some(agent_source_id),
         config_path: Some(config_path),
         saved_session_config,
+        role_config: None,
         code_agent: None,
     };
     let command_tx = server_cmd_tx.clone();

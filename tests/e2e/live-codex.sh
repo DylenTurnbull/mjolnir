@@ -3,7 +3,6 @@ set -eu
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 bin=${MJ_E2E_BIN:-"$repo/target/debug/mj"}
-npx=$(command -v npx)
 real_home=$HOME
 root=$(mktemp -d "${TMPDIR:-/tmp}/mj-code-agent-live.XXXXXX")
 cleanup() {
@@ -22,7 +21,7 @@ nonce=$(date +%s)-$$
 target="$workspace/codeagent-live-$nonce.txt"
 token="CODEAGENT_LIVE_OK_$nonce"
 
-config="[agent]\nsource_id = \"custom:live-codex-primary\"\nprogram = \"$npx\"\nargs = [\"-y\", \"@agentclientprotocol/codex-acp\"]\n"
+config="[models]\nthor = \"auto\"\nloki = \"auto\"\neitri = \"auto\"\n"
 printf '%b' "$config" >"$root/home/.config/mj/config.toml"
 printf '%b' "$config" >"$root/home/Library/Application Support/mj/config.toml"
 
@@ -45,8 +44,8 @@ MJ_E2E_EXIT_ON_RUNTIME_CLOSE=1 \
   expect "$repo/tests/e2e/drive-live.exp"
 
 node -e 'const fs=require("fs"); if(!fs.readFileSync(process.argv[1]).equals(Buffer.from("live-code-agent-ok"))) process.exit(1)' "$target"
-grep -a "code agent" "$root/transcript.log" >/dev/null
-grep -a "codex tool" "$root/transcript.log" >/dev/null
+grep -a "Eitri" "$root/transcript.log" >/dev/null
+grep -a "Eitri tool" "$root/transcript.log" >/dev/null
 grep -a "$token" "$root/transcript.log" >/dev/null
 
 sleep 1

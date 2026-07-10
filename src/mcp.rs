@@ -1050,6 +1050,7 @@ impl McpServer {
             agent_source_id: resolved.source_id,
             config_path: Some(self.config.config_path.clone()),
             saved_session_config: resolved.saved_session_config,
+            role_config: None,
             code_agent: None,
         })
     }

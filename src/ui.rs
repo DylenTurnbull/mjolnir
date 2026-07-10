@@ -324,6 +324,8 @@ pub struct UiRunOptions<'a> {
     pub session_boundary: Option<String>,
     /// The ACP session cwd; `/ragnarok` battles are rooted here.
     pub session_cwd: PathBuf,
+    pub council_choices: Vec<crate::council::ModelChoice>,
+    pub council_models: crate::config::ModelsConfig,
 }
 
 pub struct UiRunResult {
@@ -347,6 +349,8 @@ struct UiInitialState {
     spinner_style: SpinnerStyle,
     session_boundary: Option<String>,
     session_cwd: PathBuf,
+    council_choices: Vec<crate::council::ModelChoice>,
+    council_models: crate::config::ModelsConfig,
 }
 
 /// Internal result of [`ui_loop`]. `run` unpacks it into the public
@@ -401,6 +405,8 @@ pub async fn run(
             spinner_style: options.spinner_style,
             session_boundary: options.session_boundary,
             session_cwd: options.session_cwd,
+            council_choices: options.council_choices,
+            council_models: options.council_models,
         },
         options.mode,
     )
@@ -582,6 +588,8 @@ async fn ui_loop(
     state.score_store = initial.score_store;
     state.active_agent_launch = initial.active_agent_launch;
     state.session_cwd = initial.session_cwd;
+    state.council_choices = initial.council_choices;
+    state.council_models = initial.council_models;
     state.transcript_export_dir = initial.transcript_export_dir;
     state.set_theme(initial.theme_kind);
     state.set_spinner_style(initial.spinner_style);
@@ -978,7 +986,7 @@ fn notification_message_for_event(
         )),
         UiEvent::PermissionRequest(prompt) => Some(permission_request_notification(prompt)),
         UiEvent::CodeAgent(crate::event::CodeAgentEvent::PermissionRequest(prompt)) => Some(
-            format!("Codex: {}", permission_request_notification(prompt)),
+            format!("Eitri: {}", permission_request_notification(prompt)),
         ),
         _ => None,
     }
@@ -1978,7 +1986,7 @@ fn cancel_current_turn(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCo
     }
     let _ = cmd_tx.send(UiCommand::CancelPrompt);
     if state.code_agent_active {
-        state.status_line = Some(StatusMessage::info("cancelling code agent..."));
+        state.status_line = Some(StatusMessage::info("cancelling Eitri..."));
         return;
     }
     state.mark_cancelling();
@@ -3123,6 +3131,28 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
+    if images.is_empty() && (text == "/council" || text.starts_with("/council ")) {
+        state.input.clear();
+        clear_attachments(state);
+        state.input_cursor = 0;
+        state.scroll_input_to_bottom();
+        let args = text["/council".len()..]
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        match args.as_slice() {
+            [] => state.record_status_message(StatusKind::Info, state.council_summary()),
+            [role, model] => match state.set_council_model(role, model) {
+                Ok(message) => state.record_status_message(StatusKind::Info, message),
+                Err(message) => state.record_status_message(StatusKind::Warning, message),
+            },
+            _ => state.record_status_message(
+                StatusKind::Warning,
+                "usage: /council [thor|loki|eitri auto|model-id]",
+            ),
+        }
+        return;
+    }
+
     if images.is_empty() && text == "/export" {
         state.input.clear();
         clear_attachments(state);
@@ -3558,9 +3588,9 @@ fn transcript_export_markdown(state: &AppState) -> String {
             Entry::UserPrompt(text) => push_export_text(&mut out, "You", text),
             Entry::AgentMessage(text) => push_export_text(&mut out, "Agent", text),
             Entry::AgentThought(text) => push_export_text(&mut out, "Thought", text),
-            Entry::CodeAgentPrompt(text) => push_export_text(&mut out, "Primary → Codex", text),
-            Entry::CodeAgentMessage(text) => push_export_text(&mut out, "Codex", text),
-            Entry::CodeAgentThought(text) => push_export_text(&mut out, "Codex Thought", text),
+            Entry::CodeAgentPrompt(text) => push_export_text(&mut out, "Thor → Eitri", text),
+            Entry::CodeAgentMessage(text) => push_export_text(&mut out, "Eitri", text),
+            Entry::CodeAgentThought(text) => push_export_text(&mut out, "Eitri Thought", text),
             Entry::ActorActivity(activity) => push_export_text(
                 &mut out,
                 &actor_activity_label(activity),
@@ -3570,7 +3600,7 @@ fn transcript_export_markdown(state: &AppState) -> String {
             Entry::SessionBoundary(text) => push_export_text(&mut out, "Session", text),
             Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
                 let heading = if matches!(entry, Entry::CodeAgentPlan(_)) {
-                    "## Codex Plan\n\n"
+                    "## Eitri Plan\n\n"
                 } else {
                     "## Plan\n\n"
                 };
@@ -3588,7 +3618,7 @@ fn transcript_export_markdown(state: &AppState) -> String {
             Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
                 if let Some(view) = state.tool_calls.get(id) {
                     let label = if matches!(entry, Entry::CodeAgentToolCall(_)) {
-                        "Codex Tool"
+                        "Eitri Tool"
                     } else {
                         "Tool"
                     };
@@ -4911,14 +4941,14 @@ fn render_transcript_entry_range(
                 push_markdown_block(&mut out, "thought", theme.thought, text.clone(), theme)
             }
             Entry::CodeAgentPrompt(text) => {
-                push_plain_block(&mut out, "primary → codex", theme.user, text.clone())
+                push_plain_block(&mut out, "Thor → Eitri", theme.user, text.clone())
             }
             Entry::CodeAgentMessage(text) => {
-                push_markdown_block(&mut out, "codex", theme.agent, text.clone(), theme)
+                push_markdown_block(&mut out, "Eitri", theme.agent, text.clone(), theme)
             }
             Entry::CodeAgentThought(text) => push_markdown_block(
                 &mut out,
-                "codex thought",
+                "Eitri thought",
                 theme.thought,
                 text.clone(),
                 theme,
@@ -4948,7 +4978,7 @@ fn render_transcript_entry_range(
             }
             Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
                 let label = if matches!(entry, Entry::CodeAgentPlan(_)) {
-                    "codex plan"
+                    "Eitri plan"
                 } else {
                     "plan"
                 };
@@ -4980,7 +5010,7 @@ fn render_transcript_entry_range(
                     // already implies success. Only annotate non-completed states
                     // (pending/running/failed/interrupted) so they stand out.
                     let tool_label = if matches!(entry, Entry::CodeAgentToolCall(_)) {
-                        "codex tool"
+                        "Eitri tool"
                     } else {
                         "tool"
                     };
@@ -7163,7 +7193,7 @@ fn permission_view_lines(
 ) -> Vec<Line<'static>> {
     let selected = clamp_permission_selected(pending.selected, pending.prompt.options.len());
     let source = if pending.code_agent {
-        "codex permission"
+        "Eitri permission"
     } else {
         "permission request"
     };
@@ -7257,7 +7287,7 @@ fn elicitation_view_lines(
 ) -> ElicitationContent {
     let view = classify_elicitation(&pending.prompt);
     let source = if pending.code_agent {
-        "codex setup"
+        "Eitri setup"
     } else {
         "setup request"
     };

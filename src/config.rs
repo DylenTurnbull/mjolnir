@@ -32,12 +32,62 @@ pub struct Config {
     /// keyed by agent source id and then config option id.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub session_config: HashMap<String, HashMap<String, String>>,
+    /// Model-first council role selection. ACP adapters are resolved internally.
+    #[serde(default, skip_serializing_if = "ModelsConfig::is_default")]
+    pub models: ModelsConfig,
+    /// Optional Loki review behavior.
+    #[serde(default, skip_serializing_if = "LokiConfig::is_default")]
+    pub loki: LokiConfig,
     /// Model strength score (LMArena Elo) display in the picker.
     #[serde(default, skip_serializing_if = "ScoresConfig::is_default")]
     pub scores: ScoresConfig,
     /// `/ragnarok` battle knobs.
     #[serde(default, skip_serializing_if = "RagnarokConfig::is_default")]
     pub ragnarok: RagnarokConfig,
+}
+
+fn default_auto() -> String {
+    "auto".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ModelsConfig {
+    #[serde(default = "default_auto")]
+    pub thor: String,
+    #[serde(default = "default_auto")]
+    pub loki: String,
+    #[serde(default = "default_auto")]
+    pub eitri: String,
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            thor: default_auto(),
+            loki: default_auto(),
+            eitri: default_auto(),
+        }
+    }
+}
+
+impl ModelsConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LokiConfig {
+    #[serde(default)]
+    pub streaming_review: bool,
+    #[serde(default)]
+    pub final_review: bool,
+}
+
+impl LokiConfig {
+    fn is_default(&self) -> bool {
+        !self.streaming_review && !self.final_review
+    }
 }
 
 /// Knobs for `/ragnarok` battles.
@@ -361,6 +411,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let cfg = Config {
+            models: ModelsConfig::default(),
+            loki: LokiConfig::default(),
             theme: TerminalThemeKind::Light,
             spinner: SpinnerStyle::default(),
             agent: Some(SelectedAgent {
@@ -391,6 +443,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nested").join("deep").join("config.toml");
         let cfg = Config {
+            models: ModelsConfig::default(),
+            loki: LokiConfig::default(),
             theme: TerminalThemeKind::Dark,
             spinner: SpinnerStyle::default(),
             agent: Some(SelectedAgent {
@@ -477,6 +531,8 @@ args = ["--config", "$HOME/.config/agent.toml", "${HOME}/literal"]
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let cfg = Config {
+            models: ModelsConfig::default(),
+            loki: LokiConfig::default(),
             theme: TerminalThemeKind::AnsiDark,
             spinner: SpinnerStyle::default(),
             agent: None,

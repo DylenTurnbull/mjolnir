@@ -37,23 +37,29 @@ use tokio_util::sync::CancellationToken;
 
 use crate::acp::{self, AcpRuntimeConfig, RuntimeAccessMode};
 use crate::event::{CodeAgentEvent, CodeAgentOutcome, UiCommand, UiEvent, content_block_text};
+use crate::loki;
 
-pub const LABEL: &str = "codex";
+pub const LABEL: &str = "Eitri";
 pub const MCP_SERVER_NAME: &str = "mj-code-agent";
-pub const PRIMARY_SESSION_DIRECTIVE: &str = "<mj-code-agent-policy>\nYou are the primary coordinator, not the implementation agent. This policy applies to every subsequent user request in this ACP session. If a user asks to create, modify, debug, refactor, test, or otherwise implement code, you MUST call the code_agent MCP tool from the mj-code-agent server before using any other tool. Do not inspect files, edit files, or run implementation commands yourself, even when the task is trivial. Pass the complete user request and all relevant context as standalone instructions, wait for the delegated agent to finish, then answer the user from its result. If a request requires no code changes, answer it yourself without calling code_agent. Do not call any tool now. Acknowledge this policy with exactly MJ_CODE_AGENT_POLICY_READY.\n</mj-code-agent-policy>";
+pub const PRIMARY_SESSION_DIRECTIVE: &str = "<mj-code-agent-policy>\nYou are Thor, the primary coordinator. Eitri is the implementation agent exposed as the code_agent MCP tool. This policy applies to every subsequent user request in this ACP session. If a user asks to create, modify, debug, refactor, test, or otherwise implement code, you MUST call code_agent before using any other tool. Do not inspect files, edit files, or run implementation commands yourself, even when the task is trivial. Pass the complete user request and all relevant context as standalone instructions, wait for Eitri to finish, then answer the user from its result. If a request requires no code changes, answer it yourself without calling code_agent. Do not call any tool now. Acknowledge this policy with exactly MJ_CODE_AGENT_POLICY_READY.\n</mj-code-agent-policy>";
 const MCP_PATH: &str = "/mcp";
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub display_label: String,
     pub command: PathBuf,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub agent_stderr: Option<PathBuf>,
+    pub role_config: Option<acp::RuntimeRoleConfig>,
+    pub loki: Option<loki::Handle>,
 }
 
 impl Config {
+    #[cfg(test)]
     pub fn codex(agent_stderr: Option<PathBuf>, env: HashMap<String, String>) -> Self {
         Self {
+            display_label: "Eitri · codex".to_string(),
             command: PathBuf::from("npx"),
             args: vec![
                 "-y".to_string(),
@@ -61,6 +67,32 @@ impl Config {
             ],
             env,
             agent_stderr,
+            role_config: None,
+            loki: None,
+        }
+    }
+
+    pub fn council(
+        command: PathBuf,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        agent_stderr: Option<PathBuf>,
+        model_id: String,
+        model_value: String,
+        loki: Option<loki::Handle>,
+    ) -> Self {
+        Self {
+            display_label: format!("Eitri · {model_id}"),
+            command,
+            args,
+            env,
+            agent_stderr,
+            role_config: Some(acp::RuntimeRoleConfig {
+                label: LABEL.to_string(),
+                model_value,
+                force_high_reasoning: true,
+            }),
+            loki,
         }
     }
 }
@@ -111,7 +143,7 @@ impl McpHandler {
 
     #[tool(
         name = "code_agent",
-        description = "MANDATORY CODING ROUTER. For EVERY user request that asks to create, modify, debug, refactor, test, or otherwise implement code, call this tool BEFORE using any other tool or doing the work yourself. This rule applies even when the task is trivial and even when you could complete it directly. You are the coordinator: do not read, edit, write, or run commands for an implementation task yourself. Pass complete standalone instructions including the desired outcome, relevant constraints, and verification requirements. Wait for the delegated agent's final message, then use that result to finish your response. Do not call this tool only for explanation-only or informational requests that require no code changes."
+        description = "MANDATORY CODING ROUTER (EITRI). For EVERY user request that asks to create, modify, debug, refactor, test, or otherwise implement code, call this tool BEFORE using any other tool or doing the work yourself. This rule applies even when the task is trivial. You are Thor, the coordinator: do not read, edit, write, or run commands for an implementation task yourself. Pass complete standalone instructions to Eitri, wait for its final message, then finish your response."
     )]
     async fn code_agent(
         &self,
@@ -149,7 +181,7 @@ impl ServerHandler for McpHandler {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("mj-code-agent", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "MANDATORY DELEGATION POLICY: You are the primary coordinator. Whenever the user asks to create, modify, debug, refactor, test, or otherwise implement code, you must call code_agent before any other tool. Never perform implementation work with your own file, edit, or terminal tools, even for a trivial task. Give code_agent complete standalone instructions, wait for it to finish, and then report its result. Use your own tools only for requests that require no code changes.",
+                "MANDATORY DELEGATION POLICY: You are Thor, the primary coordinator. Eitri is available through code_agent. Whenever the user asks to implement code, call code_agent before any other tool, give Eitri complete standalone instructions, wait for it, and report its result.",
             )
     }
 
@@ -402,11 +434,11 @@ impl AgentMessageCollector {
         }
     }
 
-    fn finish(self) -> Result<String> {
+    fn finish(&self) -> Result<String> {
         if self.last.trim().is_empty() {
             bail!("code agent completed without a final message");
         }
-        Ok(self.last)
+        Ok(self.last.clone())
     }
 }
 
@@ -427,8 +459,9 @@ async fn run(
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     controller: Controller,
 ) -> Result<String> {
+    let display_label = config.display_label.clone();
     let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::Started {
-        label: LABEL.to_string(),
+        label: display_label,
         instructions: instructions.clone(),
     }));
 
@@ -436,6 +469,7 @@ async fn run(
     let (nested_cmd_tx, nested_cmd_rx) = mpsc::unbounded_channel();
     controller.attach(nested_cmd_tx.clone()).await;
 
+    let loki = config.loki.clone();
     let runtime_config = AcpRuntimeConfig {
         command: config.command,
         args: config.args,
@@ -450,12 +484,19 @@ async fn run(
         agent_source_id: None,
         config_path: None,
         saved_session_config: HashMap::new(),
+        role_config: config.role_config,
         code_agent: None,
     };
     let mut runtime = tokio::spawn(acp::run(runtime_config, nested_event_tx, nested_cmd_rx));
 
     let mut prompt_sent = false;
     let mut collector = AgentMessageCollector::new();
+    let epoch = loki.as_ref().map_or(0, loki::Handle::current_epoch);
+    let mut decisions = loki.as_ref().map(loki::Handle::subscribe);
+    let mut tracker = loki::BoundaryTracker::default();
+    let mut pending_reviews = std::collections::HashSet::new();
+    let mut completed: Option<Result<String>> = None;
+    let mut intervention: Option<String> = None;
     let result = loop {
         tokio::select! {
             joined = &mut runtime => {
@@ -469,6 +510,17 @@ async fn run(
                 let Some(event) = event else {
                     break Err(anyhow!("code agent event stream closed before completing"));
                 };
+                if epoch > 0
+                    && let Some(boundary) = tracker.observe(&event)
+                    && let Some(id) = loki.as_ref().and_then(|reviewer| reviewer.observe(
+                        epoch,
+                        loki::Target::Eitri,
+                        boundary,
+                        tracker.trajectory(),
+                    ))
+                {
+                    pending_reviews.insert(id);
+                }
                 match event {
                     UiEvent::Connected { .. } => {}
                     UiEvent::SessionStarted { .. } if !prompt_sent => {
@@ -504,21 +556,73 @@ async fn run(
                         let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::Status(message)));
                     }
                     UiEvent::PromptDone { stop_reason, .. } => {
-                        break if matches!(stop_reason, StopReason::Cancelled) {
-                            Err(anyhow!("code agent cancelled"))
-                        } else {
-                            collector.finish()
-                        };
+                        if matches!(stop_reason, StopReason::Cancelled) {
+                            if let Some(critique) = intervention.take() {
+                                collector = AgentMessageCollector::new();
+                                tracker.reset_attempt();
+                                pending_reviews.clear();
+                                completed = None;
+                                let continuation = continuation_prompt(&instructions, &critique, &tracker.trajectory());
+                                if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
+                                    break Err(anyhow!("re-prompt Eitri after Loki intervention"));
+                                }
+                                continue;
+                            }
+                            break Err(anyhow!("code agent cancelled"));
+                        }
+                        completed = Some(collector.finish());
+                        if pending_reviews.is_empty() {
+                            break completed.take().expect("completion stored");
+                        }
                     }
                     UiEvent::PromptFailed { message }
                     | UiEvent::SessionForkFailed { message }
-                    | UiEvent::Fatal(message) => break Err(anyhow!(message)),
+                    | UiEvent::Fatal(message) => {
+                        completed = Some(Err(anyhow!(message)));
+                        if pending_reviews.is_empty() {
+                            break completed.take().expect("completion stored");
+                        }
+                    }
                     UiEvent::ClaudeUsage(_)
                     | UiEvent::RemotePermissionDecision { .. }
                     | UiEvent::ActorActivity(_) => {}
                     UiEvent::CodeAgent(_) => {
                         break Err(anyhow!("nested code agent attempted recursive delegation"));
                     }
+                }
+            }
+            decision = async {
+                match decisions.as_mut() {
+                    Some(rx) => rx.recv().await.ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(decision) = decision else { continue; };
+                if decision.epoch != epoch || decision.target != loki::Target::Eitri || !pending_reviews.remove(&decision.id) {
+                    continue;
+                }
+                match decision.verdict {
+                    loki::Verdict::Intervention(critique) => {
+                        if completed.is_some() {
+                            completed = None;
+                            collector = AgentMessageCollector::new();
+                            tracker.reset_attempt();
+                            pending_reviews.clear();
+                            let continuation = continuation_prompt(&instructions, &critique, &tracker.trajectory());
+                            if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
+                                break Err(anyhow!("re-prompt Eitri after Loki intervention"));
+                            }
+                        } else {
+                            intervention = Some(critique);
+                            let _ = nested_cmd_tx.send(UiCommand::CancelPrompt);
+                        }
+                    }
+                    loki::Verdict::NoIntervention | loki::Verdict::Failed(_) => {}
+                }
+                if pending_reviews.is_empty() && intervention.is_none()
+                    && let Some(result) = completed.take()
+                {
+                    break result;
                 }
             }
         }
@@ -541,6 +645,12 @@ async fn run(
     };
     let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::Finished { outcome }));
     result
+}
+
+fn continuation_prompt(task: &str, critique: &str, trajectory: &str) -> String {
+    format!(
+        "Continue the original task after a material Loki review. Correct the issue and finish the implementation.\n\nOriginal task:\n{task}\n\nLoki critique:\n{critique}\n\nBounded prior trajectory:\n{trajectory}"
+    )
 }
 
 #[cfg(test)]
