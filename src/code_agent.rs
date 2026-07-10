@@ -42,6 +42,7 @@ use crate::event::{
     content_block_text,
 };
 use crate::loki;
+use crate::workspace_snapshot::{WorkspaceDelta, WorkspaceSnapshot};
 
 pub const LABEL: &str = "Eitri";
 pub const MCP_SERVER_NAME: &str = "mj-code-agent";
@@ -183,9 +184,15 @@ impl McpHandler {
             self.controller.clone(),
         )
         .await;
-        Ok(match result {
-            Ok(message) => CallToolResult::success(vec![Content::text(message)]),
-            Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
+        Ok(match result.outcome {
+            Ok(message) => CallToolResult::success(vec![Content::text(with_workspace_receipt(
+                &message,
+                &result.workspace_delta,
+            ))]),
+            Err(error) => CallToolResult::error(vec![Content::text(with_workspace_receipt(
+                &error.to_string(),
+                &result.workspace_delta,
+            ))]),
         })
     }
 }
@@ -456,13 +463,18 @@ impl AgentMessageCollector {
     }
 }
 
-pub fn run_boxed(
+struct CodeAgentRunResult {
+    outcome: Result<String>,
+    workspace_delta: WorkspaceDelta,
+}
+
+fn run_boxed(
     config: Config,
     context: RunContext,
     instructions: String,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     controller: Controller,
-) -> futures::future::BoxFuture<'static, Result<String>> {
+) -> futures::future::BoxFuture<'static, CodeAgentRunResult> {
     Box::pin(run(config, context, instructions, ui_tx, controller))
 }
 
@@ -472,7 +484,7 @@ async fn run(
     instructions: String,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     controller: Controller,
-) -> Result<String> {
+) -> CodeAgentRunResult {
     if let Some(observer) = config.delegation_observer.as_ref() {
         observer.store(true, Ordering::Release);
     }
@@ -487,6 +499,11 @@ async fn run(
     let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::Started {
         label: display_label,
     }));
+
+    let mut workspace_roots = Vec::with_capacity(1 + context.additional_directories.len());
+    workspace_roots.push(context.cwd.clone());
+    workspace_roots.extend(context.additional_directories.iter().cloned());
+    let invocation_snapshot = WorkspaceSnapshot::capture(&workspace_roots).await;
 
     let (nested_event_tx, mut nested_event_rx) = mpsc::unbounded_channel();
     let (nested_cmd_tx, nested_cmd_rx) = mpsc::unbounded_channel();
@@ -715,8 +732,10 @@ async fn run(
             .is_err()
     {
         runtime.abort();
+        let _ = runtime.await;
     }
     controller.finish().await;
+    let workspace_delta = invocation_snapshot.delta().await;
 
     let outcome = match &result {
         Ok(_) => CodeAgentOutcome::Completed,
@@ -724,7 +743,17 @@ async fn run(
         Err(error) => CodeAgentOutcome::Failed(error.to_string()),
     };
     let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::Finished { outcome }));
-    result
+    CodeAgentRunResult {
+        outcome: result,
+        workspace_delta,
+    }
+}
+
+fn with_workspace_receipt(message: &str, delta: &WorkspaceDelta) -> String {
+    format!(
+        "{message}\n\n<workspace_delta scope=\"eitri-invocation\">\n{}\n</workspace_delta>",
+        delta.receipt()
+    )
 }
 
 fn continuation_prompt(_task: &str, critique: &str, _trajectory: &str) -> String {

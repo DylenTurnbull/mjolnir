@@ -4137,66 +4137,12 @@ struct WorkspaceDiff {
     path: PathBuf,
     old_text: Option<String>,
     new_text: String,
-    new_present: bool,
 }
 
 #[derive(Debug)]
 struct TurnDiffTracker {
     roots: Vec<GitTurnDiffRoot>,
     max_text_bytes: u64,
-}
-
-/// A cheap, shareable baseline for attributing workspace changes to one outer
-/// user turn. This uses the same dirty-tree-aware capture as the synthetic
-/// post-prompt workspace diff emitted by the ACP runtime.
-#[derive(Debug, Clone)]
-pub(crate) struct WorkspaceTurnSnapshot(Arc<TurnDiffTracker>);
-
-impl WorkspaceTurnSnapshot {
-    pub(crate) async fn capture(workspace_roots: &[PathBuf], max_text_bytes: u64) -> Self {
-        Self(Arc::new(
-            TurnDiffTracker::snapshot(workspace_roots, max_text_bytes).await,
-        ))
-    }
-
-    /// Complete captured before/after text for every file changed since this
-    /// snapshot. `None` means the turn has no attributable workspace changes.
-    pub(crate) async fn complete_diff(&self) -> Option<String> {
-        let diffs = self.0.changed_diffs().await;
-        if diffs.is_empty() {
-            return None;
-        }
-
-        let mut output = format!(
-            "Complete workspace diff since the user prompt began ({} file{}):\n",
-            diffs.len(),
-            if diffs.len() == 1 { "" } else { "s" }
-        );
-        for diff in diffs {
-            output.push_str("\n=== ");
-            output.push_str(&diff.path.display().to_string());
-            output.push_str(" ===\n--- before\n");
-            push_snapshot_file_text(&mut output, diff.old_text.as_deref());
-            output.push_str("+++ after\n");
-            push_snapshot_file_text(
-                &mut output,
-                diff.new_present.then_some(diff.new_text.as_str()),
-            );
-        }
-        Some(output)
-    }
-}
-
-fn push_snapshot_file_text(output: &mut String, text: Option<&str>) {
-    match text {
-        Some(text) => {
-            output.push_str(text);
-            if !text.ends_with('\n') {
-                output.push('\n');
-            }
-        }
-        None => output.push_str("[file absent]\n"),
-    }
 }
 
 #[derive(Debug)]
@@ -4326,15 +4272,14 @@ impl GitTurnDiffRoot {
                 TextFileState::Present(text) => Some(text),
                 TextFileState::Absent => None,
             };
-            let (new_text, new_present) = match new_state {
-                TextFileState::Present(text) => (text, true),
-                TextFileState::Absent => (String::new(), false),
+            let new_text = match new_state {
+                TextFileState::Present(text) => text,
+                TextFileState::Absent => String::new(),
             };
             diffs.push(WorkspaceDiff {
                 path: abs_path,
                 old_text,
                 new_text,
-                new_present,
             });
         }
         diffs

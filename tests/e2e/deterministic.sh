@@ -44,6 +44,7 @@ run_case() {
   printf 'seed\n' >"$workspace/seed.txt"
   git -C "$workspace" add seed.txt
   git -C "$workspace" commit -qm seed
+  printf 'dirty before council turn\n' >"$workspace/seed.txt"
   printf '{}\n' >"$root/home/.codex/auth.json"
   cp "$repo/src/deepswe_snapshot.json" "$root/home/.cache/mj/deepswe-v1.1.json"
   cp "$repo/src/deepswe_snapshot.json" "$root/home/Library/Caches/mj/deepswe-v1.1.json"
@@ -98,7 +99,7 @@ run_case() {
     echo "parent code-agent transport tool leaked into the transcript" >&2
     exit 1
   fi
-  grep -a 'waiting for Codex' "$root/transcript.log" >/dev/null
+  grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
 
   if [ "$mode" = unsupported ]; then
     test ! -e "$root/primary-result.json"
@@ -107,7 +108,7 @@ run_case() {
       echo "failed ACP initialization claimed a successful connection" >&2
       exit 1
     fi
-    if grep -a '"method":"session/new"' "$root/primary.log" >/dev/null; then
+    if [ -f "$root/primary.log" ] && grep -a '"method":"session/new"' "$root/primary.log" >/dev/null; then
       echo "unsupported primary received session/new" >&2
       exit 1
     fi
@@ -146,17 +147,26 @@ run_case() {
     grep -a "changed by Eitri" "$root/loki.log" >/dev/null
     grep -a 'permission:' "$root/nested.log" >/dev/null
     if [ "$mode" = details ]; then
-      node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); const done=Number(fs.readFileSync(process.argv[2],"utf8").match(/completion:(\d+)/)?.[1]); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || r.response.isError || !text.endsWith("EITRI_LONG_SUFFIX") || !done || r.toolReceivedAt<done) process.exit(1)' "$root/primary-result.json" "$root/nested.log"
+      node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); const done=Number(fs.readFileSync(process.argv[2],"utf8").match(/completion:(\d+)/)?.[1]); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || r.response.isError || !text.includes("EITRI_LONG_SUFFIX") || !text.includes("<workspace_delta scope=\"eitri-invocation\">") || !text.includes("eitri-change.txt") || text.includes("seed.txt") || text.includes("diff --git") || !done || r.toolReceivedAt<done) process.exit(1)' "$root/primary-result.json" "$root/nested.log"
     else
-      node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); const done=Number(fs.readFileSync(process.argv[2],"utf8").match(/completion:(\d+)/)?.[1]); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || r.response.isError || text!=="CODEAGENT_E2E_OK" || !done || r.toolReceivedAt<done) process.exit(1)' "$root/primary-result.json" "$root/nested.log"
+      node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); const done=Number(fs.readFileSync(process.argv[2],"utf8").match(/completion:(\d+)/g)?.at(-1)?.split(":")[1]); const text=r.response.content?.map(x=>x.text||"").join(""); const secondNoop=process.argv[3]==="loki-thor"; const badDelta=secondNoop ? !text.includes("No workspace changes.") || text.includes("eitri-change.txt") : !text.includes("eitri-change.txt"); if(r.error || r.unauthorizedStatus!==401 || r.response.isError || !text.startsWith("CODEAGENT_E2E_OK") || !text.includes("<workspace_delta scope=\"eitri-invocation\">") || badDelta || text.includes("seed.txt") || text.includes("diff --git") || !done || r.toolReceivedAt<done) process.exit(1)' "$root/primary-result.json" "$root/nested.log" "$mode"
     fi
+    grep -a 'eitri-change.txt' "$root/primary.log" >/dev/null
+    if grep -a 'seed.txt' "$root/primary.log" >/dev/null; then
+      echo "preexisting dirty file leaked into outer-turn review delta" >&2
+      exit 1
+    fi
+  elif [ "$mode" = failed ]; then
+    grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
+    test -s "$root/primary-result.json"
+    node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || !r.response.isError || !text.includes("fixture Eitri failure") || !text.includes("eitri-partial.txt") || text.includes("seed.txt")) process.exit(1)' "$root/primary-result.json"
   else
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
     test -s "$root/primary-result.json"
     grep -a "Eitri" "$root/transcript.log" >/dev/null
     grep -a "cancel-received" "$root/nested.log" >/dev/null
-    node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])); if(r.error || r.unauthorizedStatus!==401 || !r.response.isError) process.exit(1)' "$root/primary-result.json"
+    node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || !r.response.isError || !text.includes("eitri-partial.txt") || text.includes("seed.txt")) process.exit(1)' "$root/primary-result.json"
   fi
   remove_root
   trap - EXIT INT TERM
@@ -166,6 +176,7 @@ case ${MJ_E2E_CASE:-both} in
   complete) run_case complete ;;
   inline-stream) run_case inline-stream ;;
   cancel) run_case cancel ;;
+  failed) run_case failed ;;
   unsupported) run_case unsupported ;;
   no-change) run_case no-change ;;
   loki-eitri) run_case loki-eitri ;;
@@ -173,7 +184,7 @@ case ${MJ_E2E_CASE:-both} in
   thor-review) run_case thor-review ;;
   details) run_case details ;;
   both) run_case complete; run_case cancel; run_case unsupported ;;
-  council) run_case complete; run_case no-change; run_case inline-stream; run_case cancel; run_case unsupported; run_case loki-eitri; run_case loki-thor; run_case thor-review; run_case details ;;
-  *) echo "MJ_E2E_CASE must be complete, no-change, inline-stream, cancel, unsupported, loki-eitri, loki-thor, thor-review, details, both, or council" >&2; exit 2 ;;
+  council) run_case complete; run_case no-change; run_case inline-stream; run_case cancel; run_case failed; run_case unsupported; run_case loki-eitri; run_case loki-thor; run_case thor-review; run_case details ;;
+  *) echo "MJ_E2E_CASE must be complete, no-change, inline-stream, cancel, failed, unsupported, loki-eitri, loki-thor, thor-review, details, both, or council" >&2; exit 2 ;;
 esac
 echo "deterministic code-agent PTY E2E passed"

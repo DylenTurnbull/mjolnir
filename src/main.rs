@@ -46,6 +46,7 @@ mod theme_picker;
 mod transcript_bridge;
 mod ui;
 mod version;
+mod workspace_snapshot;
 mod worktree;
 
 use anyhow::{Context, Result};
@@ -1702,7 +1703,7 @@ async fn run_session(
     let turn_state = std::sync::Arc::new(tokio::sync::Mutex::new((
         0_u64,
         String::new(),
-        None::<acp::WorkspaceTurnSnapshot>,
+        None::<workspace_snapshot::WorkspaceSnapshot>,
     )));
     let event_turn_state = turn_state.clone();
     let event_loki = loki_handle.clone();
@@ -1787,6 +1788,7 @@ async fn run_session(
                         if cancelled {
                             event_tracker.observe_event(&event);
                             if ui_event_tx.send(event).is_err() { break; }
+                            event_turn_state.lock().await.2 = None;
                             discrete_review_started = false;
                             trajectory = loki::BoundaryTracker::default();
                             continue;
@@ -1821,6 +1823,12 @@ async fn run_session(
                     } else {
                         event_tracker.observe_event(&event);
                         if ui_event_tx.send(event).is_err() { break; }
+                        if target_completed {
+                            event_turn_state.lock().await.2 = None;
+                            discrete_review_started = false;
+                            intervention.clear();
+                            trajectory = loki::BoundaryTracker::default();
+                        }
                     }
                 }
                 decision = async {
@@ -1870,31 +1878,34 @@ async fn run_session(
             }
 
             if held_completion.is_some() && pending.is_empty() && !intervention.is_pending() {
-                let workspace_changed = if thor_config.discrete_review
+                let workspace_delta = if thor_config.discrete_review
                     && event_delegated.load(Ordering::Acquire)
                     && !discrete_review_started
                 {
                     let (_, _, snapshot) = event_turn_state.lock().await.clone();
                     match snapshot {
-                        Some(snapshot) => snapshot.complete_diff().await.is_some(),
-                        None => false,
+                        Some(snapshot) => Some(snapshot.delta().await),
+                        None => None,
                     }
                 } else {
-                    false
+                    None
                 };
+                let workspace_changed = workspace_delta
+                    .as_ref()
+                    .is_some_and(workspace_snapshot::WorkspaceDelta::changed);
                 if should_start_discrete_review(
                     thor_config.discrete_review,
                     discrete_review_started,
                     event_delegated.load(Ordering::Acquire),
                     workspace_changed,
                 ) {
-                    let (epoch, task, snapshot) = event_turn_state.lock().await.clone();
+                    let (epoch, task, _) = event_turn_state.lock().await.clone();
                     if epoch == 0 {
                         continue;
                     }
                     let initial_result = trajectory.final_message();
                     let context =
-                        discrete_review_context(snapshot.as_ref(), trajectory.trajectory()).await;
+                        discrete_review_context(workspace_delta.as_ref(), trajectory.trajectory());
                     held_completion = None;
                     trajectory.reset_attempt();
                     discrete_review_started = true;
@@ -1924,6 +1935,7 @@ async fn run_session(
                 if ui_event_tx.send(event).is_err() {
                     break;
                 }
+                event_turn_state.lock().await.2 = None;
                 discrete_review_started = false;
                 intervention.clear();
                 trajectory = loki::BoundaryTracker::default();
@@ -1938,7 +1950,6 @@ async fn run_session(
         Vec::with_capacity(1 + runtime_options.additional_directories.len());
     cmd_workspace_roots.push(cwd.clone());
     cmd_workspace_roots.extend(runtime_options.additional_directories.iter().cloned());
-    let cmd_max_text_bytes = runtime_options.fs_max_text_bytes;
     let cmd_proxy = tokio::spawn(async move {
         let mut local_epoch = 0_u64;
         while let Some(command) = ui_cmd_rx.recv().await {
@@ -1947,8 +1958,7 @@ async fn run_session(
                 local_epoch = local_epoch.saturating_add(1);
                 delegated_this_turn.store(false, Ordering::Release);
                 let snapshot =
-                    acp::WorkspaceTurnSnapshot::capture(&cmd_workspace_roots, cmd_max_text_bytes)
-                        .await;
+                    workspace_snapshot::WorkspaceSnapshot::capture(&cmd_workspace_roots).await;
                 let epoch = cmd_loki
                     .as_ref()
                     .map_or(local_epoch, |reviewer| reviewer.begin_turn(text.clone()));
@@ -2250,14 +2260,14 @@ fn thor_discrete_review_prompt(task: &str, initial_result: &str, context: &str) 
     )
 }
 
-async fn discrete_review_context(
-    snapshot: Option<&acp::WorkspaceTurnSnapshot>,
+fn discrete_review_context(
+    delta: Option<&workspace_snapshot::WorkspaceDelta>,
     trajectory: String,
 ) -> String {
-    let diff = match snapshot {
-        Some(snapshot) => snapshot
-            .complete_diff()
-            .await
+    let diff = match delta {
+        Some(delta) => delta
+            .review_patch()
+            .map(str::to_string)
             .unwrap_or_else(|| "[no workspace changes attributable to this user turn]".to_string()),
         None => "[workspace turn snapshot unavailable]".to_string(),
     };

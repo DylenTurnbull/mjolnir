@@ -3,6 +3,7 @@
 // One deterministic ACP fixture plays Thor or Eitri according to the model
 // Mjolnir selects before the first prompt. It also makes probe sessions cheap.
 import fs from "node:fs";
+import path from "node:path";
 import readline from "node:readline";
 
 const resultPath = process.env.MJ_E2E_PRIMARY_RESULT;
@@ -115,7 +116,16 @@ function startEitriTurn() {
   if (process.env.MJ_E2E_NESTED_PID) fs.writeFileSync(process.env.MJ_E2E_NESTED_PID, String(process.pid));
   log("prompt-started");
   update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "fixture reasoning" } });
-  if (mode === "cancel" || mode === "inline-stream") return;
+  if (mode === "cancel" || mode === "inline-stream" || mode === "failed") {
+    fs.writeFileSync(
+      path.join(process.env.MJ_E2E_WORKSPACE, "eitri-partial.txt"),
+      "partial change by Eitri\n",
+    );
+    if (mode === "failed") {
+      send({ id: promptRequestId, error: { code: -32603, message: "fixture Eitri failure" } });
+    }
+    return;
+  }
   requestEitriPermission();
 }
 
@@ -184,6 +194,7 @@ input.on("line", (line) => {
         send({ id: promptRequestId, error: { code: -32603, message: error.message } });
       });
     } else if (text.includes("Perform Thor's discrete review")) {
+      append(primaryLog, `discrete-review:${text}`);
       update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: thorReviewResult() } });
       send({ id: promptRequestId, result: { stopReason: "end_turn" } });
     } else if (mode === "no-change") {
