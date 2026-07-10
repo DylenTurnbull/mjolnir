@@ -25,17 +25,17 @@ if {$inline_mode} {
     }
 }
 
-expect {
-    -nocase -re {waiting for Codex} {}
-    timeout { exit 36 }
-}
-
 if {$mode eq "unsupported"} {
     expect {
-        -re {does not support HTTP MCP servers required for code-agent delegation} { after 500 }
+        -re {no Council model is launchable.*mcpCapabilities.http} {}
         timeout { exit 18 }
     }
     exit 0
+}
+
+expect {
+    -nocase -re {waiting for Codex} {}
+    timeout { exit 36 }
 }
 
 expect {
@@ -47,10 +47,8 @@ set user_prompt "write a hello world program in Python"
 if {$mode eq "details"} {
     set user_prompt "USER_LONG_PREFIX [string repeat u 720] USER_LONG_SUFFIX"
 }
-expect {
-    -re {F1 Model} { after 300; send -- "$user_prompt\r" }
-    timeout { exit 19 }
-}
+after 300
+send -- "$user_prompt\r"
 
 if {$mode eq "explore"} {
     expect {

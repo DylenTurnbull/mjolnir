@@ -37,13 +37,12 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use crate::archive;
 use crate::code_agent;
-use crate::config;
 use crate::event::{
     ElicitationOutcome, ElicitationPrompt, LoadSessionResult, PermissionDecision, PermissionPrompt,
     PromptImage, SessionConfigTarget, TerminalOutputSnapshot, UiCommand, UiEvent,
 };
-use crate::install;
 use crate::paths::{WorkspaceRoots, normalize_spawn_program, path_is_under_any_root};
 
 pub struct AcpRuntimeConfig {
@@ -1108,8 +1107,7 @@ async fn install_node24() -> std::result::Result<(), LaunchError> {
             source: format!("failed to create {}: {e}", root.display()),
         })?;
     let archive_url = node24_archive_url().await?;
-    let (tx, _rx) = mpsc::unbounded_channel::<install::Progress>();
-    install::download_and_extract(&archive_url, &root, &tx)
+    archive::download_and_extract(&archive_url, &root)
         .await
         .map_err(|e| LaunchError::NodeInstallFailed {
             source: e.to_string(),
@@ -1308,10 +1306,6 @@ where
     let notif_session_state = session_state.clone();
     let primary_updates_suppressed = Arc::new(AtomicBool::new(false));
     let notif_primary_updates_suppressed = primary_updates_suppressed.clone();
-    let transcript_bridge = Arc::new(Mutex::new(
-        crate::transcript_bridge::TranscriptBridge::default(),
-    ));
-    let notif_transcript_bridge = transcript_bridge.clone();
     let terminal_metadata_bridge = Arc::new(Mutex::new(TerminalMetadataBridge::default()));
     let notif_terminal_metadata_bridge = terminal_metadata_bridge.clone();
     let context_usage = Arc::new(ContextUsageTracker::default());
@@ -1344,13 +1338,6 @@ where
                     if !notif_primary_updates_suppressed.load(Ordering::Acquire) {
                         for snapshot in terminal_snapshots {
                             let _ = notif_ui_tx.send(UiEvent::TerminalOutput(snapshot));
-                        }
-                        for activity in notif_transcript_bridge
-                            .lock()
-                            .await
-                            .observe_session_update(&notification.update)
-                        {
-                            let _ = notif_ui_tx.send(UiEvent::ActorActivity(activity));
                         }
                         let _ = notif_ui_tx.send(UiEvent::SessionUpdate(notification.update));
                     }
@@ -1540,8 +1527,8 @@ async fn drive_session(
     terminals: Arc<ManagedTerminals>,
     access_mode: RuntimeAccessMode,
     fs_max_text_bytes: u64,
-    agent_source_id: Option<String>,
-    config_path: Option<PathBuf>,
+    _agent_source_id: Option<String>,
+    _config_path: Option<PathBuf>,
     saved_session_config: HashMap<String, String>,
     role_config: Option<RuntimeRoleConfig>,
     code_agent: Option<code_agent::Config>,
@@ -1796,11 +1783,6 @@ async fn drive_session(
     while let Some(cmd) = ui_rx.recv().await {
         match cmd {
             UiCommand::SendPrompt { text, images } => {
-                persist_current_session_config(
-                    config_path.as_deref(),
-                    agent_source_id.as_deref(),
-                    &session_config,
-                );
                 session_state.clear_permissions_cancelled(&session_id).await;
                 if code_agent_http.is_some()
                     && context_usage.take_directive_needed()
@@ -1993,6 +1975,7 @@ async fn drive_session(
                     }
                 }
             }
+            UiCommand::SetReviewPolicy { .. } => {}
             UiCommand::CancelPrompt => {}
             UiCommand::Shutdown => break,
         }
@@ -2178,6 +2161,7 @@ async fn drive_fork_session(
                         });
                     }
                     Some(UiCommand::CancelPrompt) => {}
+                    Some(UiCommand::SetReviewPolicy { .. }) => {}
                 }
             }
         }
@@ -3696,6 +3680,7 @@ fn session_config_target_key(target: &SessionConfigTarget) -> String {
     }
 }
 
+#[cfg(test)]
 fn current_session_config_values(session_config: &SessionConfigCache) -> HashMap<String, String> {
     session_config
         .options
@@ -3892,27 +3877,6 @@ fn config_option_current_value(option: &SessionConfigOption) -> Option<&SessionC
     }
 }
 
-fn persist_current_session_config(
-    config_path: Option<&Path>,
-    agent_source_id: Option<&str>,
-    session_config: &SessionConfigCache,
-) {
-    let (Some(config_path), Some(agent_source_id)) = (config_path, agent_source_id) else {
-        return;
-    };
-    let values = current_session_config_values(session_config);
-    if values.is_empty() {
-        return;
-    }
-    if let Err(error) = config::Config::load(config_path).and_then(|mut cfg| {
-        cfg.session_config
-            .insert(agent_source_id.to_string(), values);
-        cfg.save(config_path)
-    }) {
-        tracing::warn!("persist session config for {agent_source_id}: {error:#}");
-    }
-}
-
 async fn drive_config_update(
     conn: &ConnectionTo<Agent>,
     session_id: &SessionId,
@@ -3983,6 +3947,7 @@ async fn drive_config_update(
                         });
                     }
                     Some(UiCommand::CancelPrompt) => {}
+                    Some(UiCommand::SetReviewPolicy { .. }) => {}
                 }
             }
         }
@@ -4120,6 +4085,7 @@ async fn drive_prompt_turn(
                             message: "prompt already in flight".to_string(),
                         });
                     }
+                    Some(UiCommand::SetReviewPolicy { .. }) => {}
                 }
             }
         }
@@ -5513,34 +5479,6 @@ mod tests {
             Some("gpt-5")
         );
         assert_eq!(values.get("legacy:mode").map(String::as_str), Some("code"));
-    }
-
-    #[test]
-    fn persist_current_session_config_saves_values_by_agent() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        let session_config = SessionConfigCache {
-            options: vec![SessionConfigOption::select(
-                "model",
-                "Model",
-                "gpt-5",
-                vec![SessionConfigSelectOption::new("gpt-5", "GPT-5")],
-            )],
-            targets: vec![SessionConfigTarget::ConfigOption {
-                config_id: "model".into(),
-            }],
-        };
-
-        persist_current_session_config(Some(&path), Some("codex-acp"), &session_config);
-
-        let cfg = crate::config::Config::load(&path).expect("load config");
-        assert_eq!(
-            cfg.session_config
-                .get("codex-acp")
-                .and_then(|values| values.get("config:model"))
-                .map(String::as_str),
-            Some("gpt-5")
-        );
     }
 
     #[test]

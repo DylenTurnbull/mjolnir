@@ -14,19 +14,12 @@ path = "src/main.rs"
 [dependencies]
 agent-client-protocol = { version = "1", features = ["unstable_session_fork", "unstable_end_turn_token_usage", "unstable_elicitation"] }
 anyhow = "1"
-# Read the official LMArena leaderboard parquet (model strength scores). Pinned
-# to the same major as `parquet` below. Apache-2.0 (GPL-3.0-compatible).
-arrow-array = "55"
 axum = "0.8"
 # Use the ring CryptoProvider (already pulled by reqwest/rcgen) instead of the
 # default aws-lc-rs, which needs cmake + a C toolchain and fails to
 # cross-compile cleanly for the Android CI target.
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
-# `bytes::Bytes` is the parquet reader's in-memory `ChunkReader`; also what
-# `reqwest` hands back, so no extra copy on the network path.
-bytes = "1"
-bzip2 = "0.6"
 # `clock` pulls `iana-time-zone`/`android-tzdata` so `Local` can render reset
 # timestamps in the machine's wall-clock time (DST-correct); `default-features
 # = false` drops the wasm-only bits. chrono is already in the tree via rmcp.
@@ -44,19 +37,13 @@ hmac = "0.12"
 iana-time-zone = "0.1"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 libc = "0.2"
-# Reads the official LMArena leaderboard dataset (parquet). Keep default
-# features off to avoid native zstd in Android/cross builds; these pure-Rust
-# codecs cover common parquet encodings, with snapshot fallback otherwise.
-parquet = { version = "55", default-features = false, features = ["arrow", "brotli", "flate2", "lz4", "snap"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 rcgen = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 qrcode = { version = "0.14", default-features = false }
-# Official Rust MCP SDK. Powers the `mj mcp` stdio server that exposes mj's
-# ACP-client capabilities (connect, config, prompt, poll, cancel, result) as
-# MCP tools. `transport-io` adds the stdio transport; `server`/`macros` are
-# default features but listed for clarity. MIT-licensed (GPL-3.0-compatible).
-rmcp = { version = "1", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+# Official Rust MCP SDK. Powers the embedded Streamable HTTP `code_agent` and
+# Loki review tool servers. MIT-licensed (GPL-3.0-compatible).
+rmcp = { version = "1", features = ["server", "macros", "transport-streamable-http-server"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Parses the tailscale-issued certificate/key PEMs for the SNI resolver in
@@ -83,8 +70,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 unicode-width = "0.2.2"
 
 [dev-dependencies]
-# Build a tiny in-memory parquet to test the LMArena scores parser.
-arrow-schema = "55"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 

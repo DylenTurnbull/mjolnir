@@ -52,7 +52,7 @@ use crate::clipboard::{
 };
 use crate::config;
 use crate::event::{
-    ActorActivity, ActorIdentity, PermissionDecision, PermissionPrompt, PromptImage, UiCommand,
+    LokiActivity, LokiIdentity, PermissionDecision, PermissionPrompt, PromptImage, UiCommand,
     UiEvent,
 };
 use crate::notifications::TerminalNotificationBackend;
@@ -266,13 +266,6 @@ struct TurnToolSummary {
     changed_paths: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActorToolDisposition {
-    Successful,
-    Failed,
-    Visible,
-}
-
 fn transcript_turns(state: &AppState) -> Vec<TranscriptTurn> {
     let prompt_indexes = state
         .transcript
@@ -324,42 +317,10 @@ fn turn_final_response_index(state: &AppState, start: usize, end: usize) -> Opti
         .rev()
         .find(|&index| matches!(state.transcript[index], Entry::AgentMessage(_)))
         .or_else(|| {
-            (start..end).rev().find(|&index| {
-                matches!(&state.transcript[index], Entry::CodeAgentMessage(_))
-                    || matches!(
-                        &state.transcript[index],
-                        Entry::ActorActivity(activity)
-                            if matches!(activity.as_ref(), ActorActivity::Message { .. })
-                    )
-            })
+            (start..end)
+                .rev()
+                .find(|&index| matches!(&state.transcript[index], Entry::CodeAgentMessage(_)))
         })
-}
-
-fn actor_tool_disposition(status: Option<&str>) -> ActorToolDisposition {
-    let status = status.map(str::trim).filter(|status| !status.is_empty());
-    match status.map(|status| status.to_ascii_lowercase()) {
-        Some(status) if matches!(status.as_str(), "completed" | "success" | "succeeded") => {
-            ActorToolDisposition::Successful
-        }
-        Some(status)
-            if matches!(
-                status.as_str(),
-                "failed"
-                    | "failure"
-                    | "error"
-                    | "interrupted"
-                    | "cancelled"
-                    | "canceled"
-                    | "blocked"
-                    | "denied"
-            ) =>
-        {
-            ActorToolDisposition::Failed
-        }
-        // A structured actor snapshot is stable, but non-terminal or unknown
-        // status is still important context and must remain individually shown.
-        _ => ActorToolDisposition::Visible,
-    }
 }
 
 fn turn_tool_summary(state: &AppState, start: usize, end: usize) -> Option<TurnToolSummary> {
@@ -389,14 +350,6 @@ fn turn_tool_summary(state: &AppState, start: usize, end: usize) -> Option<TurnT
                     }
                 }
             }
-            Entry::ActorActivity(activity) => {
-                if let ActorActivity::Tool { status, .. } = activity.as_ref() {
-                    summary.tools += 1;
-                    if actor_tool_disposition(status.as_deref()) == ActorToolDisposition::Failed {
-                        summary.failures += 1;
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -410,7 +363,7 @@ fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bo
         | Entry::SessionBoundary(_)
         | Entry::Plan(_)
         | Entry::CodeAgentPlan(_)
-        | Entry::ActorActivity(_)
+        | Entry::LokiActivity(_)
         | Entry::InternalMessage(_) => true,
         Entry::EphemeralSystem(_) => false,
         Entry::AgentMessage(_) | Entry::AgentThought(_) => {
@@ -480,13 +433,16 @@ pub struct UiRunOptions<'a> {
     pub mode: UiMode,
     pub theme_kind: TerminalThemeKind,
     pub spinner_style: SpinnerStyle,
-    pub score_store: crate::scores::ScoreStore,
     pub active_agent_launch: Option<ragnarok::Launch>,
     pub session_boundary: Option<String>,
     /// The ACP session cwd; `/ragnarok` battles are rooted here.
     pub session_cwd: PathBuf,
     pub council_choices: Vec<crate::council::ModelChoice>,
     pub council_models: crate::config::ModelsConfig,
+    pub active_council_models: crate::config::ModelsConfig,
+    pub thor_review_enabled: bool,
+    pub loki_review_enabled: bool,
+    pub ragnarok_models: Vec<crate::council::ResolvedRole>,
     pub primary_acp_name: String,
 }
 
@@ -502,7 +458,6 @@ struct UiInitialState {
     header_labels: HeaderLabels,
     agent_label: Option<String>,
     agent_source_id: Option<String>,
-    score_store: crate::scores::ScoreStore,
     active_agent_launch: Option<ragnarok::Launch>,
     history: Vec<String>,
     transcript_export_dir: Option<PathBuf>,
@@ -513,6 +468,10 @@ struct UiInitialState {
     session_cwd: PathBuf,
     council_choices: Vec<crate::council::ModelChoice>,
     council_models: crate::config::ModelsConfig,
+    active_council_models: crate::config::ModelsConfig,
+    thor_review_enabled: bool,
+    loki_review_enabled: bool,
+    ragnarok_models: Vec<crate::council::ResolvedRole>,
     primary_acp_name: String,
 }
 
@@ -556,7 +515,6 @@ pub async fn run(
             header_labels,
             agent_label: initial_agent_label,
             agent_source_id: initial_agent_source_id,
-            score_store: options.score_store.clone(),
             active_agent_launch: options.active_agent_launch.clone(),
             history: initial_history,
             transcript_export_dir: options
@@ -570,6 +528,10 @@ pub async fn run(
             session_cwd: options.session_cwd,
             council_choices: options.council_choices,
             council_models: options.council_models,
+            active_council_models: options.active_council_models,
+            thor_review_enabled: options.thor_review_enabled,
+            loki_review_enabled: options.loki_review_enabled,
+            ragnarok_models: options.ragnarok_models,
             primary_acp_name: options.primary_acp_name,
         },
         options.mode,
@@ -684,7 +646,7 @@ fn streaming_redraw_budget(mode: UiMode) -> Duration {
 
 fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
     match event {
-        UiEvent::SessionUpdate(_) | UiEvent::TerminalOutput(_) | UiEvent::ActorActivity(_) => {
+        UiEvent::SessionUpdate(_) | UiEvent::TerminalOutput(_) | UiEvent::LokiActivity(_) => {
             RedrawCause::Stream
         }
         UiEvent::CodeAgent(crate::event::CodeAgentEvent::SessionUpdate(_))
@@ -753,11 +715,14 @@ async fn ui_loop(
     if let Some(source_id) = initial.agent_source_id {
         state.agent_source_id = source_id;
     }
-    state.score_store = initial.score_store;
     state.active_agent_launch = initial.active_agent_launch;
     state.session_cwd = initial.session_cwd;
     state.council_choices = initial.council_choices;
     state.council_models = initial.council_models;
+    state.active_council_models = initial.active_council_models;
+    state.thor_review_enabled = initial.thor_review_enabled;
+    state.loki_review_enabled = initial.loki_review_enabled;
+    state.ragnarok_models = initial.ragnarok_models;
     state.set_primary_acp_name(initial.primary_acp_name);
     state.transcript_export_dir = initial.transcript_export_dir;
     state.set_theme(initial.theme_kind);
@@ -3302,12 +3267,12 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && (text == "/council" || text.starts_with("/council ")) {
+    if images.is_empty() && (text == "/models" || text.starts_with("/models ")) {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
         state.scroll_input_to_bottom();
-        let args = text["/council".len()..]
+        let args = text["/models".len()..]
             .split_whitespace()
             .collect::<Vec<_>>();
         match args.as_slice() {
@@ -3318,8 +3283,34 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
             },
             _ => state.record_status_message(
                 StatusKind::Warning,
-                "usage: /council [thor|loki|eitri auto|model-id]",
+                "usage: /models [thor|loki|eitri auto|model-id]",
             ),
+        }
+        return;
+    }
+
+    if images.is_empty() && (text == "/reviews" || text.starts_with("/reviews ")) {
+        state.input.clear();
+        clear_attachments(state);
+        state.input_cursor = 0;
+        state.scroll_input_to_bottom();
+        let args = text["/reviews".len()..]
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        match args.as_slice() {
+            [] => state.record_status_message(StatusKind::Info, state.review_summary()),
+            [role, value] if matches!(*value, "on" | "off") => {
+                let enabled = *value == "on";
+                match state.set_review_policy(role, enabled) {
+                    Ok(role) => {
+                        let _ = cmd_tx.send(UiCommand::SetReviewPolicy { role, enabled });
+                        state.record_status_message(StatusKind::Info, state.review_summary());
+                    }
+                    Err(message) => state.record_status_message(StatusKind::Warning, message),
+                }
+            }
+            _ => state
+                .record_status_message(StatusKind::Warning, "usage: /reviews [thor|loki on|off]"),
         }
         return;
     }
@@ -3605,8 +3596,8 @@ fn draw_mjconfig_menu(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     f.render_widget(footer, rows[2]);
 }
 
-fn actor_identity_label(actor: &ActorIdentity) -> String {
-    let role = actor_role_name(actor);
+fn loki_identity_label(actor: &LokiIdentity) -> String {
+    let role = loki_role_name(actor);
     actor
         .model_name
         .as_deref()
@@ -3615,7 +3606,7 @@ fn actor_identity_label(actor: &ActorIdentity) -> String {
         .unwrap_or(role)
 }
 
-fn actor_role_name(actor: &ActorIdentity) -> String {
+fn loki_role_name(actor: &LokiIdentity) -> String {
     if actor.role == "nested" {
         "Nested agent".to_string()
     } else {
@@ -3627,52 +3618,17 @@ fn actor_role_name(actor: &ActorIdentity) -> String {
     }
 }
 
-fn actor_activity_label(activity: &ActorActivity) -> String {
+fn loki_activity_label(activity: &LokiActivity) -> String {
     match activity {
-        ActorActivity::Connected { actor } | ActorActivity::Status { actor, .. } => {
-            actor_identity_label(actor)
+        LokiActivity::Warning { actor, .. } => {
+            format!("{} · warning", loki_identity_label(actor))
         }
-        ActorActivity::Message { actor, .. } => actor_identity_label(actor),
-        ActorActivity::Thought { actor, .. } => actor_role_name(actor),
-        ActorActivity::Tool { actor, .. } => {
-            format!("{} · tool", actor_identity_label(actor))
-        }
-        ActorActivity::PermissionRequested { actor, .. } => {
-            format!("{} · permission", actor_identity_label(actor))
-        }
-        ActorActivity::Warning { actor, .. } => {
-            format!("{} · warning", actor_identity_label(actor))
-        }
-        ActorActivity::Info { actor, .. } => actor_identity_label(actor),
     }
 }
 
-fn actor_activity_text(activity: &ActorActivity) -> String {
+fn loki_activity_text(activity: &LokiActivity) -> String {
     match activity {
-        ActorActivity::Connected { .. } => "connected".to_string(),
-        ActorActivity::Status {
-            connection_status,
-            turn_id,
-            turn_status,
-            ..
-        } => format!("{connection_status} · turn {turn_id} · {turn_status}"),
-        ActorActivity::Message { text, .. } | ActorActivity::Thought { text, .. } => text.clone(),
-        ActorActivity::Tool {
-            title,
-            kind,
-            status,
-            ..
-        } => {
-            let kind = kind.as_deref().unwrap_or("tool");
-            let status = status.as_deref().unwrap_or("pending");
-            format!("[{status}] {kind} · {title}")
-        }
-        ActorActivity::PermissionRequested { title, .. } => {
-            format!("permission requested · {title}")
-        }
-        ActorActivity::Warning { message, .. } | ActorActivity::Info { message, .. } => {
-            message.clone()
-        }
+        LokiActivity::Warning { message, .. } => message.clone(),
     }
 }
 
@@ -3763,10 +3719,10 @@ fn transcript_export_markdown(state: &AppState) -> String {
             Entry::AgentThought(text) => push_export_text(&mut out, "Thought", text),
             Entry::CodeAgentMessage(text) => push_export_text(&mut out, "Eitri", text),
             Entry::CodeAgentThought(text) => push_export_text(&mut out, "Eitri Thought", text),
-            Entry::ActorActivity(activity) => push_export_text(
+            Entry::LokiActivity(activity) => push_export_text(
                 &mut out,
-                &actor_activity_label(activity),
-                &actor_activity_text(activity),
+                &loki_activity_label(activity),
+                &loki_activity_text(activity),
             ),
             Entry::InternalMessage(message) => {
                 let heading = match message.kind {
@@ -5208,11 +5164,6 @@ fn render_transcript_entry_range(
         {
             continue;
         }
-        if matches!(entry, Entry::ActorActivity(activity) if actor_tool_is_successful(activity))
-            && compact_turn.is_some()
-        {
-            continue;
-        }
         let collapse_message =
             collapse_limit.is_some() && transcript_entry_is_stable(state, entry_index, entry);
         if let Some(next) = entry_speaker(entry)
@@ -5247,25 +5198,11 @@ fn render_transcript_entry_range(
             Entry::AgentThought(text) | Entry::CodeAgentThought(text) => {
                 push_thinking(&mut out, text, theme)
             }
-            Entry::ActorActivity(activity) => {
-                let text = actor_activity_text(activity);
+            Entry::LokiActivity(activity) => {
+                let text = loki_activity_text(activity);
                 match activity.as_ref() {
-                    ActorActivity::Message { .. } => {
-                        push_markdown_message(&mut out, &text, collapse_message, theme)
-                    }
-                    ActorActivity::Thought { .. } => push_thinking(&mut out, &text, theme),
-                    ActorActivity::Warning { .. } => {
+                    LokiActivity::Warning { .. } => {
                         push_styled_message(&mut out, &text, theme.warning, collapse_message, theme)
-                    }
-                    ActorActivity::PermissionRequested { .. } => {
-                        push_styled_content(&mut out, text, theme.warning)
-                    }
-                    ActorActivity::Tool { .. } => push_italic_tool_call(&mut out, text, theme),
-                    ActorActivity::Connected { .. } | ActorActivity::Status { .. } => {
-                        push_styled_message(&mut out, &text, theme.muted, collapse_message, theme)
-                    }
-                    ActorActivity::Info { .. } => {
-                        push_styled_message(&mut out, &text, theme.muted, collapse_message, theme)
                     }
                 }
             }
@@ -5391,14 +5328,6 @@ fn tool_entry_is_successful(state: &AppState, entry: &Entry) -> bool {
         .is_some_and(|view| view.status == ToolCallStatus::Completed)
 }
 
-fn actor_tool_is_successful(activity: &ActorActivity) -> bool {
-    matches!(
-        activity,
-        ActorActivity::Tool { status, .. }
-            if actor_tool_disposition(status.as_deref()) == ActorToolDisposition::Successful
-    )
-}
-
 fn push_turn_header(out: &mut Vec<Line<'static>>, elapsed: Option<Duration>, theme: TerminalTheme) {
     let label = elapsed
         .map(|elapsed| format!("Thor · {}", format_duration(elapsed)))
@@ -5450,16 +5379,9 @@ fn push_turn_final_response_label(out: &mut Vec<Line<'static>>, theme: TerminalT
     )));
 }
 
-fn actor_for_activity(activity: &ActorActivity) -> &ActorIdentity {
+fn loki_for_activity(activity: &LokiActivity) -> &LokiIdentity {
     match activity {
-        ActorActivity::Connected { actor }
-        | ActorActivity::Status { actor, .. }
-        | ActorActivity::Message { actor, .. }
-        | ActorActivity::Thought { actor, .. }
-        | ActorActivity::Tool { actor, .. }
-        | ActorActivity::PermissionRequested { actor, .. }
-        | ActorActivity::Warning { actor, .. }
-        | ActorActivity::Info { actor, .. } => actor,
+        LokiActivity::Warning { actor, .. } => actor,
     }
 }
 
@@ -5473,7 +5395,7 @@ fn entry_speaker(entry: &Entry) -> Option<String> {
         | Entry::CodeAgentThought(_)
         | Entry::CodeAgentToolCall(_)
         | Entry::CodeAgentPlan(_) => Some("Eitri".to_string()),
-        Entry::ActorActivity(activity) => Some(actor_role_name(actor_for_activity(activity))),
+        Entry::LokiActivity(activity) => Some(loki_role_name(loki_for_activity(activity))),
         Entry::InternalMessage(message) => Some(message.source.clone()),
         Entry::System(_) | Entry::EphemeralSystem(_) | Entry::SessionBoundary(_) => None,
     }
@@ -5551,28 +5473,6 @@ fn push_plain_message(
     }
     if collapsed {
         push_message_collapse_hint(out, theme);
-    }
-    out.push(Line::from(""));
-}
-
-fn push_styled_content(out: &mut Vec<Line<'static>>, text: String, color: Color) {
-    for raw in text.split('\n') {
-        out.push(Line::from(Span::styled(
-            raw.to_string(),
-            Style::default().fg(color),
-        )));
-    }
-    out.push(Line::from(""));
-}
-
-fn push_italic_tool_call(out: &mut Vec<Line<'static>>, text: String, theme: TerminalTheme) {
-    for raw in text.split('\n') {
-        out.push(Line::from(Span::styled(
-            raw.to_string(),
-            Style::default()
-                .fg(theme.muted)
-                .add_modifier(Modifier::ITALIC),
-        )));
     }
     out.push(Line::from(""));
 }
@@ -8341,7 +8241,7 @@ fn help_modal_lines(
         help_blank_line(),
         help_command_line(
             "Built-in commands:",
-            "/clear keeps agent; /new opens agent picker; /load opens session picker",
+            "/clear keeps model; /new applies saved models; /load opens session picker",
             theme,
         ),
     ]);
@@ -8778,28 +8678,18 @@ fn config_value_row_text(choice: &ConfigValueChoice, score: Option<&str>, width:
 /// Attribution shown under a model-selection picker explaining the trailing
 /// number, or `None` when scores aren't being rendered (not a model option, or
 /// scoring disabled). Keeps a blank score readable as "not ranked".
-fn model_score_legend(state: &AppState, option: &SessionConfigOption) -> Option<&'static str> {
-    (crate::app::is_model_config_option(option) && state.score_store.is_active()).then_some(
-        "elo: LMArena text-arena rating, higher is better · https://lmarena.ai · blank = not ranked",
-    )
+fn model_score_legend(_state: &AppState, _option: &SessionConfigOption) -> Option<&'static str> {
+    None
 }
 
 /// The score suffix for one model choice, or `None` when this option isn't a
 /// model option or scoring is disabled/uninstalled (so nothing is appended).
 fn model_choice_score(
-    state: &AppState,
-    option: &SessionConfigOption,
-    choice: &ConfigValueChoice,
+    _state: &AppState,
+    _option: &SessionConfigOption,
+    _choice: &ConfigValueChoice,
 ) -> Option<String> {
-    if !crate::app::is_model_config_option(option) {
-        return None;
-    }
-    state.score_store.score_suffix(
-        &state.agent_source_id,
-        &choice.value.to_string(),
-        &choice.name,
-        choice.description.as_deref().unwrap_or_default(),
-    )
+    None
 }
 
 // ===========================================================================
@@ -8811,7 +8701,7 @@ const RAGNAROK_ACTION_TTL: Duration = Duration::from_secs(12);
 /// Animation frame cadence (shares the spinner heartbeat).
 const RAGNAROK_FRAME_MS: u128 = 250;
 const RAGNAROK_CARD_MIN_WIDTH: u16 = 24;
-// Borders (2) + agent/elo line + 7 half-block sprite rows + vigor bar +
+// Borders (2) + agent/pass_at_1 line + 7 half-block sprite rows + vigor bar +
 // action caption.
 const RAGNAROK_CARD_HEIGHT: u16 = 12;
 const RAGNAROK_THOR_STRIP_HEIGHT: u16 = 3;
@@ -8834,11 +8724,7 @@ fn start_ragnarok(
     let cfg = ragnarok::BattleConfig {
         task: task.clone(),
         cwd: state.session_cwd.clone(),
-        config_path: state
-            .config_path
-            .clone()
-            .unwrap_or_else(config::default_config_path),
-        score_store: state.score_store.clone(),
+        available_models: state.ragnarok_models.clone(),
         thor_host: active_thor_host(state),
     };
     state.ragnarok = Some(RagnarokUi::new(task, abort_tx, proceed_tx));
@@ -9680,13 +9566,14 @@ fn draw_fighter_card(
     }
 
     let inner_width = inner.width as usize;
-    let star = if fighter.card.provisional { "*" } else { "" };
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         fit_width(
             format!(
-                "{} ⚡{}{star}",
-                fighter.card.agent_source_id, fighter.card.elo
+                "{} ⚡{:.1}% · ${:.2}",
+                fighter.card.agent_source_id,
+                fighter.card.pass_at_1_bps as f64 / 100.0,
+                fighter.card.mean_cost_usd
             ),
             inner_width,
         ),
@@ -9934,7 +9821,7 @@ fn draw_ragnarok_verdict(
     if verdict.thor_fallback {
         lines.push(Line::from(Span::styled(
             fit_width(
-                "(Thor's judgment was garbled; finalists stand in Elo order)",
+                "(Thor's judgment was garbled; finalists stand in Pass@1 order)",
                 width,
             ),
             Style::default().fg(theme.muted),
@@ -10207,9 +10094,9 @@ mod tests {
             group: None,
         };
 
-        let row = config_value_row_text(&choice, Some("1463 elo"), 32);
+        let row = config_value_row_text(&choice, Some("1463 pass_at_1"), 32);
 
-        assert!(row.ends_with("  1463 elo"), "{row}");
+        assert!(row.ends_with("  1463 pass_at_1"), "{row}");
         assert!(row.width() <= 32, "{row}");
     }
 
@@ -12664,8 +12551,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(live.contains("searching entry points"), "{live}");
-        state.apply_event(UiEvent::ActorActivity(ActorActivity::Warning {
-            actor: ActorIdentity {
+        state.apply_event(UiEvent::LokiActivity(LokiActivity::Warning {
+            actor: LokiIdentity {
                 role: "Loki".to_string(),
                 connection_id: "explore-review".to_string(),
                 source_id: None,
@@ -12781,8 +12668,8 @@ mod tests {
         )));
         assert!(sink.pending_lines(&state, 80).is_empty());
 
-        state.apply_event(UiEvent::ActorActivity(ActorActivity::Warning {
-            actor: ActorIdentity {
+        state.apply_event(UiEvent::LokiActivity(LokiActivity::Warning {
+            actor: LokiIdentity {
                 role: "Loki".to_string(),
                 connection_id: "loki-review".to_string(),
                 source_id: None,
@@ -13422,7 +13309,7 @@ mod tests {
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let actor = ActorIdentity {
+        let actor = LokiIdentity {
             role: "Loki".to_string(),
             connection_id: "loki".to_string(),
             source_id: None,
@@ -13433,15 +13320,7 @@ mod tests {
             Entry::UserPrompt(long.clone()),
             Entry::AgentMessage(long.clone()),
             Entry::CodeAgentMessage(long.clone()),
-            Entry::ActorActivity(Box::new(ActorActivity::Message {
-                actor: actor.clone(),
-                text: long.clone(),
-            })),
-            Entry::ActorActivity(Box::new(ActorActivity::Warning {
-                actor: actor.clone(),
-                message: long.clone(),
-            })),
-            Entry::ActorActivity(Box::new(ActorActivity::Info {
+            Entry::LokiActivity(Box::new(LokiActivity::Warning {
                 actor,
                 message: long.clone(),
             })),
@@ -13463,7 +13342,7 @@ mod tests {
                 .iter()
                 .filter(|line| line.as_str() == "… details hidden (Ctrl-T to expand)")
                 .count(),
-            8,
+            6,
             "rendered: {rendered:?}"
         );
         assert!(!rendered.iter().any(|line| line == "line 7"));
@@ -14250,7 +14129,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_is_compact_and_speaker_names_have_distinct_colors() {
+    fn thinking_is_compact_and_primary_agent_names_have_distinct_colors() {
         let mut state = AppState::new();
         let theme = state.theme;
         state.transcript.push(Entry::AgentThought(
@@ -14259,19 +14138,6 @@ mod tests {
         state.transcript.push(Entry::CodeAgentThought(
             "Checking the implementation".to_string(),
         ));
-        state
-            .transcript
-            .push(Entry::ActorActivity(Box::new(ActorActivity::Thought {
-                actor: ActorIdentity {
-                    role: "Loki".to_string(),
-                    connection_id: "loki".to_string(),
-                    source_id: None,
-                    model_name: None,
-                    model_value: None,
-                },
-                text: "Reviewing the boundary".to_string(),
-            })));
-
         let rendered = render_transcript_lines(&state, 80);
         let text = rendered.iter().map(line_text).collect::<Vec<_>>();
         assert_eq!(
@@ -14281,14 +14147,11 @@ mod tests {
                 "Planning initial code_agent invocation",
                 "Eitri",
                 "Checking the implementation",
-                "Loki",
-                "Reviewing the boundary",
             ]
         );
         assert_eq!(rendered[0].spans[0].style.fg, Some(theme.primary));
         assert_eq!(rendered[2].spans[0].style.fg, Some(theme.code));
-        assert_eq!(rendered[4].spans[0].style.fg, Some(theme.secondary));
-        for line in [&rendered[1], &rendered[3], &rendered[5]] {
+        for line in [&rendered[1], &rendered[3]] {
             assert_eq!(line.spans[0].style.fg, Some(theme.thought));
         }
     }
@@ -16414,16 +16277,16 @@ mod tests {
                 agent_source_id: "a".into(),
                 model_value: "m0".into(),
                 model_name: "M0".into(),
-                elo: 1400,
-                provisional: false,
+                pass_at_1_bps: 1400,
+                mean_cost_usd: 0.0,
             },
             crate::ragnarok::FighterCard {
                 id: 1,
                 agent_source_id: "b".into(),
                 model_value: "m1".into(),
                 model_name: "M1".into(),
-                elo: 1500,
-                provisional: false,
+                pass_at_1_bps: 1500,
+                mean_cost_usd: 0.0,
             },
         ]));
 
@@ -16572,16 +16435,16 @@ mod tests {
                 agent_source_id: "a".into(),
                 model_value: "m0".into(),
                 model_name: "M0".into(),
-                elo: 1400,
-                provisional: false,
+                pass_at_1_bps: 1400,
+                mean_cost_usd: 0.0,
             },
             crate::ragnarok::FighterCard {
                 id: 1,
                 agent_source_id: "b".into(),
                 model_value: "m1".into(),
                 model_name: "M1".into(),
-                elo: 1500,
-                provisional: false,
+                pass_at_1_bps: 1500,
+                mean_cost_usd: 0.0,
             },
         ]));
         state.apply_ragnarok_event(ragnarok::RagnarokEvent::ThorAction(
@@ -16618,8 +16481,8 @@ mod tests {
                 agent_source_id: "a".into(),
                 model_value: "m0".into(),
                 model_name: "M0".into(),
-                elo: 1400,
-                provisional: false,
+                pass_at_1_bps: 1400,
+                mean_cost_usd: 0.0,
             },
         ]));
         state.apply_ragnarok_event(ragnarok::RagnarokEvent::FighterState {
@@ -16646,16 +16509,16 @@ mod tests {
                 agent_source_id: "a".into(),
                 model_value: "m0".into(),
                 model_name: "M0".into(),
-                elo: 1400,
-                provisional: false,
+                pass_at_1_bps: 1400,
+                mean_cost_usd: 0.0,
             },
             crate::ragnarok::FighterCard {
                 id: 1,
                 agent_source_id: "b".into(),
                 model_value: "m1".into(),
                 model_name: "M1".into(),
-                elo: 1500,
-                provisional: false,
+                pass_at_1_bps: 1500,
+                mean_cost_usd: 0.0,
             },
         ]));
         state.apply_ragnarok_event(ragnarok::RagnarokEvent::Verdict(Box::new(

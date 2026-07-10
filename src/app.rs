@@ -22,8 +22,8 @@ use crate::claude_usage::ClaudeUsageReport;
 use crate::clipboard::ClipboardLease;
 
 use crate::event::{
-    ActorActivity, CodeAgentEvent, CodeAgentOutcome, ElicitationOutcome, ElicitationPrompt,
-    InternalMessage, PermissionDecision, PermissionPrompt, PromptImage, SessionConfigTarget,
+    CodeAgentEvent, CodeAgentOutcome, ElicitationOutcome, ElicitationPrompt, InternalMessage,
+    LokiActivity, PermissionDecision, PermissionPrompt, PromptImage, SessionConfigTarget,
     TerminalOutputSnapshot, UiEvent, content_block_text,
 };
 use crate::palette::TerminalTheme;
@@ -41,7 +41,8 @@ const BUILTIN_LOAD_COMMAND: &str = "load";
 const BUILTIN_FORK_COMMAND: &str = "fork";
 const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
-const BUILTIN_COUNCIL_COMMAND: &str = "council";
+const BUILTIN_MODELS_COMMAND: &str = "models";
+const BUILTIN_REVIEWS_COMMAND: &str = "reviews";
 const BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
 
@@ -78,10 +79,17 @@ fn builtin_mjconfig_command() -> AvailableCommand {
     )
 }
 
-fn builtin_council_command() -> AvailableCommand {
+fn builtin_models_command() -> AvailableCommand {
     AvailableCommand::new(
-        BUILTIN_COUNCIL_COMMAND,
-        "show or select Thor/Loki/Eitri models (usage: /council [role model|auto])",
+        BUILTIN_MODELS_COMMAND,
+        "show or select Thor/Loki/Eitri models (usage: /models [role model|auto])",
+    )
+}
+
+fn builtin_reviews_command() -> AvailableCommand {
+    AvailableCommand::new(
+        BUILTIN_REVIEWS_COMMAND,
+        "show or change Council reviews (usage: /reviews [thor|loki on|off])",
     )
 }
 
@@ -100,7 +108,8 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
             && command.name != BUILTIN_FORK_COMMAND
             && command.name != BUILTIN_EXPORT_COMMAND
             && command.name != BUILTIN_MJCONFIG_COMMAND
-            && command.name != BUILTIN_COUNCIL_COMMAND
+            && command.name != BUILTIN_MODELS_COMMAND
+            && command.name != BUILTIN_REVIEWS_COMMAND
             && command.name != BUILTIN_RAGNAROK_COMMAND
     });
     if include_fork {
@@ -108,7 +117,8 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
     }
     commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_mjconfig_command());
-    commands.insert(0, builtin_council_command());
+    commands.insert(0, builtin_reviews_command());
+    commands.insert(0, builtin_models_command());
     commands.insert(0, builtin_export_command());
     commands.insert(0, builtin_load_command());
     commands.insert(0, builtin_clear_command());
@@ -116,7 +126,7 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
 }
 
 /// How the UI loop ends, so `main` can decide whether to quit entirely
-/// or start a fresh session through the agent picker.
+/// or start a fresh session from the saved Council preferences.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum UiExitReason {
     Quit,
@@ -145,8 +155,8 @@ pub enum Entry {
     /// Latest plan posted by the agent.
     Plan(Vec<PlanEntry>),
     CodeAgentPlan(Vec<PlanEntry>),
-    /// Role/model-attributed activity projected from structured MCP progress.
-    ActorActivity(Box<ActorActivity>),
+    /// Role/model-attributed Loki reviewer activity.
+    LokiActivity(Box<LokiActivity>),
     /// Council coordination prompt retained in full but normally rendered compactly.
     InternalMessage(InternalMessage),
     /// System-level note (errors, warnings, mode changes).
@@ -299,13 +309,13 @@ impl ToolCallView {
     }
 }
 
-fn is_code_agent_transport_call(tool_call: &ToolCall) -> bool {
+pub(crate) fn is_code_agent_transport_call(tool_call: &ToolCall) -> bool {
     code_agent_identity_from_raw_input(tool_call.raw_input.as_ref())
         || code_agent_identity_from_name(&tool_call.title)
         || code_agent_identity_from_meta(tool_call.meta.as_ref())
 }
 
-fn is_code_agent_transport_update(update: &ToolCallUpdate) -> bool {
+pub(crate) fn is_code_agent_transport_update(update: &ToolCallUpdate) -> bool {
     code_agent_identity_from_raw_input(update.fields.raw_input.as_ref())
         || update
             .fields
@@ -628,7 +638,6 @@ pub struct AppState {
     /// Score catalog for this UI run. It may be populated asynchronously after
     /// startup; render code reads through this explicit state rather than a
     /// process-global catalog.
-    pub score_store: crate::scores::ScoreStore,
     pub session_id: Option<String>,
     pub session_title: Option<String>,
     /// Current connection lifecycle state. Private to enforce the invariant
@@ -647,7 +656,6 @@ pub struct AppState {
     /// state remains available, but the redundant parent row is omitted from
     /// the transcript so it cannot pin nested activity behind a pending tool.
     suppressed_tool_calls: HashSet<String>,
-    actor_tool_entries: HashMap<String, usize>,
     terminal_outputs: HashMap<String, TerminalOutputSnapshot>,
     /// Bumped whenever `transcript` or `tool_calls` change in a way that
     /// affects rendering. The UI layer uses this as a cache key so it can
@@ -759,7 +767,13 @@ pub struct AppState {
     pub config_path: Option<PathBuf>,
     /// DeepSWE model catalog and current model-first council selectors.
     pub council_choices: Vec<crate::council::ModelChoice>,
+    /// Preferences saved for the next session and immutable resolutions used
+    /// by the current session are deliberately shown separately.
     pub council_models: crate::config::ModelsConfig,
+    pub active_council_models: crate::config::ModelsConfig,
+    pub thor_review_enabled: bool,
+    pub loki_review_enabled: bool,
+    pub ragnarok_models: Vec<crate::council::ResolvedRole>,
     /// Holds the platform clipboard lease so copied text remains available
     /// on Linux/X11 where the owning process must stay alive.
     #[allow(dead_code)]
@@ -979,7 +993,6 @@ impl AppState {
             primary_connected_announced: false,
             agent_source_id: String::new(),
             active_agent_launch: None,
-            score_store: crate::scores::ScoreStore::default(),
             session_id: None,
             session_title: None,
             connection_state: ConnectionState::Launching,
@@ -996,7 +1009,6 @@ impl AppState {
             transcript: Vec::new(),
             tool_calls: HashMap::new(),
             suppressed_tool_calls: HashSet::new(),
-            actor_tool_entries: HashMap::new(),
             terminal_outputs: HashMap::new(),
             transcript_revision: 0,
             input: String::new(),
@@ -1041,6 +1053,10 @@ impl AppState {
             config_path: None,
             council_choices: Vec::new(),
             council_models: crate::config::ModelsConfig::default(),
+            active_council_models: crate::config::ModelsConfig::default(),
+            thor_review_enabled: true,
+            loki_review_enabled: true,
+            ragnarok_models: Vec::new(),
             clipboard_lease: None,
             queued_prompts: VecDeque::new(),
         }
@@ -1133,16 +1149,28 @@ impl AppState {
 
     pub fn council_summary(&self) -> String {
         let mut text = format!(
-            "Council models\n\nChange with: /council <thor|loki|eitri> <auto|model-id>\n\nConfigured\n  Thor   {}\n  Loki   {}\n  Eitri  {}\n\nAuto selection · DeepSWE\n  Loki chooses the best launchable model from a provider other than Thor's.\n  Eitri chooses the cheapest Pareto model meeting the Sonnet High quality floor.\n\nAvailable models\n",
-            self.council_models.thor, self.council_models.loki, self.council_models.eitri
+            "Council models\n\nChange with: /models <thor|loki|eitri> <auto|model-id>\nChanges apply to the next session.\n\nSaved preference\n  Thor   {}\n  Loki   {}\n  Eitri  {}\n\nActive session\n  Thor   {}\n  Loki   {}\n  Eitri  {}\n\nAuto selection · DeepSWE\n  Loki chooses the best launchable model from a provider other than Thor's.\n  Eitri chooses the cheapest Pareto model meeting the Sonnet High quality floor.\n\nAvailable models\n",
+            self.council_models.thor,
+            self.council_models.loki,
+            self.council_models.eitri,
+            self.active_council_models.thor,
+            self.active_council_models.loki,
+            self.active_council_models.eitri,
         );
         for choice in &self.council_choices {
-            if choice.available {
+            if choice.available && choice.ranked {
                 text.push_str(&format!(
-                    "  ✓ {} · Pass@1 {:.1}% · ${:.2}\n",
+                    "  ✓ {} · Pass@1 {:.1}% · ${:.2} · {}\n",
                     choice.model,
                     choice.pass_at_1 * 100.0,
-                    choice.mean_cost_usd
+                    choice.mean_cost_usd,
+                    choice.adapter.as_deref().unwrap_or("adapter unknown")
+                ));
+            } else if choice.available {
+                text.push_str(&format!(
+                    "  ✓ {} · Unranked · {}\n",
+                    choice.model,
+                    choice.adapter.as_deref().unwrap_or("custom ACP")
                 ));
             } else {
                 text.push_str(&format!(
@@ -1161,7 +1189,7 @@ impl AppState {
                 .council_choices
                 .iter()
                 .find(|choice| choice.model == model)
-                .ok_or_else(|| format!("unknown DeepSWE model '{model}'"))?;
+                .ok_or_else(|| format!("unknown Council model '{model}'"))?;
             if !choice.available {
                 return Err(format!(
                     "model '{model}' is unavailable: {}",
@@ -1188,7 +1216,7 @@ impl AppState {
             .ok_or_else(|| "config path is unavailable".to_string())?;
         let mut config =
             crate::config::Config::load(path).map_err(|error| format!("load config: {error:#}"))?;
-        config.models = next.clone();
+        config.set_role_models(&next);
         config
             .save(path)
             .map_err(|error| format!("save config: {error:#}"))?;
@@ -1196,6 +1224,44 @@ impl AppState {
         Ok(format!(
             "{role} model set to {model}; starts with the next session"
         ))
+    }
+
+    pub fn review_summary(&self) -> String {
+        format!(
+            "Council reviews · Thor discrete {} · Loki streaming {}",
+            on_off(self.thor_review_enabled),
+            on_off(self.loki_review_enabled)
+        )
+    }
+
+    pub fn set_review_policy(
+        &mut self,
+        role: &str,
+        enabled: bool,
+    ) -> Result<crate::event::ReviewRole, String> {
+        let path = self
+            .config_path
+            .as_deref()
+            .ok_or_else(|| "config path is unavailable".to_string())?;
+        let mut config =
+            crate::config::Config::load(path).map_err(|error| format!("load config: {error:#}"))?;
+        let review_role = match role.to_ascii_lowercase().as_str() {
+            "thor" => {
+                config.thor.discrete_review = enabled;
+                self.thor_review_enabled = enabled;
+                crate::event::ReviewRole::Thor
+            }
+            "loki" => {
+                config.loki.streaming_review = enabled;
+                self.loki_review_enabled = enabled;
+                crate::event::ReviewRole::Loki
+            }
+            _ => return Err("review role must be thor or loki".to_string()),
+        };
+        config
+            .save(path)
+            .map_err(|error| format!("save config: {error:#}"))?;
+        Ok(review_role)
     }
 
     /// Stage a prompt to fire when the current turn completes.
@@ -1376,7 +1442,7 @@ impl AppState {
             | Entry::CodeAgentToolCall(_)
             | Entry::Plan(_)
             | Entry::CodeAgentPlan(_)
-            | Entry::ActorActivity(_)
+            | Entry::LokiActivity(_)
             | Entry::InternalMessage(_)
             | Entry::System(_)
             | Entry::EphemeralSystem(_)
@@ -2073,7 +2139,6 @@ impl AppState {
                 | UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
                     SessionUpdate::AgentThoughtChunk(_)
                 ))
-                | UiEvent::ActorActivity(ActorActivity::Thought { .. })
         );
         if !is_thinking_update && remove_trailing_thinking(&mut self.transcript) {
             self.bump_transcript_revision();
@@ -2114,7 +2179,7 @@ impl AppState {
             UiEvent::SessionConfigOptions { options, targets } => {
                 self.apply_session_config_options(options, targets);
             }
-            UiEvent::ActorActivity(activity) => self.apply_actor_activity(activity),
+            UiEvent::LokiActivity(activity) => self.apply_loki_activity(activity),
             UiEvent::InternalMessage(message) => {
                 self.transcript.push(Entry::InternalMessage(message));
                 self.bump_transcript_revision();
@@ -2385,62 +2450,10 @@ impl AppState {
         self.apply_known_terminal_outputs();
     }
 
-    fn apply_actor_activity(&mut self, activity: ActorActivity) {
-        if let ActorActivity::Thought { actor, text } = &activity {
-            if let Some(Entry::ActorActivity(previous)) = self.transcript.last_mut()
-                && let ActorActivity::Thought {
-                    actor: previous_actor,
-                    text: previous_text,
-                } = previous.as_mut()
-                && actor.connection_id == previous_actor.connection_id
-            {
-                *previous_text = text.clone();
-                self.bump_transcript_revision();
-                return;
-            }
-            remove_trailing_thinking(&mut self.transcript);
-            self.transcript
-                .push(Entry::ActorActivity(Box::new(activity)));
-            self.bump_transcript_revision();
-            return;
-        }
+    fn apply_loki_activity(&mut self, activity: LokiActivity) {
         remove_trailing_thinking(&mut self.transcript);
-        if let ActorActivity::Tool { actor, tool_id, .. } = &activity {
-            let key = format!("{}:{tool_id}", actor.connection_id);
-            if let Some(&index) = self.actor_tool_entries.get(&key)
-                && let Some(Entry::ActorActivity(previous)) = self.transcript.get_mut(index)
-                && matches!(previous.as_ref(), ActorActivity::Tool { .. })
-            {
-                **previous = activity;
-                self.bump_transcript_revision();
-                return;
-            }
-            let index = self.transcript.len();
-            self.transcript
-                .push(Entry::ActorActivity(Box::new(activity)));
-            self.actor_tool_entries.insert(key, index);
-            self.bump_transcript_revision();
-            return;
-        }
-
-        if let Some(Entry::ActorActivity(previous)) = self.transcript.last_mut() {
-            match (&activity, previous.as_mut()) {
-                (
-                    ActorActivity::Message { actor, text },
-                    ActorActivity::Message {
-                        actor: previous_actor,
-                        text: previous_text,
-                    },
-                ) if actor.connection_id == previous_actor.connection_id => {
-                    previous_text.push_str(text);
-                    self.bump_transcript_revision();
-                    return;
-                }
-                _ => {}
-            }
-        }
         self.transcript
-            .push(Entry::ActorActivity(Box::new(activity)));
+            .push(Entry::LokiActivity(Box::new(activity)));
         self.bump_transcript_revision();
     }
 
@@ -2735,11 +2748,25 @@ impl AppState {
         options: Vec<SessionConfigOption>,
         targets: Vec<SessionConfigTarget>,
     ) {
-        self.session_config_targets = if targets.len() == options.len() {
+        let targets = if targets.len() == options.len() {
             targets
         } else {
             config_option_targets(&options)
         };
+        let (options, targets): (Vec<_>, Vec<_>) = options
+            .into_iter()
+            .zip(targets)
+            .filter(|(option, _)| {
+                !matches!(
+                    option.category,
+                    Some(
+                        SessionConfigOptionCategory::Model
+                            | SessionConfigOptionCategory::ThoughtLevel
+                    )
+                )
+            })
+            .unzip();
+        self.session_config_targets = targets;
         self.session_config_options = options;
         self.refresh_config_picker();
 
@@ -2767,6 +2794,10 @@ impl AppState {
             })
             .collect()
     }
+}
+
+fn on_off(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "off" }
 }
 
 fn config_option_targets(options: &[SessionConfigOption]) -> Vec<SessionConfigTarget> {
@@ -2829,13 +2860,10 @@ fn replace_thinking(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) 
 }
 
 fn remove_trailing_thinking(transcript: &mut Vec<Entry>) -> bool {
-    let thinking = match transcript.last() {
-        Some(Entry::AgentThought(_) | Entry::CodeAgentThought(_)) => true,
-        Some(Entry::ActorActivity(activity)) => {
-            matches!(activity.as_ref(), ActorActivity::Thought { .. })
-        }
-        _ => false,
-    };
+    let thinking = matches!(
+        transcript.last(),
+        Some(Entry::AgentThought(_) | Entry::CodeAgentThought(_))
+    );
     if thinking {
         transcript.pop();
         true
@@ -4035,13 +4063,13 @@ mod tests {
             ConfigOptionUpdate::new(options),
         )));
 
-        assert_eq!(s.session_config_options.len(), 2);
+        assert_eq!(s.session_config_options.len(), 1);
         assert_eq!(s.current_mode.as_deref(), Some("ask"));
         assert!(s.status_line.is_none());
     }
 
     #[test]
-    fn config_option_update_uses_thought_level_as_current_mode() {
+    fn config_option_update_hides_thought_level_from_primary_shortcuts() {
         let mut s = AppState::new();
         let options = vec![
             SessionConfigOption::select(
@@ -4060,7 +4088,8 @@ mod tests {
             ConfigOptionUpdate::new(options),
         )));
 
-        assert_eq!(s.current_mode.as_deref(), Some("medium"));
+        assert!(s.session_config_options.is_empty());
+        assert!(s.current_mode.is_none());
     }
 
     #[test]
@@ -5485,7 +5514,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "load", "export", "council", "mjconfig", "ragnarok"
+                "new", "clear", "load", "export", "models", "reviews", "mjconfig", "ragnarok"
             ]
         );
     }
@@ -5512,7 +5541,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "load", "export", "council", "mjconfig", "ragnarok", "fork"
+                "new", "clear", "load", "export", "models", "reviews", "mjconfig", "ragnarok",
+                "fork"
             ]
         );
     }
@@ -5548,7 +5578,8 @@ mod tests {
                 "clear",
                 "load",
                 "export",
-                "council",
+                "models",
+                "reviews",
                 "mjconfig",
                 "ragnarok",
                 "fork",
@@ -5570,10 +5601,10 @@ mod tests {
         );
         assert_eq!(
             s.available_commands[4].description,
-            "show or select Thor/Loki/Eitri models (usage: /council [role model|auto])"
+            "show or select Thor/Loki/Eitri models (usage: /models [role model|auto])"
         );
         assert_eq!(
-            s.available_commands[7].description,
+            s.available_commands[8].description,
             "fork the current session (unstable ACP extension)"
         );
     }
@@ -5600,7 +5631,8 @@ mod tests {
                 "clear",
                 "load",
                 "export",
-                "council",
+                "models",
+                "reviews",
                 "mjconfig",
                 "ragnarok",
                 "review_pr"
@@ -5998,8 +6030,8 @@ mod tests {
             agent_source_id: format!("agent-{id}"),
             model_value: name.to_lowercase(),
             model_name: name.to_string(),
-            elo: 1400 + id as u32,
-            provisional: false,
+            pass_at_1_bps: 1400 + id as u32,
+            mean_cost_usd: 0.0,
         }
     }
 
@@ -6307,6 +6339,8 @@ fn council_model_selection_persists_and_rejects_disabled_choice() {
             mean_cost_usd: 1.0,
             available: true,
             disabled_reason: None,
+            adapter: Some("codex-acp".to_string()),
+            ranked: true,
         },
         crate::council::ModelChoice {
             model: "claude-disabled".to_string(),
@@ -6314,12 +6348,14 @@ fn council_model_selection_persists_and_rejects_disabled_choice() {
             mean_cost_usd: 2.0,
             available: false,
             disabled_reason: Some("claude executable not found on PATH".to_string()),
+            adapter: None,
+            ranked: true,
         },
     ];
 
     state.set_council_model("thor", "gpt-test").expect("select");
     assert_eq!(
-        crate::config::Config::load(&path).unwrap().models.thor,
+        crate::config::Config::load(&path).unwrap().thor.model,
         "gpt-test"
     );
     let error = state

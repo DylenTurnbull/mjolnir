@@ -7,7 +7,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::acp::{RuntimeAccessMode, RuntimeRoleConfig};
 use crate::council::ResolvedRole;
-use crate::event::{ActorActivity, ActorIdentity, UiEvent};
+use crate::event::{LokiActivity, LokiIdentity, UiEvent};
 use crate::ragnarok::{AgentHandle, Launch, TurnEvent};
 
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -567,7 +567,7 @@ pub struct Handle {
     epochs: Arc<AtomicU64>,
     abort: watch::Sender<bool>,
     finished: watch::Receiver<bool>,
-    pub streaming_enabled: bool,
+    streaming_enabled: Arc<AtomicBool>,
 }
 
 impl Handle {
@@ -589,7 +589,7 @@ impl Handle {
             epochs: Arc::new(AtomicU64::new(1)),
             abort,
             finished,
-            streaming_enabled,
+            streaming_enabled: Arc::new(AtomicBool::new(streaming_enabled)),
         };
         tokio::spawn(worker(
             role,
@@ -632,10 +632,14 @@ impl Handle {
     }
 
     pub async fn observe(&self, epoch: u64, target: Target, delta: String) -> Option<u64> {
-        if !self.streaming_enabled {
+        if !self.streaming_enabled.load(Ordering::Acquire) {
             return None;
         }
         Some(self.submit(epoch, target, delta))
+    }
+
+    pub fn set_streaming_enabled(&self, enabled: bool) {
+        self.streaming_enabled.store(enabled, Ordering::Release);
     }
 
     fn submit(&self, epoch: u64, target: Target, delta: String) -> u64 {
@@ -965,8 +969,8 @@ fn review_prompt(
     bounded(prompt)
 }
 
-fn identity(role: &ResolvedRole) -> ActorIdentity {
-    ActorIdentity {
+fn identity(role: &ResolvedRole) -> LokiIdentity {
+    LokiIdentity {
         role: "Loki".to_string(),
         connection_id: "loki".to_string(),
         source_id: Some(role.launch.source_id.clone()),
@@ -976,7 +980,7 @@ fn identity(role: &ResolvedRole) -> ActorIdentity {
 }
 
 fn emit_warning(ui_tx: &mpsc::UnboundedSender<UiEvent>, role: &ResolvedRole, message: String) {
-    let _ = ui_tx.send(UiEvent::ActorActivity(ActorActivity::Warning {
+    let _ = ui_tx.send(UiEvent::LokiActivity(LokiActivity::Warning {
         actor: identity(role),
         message,
     }));
@@ -1000,7 +1004,7 @@ mod tests {
                 epochs: Arc::new(AtomicU64::new(epoch.saturating_add(1))),
                 abort,
                 finished,
-                streaming_enabled: true,
+                streaming_enabled: Arc::new(AtomicBool::new(true)),
             },
             request_rx,
         )

@@ -48,7 +48,7 @@ run_case() {
   printf '{}\n' >"$root/home/.codex/auth.json"
   cp "$repo/src/deepswe_snapshot.json" "$root/home/.cache/mj/deepswe-v1.1.json"
   cp "$repo/src/deepswe_snapshot.json" "$root/home/Library/Caches/mj/deepswe-v1.1.json"
-  config="[agent]\nsource_id = \"custom:e2e-primary\"\nprogram = \"$node\"\nargs = [\"$repo/tests/e2e/primary-agent.mjs\"]\n\n[models]\neitri = \"gpt-5-6-luna\"\n"
+  config="[eitri]\nmodel = \"gpt-5-6-luna\"\n"
   printf '%b' "$config" >"$root/home/.config/mj/config.toml"
   printf '%b' "$config" >"$root/home/Library/Application Support/mj/config.toml"
 
@@ -103,11 +103,13 @@ run_case() {
     echo "parent explore-agent transport tool leaked into the transcript" >&2
     exit 1
   fi
-  grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
-
+  if grep -a 'F1 Model\|F[1-9] Reasoning' "$root/transcript.log" >/dev/null; then
+    echo "Council-owned model or reasoning control leaked into Thor's F-key controls" >&2
+    exit 1
+  fi
   if [ "$mode" = unsupported ]; then
     test ! -e "$root/primary-result.json"
-    grep -a "does not support HTTP MCP servers required for code-agent delegation" "$root/transcript.log" >/dev/null
+    grep -a "no Council model is launchable.*mcpCapabilities.http" "$root/transcript.log" >/dev/null
     if grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null; then
       echo "failed ACP initialization claimed a successful connection" >&2
       exit 1
@@ -117,12 +119,14 @@ run_case() {
       exit 1
     fi
   elif [ "$mode" = no-change ]; then
+    grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test ! -e "$root/primary-result.json"
     grep -a 'Thor session update' "$root/loki.log" >/dev/null
     grep -a 'no-advice' "$root/loki.log" >/dev/null
     grep -a "PRIMARY.*NO.*CHANGE" "$root/transcript.log" >/dev/null
   elif [ "$mode" = explore ]; then
+    grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
     test -s "$root/primary-result.json"
@@ -140,6 +144,7 @@ run_case() {
       exit 1
     fi
   elif [ "$mode" = explore-cancel ]; then
+    grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
     test -s "$root/primary-result.json"
@@ -150,6 +155,7 @@ run_case() {
     test ! -e "$workspace/eitri-change.txt"
     test ! -e "$workspace/eitri-partial.txt"
   elif [ "$mode" = complete ] || [ "$mode" = loki-eitri ] || [ "$mode" = loki-thor ] || [ "$mode" = thor-review ] || [ "$mode" = details ]; then
+    grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
     test -s "$root/primary-result.json"
@@ -193,6 +199,7 @@ run_case() {
       exit 1
     fi
   elif [ "$mode" = failed ]; then
+    grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test -s "$root/primary-result.json"
     node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || !r.response.isError || !text.includes("fixture Eitri failure") || !text.includes("<workspace_diff scope=\"eitri-invocation\" authored_by=\"Eitri\">") || !text.includes("diff --git a/eitri-partial.txt b/eitri-partial.txt") || !text.includes("eitri-partial.txt") || !text.includes("You should review Eitri\u0027s work now.") || text.includes("seed.txt")) process.exit(1)' "$root/primary-result.json"
@@ -201,6 +208,7 @@ run_case() {
       exit 1
     fi
   else
+    grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 2
     test -s "$root/primary-result.json"

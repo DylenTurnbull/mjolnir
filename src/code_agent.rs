@@ -792,7 +792,7 @@ async fn run(
                     }
                     UiEvent::ClaudeUsage(_)
                     | UiEvent::RemotePermissionDecision { .. }
-                    | UiEvent::ActorActivity(_)
+                    | UiEvent::LokiActivity(_)
                     | UiEvent::InternalMessage(_) => {}
                     UiEvent::CodeAgent(_) => {
                         break Err(anyhow!("Eitri attempted recursive delegation"));

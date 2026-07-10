@@ -22,9 +22,9 @@ pub struct PromptImage {
     pub height: u32,
 }
 
-/// One actor discovered through structured nested MCP progress.
+/// Loki identity attached to reviewer activity rendered in the transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActorIdentity {
+pub struct LokiIdentity {
     pub role: String,
     pub connection_id: String,
     pub source_id: Option<String>,
@@ -32,43 +32,12 @@ pub struct ActorIdentity {
     pub model_value: Option<String>,
 }
 
-/// Transcript-safe projection of an actor controlled through `mj mcp`.
+/// Explicit reviewer activity. Eitri uses the foreground ACP lane instead of
+/// projecting through these events.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActorActivity {
-    Connected {
-        actor: ActorIdentity,
-    },
-    Status {
-        actor: ActorIdentity,
-        connection_status: String,
-        turn_id: u64,
-        turn_status: String,
-    },
-    Message {
-        actor: ActorIdentity,
-        text: String,
-    },
-    Thought {
-        actor: ActorIdentity,
-        text: String,
-    },
-    Tool {
-        actor: ActorIdentity,
-        tool_id: String,
-        title: String,
-        kind: Option<String>,
-        status: Option<String>,
-    },
-    PermissionRequested {
-        actor: ActorIdentity,
-        title: String,
-    },
+pub enum LokiActivity {
     Warning {
-        actor: ActorIdentity,
-        message: String,
-    },
-    Info {
-        actor: ActorIdentity,
+        actor: LokiIdentity,
         message: String,
     },
 }
@@ -120,7 +89,7 @@ pub enum UiEvent {
         targets: Vec<SessionConfigTarget>,
     },
     /// Structured nested-agent activity projected from an MCP tool result.
-    ActorActivity(ActorActivity),
+    LokiActivity(LokiActivity),
     /// Hidden council coordination made inspectable in the shared transcript.
     InternalMessage(InternalMessage),
     /// `session/request_permission` from the agent. The UI is expected to
@@ -263,6 +232,8 @@ pub enum UiCommand {
         target: SessionConfigTarget,
         value: SessionConfigValueId,
     },
+    /// Change Council review policy without replacing Thor's ACP session.
+    SetReviewPolicy { role: ReviewRole, enabled: bool },
     /// Fork the current ACP session and continue in the forked session.
     ForkSession,
     /// Load another session on the existing ACP connection when supported.
@@ -276,6 +247,12 @@ pub enum UiCommand {
     CancelPrompt,
     /// Tear down: kill the agent child and exit.
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewRole {
+    Thor,
+    Loki,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
