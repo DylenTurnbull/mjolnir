@@ -191,7 +191,7 @@ impl TranscriptSink {
             self.emitted_entries..stable_entries,
             transcript_collapse_limit(state),
             state.theme,
-            true,
+            false,
         );
         self.emitted_entries = stable_entries;
         lines
@@ -235,22 +235,10 @@ impl InlineResizeReflow {
 }
 
 fn stable_transcript_entry_count(state: &AppState) -> usize {
-    let turns = transcript_turns(state);
     let mut stable = 0;
-    let mut idx = 0;
-    while idx < state.transcript.len() {
-        if let Some(turn) = turns.iter().find(|turn| turn.prompt_index == idx) {
-            if turn.is_flushable {
-                stable = turn.end;
-                idx = turn.end;
-                continue;
-            }
-            break;
-        }
-        let entry = &state.transcript[idx];
+    for (idx, entry) in state.transcript.iter().enumerate() {
         if transcript_entry_is_stable(state, idx, entry) {
             stable = idx + 1;
-            idx += 1;
         } else {
             break;
         }
@@ -266,7 +254,6 @@ struct TranscriptTurn {
     prompt_index: usize,
     end: usize,
     is_compactable: bool,
-    is_flushable: bool,
     elapsed: Option<Duration>,
     tool_summary: Option<TurnToolSummary>,
     final_response_index: Option<usize>,
@@ -312,15 +299,6 @@ fn transcript_turns(state: &AppState) -> Vec<TranscriptTurn> {
             let has_lifecycle = state.has_prompt_turn(prompt_index);
             let is_compactable =
                 has_lifecycle && state.prompt_turn_completed(prompt_index) && entries_stable;
-            // Replayed prompts have no local PromptDone event or recorded
-            // duration. They still need to enter inline scrollback once their
-            // entries are stable, but remain unbundled so no historic activity
-            // is silently inferred to be a completed local turn.
-            let is_flushable = if has_lifecycle {
-                is_compactable
-            } else {
-                entries_stable
-            };
             let tool_summary = is_compactable
                 .then(|| turn_tool_summary(state, prompt_index, end))
                 .flatten();
@@ -331,7 +309,6 @@ fn transcript_turns(state: &AppState) -> Vec<TranscriptTurn> {
                 prompt_index,
                 end,
                 is_compactable,
-                is_flushable,
                 elapsed: state.prompt_turn_elapsed(prompt_index),
                 tool_summary,
                 final_response_index,
@@ -436,11 +413,11 @@ fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bo
         | Entry::ActorActivity(_)
         | Entry::InternalMessage(_) => true,
         Entry::EphemeralSystem(_) => false,
-        Entry::AgentMessage(_)
-        | Entry::AgentThought(_)
-        | Entry::CodeAgentMessage(_)
-        | Entry::CodeAgentThought(_) => {
-            !(state.is_streaming() && idx + 1 == state.transcript.len())
+        Entry::AgentMessage(_) | Entry::AgentThought(_) => {
+            state.code_agent_active || !(state.is_streaming() && idx + 1 == state.transcript.len())
+        }
+        Entry::CodeAgentMessage(_) | Entry::CodeAgentThought(_) => {
+            !state.code_agent_active || idx + 1 != state.transcript.len()
         }
         Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
             state.tool_calls.get(id).is_some_and(|view| {
@@ -1517,7 +1494,7 @@ fn inline_resize_reflow_snapshot(
         0..stable_entries,
         transcript_collapse_limit(state),
         state.theme,
-        true,
+        false,
     );
 
     Some(InlineResizeReflowSnapshot {
@@ -4581,7 +4558,7 @@ fn inline_transcript_tail_lines(state: &AppState, width: u16) -> Vec<Line<'stati
         stable_entries..state.transcript.len(),
         transcript_collapse_limit(state),
         state.theme,
-        true,
+        false,
     )
 }
 
@@ -12329,7 +12306,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_resize_reflow_snapshot_replays_stable_entries_at_new_width() {
+    fn inline_resize_reflow_snapshot_replays_streamed_prefix_at_new_width() {
         let mut state = AppState::new();
         state.record_user_prompt("hello from the resize test".to_string());
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
@@ -12346,9 +12323,9 @@ mod tests {
         .expect("snapshot");
 
         assert_eq!(snapshot.actual_height, 4);
-        assert_eq!(snapshot.stable_entries, 0);
+        assert_eq!(snapshot.stable_entries, 1);
         let replayed: Vec<String> = snapshot.lines.iter().map(line_text).collect();
-        assert!(replayed.is_empty());
+        assert!(replayed.join("\n").contains("hello from"));
     }
 
     #[test]
@@ -12375,7 +12352,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_sink_emits_stable_prefix_during_streaming_turn() {
+    fn transcript_sink_streams_stable_prefix_during_foreground_turn() {
         let mut state = AppState::new();
         let mut sink = TranscriptSink::default();
 
@@ -12389,7 +12366,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert!(pending.is_empty());
+        assert_eq!(pending, vec!["You", "hello", ""]);
 
         state.apply_event(UiEvent::PromptDone {
             stop_reason: StopReason::EndTurn,
@@ -12400,23 +12377,12 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(
-            rendered,
-            vec![
-                "You",
-                "hello",
-                "",
-                "Thor · 0s",
-                "└─ final response",
-                "world",
-                ""
-            ]
-        );
+        assert_eq!(rendered, vec!["Thor", "world", ""]);
         assert!(sink.pending_lines(&state, 80).is_empty());
     }
 
     #[test]
-    fn replayed_turns_flush_normally_before_a_local_turn_compacts() {
+    fn replayed_and_local_turns_stream_in_order() {
         let mut state = AppState::new();
         let mut sink = TranscriptSink::default();
 
@@ -12455,21 +12421,20 @@ mod tests {
         state
             .transcript
             .push(Entry::ToolCall("local-tool".to_string()));
-        assert_eq!(stable_transcript_entry_count(&state), 2);
+        assert_eq!(stable_transcript_entry_count(&state), 4);
 
         state.apply_event(UiEvent::PromptDone {
             stop_reason: StopReason::EndTurn,
             usage: None,
         });
-        let compacted = sink
+        let streamed = sink
             .pending_lines(&state, 80)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>();
-        assert_eq!(
-            compacted,
-            vec!["You", "local prompt", "", "Thor · 0s", "│ 1 tool"]
-        );
+        let streamed = streamed.join("\n");
+        assert!(streamed.contains("local prompt"), "{streamed}");
+        assert!(streamed.contains("write src/lib.rs"), "{streamed}");
 
         let snapshot = inline_resize_reflow_snapshot(
             &state,
@@ -12487,7 +12452,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(reflowed.contains("replayed answer"), "{reflowed}");
-        assert!(reflowed.contains("│ 1 tool"), "{reflowed}");
+        assert!(reflowed.contains("write"), "{reflowed}");
+        assert!(reflowed.contains("src/lib.rs"), "{reflowed}");
     }
 
     #[test]
@@ -12598,7 +12564,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_code_agent_call_does_not_pin_eitri_activity_in_live_tail() {
+    fn foreground_handoff_streams_completed_eitri_activity_to_scrollback() {
         let mut state = AppState::new();
         let mut sink = TranscriptSink::default();
 
@@ -12608,7 +12574,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert!(initial.is_empty());
+        assert_eq!(initial, vec!["You", "delegate this", ""]);
 
         let bridge = ToolCall::new("bridge-call", "mcp.mj-code-agent.code_agent")
             .status(ToolCallStatus::InProgress)
@@ -12642,16 +12608,21 @@ mod tests {
                 .status,
             ToolCallStatus::InProgress
         );
-        assert_eq!(stable_transcript_entry_count(&state), 0);
+        assert_eq!(
+            stable_transcript_entry_count(&state),
+            state.transcript.len()
+        );
 
-        let live = inline_transcript_tail_lines(&state, 80)
+        let streamed = sink
+            .pending_lines(&state, 80)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(live.contains("forge the change"), "{live}");
-        assert!(live.contains("completed nested command"), "{live}");
-        assert!(!live.contains("mcp.mj-code-agent"), "{live}");
+        assert!(streamed.contains("forge the change"), "{streamed}");
+        assert!(streamed.contains("completed nested command"), "{streamed}");
+        assert!(!streamed.contains("mcp.mj-code-agent"), "{streamed}");
+        assert!(inline_transcript_tail_lines(&state, 80).is_empty());
     }
 
     #[test]
@@ -12666,10 +12637,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect::<Vec<_>>();
-        assert_eq!(
-            thor_tail,
-            vec!["You", "delegate this", "", "Thor", "planning the handoff"]
-        );
+        assert_eq!(thor_tail, vec!["Thor", "planning the handoff"]);
 
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
             label: "Eitri · gpt-builder".to_string(),
@@ -12682,10 +12650,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect::<Vec<_>>();
-        assert_eq!(
-            live,
-            vec!["You", "delegate this", "", "Eitri", "working now"]
-        );
+        assert_eq!(live, vec!["Eitri", "working now"]);
         assert!(inline_transcript_tail_row_count(&state, 80) > 0);
         assert!(
             desired_inline_height(
@@ -12709,12 +12674,104 @@ mod tests {
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
             outcome: CodeAgentOutcome::Completed,
         }));
-        assert!(!inline_transcript_tail_lines(&state, 80).is_empty());
+        assert!(inline_transcript_tail_lines(&state, 80).is_empty());
         terminal
             .draw(|frame| draw_header(frame, frame.area(), &state))
             .expect("draw restored header");
         let restored = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(restored.contains("Thor · gpt-primary"), "{restored}");
+    }
+
+    #[test]
+    fn foreground_handoff_detaches_thor_flushes_loki_and_reattaches_thor() {
+        let mut state = AppState::new();
+        let mut sink = TranscriptSink::default();
+        state.record_user_prompt("delegate this".to_string());
+        assert_eq!(
+            sink.pending_lines(&state, 80)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            vec!["You", "delegate this", ""]
+        );
+
+        state.apply_event(UiEvent::InternalMessage(InternalMessage {
+            source: "Thor".to_string(),
+            target: "Eitri".to_string(),
+            kind: crate::event::InternalMessageKind::Delegation,
+            text: "forge it".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "Eitri · builder".to_string(),
+        }));
+        assert!(state.code_agent_active);
+        let handoff = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(handoff.contains("delegated to Eitri"), "{handoff}");
+
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentMessageChunk(text_chunk("first Eitri segment")),
+        )));
+        assert!(sink.pending_lines(&state, 80).is_empty());
+
+        state.apply_event(UiEvent::ActorActivity(ActorActivity::Warning {
+            actor: ActorIdentity {
+                role: "Loki".to_string(),
+                connection_id: "loki-review".to_string(),
+                source_id: None,
+                model_name: Some("reviewer".to_string()),
+                model_value: None,
+            },
+            message: "material concern".to_string(),
+        }));
+        let interjection = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            interjection.contains("first Eitri segment"),
+            "{interjection}"
+        );
+        assert!(interjection.contains("Loki"), "{interjection}");
+        assert!(interjection.contains("material concern"), "{interjection}");
+
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentMessageChunk(text_chunk("Eitri final")),
+        )));
+        assert!(sink.pending_lines(&state, 80).is_empty());
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
+            outcome: CodeAgentOutcome::Completed,
+        }));
+        assert!(!state.code_agent_active);
+        let eitri_final = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(eitri_final.contains("Eitri final"), "{eitri_final}");
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk("Thor resumed"),
+        )));
+        assert!(sink.pending_lines(&state, 80).is_empty());
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        let thor_resumed = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(thor_resumed.contains("Thor resumed"), "{thor_resumed}");
     }
 
     #[test]
@@ -12739,27 +12796,25 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert!(prompt.is_empty());
+        assert_eq!(prompt, vec!["You", "run tests", ""]);
         assert!(sink.pending_lines(&state, 80).is_empty());
 
         let view = state.tool_calls.get_mut("call-1").expect("tool call");
         view.status = ToolCallStatus::Completed;
         view.body = vec![ToolCallOutput::Text("ok".to_string())];
 
-        assert!(sink.pending_lines(&state, 80).is_empty());
+        let completed = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(completed.contains("cargo test"), "{completed}");
+        assert!(completed.contains("ok"), "{completed}");
         state.apply_event(UiEvent::PromptDone {
             stop_reason: StopReason::EndTurn,
             usage: None,
         });
-        let rendered: Vec<String> = sink
-            .pending_lines(&state, 80)
-            .iter()
-            .map(line_text)
-            .collect();
-        assert_eq!(
-            rendered,
-            vec!["You", "run tests", "", "Thor · 0s", "│ 1 tool"]
-        );
         assert!(sink.pending_lines(&state, 80).is_empty());
     }
 
@@ -12790,7 +12845,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert!(prompt.is_empty());
+        assert_eq!(prompt, vec!["You", "run tests", ""]);
         assert!(
             sink.pending_lines(&state, 80).is_empty(),
             "completed terminal tool call must not flush before terminal exit status arrives"
@@ -12803,20 +12858,19 @@ mod tests {
             exit_status: Some(TerminalExitStatus::new().exit_code(0)),
         }));
 
-        assert!(sink.pending_lines(&state, 80).is_empty());
+        let completed = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(completed.contains("cargo test"), "{completed}");
+        assert!(completed.contains("ok"), "{completed}");
         state.apply_event(UiEvent::PromptDone {
             stop_reason: StopReason::EndTurn,
             usage: None,
         });
-        let rendered: Vec<String> = sink
-            .pending_lines(&state, 80)
-            .iter()
-            .map(line_text)
-            .collect();
-        assert_eq!(
-            rendered,
-            vec!["You", "run tests", "", "Thor · 0s", "│ 1 tool"]
-        );
+        assert!(sink.pending_lines(&state, 80).is_empty());
     }
 
     #[test]
@@ -12841,7 +12895,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert!(first_prompt.is_empty());
+        assert_eq!(first_prompt, vec!["You", "run tests", ""]);
 
         state.apply_event(UiEvent::PromptDone {
             stop_reason: StopReason::Cancelled,
@@ -12852,20 +12906,11 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(
-            cancelled_tool,
-            vec![
-                "You",
-                "run tests",
-                "",
-                "Thor · 0s",
-                "│ 1 tool · 1 failed",
-                "│ [failed] exec cargo test",
-                "│   running",
-                "│   [tool call ended before completion]",
-                ""
-            ]
-        );
+        let cancelled_tool = cancelled_tool.join("\n");
+        assert!(cancelled_tool.contains("Thor"), "{cancelled_tool}");
+        assert!(cancelled_tool.contains("[failed]"), "{cancelled_tool}");
+        assert!(cancelled_tool.contains("cargo test"), "{cancelled_tool}");
+        assert!(cancelled_tool.contains("running"), "{cancelled_tool}");
 
         state.record_user_prompt("next prompt".to_string());
         let next_prompt: Vec<String> = sink
@@ -12873,7 +12918,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert!(next_prompt.is_empty());
+        assert_eq!(next_prompt, vec!["You", "next prompt", ""]);
     }
 
     #[test]

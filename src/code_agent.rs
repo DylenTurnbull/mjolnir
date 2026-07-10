@@ -347,8 +347,8 @@ enum ActiveRun {
     },
 }
 
-/// Coordinates the one allowed nested run and routes primary UI cancellation
-/// without giving the nested runtime ownership of the primary command stream.
+/// Coordinates the one allowed Eitri foreground run. Thor remains suspended in
+/// its MCP request while UI cancellation is routed exclusively to this lane.
 #[derive(Debug, Clone, Default)]
 pub struct Controller {
     state: Arc<Mutex<ActiveRun>>,

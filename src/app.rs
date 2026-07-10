@@ -711,9 +711,10 @@ pub struct AppState {
     pub exit_reason: Option<UiExitReason>,
     /// True once the runtime has stopped accepting commands.
     pub runtime_closed: bool,
-    /// A client-side nested ACP turn is currently serving the injected MCP tool.
+    /// Eitri currently owns the foreground ACP lane while Thor is suspended in
+    /// the `code_agent` MCP request.
     pub code_agent_active: bool,
-    /// Nested ACP identity currently holding the interactive UI/control lane.
+    /// Eitri identity currently holding the interactive UI/control lane.
     pub code_agent_label: Option<String>,
     /// Transient status line with severity.
     pub status_line: Option<StatusMessage>,
