@@ -9892,7 +9892,7 @@ mod tests {
     use crate::app::StatusKind;
     use crate::claude_usage::ClaudeUsageReport;
     use crate::event::{
-        CodeAgentEvent, CodeAgentOutcome, ElicitationPrompt, SessionConfigTarget,
+        CodeAgentEvent, CodeAgentOutcome, ElicitationPrompt, InternalMessage, SessionConfigTarget,
         TerminalOutputSnapshot,
     };
 
@@ -9902,7 +9902,7 @@ mod tests {
         ElicitationMode, ElicitationSchema, ElicitationSessionScope, ElicitationUrlMode,
         EnumOption, PermissionOption, PermissionOptionKind, SessionConfigOption,
         SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-        SessionUpdate, StopReason, StringPropertySchema, TerminalExitStatus, TextContent,
+        SessionUpdate, StopReason, StringPropertySchema, TerminalExitStatus, TextContent, ToolCall,
         ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -12093,6 +12093,68 @@ mod tests {
             .collect();
         assert_eq!(rendered, vec!["Thor", "world", ""]);
         assert!(sink.pending_lines(&state, 80).is_empty());
+    }
+
+    #[test]
+    fn parent_code_agent_call_does_not_pin_eitri_activity_in_live_tail() {
+        let mut state = AppState::new();
+        let mut sink = TranscriptSink::default();
+
+        state.record_user_prompt("delegate this".to_string());
+        let initial: Vec<String> = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(initial, vec!["You", "delegate this", ""]);
+
+        let bridge = ToolCall::new("bridge-call", "mcp.mj-code-agent.code_agent")
+            .status(ToolCallStatus::InProgress)
+            .raw_input(serde_json::json!({
+                "server": "mj-code-agent",
+                "tool": "code_agent",
+                "arguments": { "instructions": "forge the change" }
+            }));
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(bridge)));
+        state.apply_event(UiEvent::InternalMessage(InternalMessage {
+            source: "Thor".to_string(),
+            target: "Eitri".to_string(),
+            kind: crate::event::InternalMessageKind::Delegation,
+            text: "forge the change".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "Eitri · builder".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::ToolCall(
+                ToolCall::new("nested-call", "completed nested command")
+                    .status(ToolCallStatus::Completed),
+            ),
+        )));
+
+        assert_eq!(
+            state
+                .tool_calls
+                .get("bridge-call")
+                .expect("parent bridge")
+                .status,
+            ToolCallStatus::InProgress
+        );
+        assert_eq!(
+            stable_transcript_entry_count(&state),
+            state.transcript.len()
+        );
+        assert!(inline_transcript_tail_lines(&state, 80).is_empty());
+
+        let emitted = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(emitted.contains("forge the change"), "{emitted}");
+        assert!(emitted.contains("completed nested command"), "{emitted}");
+        assert!(!emitted.contains("mcp.mj-code-agent"), "{emitted}");
     }
 
     #[test]

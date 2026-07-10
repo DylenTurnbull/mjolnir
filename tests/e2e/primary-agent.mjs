@@ -79,6 +79,16 @@ function finishPrimary(text) {
   setTimeout(() => process.exit(0), 500);
 }
 
+function updatePrimaryTool(update) {
+  send({
+    method: "session/update",
+    params: {
+      sessionId: "primary-session",
+      update,
+    },
+  });
+}
+
 async function prepareMcp() {
   const unauthorized = await postMcp(
     {
@@ -130,6 +140,18 @@ async function callCodeAgent() {
   const { unauthorizedStatus } = await mcpReady;
   const toolSentAt = Date.now();
   appendLog(`tool-call-start:${toolSentAt}`);
+  updatePrimaryTool({
+    sessionUpdate: "tool_call",
+    toolCallId: "primary-code-agent-call",
+    title: "mcp.mj-code-agent.code_agent",
+    kind: "execute",
+    status: "in_progress",
+    rawInput: {
+      server: "mj-code-agent",
+      tool: "code_agent",
+      arguments: { instructions },
+    },
+  });
   const called = await postMcp(
     {
       jsonrpc: "2.0",
@@ -145,6 +167,12 @@ async function callCodeAgent() {
     throw new Error(`MCP tool call failed: ${JSON.stringify(called)}`);
   }
   const result = called.message.result;
+  updatePrimaryTool({
+    sessionUpdate: "tool_call_update",
+    toolCallId: "primary-code-agent-call",
+    status: result.isError ? "failed" : "completed",
+    rawOutput: result,
+  });
   writeResult({
     response: result,
     toolSentAt,

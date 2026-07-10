@@ -5,7 +5,7 @@
 //! ACP event is folded in through `apply_event`; ratatui then renders from
 //! this state.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -285,6 +285,58 @@ impl ToolCallView {
             }
         }
     }
+}
+
+fn is_code_agent_transport_call(tool_call: &ToolCall) -> bool {
+    code_agent_identity_from_raw_input(tool_call.raw_input.as_ref())
+        || code_agent_identity_from_name(&tool_call.title)
+        || code_agent_identity_from_meta(tool_call.meta.as_ref())
+}
+
+fn is_code_agent_transport_update(update: &ToolCallUpdate) -> bool {
+    code_agent_identity_from_raw_input(update.fields.raw_input.as_ref())
+        || update
+            .fields
+            .title
+            .as_deref()
+            .is_some_and(code_agent_identity_from_name)
+        || code_agent_identity_from_meta(update.meta.as_ref())
+}
+
+fn code_agent_identity_from_raw_input(raw_input: Option<&serde_json::Value>) -> bool {
+    let Some(object) = raw_input.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    object
+        .get("server")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|server| server == "mj-code-agent")
+        && object
+            .get("tool")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|tool| tool == "code_agent")
+}
+
+fn code_agent_identity_from_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("mj-code-agent") && name.contains("code_agent")
+}
+
+fn code_agent_identity_from_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> bool {
+    let Some(meta) = meta else {
+        return false;
+    };
+    meta.get("toolName")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(code_agent_identity_from_name)
+        || meta
+            .get("claudeCode")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|claude| claude.get("toolName"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(code_agent_identity_from_name)
 }
 
 /// Lifecycle of the ACP connection from launch through shutdown.
@@ -573,6 +625,10 @@ pub struct AppState {
     pub session_fork_supported: bool,
     pub transcript: Vec<Entry>,
     pub tool_calls: HashMap<String, ToolCallView>,
+    /// Primary-agent MCP calls that transport an Eitri turn. Their protocol
+    /// state remains available, but the redundant parent row is omitted from
+    /// the transcript so it cannot pin nested activity behind a pending tool.
+    suppressed_tool_calls: HashSet<String>,
     actor_tool_entries: HashMap<String, usize>,
     terminal_outputs: HashMap<String, TerminalOutputSnapshot>,
     /// Bumped whenever `transcript` or `tool_calls` change in a way that
@@ -912,6 +968,7 @@ impl AppState {
             session_fork_supported: false,
             transcript: Vec::new(),
             tool_calls: HashMap::new(),
+            suppressed_tool_calls: HashSet::new(),
             actor_tool_entries: HashMap::new(),
             terminal_outputs: HashMap::new(),
             transcript_revision: 0,
@@ -2400,14 +2457,28 @@ impl AppState {
             SessionUpdate::ToolCall(tc) => {
                 remove_trailing_thinking(&mut self.transcript);
                 let id = tc.tool_call_id.to_string();
+                let suppressed = is_code_agent_transport_call(&tc);
                 self.tool_calls
                     .insert(id.clone(), ToolCallView::from_tool_call(&tc));
-                self.transcript.push(Entry::ToolCall(id));
+                if suppressed {
+                    self.suppressed_tool_calls.insert(id);
+                } else {
+                    self.transcript.push(Entry::ToolCall(id));
+                }
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCallUpdate(u) => {
                 remove_trailing_thinking(&mut self.transcript);
                 let id = u.tool_call_id.to_string();
+                let suppressed =
+                    self.suppressed_tool_calls.contains(&id) || is_code_agent_transport_update(&u);
+                if suppressed {
+                    self.suppressed_tool_calls.insert(id.clone());
+                    if matches!(self.transcript.last(), Some(Entry::ToolCall(entry_id)) if entry_id == &id)
+                    {
+                        self.transcript.pop();
+                    }
+                }
                 if let Some(view) = self.tool_calls.get_mut(&id) {
                     view.apply_update(&u);
                 } else {
@@ -2422,7 +2493,9 @@ impl AppState {
                         view.set_content(content);
                     }
                     self.tool_calls.insert(id.clone(), view);
-                    self.transcript.push(Entry::ToolCall(id));
+                    if !suppressed {
+                        self.transcript.push(Entry::ToolCall(id));
+                    }
                 }
                 self.bump_transcript_revision();
             }
@@ -3427,6 +3500,56 @@ mod tests {
         let view = s.tool_calls.get("call-1").expect("view");
         assert_eq!(view.status, ToolCallStatus::Completed);
         assert_eq!(view.title, "running ls");
+    }
+
+    #[test]
+    fn primary_code_agent_transport_call_is_tracked_but_not_transcribed() {
+        let mut state = AppState::new();
+        let call = ToolCall::new("bridge-call", "mcp.mj-code-agent.code_agent")
+            .status(ToolCallStatus::InProgress)
+            .raw_input(serde_json::json!({
+                "server": "mj-code-agent",
+                "tool": "code_agent",
+                "arguments": { "instructions": "build it" }
+            }));
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)));
+
+        assert!(state.tool_calls.contains_key("bridge-call"));
+        assert!(state.transcript.is_empty());
+
+        let fields = agent_client_protocol::schema::v1::ToolCallUpdateFields::default()
+            .status(ToolCallStatus::Completed);
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new("bridge-call", fields),
+        )));
+
+        assert_eq!(
+            state.tool_calls.get("bridge-call").expect("bridge").status,
+            ToolCallStatus::Completed
+        );
+        assert!(state.transcript.is_empty());
+    }
+
+    #[test]
+    fn claude_code_agent_transport_update_before_create_is_not_transcribed() {
+        let mut state = AppState::new();
+        let fields = agent_client_protocol::schema::v1::ToolCallUpdateFields::default()
+            .title("Running MCP tool")
+            .status(ToolCallStatus::InProgress);
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "claudeCode".to_string(),
+            serde_json::json!({ "toolName": "mcp__mj-code-agent__code_agent" }),
+        );
+        let mut update = ToolCallUpdate::new("claude-bridge", fields);
+        update.meta = Some(meta);
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(
+            update,
+        )));
+
+        assert!(state.tool_calls.contains_key("claude-bridge"));
+        assert!(state.transcript.is_empty());
     }
 
     #[test]

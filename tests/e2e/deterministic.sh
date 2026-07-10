@@ -94,6 +94,10 @@ run_case() {
     echo "hidden code-agent session directive leaked into the transcript" >&2
     exit 1
   fi
+  if grep -a 'mcp.mj-code-agent.code_agent' "$root/transcript.log" >/dev/null; then
+    echo "parent code-agent transport tool leaked into the transcript" >&2
+    exit 1
+  fi
 
   if [ "$mode" = unsupported ]; then
     test ! -e "$root/primary-result.json"
