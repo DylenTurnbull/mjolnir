@@ -55,7 +55,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -1567,7 +1567,7 @@ async fn run_session(
     let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
     let (runtime_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel();
-    let delegated_this_turn = Arc::new(AtomicBool::new(false));
+    let implementation_handoffs_this_turn = Arc::new(AtomicUsize::new(0));
     let _ = ui_event_tx.send(crate::event::UiEvent::Info(format!(
         "Council · Thor {} · Loki {} · Eitri {} · {} launchable models",
         council.thor.model.model,
@@ -1658,7 +1658,7 @@ async fn run_session(
                 eitri_role.model_value.clone(),
                 loki_handle.clone(),
             )
-            .with_delegation_observer(delegated_this_turn.clone()),
+            .with_implementation_handoff_counter(implementation_handoffs_this_turn.clone()),
         ),
     };
 
@@ -1707,7 +1707,7 @@ async fn run_session(
     )));
     let event_turn_state = turn_state.clone();
     let event_loki = loki_handle.clone();
-    let event_delegated = delegated_this_turn.clone();
+    let event_handoffs = implementation_handoffs_this_turn.clone();
     let event_proxy = tokio::spawn(async move {
         let mut runtime_event_rx = runtime_event_rx;
         let mut decisions = event_loki.as_ref().map(loki::Handle::subscribe);
@@ -1878,8 +1878,9 @@ async fn run_session(
             }
 
             if held_completion.is_some() && pending.is_empty() && !intervention.is_pending() {
+                let implementation_handoffs = event_handoffs.load(Ordering::Acquire);
                 let workspace_delta = if thor_config.discrete_review
-                    && event_delegated.load(Ordering::Acquire)
+                    && implementation_handoffs > 1
                     && !discrete_review_started
                 {
                     let (_, _, snapshot) = event_turn_state.lock().await.clone();
@@ -1896,7 +1897,7 @@ async fn run_session(
                 if should_start_discrete_review(
                     thor_config.discrete_review,
                     discrete_review_started,
-                    event_delegated.load(Ordering::Acquire),
+                    implementation_handoffs,
                     workspace_changed,
                 ) {
                     let (epoch, task, _) = event_turn_state.lock().await.clone();
@@ -1956,7 +1957,7 @@ async fn run_session(
             cmd_tracker.observe_command(&command);
             if let UiCommand::SendPrompt { text, .. } = &command {
                 local_epoch = local_epoch.saturating_add(1);
-                delegated_this_turn.store(false, Ordering::Release);
+                implementation_handoffs_this_turn.store(0, Ordering::Release);
                 let snapshot =
                     workspace_snapshot::WorkspaceSnapshot::capture(&cmd_workspace_roots).await;
                 let epoch = cmd_loki
@@ -2217,10 +2218,10 @@ fn council_continuation_prompt(_task: &str, critique: &str, _trajectory: &str) -
 fn should_start_discrete_review(
     enabled: bool,
     already_started: bool,
-    delegated_to_eitri: bool,
+    implementation_handoffs: usize,
     workspace_changed: bool,
 ) -> bool {
-    enabled && !already_started && delegated_to_eitri && workspace_changed
+    enabled && !already_started && implementation_handoffs > 1 && workspace_changed
 }
 
 fn emit_internal_message(
@@ -2457,12 +2458,13 @@ mod tests {
     }
 
     #[test]
-    fn discrete_review_requires_eitri_and_attributable_workspace_changes() {
-        assert!(should_start_discrete_review(true, false, true, true));
-        assert!(!should_start_discrete_review(true, false, false, true));
-        assert!(!should_start_discrete_review(true, false, true, false));
-        assert!(!should_start_discrete_review(false, false, true, true));
-        assert!(!should_start_discrete_review(true, true, true, true));
+    fn discrete_review_requires_multiple_eitri_handoffs_and_workspace_changes() {
+        assert!(should_start_discrete_review(true, false, 2, true));
+        assert!(!should_start_discrete_review(true, false, 0, true));
+        assert!(!should_start_discrete_review(true, false, 1, true));
+        assert!(!should_start_discrete_review(true, false, 2, false));
+        assert!(!should_start_discrete_review(false, false, 2, true));
+        assert!(!should_start_discrete_review(true, true, 2, true));
     }
 
     #[test]

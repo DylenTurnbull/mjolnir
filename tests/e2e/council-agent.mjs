@@ -27,6 +27,8 @@ let directiveCount = 0;
 let lokiIntervened = false;
 let clientCapabilities = null;
 let sessionMcpServers = [];
+let primaryHandoffCount = 0;
+const eitriResponses = [];
 
 const modelOptions = [
   ["gpt-5.6-sol", "GPT-5.6-Sol"],
@@ -105,6 +107,7 @@ function thorReviewResult() {
 }
 
 async function callEitri() {
+  primaryHandoffCount += 1;
   const unauthorizedStatus = await mcpReady;
   const toolSentAt = Date.now();
   const name = exploreMode ? "explore_agent" : "code_agent";
@@ -114,8 +117,14 @@ async function callEitri() {
   const called = await postMcp({ jsonrpc: "2.0", id: "call", method: "tools/call", params: { name, arguments: arguments_ } });
   const toolReceivedAt = Date.now();
   const response = called.message?.result;
-  if (resultPath) fs.writeFileSync(resultPath, JSON.stringify({ response, toolSentAt, toolReceivedAt, unauthorizedStatus }));
+  const record = { response, toolSentAt, toolReceivedAt, unauthorizedStatus };
+  eitriResponses.push(record);
+  if (resultPath) fs.writeFileSync(resultPath, JSON.stringify({ ...record, responses: eitriResponses }));
   const text = response?.content?.map((item) => item.text ?? "").join("") ?? "";
+  if (!response?.isError && primaryHandoffCount === 1 && (mode === "thor-review" || mode === "details")) {
+    await callEitri();
+    return;
+  }
   finishPrimary(response?.isError ? `PRIMARY CANCELLED: ${text}` : `PRIMARY RECEIVED: ${text}`);
 }
 

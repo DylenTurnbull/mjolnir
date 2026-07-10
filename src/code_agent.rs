@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
@@ -46,7 +46,7 @@ use crate::workspace_snapshot::{WorkspaceDelta, WorkspaceSnapshot};
 
 pub const LABEL: &str = "Eitri";
 pub const MCP_SERVER_NAME: &str = "mj-code-agent";
-pub const PRIMARY_SESSION_DIRECTIVE: &str = "<mj-code-agent-policy>\nYou are Thor, the primary coordinator and owner of the user's outcome. You are responsible for understanding the request, doing necessary research and context gathering, forming the plan, coordinating implementation, reviewing and verifying the result, and delivering the final answer. You are not a thin handoff between the user and Eitri. This policy applies to every subsequent user request in this ACP session.\n\nEitri is available through two MCP tools. Use explore_agent for open-ended, multi-step codebase research when locations are unknown, the question crosses multiple areas, or tracing architecture or execution flow requires several files or search strategies. Do not use explore_agent to read a known path, find a known symbol or exact definition, inspect code confined to roughly two or three known files, or perform a trivial single-step lookup; use your direct tools for those. The explore_agent prompt must be a complete standalone research brief and should state quick, medium, or very thorough.\n\nUse code_agent for substantial implementation chunks after you have investigated and planned enough to give useful direction. You may personally make small, local code changes when describing and delegating them would take more effort than simply doing them; use judgment rather than delegating mechanically. Pass code_agent complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. After Eitri returns, independently review its result, inspect or verify the work as needed, and delegate a substantial corrective follow-up if implementation changes remain. If a request requires no code changes and no open-ended exploration, handle it yourself.\n\nEvery Eitri call starts a brand-new ACP process and session. Eitri has no conversation context and no memory of the user's request or any earlier Eitri call, including an immediately preceding call. Do not call either tool now. Acknowledge this policy with exactly MJ_CODE_AGENT_POLICY_READY.\n</mj-code-agent-policy>";
+pub const PRIMARY_SESSION_DIRECTIVE: &str = "<mj-code-agent-policy>\nYou are Thor, the primary coordinator and owner of the user's outcome. You are responsible for understanding the request, doing necessary research and context gathering, forming the plan, coordinating implementation, reviewing and verifying the result, and delivering the final answer. You are not a thin handoff between the user and Eitri. This policy applies to every subsequent user request in this ACP session.\n\nEitri is available through two MCP tools. Use explore_agent for open-ended, multi-step codebase research when locations are unknown, the question crosses multiple areas, or tracing architecture or execution flow requires several files or search strategies. Do not use explore_agent to read a known path, find a known symbol or exact definition, inspect code confined to roughly two or three known files, or perform a trivial single-step lookup; use your direct tools for those. The explore_agent prompt must be a complete standalone research brief and should state quick, medium, or very thorough.\n\nUse code_agent for substantial implementation chunks after you have investigated and planned enough to give useful direction. You may personally make small, local code changes when describing and delegating them would take more effort than simply doing them; use judgment rather than delegating mechanically. Pass code_agent complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. Its result includes the bounded full workspace diff attributable to that invocation. After Eitri returns, independently review its result and diff, inspect or verify the work as needed, and delegate a substantial corrective follow-up if implementation changes remain. If a request requires no code changes and no open-ended exploration, handle it yourself.\n\nEvery Eitri call starts a brand-new ACP process and session. Eitri has no conversation context and no memory of the user's request or any earlier Eitri call, including an immediately preceding call. Do not call either tool now. Acknowledge this policy with exactly MJ_CODE_AGENT_POLICY_READY.\n</mj-code-agent-policy>";
 
 const CODE_PREAMBLE: &str = "You are Eitri, the implementation agent. This is a fresh ACP process and session. You have no memory of the user conversation or of any earlier Eitri call, including an immediately preceding call. Treat the standalone instructions below and the current workspace as your only task context.\n\n";
 const EXPLORE_PREAMBLE: &str = "You are Eitri, a file-search specialist. This is a fresh ACP process and session with no memory of the user conversation or any earlier Eitri call. Your role is exclusively to search and analyze existing code and report findings.\n\nREAD-ONLY EXPLORATION: Never create, modify, delete, move, or copy files. Never install dependencies, change configuration, create commits, or run commands that modify system or workspace state. Do not create a report file; return the report as your final message. Use efficient file-pattern searches, regex/text searches, and targeted reads. Start broad and narrow down, try multiple naming conventions when needed, and parallelize independent searches or reads when supported. Use shell only for read-only operations if it is available. Return relevant file paths as absolute paths. Include code snippets only when the exact text is load-bearing. Be concise but match the requested thoroughness.\n\n";
@@ -121,7 +121,7 @@ pub struct Config {
     pub agent_stderr: Option<PathBuf>,
     pub role_config: Option<acp::RuntimeRoleConfig>,
     pub loki: Option<loki::Handle>,
-    pub delegation_observer: Option<Arc<AtomicBool>>,
+    pub implementation_handoff_counter: Option<Arc<AtomicUsize>>,
 }
 
 impl Config {
@@ -138,7 +138,7 @@ impl Config {
             agent_stderr,
             role_config: None,
             loki: None,
-            delegation_observer: None,
+            implementation_handoff_counter: None,
         }
     }
 
@@ -163,12 +163,12 @@ impl Config {
                 force_high_reasoning: true,
             }),
             loki,
-            delegation_observer: None,
+            implementation_handoff_counter: None,
         }
     }
 
-    pub fn with_delegation_observer(mut self, observer: Arc<AtomicBool>) -> Self {
-        self.delegation_observer = Some(observer);
+    pub fn with_implementation_handoff_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
+        self.implementation_handoff_counter = Some(counter);
         self
     }
 }
@@ -226,7 +226,7 @@ impl McpHandler {
 
     #[tool(
         name = "code_agent",
-        description = "IMPLEMENTATION DELEGATE (EITRI). Thor owns research, planning, coordination, review, verification, and the final response. Delegate substantial implementation chunks to Eitri, but make small local changes directly when describing and delegating them would take more effort than doing them. Every call starts a fresh ACP process/session with zero conversation or prior-call memory. Pass complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. Review Eitri's result independently and call it again for substantial corrections."
+        description = "IMPLEMENTATION DELEGATE (EITRI). Thor owns research, planning, coordination, review, verification, and the final response. Delegate substantial implementation chunks to Eitri, but make small local changes directly when describing and delegating them would take more effort than doing them. Every call starts a fresh ACP process/session with zero conversation or prior-call memory. Pass complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. The result includes the bounded full workspace diff attributable to this invocation. Review Eitri's result and diff independently and call it again for substantial corrections."
     )]
     async fn code_agent(
         &self,
@@ -258,11 +258,11 @@ impl McpHandler {
             .as_ref()
             .expect("code_agent always captures a workspace delta");
         Ok(match result.outcome {
-            Ok(message) => CallToolResult::success(vec![Content::text(with_workspace_receipt(
+            Ok(message) => CallToolResult::success(vec![Content::text(with_workspace_diff(
                 &message,
                 workspace_delta,
             ))]),
-            Err(error) => CallToolResult::error(vec![Content::text(with_workspace_receipt(
+            Err(error) => CallToolResult::error(vec![Content::text(with_workspace_diff(
                 &error.to_string(),
                 workspace_delta,
             ))]),
@@ -594,9 +594,9 @@ async fn run(
     controller: Controller,
 ) -> EitriRunResult {
     if purpose.marks_implementation_delegation()
-        && let Some(observer) = config.delegation_observer.as_ref()
+        && let Some(counter) = config.implementation_handoff_counter.as_ref()
     {
-        observer.store(true, Ordering::Release);
+        counter.fetch_add(1, Ordering::AcqRel);
     }
     let standalone_prompt = purpose.standalone_prompt(&task);
     let display_label = config.display_label.clone();
@@ -866,10 +866,10 @@ async fn run(
     }
 }
 
-fn with_workspace_receipt(message: &str, delta: &WorkspaceDelta) -> String {
+fn with_workspace_diff(message: &str, delta: &WorkspaceDelta) -> String {
+    let diff = delta.review_patch().unwrap_or_else(|| delta.receipt());
     let mut result = format!(
-        "{message}\n\n<workspace_delta scope=\"eitri-invocation\">\n{}\n</workspace_delta>",
-        delta.receipt()
+        "{message}\n\n<workspace_diff scope=\"eitri-invocation\" authored_by=\"Eitri\">\n{diff}\n</workspace_diff>"
     );
     if delta.changed() {
         result.push_str("\n\nYou should review Eitri's work now.");
@@ -1000,7 +1000,8 @@ mod tests {
         assert!(description.contains("small local changes directly"));
         assert!(description.contains("fresh ACP process/session"));
         assert!(description.contains("zero conversation or prior-call memory"));
-        assert!(description.contains("Review Eitri's result independently"));
+        assert!(description.contains("bounded full workspace diff"));
+        assert!(description.contains("Review Eitri's result and diff independently"));
         assert_eq!(
             tool["inputSchema"]["required"],
             serde_json::json!(["instructions"])

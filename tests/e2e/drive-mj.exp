@@ -109,9 +109,11 @@ if {$mode eq "explore"} {
         -re {details hidden} {}
         timeout { exit 28 }
     }
-    expect {
-        -re {Eitri permission} { send -- "\r" }
-        timeout { exit 29 }
+    for {set handoff 0} {$handoff < 2} {incr handoff} {
+        expect {
+            -re {Eitri permission} { send -- "\r" }
+            timeout { exit 29 }
+        }
     }
     expect {
         -re {discrete review brief} {}
@@ -149,6 +151,12 @@ if {$mode eq "explore"} {
     send -- "\024"
     after 500
     send_ctrl_c
+} elseif {$mode eq "complete" || $mode eq "loki-eitri"} {
+    expect {
+        -re {Eitri permission} { send -- "\r"; exp_continue }
+        -re {PRIMARY.*RECEIVED.*CODEAGENT_E2E_OK} { after 500; send_ctrl_c }
+        timeout { exit 43 }
+    }
 } else {
     expect {
         -re {Eitri permission} { send -- "\r"; exp_continue }
