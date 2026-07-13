@@ -134,6 +134,7 @@ pub enum UiExitReason {
     ClearSession,
     LoadSession,
     SwitchSession,
+    CycleAgent,
 }
 
 /// One entry in the scrolling transcript.
@@ -705,6 +706,8 @@ pub struct AppState {
     /// cancelling) its responder. Private; accessed via the
     /// `*_pending_elicitation*` helpers.
     elicitation_queue: VecDeque<PendingElicitation>,
+    pub agent_picker: Option<AgentPicker>,
+    pub selected_agent_role: Option<usize>,
     pub config_picker: Option<ConfigPicker>,
     /// Scroll offset measured in rendered lines from the bottom of the
     /// transcript. `0` keeps the view pinned to the newest line.
@@ -950,6 +953,15 @@ impl InputPasteBurst {
     }
 }
 
+/// ACP agent picker overlay state.
+#[derive(Debug, Clone)]
+pub struct AgentPicker {
+    pub selected: usize,
+    /// Indices into `ragnarok_models`, deduplicated by ACP source ID.
+    pub role_indices: Vec<usize>,
+    pub confirming: bool,
+}
+
 /// Config option picker overlay state.
 #[derive(Debug, Clone)]
 pub struct ConfigPicker {
@@ -1023,6 +1035,8 @@ impl AppState {
             history_saved_input: String::new(),
             permission_queue: VecDeque::new(),
             elicitation_queue: VecDeque::new(),
+            agent_picker: None,
+            selected_agent_role: None,
             config_picker: None,
             scroll_offset: 0,
             expand_transcript_details: false,
@@ -1074,6 +1088,68 @@ impl AppState {
         self.spinner_style = spinner_style;
     }
 
+    pub fn open_agent_picker(&mut self) -> bool {
+        let mut seen = HashSet::new();
+        let role_indices = self
+            .ragnarok_models
+            .iter()
+            .enumerate()
+            .filter_map(|(index, role)| {
+                seen.insert(role.launch.source_id.as_str()).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if role_indices.len() < 2 {
+            return false;
+        }
+        let selected = role_indices
+            .iter()
+            .position(|&index| self.ragnarok_models[index].launch.source_id == self.agent_source_id)
+            .unwrap_or(0);
+        self.agent_picker = Some(AgentPicker {
+            selected,
+            role_indices,
+            confirming: false,
+        });
+        true
+    }
+
+    pub fn agent_picker_move(&mut self, delta: i32) {
+        let Some(picker) = self.agent_picker.as_mut() else {
+            return;
+        };
+        picker.confirming = false;
+        move_wrapped(&mut picker.selected, delta, picker.role_indices.len());
+    }
+
+    pub fn agent_picker_request_confirmation(&mut self) -> bool {
+        let Some(picker) = self.agent_picker.as_mut() else {
+            return false;
+        };
+        let Some(&role_index) = picker.role_indices.get(picker.selected) else {
+            return false;
+        };
+        let Some(role) = self.ragnarok_models.get(role_index) else {
+            return false;
+        };
+        if role.launch.source_id == self.agent_source_id {
+            self.agent_picker = None;
+            return false;
+        }
+        picker.confirming = true;
+        true
+    }
+
+    pub fn agent_picker_confirm(&mut self) -> bool {
+        let Some(picker) = self.agent_picker.take() else {
+            return false;
+        };
+        if !picker.confirming {
+            return false;
+        }
+        self.selected_agent_role = picker.role_indices.get(picker.selected).copied();
+        self.selected_agent_role.is_some()
+    }
+
     /// Open the `/mjconfig` overlay, seeded with the current theme and spinner.
     pub fn open_mjconfig_menu(&mut self) {
         let theme_idx = TerminalThemeKind::ALL
@@ -1112,13 +1188,11 @@ impl AppState {
         let mut next_spinner = None;
         match menu.section {
             MjConfigSection::Theme => {
-                let len = TerminalThemeKind::ALL.len() as i32;
-                menu.theme_idx = (menu.theme_idx as i32 + delta).rem_euclid(len) as usize;
+                move_wrapped(&mut menu.theme_idx, delta, TerminalThemeKind::ALL.len());
                 next_theme = Some(TerminalThemeKind::ALL[menu.theme_idx]);
             }
             MjConfigSection::Spinner => {
-                let len = SpinnerStyle::ALL.len() as i32;
-                menu.spinner_idx = (menu.spinner_idx as i32 + delta).rem_euclid(len) as usize;
+                move_wrapped(&mut menu.spinner_idx, delta, SpinnerStyle::ALL.len());
                 next_spinner = Some(SpinnerStyle::ALL[menu.spinner_idx]);
             }
         }
@@ -1615,6 +1689,7 @@ impl AppState {
         self.finish_turn_timer();
         self.cancel_all_pending_permissions();
         self.cancel_all_pending_elicitations();
+        self.agent_picker = None;
         self.config_picker = None;
         self.autocomplete = Autocomplete::default();
         self.clear_queued_prompts();
@@ -1787,8 +1862,8 @@ impl AppState {
             return;
         }
         if let Some(pending) = self.elicitation_queue.front_mut() {
-            let cur = pending.selected.min(len - 1) as i32;
-            pending.selected = (cur + delta).rem_euclid(len as i32) as usize;
+            pending.selected = pending.selected.min(len - 1);
+            move_wrapped(&mut pending.selected, delta, len);
             // Resume auto-scroll so the newly selected option stays visible.
             pending.scroll_offset = None;
         }
@@ -1934,8 +2009,7 @@ impl AppState {
         if len == 0 {
             return;
         }
-        let cur = picker.selected_value as i32;
-        picker.selected_value = (cur + delta).rem_euclid(len as i32) as usize;
+        move_wrapped(&mut picker.selected_value, delta, len);
     }
 
     /// Update the config picker search query, recompute the filtered
@@ -2102,9 +2176,7 @@ impl AppState {
         if !self.autocomplete.visible || len == 0 {
             return;
         }
-        let cur = self.autocomplete.selected as i32;
-        let new = (cur + delta).rem_euclid(len as i32);
-        self.autocomplete.selected = new as usize;
+        move_wrapped(&mut self.autocomplete.selected, delta, len);
     }
 
     /// Replace the input buffer with the currently-selected command,
@@ -2793,6 +2865,12 @@ impl AppState {
                 (option_index, option, config_shortcut_char(select_index))
             })
             .collect()
+    }
+}
+
+fn move_wrapped(selected: &mut usize, delta: i32, len: usize) {
+    if len > 0 {
+        *selected = (*selected as i32 + delta).rem_euclid(len as i32) as usize;
     }
 }
 
