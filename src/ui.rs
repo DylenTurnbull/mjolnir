@@ -5502,9 +5502,12 @@ fn god_name_color(role: &str, theme: TerminalTheme) -> Color {
 }
 
 fn push_thinking(out: &mut Vec<Line<'static>>, text: &str, theme: TerminalTheme) {
+    let mut in_html_comment = false;
     let text = text
-        .replace("<!-- -->", " ")
-        .replace("<!---->", " ")
+        .split('\n')
+        .map(|line| strip_html_comments(line, &mut in_html_comment))
+        .collect::<Vec<_>>()
+        .join("\n")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -5637,13 +5640,16 @@ fn push_tool_markdown_lines_limited(
     collapse_limit: Option<usize>,
     theme: TerminalTheme,
 ) {
-    let (preview, hidden) = tool_output_preview(&text, collapse_limit);
+    let (_, hidden) = tool_output_preview(&text, collapse_limit);
     if let Some(ToolOutputHidden::Lines(lines)) = hidden {
         push_tool_collapse_hint(out, indent, ToolOutputHidden::Lines(lines), theme);
-    }
-    push_markdown_lines_limited_inner(out, preview, indent, None, theme, true);
-    if let Some(ToolOutputHidden::Details) = hidden {
-        push_tool_collapse_hint(out, indent, ToolOutputHidden::Details, theme);
+        push_markdown_lines_limited_inner(out, text, indent, collapse_limit, theme, true);
+    } else {
+        let (preview, hidden) = tool_output_preview(&text, collapse_limit);
+        push_markdown_lines_limited_inner(out, preview, indent, None, theme, true);
+        if let Some(ToolOutputHidden::Details) = hidden {
+            push_tool_collapse_hint(out, indent, ToolOutputHidden::Details, theme);
+        }
     }
 }
 
@@ -5713,7 +5719,8 @@ fn push_markdown_lines_limited_inner(
     use_tool_output_style: bool,
 ) {
     let prefix = " ".repeat(indent);
-    let mut in_code_block = false;
+    let mut code_fence: Option<(char, usize)> = None;
+    let mut in_html_comment = false;
     let mut code_lang = String::new();
     let lines: Vec<&str> = text.split('\n').collect();
     // Collapse keeps the *tail*: for tool output the end is where the signal
@@ -5721,46 +5728,62 @@ fn push_markdown_lines_limited_inner(
     // keeps exactly the lines the user wanted. The hint sits on top, standing
     // in for the elided head.
     let hidden = collapsed_head_len(lines.len(), collapse_limit);
-    // Replay fence toggles across the hidden head so a tail that starts
-    // inside a code block still renders as code.
+    // Replay parser state across the hidden head so a tail that starts inside
+    // a code block or HTML comment renders consistently with the full text.
     for raw in &lines[..hidden] {
-        if raw.trim_start().starts_with("```") {
-            in_code_block = !in_code_block;
+        if let Some((marker, length)) = code_fence {
+            if markdown_fence(raw).is_some_and(|(next, count, _)| next == marker && count >= length)
+            {
+                code_fence = None;
+            }
+        } else {
+            let filtered = strip_html_comments(raw, &mut in_html_comment);
+            if !in_html_comment && let Some((marker, length, _)) = markdown_fence(&filtered) {
+                code_fence = Some((marker, length));
+            }
         }
     }
     if hidden > 0 {
         push_collapse_hint(out, indent, hidden, theme);
     }
-    for raw in &lines[hidden..] {
-        let trimmed = raw.trim_start();
-        if trimmed.starts_with("```") {
-            in_code_block = !in_code_block;
-            if in_code_block {
-                code_lang = trimmed.trim_start_matches('`').trim().to_string();
-                let title = if code_lang.is_empty() {
-                    "code".to_string()
-                } else {
-                    format!("code {code_lang}")
-                };
-                out.push(Line::from(Span::styled(
-                    format!("{prefix}{title}"),
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::BOLD),
-                )));
-            } else {
+    for original in &lines[hidden..] {
+        if let Some((marker, length)) = code_fence {
+            if markdown_fence(original)
+                .is_some_and(|(next, count, _)| next == marker && count >= length)
+            {
+                code_fence = None;
                 code_lang.clear();
+                continue;
             }
-            continue;
-        }
-
-        if in_code_block {
             out.push(Line::from(Span::styled(
-                format!("{prefix}  {raw}"),
+                format!("{prefix}  {original}"),
                 Style::default().fg(theme.quote),
             )));
             continue;
         }
+
+        let filtered = strip_html_comments(original, &mut in_html_comment);
+        if filtered.trim().is_empty() && !original.trim().is_empty() {
+            continue;
+        }
+        let raw = filtered.as_str();
+        if !in_html_comment && let Some((marker, length, language)) = markdown_fence(raw) {
+            code_fence = Some((marker, length));
+            code_lang = language.to_string();
+            let title = if code_lang.is_empty() {
+                "code".to_string()
+            } else {
+                format!("code {code_lang}")
+            };
+            out.push(Line::from(Span::styled(
+                format!("{prefix}{title}"),
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+        let trimmed = raw.trim_start();
 
         if raw.trim().is_empty() {
             out.push(Line::from(""));
@@ -5828,6 +5851,61 @@ fn push_markdown_lines_limited_inner(
         spans.extend(inline_markdown_spans_with_style(raw, theme, base_style));
         out.push(Line::from(spans));
     }
+}
+
+fn markdown_fence(raw: &str) -> Option<(char, usize, &str)> {
+    let trimmed = raw.trim_start();
+    let marker = trimmed.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    let length = trimmed.chars().take_while(|ch| *ch == marker).count();
+    (length >= 3).then(|| (marker, length, trimmed[length..].trim()))
+}
+
+fn strip_html_comments(raw: &str, in_comment: &mut bool) -> String {
+    let mut visible = String::with_capacity(raw.len());
+    let mut index = 0;
+
+    while index < raw.len() {
+        if *in_comment {
+            let Some(relative_end) = raw[index..].find("-->") else {
+                return visible;
+            };
+            *in_comment = false;
+            index += relative_end + 3;
+            continue;
+        }
+
+        if raw[index..].starts_with("<!--") {
+            *in_comment = true;
+            index += 4;
+            continue;
+        }
+
+        if raw.as_bytes()[index] == b'`' {
+            let delimiter_len = raw[index..]
+                .bytes()
+                .take_while(|byte| *byte == b'`')
+                .count();
+            let delimiter = &raw[index..index + delimiter_len];
+            if let Some(relative_end) = raw[index + delimiter_len..].find(delimiter) {
+                let end = index + delimiter_len + relative_end + delimiter_len;
+                visible.push_str(&raw[index..end]);
+                index = end;
+                continue;
+            }
+        }
+
+        let ch = raw[index..]
+            .chars()
+            .next()
+            .expect("valid character boundary");
+        visible.push(ch);
+        index += ch.len_utf8();
+    }
+
+    visible
 }
 
 fn markdown_heading(raw: &str) -> Option<(usize, &str)> {
@@ -14817,6 +14895,77 @@ mod tests {
                 .all(|span| span.style.fg == Some(theme.thought)),
             "thought heading must be dimmed, not left at reply contrast: {heading:?}"
         );
+    }
+
+    #[test]
+    fn agent_markdown_hides_html_comments_but_keeps_them_in_code() {
+        let mut state = AppState::new();
+        state.expand_transcript_details = true;
+        state.transcript.push(Entry::AgentMessage(
+            "before <!-- inline --> after\n`<!-- inline code -->`\n``<!-- multi-tick code -->``\nunmatched ` <!-- hidden after unmatched tick -->visible\n<!-- standalone -->\n<!-- multiline\nstill hidden -->visible\n```html\n<!-- literal -->\n```\n~~~html\n<!-- tilde literal -->\n~~~"
+                .to_string(),
+        ));
+
+        let rendered: Vec<String> = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        assert!(rendered.iter().any(|line| line == "before  after"));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("<!-- inline code -->"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("<!-- multi-tick code -->"))
+        );
+        assert!(rendered.iter().any(|line| line == "unmatched ` visible"));
+        assert!(rendered.iter().any(|line| line.contains("visible")));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("<!-- literal -->"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("<!-- tilde literal -->"))
+        );
+        assert!(!rendered.iter().any(|line| line.contains("standalone")));
+        assert!(!rendered.iter().any(|line| line.contains("multiline")));
+        assert!(!rendered.iter().any(|line| line.contains("still hidden")));
+    }
+
+    #[test]
+    fn collapsed_tool_markdown_replays_html_comment_state() {
+        let mut state = AppState::new();
+        let mut lines: Vec<String> = (1..TOOL_OUTPUT_COLLAPSED_LINES)
+            .map(|line| format!("line {line}"))
+            .collect();
+        lines.push("<!-- hidden metadata".to_string());
+        lines.extend(["still hidden".to_string(), "-->visible result".to_string()]);
+        state.tool_calls.insert(
+            "call-1".to_string(),
+            crate::app::ToolCallView {
+                title: "log".to_string(),
+                kind: ToolKind::Execute,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Text(lines.join("\n"))],
+            },
+        );
+        state.transcript.push(Entry::ToolCall("call-1".to_string()));
+
+        let rendered = render_transcript_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(rendered.iter().any(|line| line.contains("visible result")));
+        assert!(!rendered.iter().any(|line| line.contains("still hidden")));
+        assert!(!rendered.iter().any(|line| line.contains("-->")));
     }
 
     #[test]
