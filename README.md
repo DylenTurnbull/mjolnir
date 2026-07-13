@@ -78,11 +78,11 @@ launchable model from a different provider. Eitri chooses a cost-efficient
 model on the DeepSWE Pass@1/cost Pareto frontier at the current Sonnet High
 quality floor.
 
-Use `/models` to see saved preferences, active resolved models, benchmark data,
-adapter routes, custom unranked models, and disabled reasons. Changes made with
-`/models <thor|loki|eitri> <auto|model-id>` apply to the next session. Use
-`/reviews`, `/reviews thor on|off`, and `/reviews loki on|off` to inspect or
-change review policy.
+Use `/mjconfig` to inspect Council settings alongside local UI preferences, or
+`/council` to jump straight to the Council panel. Council model changes are
+owned by that panel so agent-provided commands such as `/models` remain
+available to the active ACP agent. Use `/reviews`, `/reviews thor on|off`, and
+`/reviews loki on|off` to inspect or change review policy.
 
 Thor's remaining ACP session controls appear on F1–F9. Model and Thought Level
 are owned by the Council and therefore omitted from those controls; the other

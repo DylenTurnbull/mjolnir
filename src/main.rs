@@ -935,6 +935,75 @@ fn apply_session_result_to_config(cfg: &mut Config, result: &RunSessionResult) {
     cfg.spinner = result.spinner_style;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigStartupState {
+    Existing,
+    FirstRun,
+    Upgraded,
+}
+
+fn classify_config_startup(config_path: &Path) -> ConfigStartupState {
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return ConfigStartupState::FirstRun;
+    };
+    if config_needs_council_upgrade(&raw) {
+        ConfigStartupState::Upgraded
+    } else {
+        ConfigStartupState::Existing
+    }
+}
+
+fn config_needs_council_upgrade(raw: &str) -> bool {
+    let has_council_roles = raw.lines().any(|line| {
+        let line = line.trim();
+        matches!(line, "[thor]" | "[loki]" | "[eitri]")
+    });
+    if has_council_roles {
+        return false;
+    }
+
+    raw.lines().any(|line| {
+        let line = line.trim();
+        line == "[models]"
+            || line == "[[custom_agents]]"
+            || line.starts_with("agent =")
+            || line.starts_with("favorite_agents =")
+            || line.starts_with("[session_config.")
+    })
+}
+
+fn show_council_startup_hint(
+    config_path: &Path,
+    council: &council::ResolvedCouncil,
+    state: ConfigStartupState,
+) {
+    let intro = match state {
+        ConfigStartupState::FirstRun => {
+            format!("Welcome to mj. I created {}.", config_path.display())
+        }
+        ConfigStartupState::Upgraded => {
+            format!(
+                "mj upgraded {} for the new Council runtime.",
+                config_path.display()
+            )
+        }
+        ConfigStartupState::Existing => return,
+    };
+
+    eprintln!(
+        "{intro}\n\
+         Starting with Thor: {}, Loki: {}, Eitri: {}.\n\
+         Change this later inside mj with /council and /reviews.",
+        council.thor.model.model,
+        council
+            .loki
+            .as_ref()
+            .map(|role| role.model.model.as_str())
+            .unwrap_or("off"),
+        council.eitri.model.model,
+    );
+}
+
 async fn run_app(
     cwd: PathBuf,
     runtime_options: RuntimeOptions,
@@ -945,8 +1014,16 @@ async fn run_app(
     mode: UiMode,
 ) -> Result<Option<String>> {
     let config_path = config::default_config_path();
+    let startup_state = classify_config_startup(&config_path);
     let mut cfg = Config::load(&config_path)?;
+    if matches!(
+        startup_state,
+        ConfigStartupState::FirstRun | ConfigStartupState::Upgraded
+    ) {
+        cfg.save(&config_path)?;
+    }
     let mut council = council::resolve(&cfg, &cwd).await?;
+    show_council_startup_hint(&config_path, &council, startup_state);
     if let Some(agent) = initial_agent.as_ref()
         && let Some(pinned) = council.available.iter().find(|role| {
             role.launch.command == agent.program
@@ -2383,6 +2460,47 @@ mod tests {
         assert!(
             rendered.contains("\nRemove worktree 'pale-tide'? [y/N] "),
             "cleanup prompt should not share the shell prompt line: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn config_startup_classification_distinguishes_first_run_upgrade_and_existing_council() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.toml");
+        assert_eq!(
+            classify_config_startup(&missing),
+            ConfigStartupState::FirstRun
+        );
+
+        let legacy = dir.path().join("legacy.toml");
+        std::fs::write(
+            &legacy,
+            r#"
+agent = "legacy"
+favorite_agents = ["old"]
+
+[models]
+thor = "gpt-old"
+
+[[custom_agents]]
+name = "company"
+program = "company-acp"
+
+[session_config.old]
+mode = "ask"
+"#,
+        )
+        .expect("write legacy config");
+        assert_eq!(
+            classify_config_startup(&legacy),
+            ConfigStartupState::Upgraded
+        );
+
+        let current = dir.path().join("current.toml");
+        std::fs::write(&current, "[thor]\nmodel = \"auto\"\n").expect("write current config");
+        assert_eq!(
+            classify_config_startup(&current),
+            ConfigStartupState::Existing
         );
     }
 

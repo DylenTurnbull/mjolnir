@@ -41,7 +41,7 @@ const BUILTIN_LOAD_COMMAND: &str = "load";
 const BUILTIN_FORK_COMMAND: &str = "fork";
 const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
-const BUILTIN_MODELS_COMMAND: &str = "models";
+const BUILTIN_COUNCIL_COMMAND: &str = "council";
 const BUILTIN_REVIEWS_COMMAND: &str = "reviews";
 const BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
@@ -75,14 +75,14 @@ fn builtin_export_command() -> AvailableCommand {
 fn builtin_mjconfig_command() -> AvailableCommand {
     AvailableCommand::new(
         BUILTIN_MJCONFIG_COMMAND,
-        "open the mj config menu (theme + spinner)",
+        "open the mj config menu (theme, spinner, Council)",
     )
 }
 
-fn builtin_models_command() -> AvailableCommand {
+fn builtin_council_command() -> AvailableCommand {
     AvailableCommand::new(
-        BUILTIN_MODELS_COMMAND,
-        "show or select Thor/Loki/Eitri models (usage: /models [role model|auto])",
+        BUILTIN_COUNCIL_COMMAND,
+        "open the mj config menu focused on Council settings",
     )
 }
 
@@ -108,7 +108,7 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
             && command.name != BUILTIN_FORK_COMMAND
             && command.name != BUILTIN_EXPORT_COMMAND
             && command.name != BUILTIN_MJCONFIG_COMMAND
-            && command.name != BUILTIN_MODELS_COMMAND
+            && command.name != BUILTIN_COUNCIL_COMMAND
             && command.name != BUILTIN_REVIEWS_COMMAND
             && command.name != BUILTIN_RAGNAROK_COMMAND
     });
@@ -117,8 +117,8 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
     }
     commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_mjconfig_command());
+    commands.insert(0, builtin_council_command());
     commands.insert(0, builtin_reviews_command());
-    commands.insert(0, builtin_models_command());
     commands.insert(0, builtin_export_command());
     commands.insert(0, builtin_load_command());
     commands.insert(0, builtin_clear_command());
@@ -589,6 +589,20 @@ fn number_field(
 pub enum MjConfigSection {
     Theme,
     Spinner,
+    CouncilThor,
+    CouncilLoki,
+    CouncilEitri,
+}
+
+impl MjConfigSection {
+    pub fn council_role(self) -> Option<&'static str> {
+        match self {
+            Self::CouncilThor => Some("thor"),
+            Self::CouncilLoki => Some("loki"),
+            Self::CouncilEitri => Some("eitri"),
+            Self::Theme | Self::Spinner => None,
+        }
+    }
 }
 
 /// In-session `/mjconfig` overlay: pick the terminal theme and spinner style.
@@ -599,8 +613,12 @@ pub struct MjConfigMenu {
     pub section: MjConfigSection,
     pub theme_idx: usize,
     pub spinner_idx: usize,
+    pub thor_idx: usize,
+    pub loki_idx: usize,
+    pub eitri_idx: usize,
     orig_theme: TerminalThemeKind,
     orig_spinner: SpinnerStyle,
+    orig_models: crate::config::ModelsConfig,
 }
 
 #[derive(Debug)]
@@ -1076,6 +1094,10 @@ impl AppState {
 
     /// Open the `/mjconfig` overlay, seeded with the current theme and spinner.
     pub fn open_mjconfig_menu(&mut self) {
+        self.open_mjconfig_menu_section(MjConfigSection::Theme);
+    }
+
+    pub fn open_mjconfig_menu_section(&mut self, section: MjConfigSection) {
         let theme_idx = TerminalThemeKind::ALL
             .iter()
             .position(|kind| *kind == self.theme_kind)
@@ -1084,12 +1106,27 @@ impl AppState {
             .iter()
             .position(|style| *style == self.spinner_style)
             .unwrap_or(0);
+        let model_index = |model: &str, choices: &[crate::council::ModelChoice]| {
+            if model == "auto" {
+                0
+            } else {
+                choices
+                    .iter()
+                    .position(|choice| choice.model == model)
+                    .map(|idx| idx + 1)
+                    .unwrap_or(0)
+            }
+        };
         self.mjconfig_menu = Some(MjConfigMenu {
-            section: MjConfigSection::Theme,
+            section,
             theme_idx,
             spinner_idx,
+            thor_idx: model_index(&self.council_models.thor, &self.council_choices),
+            loki_idx: model_index(&self.council_models.loki, &self.council_choices),
+            eitri_idx: model_index(&self.council_models.eitri, &self.council_choices),
             orig_theme: self.theme_kind,
             orig_spinner: self.spinner_style,
+            orig_models: self.council_models.clone(),
         });
     }
 
@@ -1097,7 +1134,10 @@ impl AppState {
         if let Some(menu) = self.mjconfig_menu.as_mut() {
             menu.section = match menu.section {
                 MjConfigSection::Theme => MjConfigSection::Spinner,
-                MjConfigSection::Spinner => MjConfigSection::Theme,
+                MjConfigSection::Spinner => MjConfigSection::CouncilThor,
+                MjConfigSection::CouncilThor => MjConfigSection::CouncilLoki,
+                MjConfigSection::CouncilLoki => MjConfigSection::CouncilEitri,
+                MjConfigSection::CouncilEitri => MjConfigSection::Theme,
             };
         }
     }
@@ -1121,6 +1161,33 @@ impl AppState {
                 menu.spinner_idx = (menu.spinner_idx as i32 + delta).rem_euclid(len) as usize;
                 next_spinner = Some(SpinnerStyle::ALL[menu.spinner_idx]);
             }
+            MjConfigSection::CouncilThor => {
+                menu.thor_idx = move_model_index(menu.thor_idx, delta, &self.council_choices);
+                self.council_models.thor = model_at_index(menu.thor_idx, &self.council_choices);
+            }
+            MjConfigSection::CouncilLoki => {
+                menu.loki_idx = move_model_index(menu.loki_idx, delta, &self.council_choices);
+                self.council_models.loki = model_at_index(menu.loki_idx, &self.council_choices);
+            }
+            MjConfigSection::CouncilEitri => {
+                menu.eitri_idx = move_model_index(menu.eitri_idx, delta, &self.council_choices);
+                self.council_models.eitri = model_at_index(menu.eitri_idx, &self.council_choices);
+            }
+        }
+        if Some(self.council_models.thor.as_str()) == Some(self.council_models.loki.as_str())
+            && self.council_models.thor != "auto"
+        {
+            match menu.section {
+                MjConfigSection::CouncilThor => {
+                    menu.loki_idx = 0;
+                    self.council_models.loki = "auto".to_string();
+                }
+                MjConfigSection::CouncilLoki => {
+                    menu.thor_idx = 0;
+                    self.council_models.thor = "auto".to_string();
+                }
+                _ => {}
+            }
         }
         if let Some(theme) = next_theme {
             self.set_theme(theme);
@@ -1132,10 +1199,16 @@ impl AppState {
 
     /// Close the menu, keeping the live-previewed theme and spinner. Returns the
     /// accepted pair so the caller can persist it.
-    pub fn mjconfig_menu_accept(&mut self) -> Option<(TerminalThemeKind, SpinnerStyle)> {
-        self.mjconfig_menu
-            .take()
-            .map(|_| (self.theme_kind, self.spinner_style))
+    pub fn mjconfig_menu_accept(
+        &mut self,
+    ) -> Option<(TerminalThemeKind, SpinnerStyle, crate::config::ModelsConfig)> {
+        self.mjconfig_menu.take().map(|_| {
+            (
+                self.theme_kind,
+                self.spinner_style,
+                self.council_models.clone(),
+            )
+        })
     }
 
     /// Close the menu and restore the theme and spinner that were active when
@@ -1144,12 +1217,14 @@ impl AppState {
         if let Some(menu) = self.mjconfig_menu.take() {
             self.set_theme(menu.orig_theme);
             self.set_spinner_style(menu.orig_spinner);
+            self.council_models = menu.orig_models;
         }
     }
 
+    #[allow(dead_code)]
     pub fn council_summary(&self) -> String {
         let mut text = format!(
-            "Council models\n\nChange with: /models <thor|loki|eitri> <auto|model-id>\nChanges apply to the next session.\n\nSaved preference\n  Thor   {}\n  Loki   {}\n  Eitri  {}\n\nActive session\n  Thor   {}\n  Loki   {}\n  Eitri  {}\n\nAuto selection · DeepSWE\n  Loki chooses the best launchable model from a provider other than Thor's.\n  Eitri chooses the cheapest Pareto model meeting the Sonnet High quality floor.\n\nAvailable models\n",
+            "Council models\n\nOpen /mjconfig or /council to change Council-owned model routing.\nChanges apply to the next session.\n\nSaved preference\n  Thor   {}\n  Loki   {}\n  Eitri  {}\n\nActive session\n  Thor   {}\n  Loki   {}\n  Eitri  {}\n\nAuto selection · DeepSWE\n  Loki chooses the best launchable model from a provider other than Thor's.\n  Eitri chooses the cheapest Pareto model meeting the Sonnet High quality floor.\n\nAvailable models\n",
             self.council_models.thor,
             self.council_models.loki,
             self.council_models.eitri,
@@ -1183,6 +1258,7 @@ impl AppState {
         text
     }
 
+    #[allow(dead_code)]
     pub fn set_council_model(&mut self, role: &str, model: &str) -> Result<String, String> {
         if model != "auto" {
             let choice = self
@@ -2793,6 +2869,30 @@ impl AppState {
                 (option_index, option, config_shortcut_char(select_index))
             })
             .collect()
+    }
+}
+
+fn move_model_index(current: usize, delta: i32, choices: &[crate::council::ModelChoice]) -> usize {
+    let len = choices.len() + 1;
+    let mut next = current;
+    for _ in 0..len {
+        next = (next as i32 + delta).rem_euclid(len as i32) as usize;
+        if next == 0 || choices.get(next - 1).is_some_and(|choice| choice.available) {
+            return next;
+        }
+    }
+    0
+}
+
+fn model_at_index(index: usize, choices: &[crate::council::ModelChoice]) -> String {
+    if index == 0 {
+        "auto".to_string()
+    } else {
+        choices
+            .get(index - 1)
+            .filter(|choice| choice.available)
+            .map(|choice| choice.model.clone())
+            .unwrap_or_else(|| "auto".to_string())
     }
 }
 
@@ -5514,7 +5614,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "load", "export", "models", "reviews", "mjconfig", "ragnarok"
+                "new", "clear", "load", "export", "reviews", "council", "mjconfig", "ragnarok"
             ]
         );
     }
@@ -5541,7 +5641,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "load", "export", "models", "reviews", "mjconfig", "ragnarok",
+                "new", "clear", "load", "export", "reviews", "council", "mjconfig", "ragnarok",
                 "fork"
             ]
         );
@@ -5578,8 +5678,8 @@ mod tests {
                 "clear",
                 "load",
                 "export",
-                "models",
                 "reviews",
+                "council",
                 "mjconfig",
                 "ragnarok",
                 "fork",
@@ -5600,8 +5700,8 @@ mod tests {
             "export transcript to markdown"
         );
         assert_eq!(
-            s.available_commands[4].description,
-            "show or select Thor/Loki/Eitri models (usage: /models [role model|auto])"
+            s.available_commands[5].description,
+            "open the mj config menu focused on Council settings"
         );
         assert_eq!(
             s.available_commands[8].description,
@@ -5631,8 +5731,8 @@ mod tests {
                 "clear",
                 "load",
                 "export",
-                "models",
                 "reviews",
+                "council",
                 "mjconfig",
                 "ragnarok",
                 "review_pr"

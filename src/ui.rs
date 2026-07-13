@@ -73,8 +73,8 @@ pub const INLINE_CHAT_HEIGHT: u16 = 8;
 const INLINE_EXPANDED_MAX_HEIGHT: u16 = 20;
 const INLINE_TRANSCRIPT_TAIL_MAX_ROWS: usize = 12;
 const INLINE_HELP_HEIGHT: u16 = 18;
-/// Inline viewport height for the `/mjconfig` overlay (border + two sections).
-const INLINE_MJCONFIG_HEIGHT: u16 = 15;
+/// Inline viewport height for the `/mjconfig` overlay.
+const INLINE_MJCONFIG_HEIGHT: u16 = 18;
 const QUEUED_PROMPT_VISIBLE_ROWS: usize = 3;
 const CURSOR_POSITION_TIMEOUT_MESSAGE: &str =
     "The cursor position could not be read within a normal duration";
@@ -3311,25 +3311,12 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && (text == "/models" || text.starts_with("/models ")) {
+    if images.is_empty() && text == "/council" {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
         state.scroll_input_to_bottom();
-        let args = text["/models".len()..]
-            .split_whitespace()
-            .collect::<Vec<_>>();
-        match args.as_slice() {
-            [] => state.record_status_message(StatusKind::Info, state.council_summary()),
-            [role, model] => match state.set_council_model(role, model) {
-                Ok(message) => state.record_status_message(StatusKind::Info, message),
-                Err(message) => state.record_status_message(StatusKind::Warning, message),
-            },
-            _ => state.record_status_message(
-                StatusKind::Warning,
-                "usage: /models [thor|loki|eitri auto|model-id]",
-            ),
-        }
+        state.open_mjconfig_menu_section(MjConfigSection::CouncilThor);
         return;
     }
 
@@ -3491,8 +3478,8 @@ fn handle_mjconfig_menu_key(
             inline_repair_request(mode)
         }
         (_, KeyCode::Enter) => {
-            if let Some((theme, style)) = state.mjconfig_menu_accept() {
-                persist_mjconfig_selection(state, theme, style);
+            if let Some((theme, style, models)) = state.mjconfig_menu_accept() {
+                persist_mjconfig_selection(state, theme, style, models);
             }
             inline_repair_request(mode)
         }
@@ -3519,16 +3506,24 @@ fn handle_mjconfig_menu_key(
 
 /// Persist the theme + spinner accepted in the `/mjconfig` menu. The live UI is
 /// already showing them (preview), so this only writes config and reports.
-fn persist_mjconfig_selection(state: &mut AppState, theme: TerminalThemeKind, style: SpinnerStyle) {
+fn persist_mjconfig_selection(
+    state: &mut AppState,
+    theme: TerminalThemeKind,
+    style: SpinnerStyle,
+    models: config::ModelsConfig,
+) {
     if let Some(path) = state.config_path.clone() {
         match config::Config::load(&path).and_then(|mut cfg| {
             cfg.theme = theme;
             cfg.spinner = style;
+            cfg.set_role_models(&models);
             cfg.save(&path)
         }) {
             Ok(()) => state.record_status_message(
                 StatusKind::Info,
-                format!("config saved — theme {theme}, spinner {style}"),
+                format!(
+                    "config saved — theme {theme}, spinner {style}, Council models apply next session"
+                ),
             ),
             Err(e) => state.record_status_message(
                 StatusKind::Warning,
@@ -3536,7 +3531,10 @@ fn persist_mjconfig_selection(state: &mut AppState, theme: TerminalThemeKind, st
             ),
         }
     } else {
-        state.record_status_message(StatusKind::Info, format!("theme {theme}, spinner {style}"));
+        state.record_status_message(
+            StatusKind::Info,
+            format!("theme {theme}, spinner {style}, Council models apply next session"),
+        );
     }
 }
 
@@ -3571,17 +3569,50 @@ fn mjconfig_option_line(
     Line::from(Span::styled(format!("{marker}{label}"), style))
 }
 
+fn council_model_label(model: &str, state: &AppState) -> String {
+    if model == "auto" {
+        return "auto".to_string();
+    }
+    match state
+        .council_choices
+        .iter()
+        .find(|choice| choice.model == model)
+    {
+        Some(choice) if choice.available && choice.ranked => format!(
+            "{} · {:.1}% · ${:.2} · {}",
+            choice.model,
+            choice.pass_at_1 * 100.0,
+            choice.mean_cost_usd,
+            choice.adapter.as_deref().unwrap_or("adapter unknown")
+        ),
+        Some(choice) if choice.available => format!(
+            "{} · unranked · {}",
+            choice.model,
+            choice.adapter.as_deref().unwrap_or("custom ACP")
+        ),
+        Some(choice) => format!(
+            "{} · unavailable: {}",
+            choice.model,
+            choice
+                .disabled_reason
+                .as_deref()
+                .unwrap_or("not launchable")
+        ),
+        None => model.to_string(),
+    }
+}
+
 fn draw_mjconfig_menu(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let Some(menu) = state.mjconfig_menu.as_ref() else {
         return;
     };
     let theme = state.theme;
 
-    // Bail on terminals too small to render the two sections legibly.
-    if area.width.min(58) < 24 || area.height.min(15) < 8 {
+    // Bail on terminals too small to render the sections legibly.
+    if area.width.min(74) < 24 || area.height.min(18) < 8 {
         return;
     }
-    let rect = crate::term::centered_rect(area, 58, 15);
+    let rect = crate::term::centered_rect(area, 74, 18);
     f.render_widget(Clear, rect);
 
     let block = Block::default()
@@ -3595,18 +3626,22 @@ fn draw_mjconfig_menu(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
-            Constraint::Min(4),
+            Constraint::Min(6),
             Constraint::Length(1),
         ])
         .split(inner);
 
-    let intro = Paragraph::new("Changes preview live. Enter saves to config; Esc reverts.")
+    let intro = Paragraph::new("Theme/spinner preview live. Council model routing is shown here; use /council to jump back.")
         .style(Style::default().fg(theme.muted));
     f.render_widget(intro, rows[0]);
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .constraints([
+            Constraint::Percentage(28),
+            Constraint::Percentage(28),
+            Constraint::Percentage(44),
+        ])
         .split(rows[1]);
 
     let theme_focused = menu.section == MjConfigSection::Theme;
@@ -3635,8 +3670,85 @@ fn draw_mjconfig_menu(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     }
     f.render_widget(Paragraph::new(spinner_lines), cols[1]);
 
-    let footer = Paragraph::new("↑/↓ change · Tab switch · Enter save · Esc cancel")
-        .style(Style::default().fg(theme.muted));
+    let mut council_lines = vec![mjconfig_section_header(
+        "Council",
+        menu.section.council_role().is_some(),
+        theme,
+    )];
+    council_lines.push(mjconfig_option_line(
+        menu.section == MjConfigSection::CouncilThor,
+        menu.section == MjConfigSection::CouncilThor,
+        format!(
+            "Thor  {}",
+            council_model_label(&state.council_models.thor, state)
+        ),
+        theme,
+    ));
+    council_lines.push(mjconfig_option_line(
+        menu.section == MjConfigSection::CouncilLoki,
+        menu.section == MjConfigSection::CouncilLoki,
+        format!(
+            "Loki  {}",
+            council_model_label(&state.council_models.loki, state)
+        ),
+        theme,
+    ));
+    council_lines.push(mjconfig_option_line(
+        menu.section == MjConfigSection::CouncilEitri,
+        menu.section == MjConfigSection::CouncilEitri,
+        format!(
+            "Eitri {}",
+            council_model_label(&state.council_models.eitri, state)
+        ),
+        theme,
+    ));
+    council_lines.extend([
+        Line::from(Span::styled("", Style::default().fg(theme.muted))),
+        Line::from(Span::styled(
+            "Active this session",
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("  Thor  {}", state.active_council_models.thor),
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(Span::styled(
+            format!("  Loki  {}", state.active_council_models.loki),
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(Span::styled(
+            format!("  Eitri {}", state.active_council_models.eitri),
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(Span::styled("", Style::default().fg(theme.muted))),
+        Line::from(Span::styled(
+            format!(
+                "{} launchable · {} total choices",
+                state
+                    .council_choices
+                    .iter()
+                    .filter(|choice| choice.available)
+                    .count(),
+                state.council_choices.len()
+            ),
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(Span::styled(
+            "Changes apply to the next session. /models is left to the ACP agent.",
+            Style::default().fg(theme.warning),
+        )),
+    ]);
+    f.render_widget(
+        Paragraph::new(council_lines).wrap(Wrap { trim: false }),
+        cols[2],
+    );
+
+    let footer = Paragraph::new(
+        "↑/↓ change focused choice · Tab switch Theme/Spinner/Thor/Loki/Eitri · Enter save · Esc cancel",
+    )
+    .style(Style::default().fg(theme.muted));
     f.render_widget(footer, rows[2]);
 }
 
@@ -8328,7 +8440,7 @@ fn help_modal_lines(
         help_blank_line(),
         help_command_line(
             "Built-in commands:",
-            "/clear keeps model; /new applies saved models; /load opens session picker",
+            "/mjconfig opens theme/spinner/Council; /council jumps there; /load opens sessions",
             theme,
         ),
     ]);
