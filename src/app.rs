@@ -9,6 +9,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::claude_usage::ClaudeUsageReport;
+use crate::clipboard::ClipboardLease;
+use crate::codex_usage::CodexUsageStatus;
 use agent_client_protocol::schema::v1::{
     AvailableCommand, Diff, ElicitationContentValue, ElicitationMode, ElicitationPropertySchema,
     EnumOption, Plan, PlanEntry, SessionConfigKind, SessionConfigOption,
@@ -16,10 +19,6 @@ use agent_client_protocol::schema::v1::{
     SessionConfigValueId, SessionUpdate, StopReason, TerminalExitStatus, ToolCall, ToolCallContent,
     ToolCallStatus, ToolCallUpdate, ToolKind, Usage, UsageUpdate,
 };
-use chrono::{DateTime, FixedOffset, Local, TimeZone};
-
-use crate::claude_usage::ClaudeUsageReport;
-use crate::clipboard::ClipboardLease;
 
 use crate::event::{
     CodeAgentEvent, CodeAgentOutcome, ElicitationOutcome, ElicitationPrompt, InternalMessage,
@@ -506,7 +505,7 @@ fn format_claude_rate_limit(value: &serde_json::Value) -> Option<String> {
         .map(|util| format!("{}% used", util.round().clamp(0.0, 100.0) as u64));
     let reset = number_field(object, "resetsAt", "resets_at")
         .or_else(|| number_field(object, "overageResetsAt", "overage_resets_at"))
-        .and_then(format_reset_local)
+        .and_then(crate::usage_format::format_reset_local)
         .map(|reset| format!("resets {reset}"));
 
     let detail = [utilization, reset]
@@ -532,33 +531,6 @@ fn rate_limit_window_label(kind: Option<&str>) -> &'static str {
         Some("seven_day_sonnet") => "Current week (Sonnet)",
         Some("overage") => "Extra usage",
         _ => "Usage limit",
-    }
-}
-
-/// Format a unix reset timestamp as wall-clock time in the machine's local
-/// time zone, e.g. `Jun 17 at 4:49pm (Europe/Paris)`. Accepts seconds or
-/// milliseconds; returns `None` if the timestamp is out of range.
-fn format_reset_local(epoch: f64) -> Option<String> {
-    if !epoch.is_finite() {
-        return None;
-    }
-    let seconds = if epoch.abs() >= 1_000_000_000_000.0 {
-        (epoch / 1000.0).trunc() as i64
-    } else {
-        epoch.trunc() as i64
-    };
-    let local = Local.timestamp_opt(seconds, 0).single()?;
-    let zone = iana_time_zone::get_timezone().ok();
-    Some(format_reset_label(local.fixed_offset(), zone.as_deref()))
-}
-
-/// Pure formatter for a reset instant, split out from the `Local` and
-/// `get_timezone` lookups so it can be unit-tested deterministically.
-fn format_reset_label(reset: DateTime<FixedOffset>, zone: Option<&str>) -> String {
-    let when = reset.format("%b %-d at %-I:%M%P").to_string();
-    match zone {
-        Some(zone) if !zone.is_empty() => format!("{when} ({zone})"),
-        _ => when,
     }
 }
 
@@ -763,6 +735,8 @@ pub struct AppState {
     code_agent_token_usage: TokenUsage,
     /// Last Claude Code `/usage` quota scrape, when the active agent is Claude.
     pub claude_usage: Option<ClaudeUsageReport>,
+    /// Last Codex app-server quota query, including explicit unavailable states.
+    pub codex_usage: Option<CodexUsageStatus>,
     /// Slash-command autocomplete state, recomputed on every input edit.
     pub autocomplete: Autocomplete,
     /// True while the keyboard help overlay is visible.
@@ -1070,6 +1044,7 @@ impl AppState {
             token_usage: TokenUsage::default(),
             code_agent_token_usage: TokenUsage::default(),
             claude_usage: None,
+            codex_usage: None,
             autocomplete: Autocomplete::default(),
             help_overlay: false,
             text_selection_mode: false,
@@ -2423,6 +2398,9 @@ impl AppState {
             }
             UiEvent::ClaudeUsage(report) => {
                 self.claude_usage = Some(report);
+            }
+            UiEvent::CodexUsage(status) => {
+                self.codex_usage = Some(status);
             }
             UiEvent::PromptFailed { message } => {
                 if remove_trailing_thinking(&mut self.transcript) {
@@ -4834,31 +4812,6 @@ mod tests {
     }
 
     #[test]
-    fn format_reset_label_renders_local_wall_clock() {
-        let paris = FixedOffset::east_opt(2 * 3600).expect("offset");
-        let reset = paris
-            .with_ymd_and_hms(2026, 6, 17, 16, 49, 0)
-            .single()
-            .expect("instant");
-        assert_eq!(
-            format_reset_label(reset, Some("Europe/Paris")),
-            "Jun 17 at 4:49pm (Europe/Paris)"
-        );
-        // No zone name available → bare wall-clock time.
-        assert_eq!(format_reset_label(reset, None), "Jun 17 at 4:49pm");
-
-        // Past midnight exercises the 12-hour/am formatting (12:59am, not 0:59).
-        let midnight = paris
-            .with_ymd_and_hms(2026, 6, 18, 0, 59, 0)
-            .single()
-            .expect("instant");
-        assert_eq!(
-            format_reset_label(midnight, Some("Europe/Paris")),
-            "Jun 18 at 12:59am (Europe/Paris)"
-        );
-    }
-
-    #[test]
     fn usage_update_accepts_snake_case_claude_rate_limit_meta() {
         let mut s = AppState::new();
         let mut meta = serde_json::Map::new();
@@ -4935,6 +4888,33 @@ mod tests {
                 .as_ref()
                 .map(ClaudeUsageReport::compact_label),
             Some("Claude usage: 5H 88% left · week 63% left".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_usage_event_replaces_available_with_unavailable() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::CodexUsage(CodexUsageStatus::Available(
+            crate::codex_usage::CodexUsageReport {
+                primary: Some(crate::codex_usage::CodexUsageWindow {
+                    label: "5H".to_string(),
+                    remaining_percent: 75,
+                    resets_at: None,
+                }),
+                secondary: None,
+            },
+        )));
+        assert!(matches!(
+            state.codex_usage,
+            Some(CodexUsageStatus::Available(_))
+        ));
+
+        state.apply_event(UiEvent::CodexUsage(CodexUsageStatus::Unavailable(
+            "not signed in".to_string(),
+        )));
+        assert_eq!(
+            state.codex_usage,
+            Some(CodexUsageStatus::Unavailable("not signed in".to_string()))
         );
     }
 

@@ -10,6 +10,7 @@ mod archive;
 mod claude_usage;
 mod clipboard;
 mod code_agent;
+mod codex_usage;
 mod config;
 mod council;
 mod deepswe;
@@ -37,6 +38,7 @@ mod term;
 mod text;
 mod theme;
 mod ui;
+mod usage_format;
 mod version;
 mod workspace_snapshot;
 mod worktree;
@@ -1395,7 +1397,7 @@ async fn run_session(
                 .to_string(),
         ));
     }
-    let (usage_turn_tx, usage_task) = if agent.source_id == "claude-acp" {
+    let (usage_turn_tx, usage_shutdown_tx, usage_task) = if agent.source_id == "claude-acp" {
         let (tx, mut rx) = mpsc::unbounded_channel::<()>();
         let usage_ui_tx = ui_event_tx.clone();
         let usage_cwd = cwd.clone();
@@ -1417,9 +1419,38 @@ async fn run_session(
                 }
             }
         });
-        (Some(tx), Some(handle))
+        (Some(tx), None, Some(handle))
+    } else if agent.source_id == "codex-acp" {
+        let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
+        let _ = tx.send(());
+        let usage_ui_tx = ui_event_tx.clone();
+        let usage_cwd = cwd.clone();
+        let usage_env = agent.env.clone();
+        let handle = tokio::spawn(async move {
+            let mut client = None;
+            while rx.recv().await.is_some() {
+                let refresh =
+                    codex_usage::refresh(&mut client, usage_cwd.clone(), usage_env.clone());
+                let status = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => break,
+                    status = refresh => status,
+                };
+                if usage_ui_tx
+                    .send(crate::event::UiEvent::CodexUsage(status))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            if let Some(client) = client {
+                client.shutdown().await;
+            }
+        });
+        (Some(tx), Some(shutdown_tx), Some(handle))
     } else {
-        (None, None)
+        (None, None, None)
     };
     let mut ui_event_rx = ui_event_rx;
 
@@ -1503,6 +1534,8 @@ async fn run_session(
     let event_cwd = cwd.clone();
     let thor_review_enabled = Arc::new(AtomicBool::new(thor_config.discrete_review));
     let event_thor_review_enabled = thor_review_enabled.clone();
+    let refresh_usage_on_failure = agent.source_id == "codex-acp";
+    let event_usage_turn_tx = usage_turn_tx.clone();
     let event_proxy = tokio::spawn(async move {
         let mut runtime_event_rx = runtime_event_rx;
         let mut decisions = event_loki.as_ref().map(loki::Handle::subscribe);
@@ -1625,6 +1658,12 @@ async fn run_session(
                         });
                         continue;
                     } else {
+                        if refresh_usage_on_failure
+                            && matches!(event, crate::event::UiEvent::PromptFailed { .. })
+                            && let Some(tx) = event_usage_turn_tx.as_ref()
+                        {
+                            let _ = tx.send(());
+                        }
                         event_tracker.observe_event(&event);
                         if ui_event_tx.send(event).is_err() { break; }
                         if target_completed {
@@ -1735,7 +1774,7 @@ async fn run_session(
                 }
                 let event = held_completion.take().expect("completion held");
                 event_tracker.observe_event(&event);
-                if let Some(tx) = usage_turn_tx.as_ref() {
+                if let Some(tx) = event_usage_turn_tx.as_ref() {
                     let _ = tx.send(());
                 }
                 if ui_event_tx.send(event).is_err() {
@@ -1927,6 +1966,11 @@ async fn run_session(
         {
             LoadSessionResult::Switched => {
                 header_labels.session_title = target_title;
+                if agent.source_id == "codex-acp"
+                    && let Some(tx) = usage_turn_tx.as_ref()
+                {
+                    let _ = tx.send(());
+                }
                 // A fresh terminal starts unrestored, so the exit path will
                 // restore it again — no manual bookkeeping needed.
                 terminal = match SessionTerminal::fresh(mode) {
@@ -1995,10 +2039,20 @@ async fn run_session(
         }
     }
 
-    wait_for_task("remote-control event proxy", event_proxy).await;
-    wait_for_task("remote-control command proxy", cmd_proxy).await;
+    if let Some(tx) = usage_shutdown_tx {
+        let _ = tx.send(());
+    }
+    drop(usage_turn_tx);
+    let event_proxy_wait = wait_for_task("remote-control event proxy", event_proxy);
+    let cmd_proxy_wait = wait_for_task("remote-control command proxy", cmd_proxy);
     if let Some(task) = usage_task {
-        wait_for_task("claude usage poller", task).await;
+        tokio::join!(
+            event_proxy_wait,
+            cmd_proxy_wait,
+            wait_for_task("subscription usage poller", task),
+        );
+    } else {
+        tokio::join!(event_proxy_wait, cmd_proxy_wait);
     }
 
     // Restore the terminal only now, after the runtime has finished tearing

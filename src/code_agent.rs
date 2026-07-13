@@ -791,6 +791,7 @@ async fn run(
                         }
                     }
                     UiEvent::ClaudeUsage(_)
+                    | UiEvent::CodexUsage(_)
                     | UiEvent::RemotePermissionDecision { .. }
                     | UiEvent::LokiActivity(_)
                     | UiEvent::InternalMessage(_) => {}
