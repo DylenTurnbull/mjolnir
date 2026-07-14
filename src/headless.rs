@@ -167,6 +167,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let agent_label = format!("Thor · {}", thor.model.model);
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    for warning in &resolved.warnings {
+        let _ = event_tx.send(UiEvent::Warning(warning.clone()));
+    }
     let (loki_role, _loki_codex_home) = match resolved.loki.clone() {
         Some(role) => {
             let (role, guard) = crate::isolated_council_role(role, "loki")?;
@@ -187,7 +190,13 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     } else {
         None
     };
-    let (eitri, _eitri_codex_home) = crate::isolated_council_role(resolved.eitri.clone(), "eitri")?;
+    let (eitri, _eitri_codex_home) = match resolved.eitri.clone() {
+        Some(role) => {
+            let (role, guard) = crate::isolated_council_role(role, "eitri")?;
+            (Some(role), guard)
+        }
+        None => (None, None),
+    };
     let implementation_handoffs = Arc::new(AtomicUsize::new(0));
     let runtime_cfg = AcpRuntimeConfig {
         command: thor.launch.command.clone(),
@@ -208,7 +217,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             model_value: thor.model_value.clone(),
             force_high_reasoning: true,
         }),
-        code_agent: Some(
+        code_agent: eitri.map(|eitri| {
             code_agent::Config::council(
                 eitri.launch.command,
                 eitri.launch.args,
@@ -218,8 +227,8 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 eitri.model_value,
                 loki_handle.clone(),
             )
-            .with_implementation_handoff_counter(implementation_handoffs.clone()),
-        ),
+            .with_implementation_handoff_counter(implementation_handoffs.clone())
+        }),
     };
 
     let runtime = tokio::spawn(async move { acp::run(runtime_cfg, event_tx, cmd_rx).await });
