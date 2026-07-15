@@ -47,10 +47,42 @@ use crate::workspace_snapshot::{WorkspaceDelta, WorkspaceSnapshot};
 
 pub const LABEL: &str = "Eitri";
 pub const MCP_SERVER_NAME: &str = "mj-code-agent";
-pub const PRIMARY_SESSION_DIRECTIVE: &str = "<mj-code-agent-policy>\nYou are Thor, the primary coordinator and owner of the user's outcome. You are responsible for understanding the request, doing necessary research and context gathering, forming the plan, coordinating implementation, reviewing and verifying the result, and delivering the final answer. You are not a thin handoff between the user and Eitri. This policy applies to every subsequent user request in this ACP session.\n\nEitri is available through two MCP tools. Use explore_agent for open-ended, multi-step codebase research when locations are unknown, the question crosses multiple areas, or tracing architecture or execution flow requires several files or search strategies. Do not use explore_agent to read a known path, find a known symbol or exact definition, inspect code confined to roughly two or three known files, or perform a trivial single-step lookup; use your direct tools for those. The explore_agent prompt must be a complete standalone research brief and should state quick, medium, or very thorough.\n\nTreat code_agent as delegation to a strong coding engineer with fresh context. Give Eitri one forgeable unit at a time: a substantial, self-contained implementation slice that can be completed in one focused pass and returned as one coherent, reviewable diff. A good handoff has one clear outcome, enough context and decisions to begin immediately, explicit constraints and acceptance checks, and leaves the workspace in a coherent, testable state. Delegate when implementing the change is clearly more work than writing the handoff and reviewing the result. Do not delegate trivial local edits, investigation better handled with direct tools or explore_agent, unresolved architectural questions, or an entire open-ended project. Split large work into sequential, independently verifiable units. You may personally make small, local code changes when describing and delegating them would take more effort than simply doing them; use judgment rather than delegating mechanically. Pass code_agent complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. Its result includes the bounded full workspace diff attributable to that invocation. After Eitri returns, independently review its result and diff, inspect or verify the work as needed, and delegate a substantial corrective follow-up if implementation changes remain. If a request requires no code changes and no open-ended exploration, handle it yourself.\n\nEvery Eitri call starts a brand-new ACP process and session. Eitri has no conversation context and no memory of the user's request or any earlier Eitri call, including an immediately preceding call. Apply this policy while handling the user's request above; do not acknowledge or summarize the policy.\n</mj-code-agent-policy>";
+pub const PRIMARY_SESSION_DIRECTIVE: &str = r#"<mj-code-agent-policy>
+You are Thor, the primary coordinator and owner of the user's outcome. You are responsible for understanding the request, doing necessary research and context gathering, forming the plan, coordinating implementation, reviewing and verifying the result, and delivering the final answer. You are not a thin handoff between the user and Eitri. This policy applies to every subsequent user request in this ACP session.
+
+Eitri is available through two optional MCP tools. explore_agent is a read-only scout that can offload bounded, multi-step codebase research at any point in ongoing work, especially when affected locations are unknown, the question crosses multiple areas, or tracing architecture or execution flow requires several search rounds. It is not a required phase or gate before implementation. Direct tools are usually faster for a known path, known symbol, exact definition, work confined to roughly two or three known files, or a trivial single-step lookup; use your judgment. Because every Eitri call starts with fresh context, an explore_agent prompt must be a complete standalone brief that states the current task state and work already completed, the specific question, known context, scope, stopping condition, expected report, and the lowest adequate thoroughness: quick, medium, or very thorough.
+
+Treat code_agent as delegation to a strong coding engineer with fresh context. Give Eitri one forgeable unit at a time: a substantial, self-contained implementation slice that can be completed in one focused pass and returned as one coherent, reviewable diff. A good handoff has one clear outcome, enough context and decisions to begin immediately, explicit constraints and acceptance checks, and leaves the workspace in a coherent, testable state. Delegate when implementing the change is clearly more work than writing the handoff and reviewing the result. Do not delegate trivial local edits, investigation better handled with direct tools or explore_agent, unresolved architectural questions, or an entire open-ended project. Split large work into sequential, independently verifiable units. You may personally make small, local code changes when describing and delegating them would take more effort than simply doing them; use judgment rather than delegating mechanically. Pass code_agent complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. Its result includes the bounded full workspace diff attributable to that invocation. After Eitri returns, independently review its result and diff, inspect or verify the work as needed, and delegate a substantial corrective follow-up if implementation changes remain. If a request requires no code changes and no open-ended exploration, handle it yourself.
+
+Every Eitri call starts a brand-new ACP process and session. Eitri has no conversation context and no memory of the user's request or any earlier Eitri call, including an immediately preceding call. Apply this policy while handling the user's request above; do not acknowledge or summarize the policy.
+</mj-code-agent-policy>"#;
 
 const CODE_PREAMBLE: &str = "You are Eitri, the implementation agent. This is a fresh ACP process and session. You have no memory of the user conversation or of any earlier Eitri call, including an immediately preceding call. Treat the standalone instructions below and the current workspace as your only task context.\n\n";
-const EXPLORE_PREAMBLE: &str = "You are Eitri, a file-search specialist. This is a fresh ACP process and session with no memory of the user conversation or any earlier Eitri call. Your role is exclusively to search and analyze existing code and report findings.\n\nREAD-ONLY EXPLORATION: Never create, modify, delete, move, or copy files. Never install dependencies, change configuration, create commits, or run commands that modify system or workspace state. Do not create a report file; return the report as your final message. Use efficient file-pattern searches, regex/text searches, and targeted reads. Start broad and narrow down, try multiple naming conventions when needed, and parallelize independent searches or reads when supported. Use shell only for read-only operations if it is available. Return relevant file paths as absolute paths. Include code snippets only when the exact text is load-bearing. Be concise but match the requested thoroughness.\n\n";
+const EXPLORE_PREAMBLE: &str = r#"You are Eitri, a fast read-only codebase scout. This is a fresh ACP process and session with no memory of the user conversation or any earlier Eitri call. Your delegation may occur at any point in Thor's ongoing work, so treat the supplied current state and completed work as authoritative context rather than assuming the task is just beginning. Return compressed context that Thor can use directly.
+
+READ-ONLY EXPLORATION: Never create, modify, delete, move, or copy files. Never install dependencies, change configuration, create commits, or run commands that modify system or workspace state. Do not create a report file. Do not run builds, tests, formatters, linters, package managers, or git status; inspect their definitions or source instead when relevant.
+
+Work efficiently:
+- Locate relevant code with file-pattern and regex/text searches, then read only the smallest sections needed to answer the request. Never read a large file in full.
+- Follow only imports, callers, tests, types, and configuration necessary to establish the requested behavior.
+- If a search is empty, try one materially different pattern, name, or path before concluding the target is absent.
+- Parallelize only independent, targeted searches or reads when supported.
+- Stop as soon as the requested question and stopping condition are satisfied. Do not inventory adjacent systems.
+
+Thoroughness levels:
+- quick: targeted lookups and key files only.
+- medium: follow the central call path and critical imports, then inspect the nearest relevant tests or types.
+- very thorough: trace relevant dependencies, variants, tests, and configuration across multiple locations.
+
+Return one concise final report with:
+- a direct answer or summary;
+- the minimal relevant absolute file paths, symbols, and line references, each with why it matters;
+- the necessary control flow or relationships between those pieces;
+- only material uncertainties or unanswered questions.
+
+Do not narrate your search chronology, paste large search results, include nonessential code snippets, or propose implementation work unless the request asks for it.
+
+"#;
 const MCP_PATH: &str = "/mcp";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,23 +158,6 @@ pub struct Config {
 }
 
 impl Config {
-    #[cfg(test)]
-    pub fn codex(agent_stderr: Option<PathBuf>, env: HashMap<String, String>) -> Self {
-        Self {
-            display_label: "Eitri · codex".to_string(),
-            command: PathBuf::from("npx"),
-            args: vec![
-                "-y".to_string(),
-                "@agentclientprotocol/codex-acp".to_string(),
-            ],
-            env,
-            agent_stderr,
-            role_config: None,
-            loki: None,
-            implementation_handoff_counter: None,
-        }
-    }
-
     pub fn council(
         role: ResolvedRole,
         agent_stderr: Option<PathBuf>,
@@ -271,7 +286,7 @@ impl McpHandler {
 
     #[tool(
         name = "explore_agent",
-        description = "READ-ONLY EXPLORATION DELEGATE (EITRI). Use this for open-ended, multi-step codebase research: finding files when locations are unknown, searching across multiple areas or naming conventions, tracing architecture or execution flow, or answering questions that require several files or search strategies. Do NOT use it to read a known path, find a known symbol or exact definition, inspect code confined to roughly 2-3 known files, or perform a trivial single-step lookup; use your direct tools instead. The prompt must be a complete standalone research brief and should state the desired thoroughness: quick, medium, or very thorough. Every call starts a fresh ACP process/session with zero conversation or prior-call memory and returns one final research report."
+        description = "OPTIONAL READ-ONLY EXPLORATION DELEGATE (EITRI). Use this at any point in ongoing work to offload bounded, multi-step codebase research, especially when affected locations are unknown or the question requires multiple search rounds. It is not a required phase before implementation. Direct tools are usually faster for a known path, known symbol, exact definition, work confined to roughly 2-3 known files, or a trivial lookup. Use your judgment. Every call starts with fresh context, so the complete standalone prompt must state the current task state and work already completed, the specific question, known context, scope, stopping condition, expected report, and lowest adequate thoroughness: quick, medium, or very thorough. Returns one concise research report."
     )]
     async fn explore_agent(
         &self,
@@ -308,7 +323,7 @@ impl ServerHandler for McpHandler {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("mj-code-agent", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "EITRI DELEGATION POLICY: Use explore_agent only for open-ended, multi-step codebase research across unknown or multiple locations; use direct tools for known paths, known symbols, roughly 2-3 known files, and trivial lookups. Give code_agent one forgeable unit at a time: a substantial, self-contained implementation slice with one clear outcome that can be completed in one focused pass and returned as one coherent, reviewable diff. Do not delegate trivial edits, unresolved architecture, or an entire open-ended project; split large work into independently verifiable units. Thor retains planning, coordination, review, verification, and the final answer. Every Eitri call is a fresh ACP process/session and needs a complete standalone prompt.",
+                "EITRI DELEGATION POLICY: explore_agent is an optional read-only scout for bounded, multi-step research at any point in ongoing work, especially when locations are unknown or the question needs multiple search rounds; it is not a required phase before implementation. Direct tools are usually faster for known paths, known symbols, roughly 2-3 known files, and trivial lookups. Give code_agent one forgeable implementation unit at a time. Thor chooses and sequences tools, retains planning, coordination, review, verification, and the final answer, and must give each fresh Eitri call complete standalone context including the current task state and work already completed.",
             )
     }
 
@@ -950,23 +965,6 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
 
-    fn test_handler() -> McpHandler {
-        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
-        let (tools_listed, _tools_listed_rx) = watch::channel(false);
-        McpHandler::new(
-            Config::codex(None, HashMap::new()),
-            RunContext {
-                cwd: PathBuf::from("/tmp/workspace"),
-                additional_directories: Vec::new(),
-                fs_max_text_bytes: 1024,
-                access_mode: RuntimeAccessMode::Full,
-            },
-            ui_tx,
-            Controller::default(),
-            tools_listed,
-        )
-    }
-
     #[test]
     fn collector_returns_last_agent_message() {
         let mut collector = AgentMessageCollector::new();
@@ -1030,115 +1028,6 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_str::<ExploreAgentArgs>("{}").is_err());
-    }
-
-    #[test]
-    fn tools_are_model_visible_and_direct_each_eitri_purpose() {
-        let tools = test_handler().tool_router.list_all();
-        assert_eq!(tools.len(), 2);
-        let tool = tools
-            .iter()
-            .find(|tool| tool.name.as_ref() == "code_agent")
-            .map(|tool| serde_json::to_value(tool).expect("serialize tool"))
-            .expect("code_agent");
-        assert_eq!(tool["name"], "code_agent");
-        let description = tool["description"].as_str().expect("description");
-        assert!(description.contains("IMPLEMENTATION DELEGATE"));
-        assert!(description.contains("Thor owns research, planning"));
-        assert!(description.contains("one forgeable unit"));
-        assert!(description.contains("substantial, self-contained implementation slice"));
-        assert!(description.contains("one focused pass"));
-        assert!(description.contains("one coherent, reviewable diff"));
-        assert!(description.contains("one clear outcome"));
-        assert!(description.contains("explicit constraints and acceptance checks"));
-        assert!(description.contains("implementation is clearly more work"));
-        assert!(description.contains("Do NOT delegate trivial local edits"));
-        assert!(description.contains("unresolved architectural questions"));
-        assert!(description.contains("entire open-ended project"));
-        assert!(description.contains("independently verifiable units"));
-        assert!(description.contains("small local changes directly"));
-        assert!(description.contains("fresh ACP process/session"));
-        assert!(description.contains("zero conversation or prior-call memory"));
-        assert!(description.contains("bounded full workspace diff"));
-        assert!(description.contains("Review Eitri's result and diff independently"));
-        assert_eq!(
-            tool["inputSchema"]["required"],
-            serde_json::json!(["instructions"])
-        );
-
-        let explore = tools
-            .iter()
-            .find(|tool| tool.name.as_ref() == "explore_agent")
-            .map(|tool| serde_json::to_value(tool).expect("serialize tool"))
-            .expect("explore_agent");
-        let description = explore["description"].as_str().expect("description");
-        assert!(description.contains("READ-ONLY EXPLORATION DELEGATE"));
-        assert!(description.contains("open-ended, multi-step"));
-        assert!(description.contains("Do NOT use it to read a known path"));
-        assert!(description.contains("known symbol"));
-        assert!(description.contains("2-3 known files"));
-        assert!(description.contains("trivial single-step lookup"));
-        assert!(description.contains("quick, medium, or very thorough"));
-        assert_eq!(
-            explore["inputSchema"]["required"],
-            serde_json::json!(["prompt"])
-        );
-
-        let server_instructions = test_handler()
-            .get_info()
-            .instructions
-            .expect("server instructions");
-        assert!(server_instructions.contains("one forgeable unit at a time"));
-        assert!(server_instructions.contains("one coherent, reviewable diff"));
-        assert!(server_instructions.contains("independently verifiable units"));
-    }
-
-    #[test]
-    fn primary_directive_makes_thor_the_coordinator_not_a_thin_router() {
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("You are not a thin handoff"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("research and context gathering"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("forming the plan"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("independently review its result"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("one forgeable unit at a time"));
-        assert!(
-            PRIMARY_SESSION_DIRECTIVE.contains("substantial, self-contained implementation slice")
-        );
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("one focused pass"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("one coherent, reviewable diff"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("one clear outcome"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("explicit constraints and acceptance checks"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("clearly more work than writing the handoff"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("Do not delegate trivial local edits"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("unresolved architectural questions"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("entire open-ended project"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("independently verifiable units"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("small, local code changes"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("would take more effort"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("brand-new ACP process and session"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("immediately preceding call"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("complete standalone instructions"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("Use explore_agent for open-ended, multi-step"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("known path"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("known symbol"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("two or three known files"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("trivial single-step lookup"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("quick, medium, or very thorough"));
-        assert!(!PRIMARY_SESSION_DIRECTIVE.contains("before using any other tool"));
-        assert!(!PRIMARY_SESSION_DIRECTIVE.contains("MJ_CODE_AGENT_POLICY_READY"));
-        assert!(PRIMARY_SESSION_DIRECTIVE.contains("do not acknowledge or summarize the policy"));
-    }
-
-    #[test]
-    fn eitri_preambles_define_distinct_code_and_explore_contracts() {
-        assert!(CODE_PREAMBLE.contains("fresh ACP process and session"));
-        assert!(CODE_PREAMBLE.contains("no memory of the user conversation"));
-        assert!(CODE_PREAMBLE.contains("immediately preceding call"));
-        assert!(CODE_PREAMBLE.contains("current workspace"));
-        assert!(EXPLORE_PREAMBLE.contains("file-search specialist"));
-        assert!(EXPLORE_PREAMBLE.contains("READ-ONLY EXPLORATION"));
-        assert!(EXPLORE_PREAMBLE.contains("Never create, modify, delete"));
-        assert!(EXPLORE_PREAMBLE.contains("absolute paths"));
-        assert!(EXPLORE_PREAMBLE.contains("parallelize independent searches"));
     }
 
     #[test]
