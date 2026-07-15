@@ -8029,9 +8029,15 @@ fn draw_usage_quota_row(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let paragraph = Paragraph::new(label)
-        .style(Style::default().fg(state.theme.warning))
-        .wrap(Wrap { trim: false });
+    let paragraph = if matches!(
+        state.anvil_quota_source,
+        Some(crate::app::AnvilQuotaSource::DeepSeek)
+    ) {
+        Paragraph::new(label).wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(truncate_text_to_width(label, area.width))
+    }
+    .style(Style::default().fg(state.theme.warning));
     f.render_widget(paragraph, area);
 }
 
@@ -8041,6 +8047,12 @@ fn usage_quota_row_count(state: &AppState, width: u16) -> usize {
     };
     if width == 0 {
         return 0;
+    }
+    if !matches!(
+        state.anvil_quota_source,
+        Some(crate::app::AnvilQuotaSource::DeepSeek)
+    ) {
+        return 1;
     }
     Paragraph::new(label)
         .wrap(Wrap { trim: false })
@@ -16812,7 +16824,7 @@ mod tests {
         terminal
             .draw(|frame| draw_usage_quota_row(frame, frame.area(), &state))
             .expect("draw");
-        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        let rendered = buffer_lines(terminal.backend().buffer());
         for expected in [
             "CNY total",
             "123.4500",
@@ -16826,8 +16838,8 @@ mod tests {
             "2026-07-15T18:42:00Z",
         ] {
             assert!(
-                rendered.contains(expected),
-                "missing {expected}: {rendered}"
+                rendered.iter().any(|line| line.contains(expected)),
+                "missing intact {expected}: {rendered:?}"
             );
         }
         assert!(usage_quota_row_count(&state, 50) > 1);
@@ -16844,6 +16856,35 @@ mod tests {
                 "DeepSeek balance unavailable: billing credentials are unavailable · as of 2026-07-15T18:43:00Z"
             )
         );
+    }
+
+    #[test]
+    fn peer_quota_rows_remain_single_line_and_truncated() {
+        let mut state = AppState::new();
+        state.set_bedrock_credits(crate::bedrock_credits::BedrockCreditsStatus::Unavailable(
+            "request timed out".to_string(),
+        ));
+        assert_eq!(usage_quota_row_count(&state, 12), 1);
+
+        let backend = TestBackend::new(12, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_usage_quota_row(frame, frame.area(), &state))
+            .expect("draw");
+        assert_eq!(
+            buffer_lines(terminal.backend().buffer())[0],
+            truncate_text_to_width(
+                "Bedrock credits unavailable: request timed out".to_string(),
+                12
+            )
+        );
+
+        state.set_openrouter_balance(
+            crate::openrouter_balance::OpenRouterBalanceStatus::Unavailable(
+                "request timed out".to_string(),
+            ),
+        );
+        assert_eq!(usage_quota_row_count(&state, 12), 1);
     }
 
     #[test]
