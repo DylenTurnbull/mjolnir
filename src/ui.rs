@@ -5479,19 +5479,33 @@ fn render_transcript_entry_range(
             Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
                 if let Some(view) = state.tool_calls.get(id) {
                     let color = tool_status_color(view.status, theme);
-                    let status = match view.status {
-                        agent_client_protocol::schema::v1::ToolCallStatus::Completed => {
+                    let terminal_exit_status = view.body.iter().rev().find_map(|output| {
+                        if let ToolCallOutput::Terminal { exit_status, .. } = output {
+                            exit_status.as_ref()
+                        } else {
+                            None
+                        }
+                    });
+                    let status = match (view.status, terminal_exit_status) {
+                        (agent_client_protocol::schema::v1::ToolCallStatus::Completed, _) => {
                             String::new()
                         }
+                        (_, Some(_)) => String::new(),
                         _ => format!("[{}] ", tool_status_label(view.status)),
                     };
                     let call = format!("{status}{} {}", tool_kind_label(view.kind), view.title);
-                    let spans = vec![Span::styled(
+                    let mut spans = vec![Span::styled(
                         call,
                         Style::default()
                             .fg(theme.muted)
                             .add_modifier(Modifier::ITALIC),
                     )];
+                    if let Some(exit_status) = terminal_exit_status {
+                        spans.push(Span::styled(
+                            format!(" · {}", terminal_header_outcome_label(exit_status)),
+                            terminal_header_outcome_style(exit_status, theme),
+                        ));
+                    }
                     // Render the whole tool call — header plus outputs — into a
                     // temporary buffer, wrap each line to the width left of the
                     // gutter, then frame every resulting row with a colored left
@@ -6379,7 +6393,13 @@ fn push_tool_outputs(
                     )));
                 }
                 if !output.trim().is_empty() {
-                    push_tool_text_lines(out, output.clone(), 2, collapse_limit, theme);
+                    push_tool_text_lines(
+                        out,
+                        output.trim_end_matches(['\r', '\n']).to_string(),
+                        2,
+                        collapse_limit,
+                        theme,
+                    );
                 } else if exit_status.is_some() {
                     out.push(Line::from(Span::styled(
                         "  no stdout/stderr captured",
@@ -6389,12 +6409,6 @@ fn push_tool_outputs(
                     let state = terminal_empty_state_label(tool_status);
                     out.push(Line::from(Span::styled(
                         format!("  {state}"),
-                        Style::default().fg(theme.muted),
-                    )));
-                }
-                if let Some(status) = exit_status {
-                    out.push(Line::from(Span::styled(
-                        format!("  exit {}", terminal_exit_status_label(status)),
                         Style::default().fg(theme.muted),
                     )));
                 }
@@ -6424,6 +6438,32 @@ fn terminal_exit_status_label(
         (Some(code), None) => format!("code {code}"),
         (None, Some(signal)) => format!("signal {signal}"),
         (None, None) => "unknown".to_string(),
+    }
+}
+
+fn terminal_header_outcome_label(
+    status: &agent_client_protocol::schema::v1::TerminalExitStatus,
+) -> String {
+    match (&status.exit_code, &status.signal) {
+        (Some(code), Some(signal)) => format!("exit {code}, signal {signal}"),
+        (Some(code), None) => format!("exit {code}"),
+        (None, Some(signal)) => format!("signal {signal}"),
+        (None, None) => "exit unknown".to_string(),
+    }
+}
+
+fn terminal_header_outcome_style(
+    status: &agent_client_protocol::schema::v1::TerminalExitStatus,
+    theme: TerminalTheme,
+) -> Style {
+    if status.exit_code == Some(0) && status.signal.is_none() {
+        Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD)
     }
 }
 
@@ -13646,13 +13686,7 @@ mod tests {
             .collect();
         assert_eq!(
             rendered,
-            vec![
-                "Thor",
-                "│ exec cargo test",
-                "│   ok",
-                "│   ",
-                "│   exit code 0",
-            ]
+            vec!["Thor", "│ exec cargo test · exit 0", "│   ok"]
         );
     }
 
@@ -15123,19 +15157,25 @@ mod tests {
             .transcript
             .push(Entry::ToolCall("call-q403".to_string()));
 
-        let rendered: Vec<String> = render_transcript_lines(&state, 80)
-            .iter()
-            .map(line_text)
-            .collect();
+        let rendered_lines = render_transcript_lines(&state, 80);
+        let rendered: Vec<String> = rendered_lines.iter().map(line_text).collect();
 
         assert!(
             rendered
                 .iter()
-                .any(|line| line == "│ [failed] exec cargo test")
+                .any(|line| line == "│ exec cargo test · exit 101")
         );
         assert!(rendered.iter().any(|line| line == "│   [output truncated]"));
         assert!(rendered.iter().any(|line| line == "│   error: test failed"));
-        assert!(rendered.iter().any(|line| line == "│   exit code 101"));
+        assert!(!rendered.iter().any(|line| line.contains("[failed]")));
+        assert!(!rendered.iter().any(|line| line.contains("exit code")));
+        let header = rendered_lines
+            .iter()
+            .find(|line| line_text(line) == "│ exec cargo test · exit 101")
+            .expect("terminal tool header");
+        let outcome = header.spans.last().expect("terminal outcome span");
+        assert_eq!(outcome.style.fg, Some(state.theme.error));
+        assert!(outcome.style.add_modifier.contains(Modifier::BOLD));
         assert!(
             !rendered.iter().any(|line| line.contains("call_q403")),
             "terminal ids should not leak into user-facing transcript rows: {rendered:?}"
