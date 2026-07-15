@@ -77,8 +77,8 @@ pub struct ModelChoice {
 
 #[derive(Debug, Clone)]
 pub struct Availability {
-    pub codex: Option<PathBuf>,
-    pub claude: Option<PathBuf>,
+    pub codex_credentials: bool,
+    pub claude_credentials: bool,
     pub anvil: Option<PathBuf>,
     pub opencode: Option<PathBuf>,
 }
@@ -86,8 +86,8 @@ pub struct Availability {
 impl Availability {
     pub fn detect() -> Self {
         Self {
-            codex: find_on_path("codex"),
-            claude: find_on_path("claude"),
+            codex_credentials: codex_credentials_available(),
+            claude_credentials: claude_credentials_available(),
             anvil: find_on_path("anvil"),
             opencode: find_on_path("opencode"),
         }
@@ -95,12 +95,8 @@ impl Availability {
 
     pub fn missing_reason(&self, model: &str) -> Option<&'static str> {
         match adapter_kind(model) {
-            AdapterKind::Codex if self.codex.is_none() => {
-                Some("codex executable not found on PATH")
-            }
-            AdapterKind::Claude if self.claude.is_none() => {
-                Some("claude executable not found on PATH")
-            }
+            AdapterKind::Codex if !self.codex_credentials => Some("Codex credentials not found"),
+            AdapterKind::Claude if !self.claude_credentials => Some("Claude credentials not found"),
             AdapterKind::Anvil if self.anvil.is_none() => {
                 Some("anvil executable not found on PATH")
             }
@@ -110,6 +106,65 @@ impl Availability {
             _ => None,
         }
     }
+}
+
+fn nonempty_env(names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        std::env::var_os(name).is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+    })
+}
+
+fn credential_file_has_any(path: &Path, pointers: &[&str]) -> bool {
+    let Ok(contents) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    pointers.iter().any(|pointer| {
+        document
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
+fn codex_credentials_available() -> bool {
+    if nonempty_env(&["CODEX_API_KEY", "OPENAI_API_KEY"]) {
+        return true;
+    }
+    let root = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")));
+    root.is_some_and(|root| {
+        credential_file_has_any(
+            &root.join("auth.json"),
+            &[
+                "/OPENAI_API_KEY",
+                "/tokens/access_token",
+                "/tokens/refresh_token",
+            ],
+        )
+    })
+}
+
+fn claude_credentials_available() -> bool {
+    if nonempty_env(&[
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+    ]) {
+        return true;
+    }
+    let root = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")));
+    root.is_some_and(|root| {
+        credential_file_has_any(
+            &root.join(".credentials.json"),
+            &["/claudeAiOauth/accessToken", "/claudeAiOauth/refreshToken"],
+        )
+    })
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -355,10 +410,10 @@ fn configured_launches(config: &Config, availability: &Availability) -> Vec<Adap
             env: HashMap::new(),
         })
         .collect::<Vec<_>>();
-    if config.acp.codex && availability.codex.is_some() {
+    if config.acp.codex && availability.codex_credentials {
         launches.push(launch_for(AdapterKind::Codex));
     }
-    if config.acp.claude && availability.claude.is_some() {
+    if config.acp.claude && availability.claude_credentials {
         launches.push(launch_for(AdapterKind::Claude));
     }
     if config.acp.anvil && availability.anvil.is_some() {
@@ -378,15 +433,15 @@ fn missing_enabled_adapter_errors(
     for (enabled, missing, kind, reason) in [
         (
             config.acp.codex,
-            availability.codex.is_none(),
+            !availability.codex_credentials,
             AdapterKind::Codex,
-            "codex executable not found on PATH",
+            "Codex credentials not found",
         ),
         (
             config.acp.claude,
-            availability.claude.is_none(),
+            !availability.claude_credentials,
             AdapterKind::Claude,
-            "claude executable not found on PATH",
+            "Claude credentials not found",
         ),
         (
             config.acp.anvil,
@@ -413,7 +468,7 @@ fn custom_model_id(source_id: &str, model_value: &str) -> String {
     format!("custom/{name}/{model_value}")
 }
 
-fn installed_provider_capabilities(
+fn credentialed_provider_capabilities(
     launch: &AdapterLaunch,
     rows: &[Row],
 ) -> Option<probe::AdapterCapabilities> {
@@ -442,12 +497,12 @@ async fn discover_available(
     let launches = configured_launches(config, availability);
     let probes = stream::iter(launches.into_iter().enumerate().map(|(priority, launch)| {
         let cwd = cwd.to_path_buf();
-        let installed = installed_provider_capabilities(&launch, rows);
+        let credentialed = credentialed_provider_capabilities(&launch, rows);
         async move {
             // Built-in Codex and Claude discovery is intentionally only a
-            // PATH check. Launching their npx bridges here can download npm
-            // packages before the UI has rendered anything.
-            let capabilities = match installed {
+            // credential check. Launching their npx bridges here can download
+            // npm packages before the UI has rendered anything.
+            let capabilities = match credentialed {
                 Some(capabilities) => Ok(capabilities),
                 None => probe_launch(&launch, &cwd).await,
             };
@@ -577,8 +632,8 @@ fn unavailable_reason(
     let native = adapter_kind(&row.model);
     let native_source = launch_for(native).source_id;
     let native_detected = match native {
-        AdapterKind::Codex => availability.codex.is_some(),
-        AdapterKind::Claude => availability.claude.is_some(),
+        AdapterKind::Codex => availability.codex_credentials,
+        AdapterKind::Claude => availability.claude_credentials,
         AdapterKind::Anvil => true,
         _ => false,
     };
@@ -785,24 +840,42 @@ mod tests {
     }
 
     #[test]
-    fn installed_codex_and_claude_use_catalog_without_startup_probe() {
+    fn credentialed_codex_and_claude_use_catalog_without_startup_probe() {
         let rows = vec![
             role_at("gpt-5-6-sol", 0.7, 1.0).model,
             role_at("claude-sonnet-5", 0.6, 1.0).model,
             role_at("gemini-3-5-flash", 0.5, 1.0).model,
         ];
 
-        let codex = installed_provider_capabilities(&launch_for(AdapterKind::Codex), &rows)
-            .expect("Codex PATH discovery");
+        let codex = credentialed_provider_capabilities(&launch_for(AdapterKind::Codex), &rows)
+            .expect("Codex credential discovery");
         assert_eq!(codex.models.len(), 1);
         assert_eq!(codex.models[0].value, "gpt-5-6-sol");
 
-        let claude = installed_provider_capabilities(&launch_for(AdapterKind::Claude), &rows)
-            .expect("Claude PATH discovery");
+        let claude = credentialed_provider_capabilities(&launch_for(AdapterKind::Claude), &rows)
+            .expect("Claude credential discovery");
         assert_eq!(claude.models.len(), 1);
         assert_eq!(claude.models[0].value, "claude-sonnet-5");
 
-        assert!(installed_provider_capabilities(&launch_for(AdapterKind::Anvil), &rows).is_none());
+        assert!(
+            credentialed_provider_capabilities(&launch_for(AdapterKind::Anvil), &rows).is_none()
+        );
+    }
+
+    #[test]
+    fn credential_files_require_a_nonempty_supported_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("credentials.json");
+        let pointers = ["/oauth/accessToken", "/apiKey"];
+
+        std::fs::write(&path, r#"{"oauth":{"accessToken":"token"}}"#).expect("write");
+        assert!(credential_file_has_any(&path, &pointers));
+
+        std::fs::write(&path, r#"{"oauth":{"accessToken":"  "}}"#).expect("write");
+        assert!(!credential_file_has_any(&path, &pointers));
+
+        std::fs::write(&path, "not json").expect("write");
+        assert!(!credential_file_has_any(&path, &pointers));
     }
 
     #[test]
@@ -853,8 +926,8 @@ mod tests {
             enabled: true,
         });
         let availability = Availability {
-            codex: Some(PathBuf::from("codex")),
-            claude: Some(PathBuf::from("claude")),
+            codex_credentials: true,
+            claude_credentials: true,
             anvil: Some(PathBuf::from("anvil")),
             opencode: Some(PathBuf::from("opencode")),
         };
@@ -870,8 +943,8 @@ mod tests {
     fn missing_enabled_adapters_report_errors_and_disabled_adapters_are_silent() {
         let mut config = Config::default();
         let availability = Availability {
-            codex: None,
-            claude: None,
+            codex_credentials: false,
+            claude_credentials: false,
             anvil: None,
             opencode: None,
         };
@@ -879,11 +952,11 @@ mod tests {
         let errors = missing_enabled_adapter_errors(&config, &availability);
         assert_eq!(
             errors.get("codex-acp").map(String::as_str),
-            Some("codex executable not found on PATH")
+            Some("Codex credentials not found")
         );
         assert_eq!(
             errors.get("claude-acp").map(String::as_str),
-            Some("claude executable not found on PATH")
+            Some("Claude credentials not found")
         );
         assert_eq!(
             errors.get("anvil").map(String::as_str),
@@ -1003,14 +1076,14 @@ mod tests {
     #[test]
     fn missing_reasons_are_based_on_adapter_presence() {
         let availability = Availability {
-            codex: None,
-            claude: None,
+            codex_credentials: false,
+            claude_credentials: false,
             anvil: None,
             opencode: None,
         };
         assert_eq!(
             availability.missing_reason("gpt-5-6-sol"),
-            Some("codex executable not found on PATH")
+            Some("Codex credentials not found")
         );
         assert_eq!(
             availability.missing_reason("glm-5-2"),
@@ -1027,8 +1100,8 @@ mod tests {
             mean_cost_usd: 3.0,
         }];
         let availability = Availability {
-            codex: None,
-            claude: None,
+            codex_credentials: false,
+            claude_credentials: false,
             anvil: None,
             opencode: None,
         };
