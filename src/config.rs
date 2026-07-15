@@ -293,12 +293,6 @@ impl Config {
         }
     }
 
-    pub fn set_role_models(&mut self, models: &ModelsConfig) {
-        self.thor.model.clone_from(&models.thor);
-        self.loki.model.clone_from(&models.loki);
-        self.eitri.model.clone_from(&models.eitri);
-    }
-
     /// Read the config from `path`. Returns `Config::default()` when the
     /// file does not exist; surfaces a parse error otherwise.
     pub fn load(path: &Path) -> Result<Self> {

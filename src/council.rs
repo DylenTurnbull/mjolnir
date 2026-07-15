@@ -491,6 +491,19 @@ fn choose_loki<'a>(thor: &ResolvedRole, available: &'a [ResolvedRole]) -> Option
         .find(|candidate| provider_key(&candidate.model.model) != thor_provider)
 }
 
+fn resolve_loki(
+    selector: &str,
+    thor: &ResolvedRole,
+    rows: &[Row],
+    available: &[ResolvedRole],
+) -> Result<Option<ResolvedRole>> {
+    if selector == "auto" {
+        Ok(choose_loki(thor, available).cloned())
+    } else {
+        explicit("Loki", selector, rows, available).map(|role| Some(role.clone()))
+    }
+}
+
 fn unavailable_reason(
     row: &Row,
     config: &Config,
@@ -616,14 +629,7 @@ pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
     } else {
         explicit("Thor", &config.thor.model, &rows, &available)?
     };
-    let loki = if config.loki.model == "auto" {
-        choose_loki(thor, &available)
-    } else {
-        Some(explicit("Loki", &config.loki.model, &rows, &available)?)
-    };
-    if loki.is_some_and(|candidate| candidate.model.model == thor.model.model) {
-        bail!("Loki must use a model distinct from Thor");
-    }
+    let loki = resolve_loki(&config.loki.model, thor, &rows, &available)?;
     let eitri = resolve_eitri(&config.eitri.model, &rows, &available)?;
 
     let mut warned = WARNED_ADAPTERS.lock().await;
@@ -644,7 +650,7 @@ pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
     warnings.sort();
     Ok(ResolvedCouncil {
         thor: thor.clone(),
-        loki: loki.cloned(),
+        loki,
         eitri,
         available,
         choices,
@@ -948,6 +954,19 @@ mod tests {
         let available = vec![role("gpt-5-6-sol", 0.70), role("gpt-5-5", 0.65)];
 
         assert!(choose_loki(&available[0], &available).is_none());
+    }
+
+    #[test]
+    fn explicit_loki_may_match_thor() {
+        let thor = role("gpt-5-6-sol", 0.70);
+        let rows = vec![thor.model.clone()];
+        let available = vec![thor.clone()];
+
+        let loki = resolve_loki("gpt-5-6-sol", &thor, &rows, &available)
+            .expect("explicit Loki selection")
+            .expect("Loki role");
+
+        assert_eq!(loki.model.model, thor.model.model);
     }
 
     #[test]

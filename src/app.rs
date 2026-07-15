@@ -27,6 +27,7 @@ use crate::event::{
 };
 use crate::palette::TerminalTheme;
 use crate::ragnarok;
+use crate::settings::{SettingsAction, SettingsEditor};
 use crate::spinner::SpinnerStyle;
 use crate::theme::TerminalThemeKind;
 
@@ -74,15 +75,12 @@ fn builtin_export_command() -> AvailableCommand {
 fn builtin_mjconfig_command() -> AvailableCommand {
     AvailableCommand::new(
         BUILTIN_MJCONFIG_COMMAND,
-        "open the mj config menu (theme + spinner)",
+        "configure Council, ACP servers, and appearance",
     )
 }
 
 fn builtin_models_command() -> AvailableCommand {
-    AvailableCommand::new(
-        BUILTIN_MODELS_COMMAND,
-        "show or select Thor/Loki/Eitri models (usage: /models [role model|auto])",
-    )
+    AvailableCommand::new(BUILTIN_MODELS_COMMAND, "open Council model settings")
 }
 
 fn builtin_reviews_command() -> AvailableCommand {
@@ -557,34 +555,10 @@ fn number_field(
         .and_then(serde_json::Value::as_f64)
 }
 
-/// Which row group the `/mjconfig` menu is currently editing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MjConfigSection {
-    Theme,
-    Spinner,
-    Agents,
-}
-
-#[derive(Debug, Clone)]
-pub struct MjConfigAgent {
-    pub id: String,
-    pub label: String,
-    pub enabled: bool,
-    pub validation: String,
-}
-
-pub type MjConfigSelection = (TerminalThemeKind, SpinnerStyle, Vec<(String, bool)>);
-
-/// In-session `/mjconfig` overlay: pick the terminal theme and spinner style.
-/// Selections preview live against the running UI; the originals are kept so
-/// cancelling can restore them.
+/// In-session host for the same settings editor used on first startup.
 #[derive(Debug, Clone)]
 pub struct MjConfigMenu {
-    pub section: MjConfigSection,
-    pub theme_idx: usize,
-    pub spinner_idx: usize,
-    pub agent_idx: usize,
-    pub agents: Vec<MjConfigAgent>,
+    pub editor: SettingsEditor,
     orig_theme: TerminalThemeKind,
     orig_spinner: SpinnerStyle,
 }
@@ -1138,93 +1112,39 @@ impl AppState {
         self.selected_agent_role.is_some()
     }
 
-    /// Open the `/mjconfig` overlay, seeded with the current theme and spinner.
+    /// Open `/mjconfig`, seeded from the same persisted config startup edits.
     pub fn open_mjconfig_menu(&mut self) {
-        let theme_idx = TerminalThemeKind::ALL
-            .iter()
-            .position(|kind| *kind == self.theme_kind)
-            .unwrap_or(0);
-        let spinner_idx = SpinnerStyle::ALL
-            .iter()
-            .position(|style| *style == self.spinner_style)
-            .unwrap_or(0);
-        let config = self
+        let mut config = self
             .config_path
             .as_deref()
             .and_then(|path| crate::config::Config::load(path).ok())
             .unwrap_or_default();
-        let agents = Self::mjconfig_agents(config, &self.council_choices);
+        config.theme = self.theme_kind;
+        config.spinner = self.spinner_style;
         self.mjconfig_menu = Some(MjConfigMenu {
-            section: MjConfigSection::Theme,
-            theme_idx,
-            spinner_idx,
-            agent_idx: 0,
-            agents,
+            editor: SettingsEditor::new(config, self.council_choices.clone(), None)
+                .with_active_models(self.active_council_models.clone()),
             orig_theme: self.theme_kind,
             orig_spinner: self.spinner_style,
         });
     }
 
-    pub fn mjconfig_menu_toggle_section(&mut self) {
-        if let Some(menu) = self.mjconfig_menu.as_mut() {
-            menu.section = match menu.section {
-                MjConfigSection::Theme => MjConfigSection::Spinner,
-                MjConfigSection::Spinner => MjConfigSection::Agents,
-                MjConfigSection::Agents => MjConfigSection::Theme,
-            };
-        }
-    }
-
-    /// Move the selection within the focused section, previewing the change
-    /// live against the running UI.
-    pub fn mjconfig_menu_move(&mut self, delta: i32) {
+    /// Apply a shared editor key and synchronize appearance preview.
+    pub fn mjconfig_menu_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         let Some(menu) = self.mjconfig_menu.as_mut() else {
-            return;
+            return SettingsAction::None;
         };
-        let mut next_theme = None;
-        let mut next_spinner = None;
-        match menu.section {
-            MjConfigSection::Theme => {
-                move_wrapped(&mut menu.theme_idx, delta, TerminalThemeKind::ALL.len());
-                next_theme = Some(TerminalThemeKind::ALL[menu.theme_idx]);
-            }
-            MjConfigSection::Spinner => {
-                move_wrapped(&mut menu.spinner_idx, delta, SpinnerStyle::ALL.len());
-                next_spinner = Some(SpinnerStyle::ALL[menu.spinner_idx]);
-            }
-            MjConfigSection::Agents => {
-                move_wrapped(&mut menu.agent_idx, delta, menu.agents.len());
-            }
-        }
-        if let Some(theme) = next_theme {
-            self.set_theme(theme);
-        }
-        if let Some(spinner) = next_spinner {
-            self.set_spinner_style(spinner);
-        }
+        let action = menu.editor.handle_key(code);
+        let theme = menu.editor.config.theme;
+        let spinner = menu.editor.config.spinner;
+        self.set_theme(theme);
+        self.set_spinner_style(spinner);
+        action
     }
 
-    pub fn mjconfig_menu_toggle_agent(&mut self) {
-        let Some(menu) = self.mjconfig_menu.as_mut() else {
-            return;
-        };
-        if let Some(agent) = menu.agents.get_mut(menu.agent_idx) {
-            agent.enabled = !agent.enabled;
-        }
-    }
-
-    /// Close the menu, keeping the live-previewed theme, spinner, and agent choices.
-    pub fn mjconfig_menu_accept(&mut self) -> Option<MjConfigSelection> {
-        self.mjconfig_menu.take().map(|menu| {
-            (
-                self.theme_kind,
-                self.spinner_style,
-                menu.agents
-                    .into_iter()
-                    .map(|agent| (agent.id, agent.enabled))
-                    .collect(),
-            )
-        })
+    /// Close the menu, keeping its live appearance preview.
+    pub fn mjconfig_menu_accept(&mut self) -> Option<crate::config::Config> {
+        self.mjconfig_menu.take().map(|menu| menu.editor.config)
     }
 
     /// Close the menu and restore the theme and spinner that were active when
@@ -1234,131 +1154,6 @@ impl AppState {
             self.set_theme(menu.orig_theme);
             self.set_spinner_style(menu.orig_spinner);
         }
-    }
-
-    fn mjconfig_agents(
-        config: crate::config::Config,
-        choices: &[crate::council::ModelChoice],
-    ) -> Vec<MjConfigAgent> {
-        config
-            .acp_server_selections()
-            .into_iter()
-            .map(|selection| MjConfigAgent {
-                validation: Self::agent_validation(choices, &selection.id, selection.enabled),
-                id: selection.id,
-                label: selection.label,
-                enabled: selection.enabled,
-            })
-            .collect()
-    }
-
-    fn agent_validation(
-        choices: &[crate::council::ModelChoice],
-        id: &str,
-        enabled: bool,
-    ) -> String {
-        if !enabled {
-            return "disabled · enable to validate next session".to_string();
-        }
-        let available = choices
-            .iter()
-            .filter(|choice| choice.available && choice.adapter.as_deref() == Some(id))
-            .count();
-        if available > 0 {
-            return format!(
-                "ready · {available} model{}",
-                if available == 1 { "" } else { "s" }
-            );
-        }
-        choices
-            .iter()
-            .filter_map(|choice| choice.disabled_reason.as_deref())
-            .find_map(|reason| {
-                reason
-                    .split("; ")
-                    .find(|part| part.starts_with(id) || part.starts_with(&id[7.min(id.len())..]))
-            })
-            .unwrap_or("not detected or no session config models")
-            .to_string()
-    }
-
-    pub fn council_summary(&self) -> String {
-        let mut text = format!(
-            "Council models\n\nChange with: /models <thor|loki|eitri> <auto|model-id>\nChanges apply to the next session.\n\nSaved preference\n  Thor   {}\n  Loki   {}\n  Eitri  {}\n\nActive session\n  Thor   {}\n  Loki   {}\n  Eitri  {}\n\nAuto selection · DeepSWE\n  Loki chooses the best launchable model from a provider other than Thor's.\n  Eitri chooses the cheapest Pareto model meeting the Sonnet High quality floor.\n\nAvailable models\n",
-            self.council_models.thor,
-            self.council_models.loki,
-            self.council_models.eitri,
-            self.active_council_models.thor,
-            self.active_council_models.loki,
-            self.active_council_models.eitri,
-        );
-        for choice in &self.council_choices {
-            if choice.available && choice.ranked {
-                text.push_str(&format!(
-                    "  ✓ {} · Pass@1 {:.1}% · ${:.2} · {}\n",
-                    choice.model,
-                    choice.pass_at_1 * 100.0,
-                    choice.mean_cost_usd,
-                    choice.adapter.as_deref().unwrap_or("adapter unknown")
-                ));
-            } else if choice.available {
-                text.push_str(&format!(
-                    "  ✓ {} · Unranked · {}\n",
-                    choice.model,
-                    choice.adapter.as_deref().unwrap_or("custom ACP")
-                ));
-            } else {
-                text.push_str(&format!(
-                    "  × {} · {}\n",
-                    choice.model,
-                    choice.disabled_reason.as_deref().unwrap_or("unavailable")
-                ));
-            }
-        }
-        text
-    }
-
-    pub fn set_council_model(&mut self, role: &str, model: &str) -> Result<String, String> {
-        if model != "auto" {
-            let choice = self
-                .council_choices
-                .iter()
-                .find(|choice| choice.model == model)
-                .ok_or_else(|| format!("unknown Council model '{model}'"))?;
-            if !choice.available {
-                return Err(format!(
-                    "model '{model}' is unavailable: {}",
-                    choice
-                        .disabled_reason
-                        .as_deref()
-                        .unwrap_or("not launchable")
-                ));
-            }
-        }
-        let mut next = self.council_models.clone();
-        match role.to_ascii_lowercase().as_str() {
-            "thor" => next.thor = model.to_string(),
-            "loki" => next.loki = model.to_string(),
-            "eitri" => next.eitri = model.to_string(),
-            _ => return Err("role must be thor, loki, or eitri".to_string()),
-        }
-        if next.thor != "auto" && next.loki == next.thor {
-            return Err("Loki must use a model distinct from Thor".to_string());
-        }
-        let path = self
-            .config_path
-            .as_deref()
-            .ok_or_else(|| "config path is unavailable".to_string())?;
-        let mut config =
-            crate::config::Config::load(path).map_err(|error| format!("load config: {error:#}"))?;
-        config.set_role_models(&next);
-        config
-            .save(path)
-            .map_err(|error| format!("save config: {error:#}"))?;
-        self.council_models = next;
-        Ok(format!(
-            "{role} model set to {model}; starts with the next session"
-        ))
     }
 
     pub fn review_summary(&self) -> String {
@@ -5764,7 +5559,7 @@ mod tests {
         );
         assert_eq!(
             s.available_commands[4].description,
-            "show or select Thor/Loki/Eitri models (usage: /models [role model|auto])"
+            "open Council model settings"
         );
         assert_eq!(
             s.available_commands[8].description,
@@ -6486,44 +6281,4 @@ mod tests {
         arena.scroll_feed(-99);
         assert_eq!(arena.feed_scroll_for_rows(2), 0);
     }
-}
-#[cfg(test)]
-#[test]
-fn council_model_selection_persists_and_rejects_disabled_choice() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("config.toml");
-    crate::config::Config::default().save(&path).expect("save");
-    let mut state = AppState::new();
-    state.config_path = Some(path.clone());
-    state.council_choices = vec![
-        crate::council::ModelChoice {
-            model: "gpt-test".to_string(),
-            pass_at_1: 0.5,
-            mean_cost_usd: 1.0,
-            available: true,
-            disabled_reason: None,
-            adapter: Some("codex-acp".to_string()),
-            ranked: true,
-        },
-        crate::council::ModelChoice {
-            model: "claude-disabled".to_string(),
-            pass_at_1: 0.4,
-            mean_cost_usd: 2.0,
-            available: false,
-            disabled_reason: Some("claude executable not found on PATH".to_string()),
-            adapter: None,
-            ranked: true,
-        },
-    ];
-
-    state.set_council_model("thor", "gpt-test").expect("select");
-    assert_eq!(
-        crate::config::Config::load(&path).unwrap().thor.model,
-        "gpt-test"
-    );
-    let error = state
-        .set_council_model("eitri", "claude-disabled")
-        .expect_err("disabled model");
-    assert!(error.contains("claude executable not found on PATH"));
-    assert!(state.council_summary().contains("× claude-disabled"));
 }

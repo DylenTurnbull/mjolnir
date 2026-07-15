@@ -32,6 +32,7 @@ mod remote;
 mod self_update;
 mod session;
 mod session_provenance;
+mod settings;
 mod speech;
 mod spinner;
 mod tailscale;
@@ -1141,14 +1142,7 @@ async fn run_onboarding_once(
     notice: Option<String>,
 ) -> Result<onboarding::Outcome> {
     let mut terminal = ui::setup_fullscreen_terminal().context("setup onboarding terminal")?;
-    let outcome = onboarding::run(
-        &mut terminal,
-        config.theme.palette(),
-        config,
-        council,
-        notice,
-    )
-    .await;
+    let outcome = onboarding::run(&mut terminal, config, council, notice).await;
     if let Err(error) = ui::restore_fullscreen_terminal(&mut terminal) {
         tracing::warn!("restore terminal (onboarding) failed: {error}");
     }

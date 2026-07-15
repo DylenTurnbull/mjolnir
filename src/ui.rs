@@ -42,10 +42,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     AppState, ArenaPane, ConfigValueChoice, ConnectionState, ElicitationView, Entry,
-    MjConfigSection, PastedAttachment, PastedImageAttachment, PendingElicitation,
-    PendingPermission, QUEUED_PROMPT_PREVIEW_WIDTH, QueuedPrompt, RagnarokDraftPrStatus,
-    RagnarokFighterUi, RagnarokUi, StatusKind, StatusMessage, ToolCallOutput, UiExitReason,
-    classify_elicitation, config_option_choices, config_option_current_value_label,
+    PastedAttachment, PastedImageAttachment, PendingElicitation, PendingPermission,
+    QUEUED_PROMPT_PREVIEW_WIDTH, QueuedPrompt, RagnarokDraftPrStatus, RagnarokFighterUi,
+    RagnarokUi, StatusKind, StatusMessage, ToolCallOutput, UiExitReason, classify_elicitation,
+    config_option_choices, config_option_current_value_label,
 };
 use crate::clipboard::{
     ClipboardImage, copy_to_clipboard, load_image_path_as_png, read_clipboard_image_as_png,
@@ -59,6 +59,7 @@ use crate::notifications::TerminalNotificationBackend;
 use crate::palette::TerminalTheme;
 use crate::ragnarok;
 use crate::ragnarok_sprites::{self, SpriteKind};
+use crate::settings::{SettingsAction, draw_settings_panel};
 use crate::speech::{dictation_error_message, run_dictation, voice_input_supported};
 use crate::spinner::SpinnerStyle;
 use crate::term::TrackedBackend;
@@ -1851,7 +1852,7 @@ fn handle_crossterm(
         && !state.has_pending_permission()
         && !state.has_pending_elicitation()
     {
-        return handle_mjconfig_menu_key(state, key.modifiers, key.code, mode);
+        return handle_mjconfig_menu_key(state, cmd_tx, key.modifiers, key.code, mode);
     }
 
     if should_open_help(key.modifiers, key.code) {
@@ -3344,25 +3345,12 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && (text == "/models" || text.starts_with("/models ")) {
+    if images.is_empty() && text == "/models" {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
         state.scroll_input_to_bottom();
-        let args = text["/models".len()..]
-            .split_whitespace()
-            .collect::<Vec<_>>();
-        match args.as_slice() {
-            [] => state.record_status_message(StatusKind::Info, state.council_summary()),
-            [role, model] => match state.set_council_model(role, model) {
-                Ok(message) => state.record_status_message(StatusKind::Info, message),
-                Err(message) => state.record_status_message(StatusKind::Warning, message),
-            },
-            _ => state.record_status_message(
-                StatusKind::Warning,
-                "usage: /models [thor|loki|eitri auto|model-id]",
-            ),
-        }
+        state.open_mjconfig_menu();
         return;
     }
 
@@ -3514,72 +3502,63 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
 
 fn handle_mjconfig_menu_key(
     state: &mut AppState,
+    cmd_tx: &mpsc::UnboundedSender<UiCommand>,
     modifiers: KeyModifiers,
     code: KeyCode,
     mode: UiMode,
 ) -> TerminalRequest {
-    match (modifiers, code) {
-        (KeyModifiers::CONTROL, KeyCode::Char('c')) | (_, KeyCode::Esc) => {
+    if modifiers == KeyModifiers::CONTROL && code == KeyCode::Char('c') {
+        state.mjconfig_menu_cancel();
+        return inline_repair_request(mode);
+    }
+    match state.mjconfig_menu_key(code) {
+        SettingsAction::Cancel => {
             state.mjconfig_menu_cancel();
             inline_repair_request(mode)
         }
-        (_, KeyCode::Char(' '))
-            if state
-                .mjconfig_menu
-                .as_ref()
-                .is_some_and(|menu| menu.section == MjConfigSection::Agents) =>
-        {
-            state.mjconfig_menu_toggle_agent();
-            TerminalRequest::None
-        }
-        (_, KeyCode::Enter) => {
-            if let Some((theme, style, agents)) = state.mjconfig_menu_accept() {
-                persist_mjconfig_selection(state, theme, style, &agents);
+        SettingsAction::Save => {
+            if let Some(config) = state.mjconfig_menu_accept() {
+                persist_mjconfig_selection(state, cmd_tx, config);
             }
             inline_repair_request(mode)
         }
-        (_, KeyCode::Tab)
-        | (_, KeyCode::BackTab)
-        | (_, KeyCode::Left)
-        | (_, KeyCode::Right)
-        | (_, KeyCode::Char('h'))
-        | (_, KeyCode::Char('l')) => {
-            state.mjconfig_menu_toggle_section();
-            TerminalRequest::None
-        }
-        (_, KeyCode::Up) | (_, KeyCode::Char('k')) => {
-            state.mjconfig_menu_move(-1);
-            TerminalRequest::None
-        }
-        (_, KeyCode::Down) | (_, KeyCode::Char('j')) => {
-            state.mjconfig_menu_move(1);
-            TerminalRequest::None
-        }
-        _ => TerminalRequest::None,
+        SettingsAction::None | SettingsAction::Changed => TerminalRequest::None,
     }
 }
 
-/// Persist the theme + spinner accepted in the `/mjconfig` menu. The live UI is
-/// already showing them (preview), so this only writes config and reports.
+/// Persist the shared settings selection and apply review switches immediately.
 fn persist_mjconfig_selection(
     state: &mut AppState,
-    theme: TerminalThemeKind,
-    style: SpinnerStyle,
-    agents: &[(String, bool)],
+    cmd_tx: &mpsc::UnboundedSender<UiCommand>,
+    config: config::Config,
 ) {
+    let theme = config.theme;
+    let style = config.spinner;
+    let thor_changed = state.thor_review_enabled != config.thor.discrete_review;
+    let loki_changed = state.loki_review_enabled != config.loki.streaming_review;
     if let Some(path) = state.config_path.clone() {
-        match config::Config::load(&path).and_then(|mut cfg| {
-            cfg.theme = theme;
-            cfg.spinner = style;
-            for (id, enabled) in agents {
-                cfg.set_acp_server_enabled(id, *enabled);
+        match config.save(&path) {
+            Ok(()) => {
+                state.council_models = config.role_models();
+                state.thor_review_enabled = config.thor.discrete_review;
+                state.loki_review_enabled = config.loki.streaming_review;
+                if thor_changed {
+                    let _ = cmd_tx.send(UiCommand::SetReviewPolicy {
+                        role: crate::event::ReviewRole::Thor,
+                        enabled: config.thor.discrete_review,
+                    });
+                }
+                if loki_changed {
+                    let _ = cmd_tx.send(UiCommand::SetReviewPolicy {
+                        role: crate::event::ReviewRole::Loki,
+                        enabled: config.loki.streaming_review,
+                    });
+                }
+                state.record_status_message(
+                    StatusKind::Info,
+                    format!("config saved — theme {theme}, spinner {style}; model and ACP changes apply next session"),
+                );
             }
-            cfg.save(&path)
-        }) {
-            Ok(()) => state.record_status_message(
-                StatusKind::Info,
-                format!("config saved — theme {theme}, spinner {style}; agent changes apply next session"),
-            ),
             Err(e) => state.record_status_message(
                 StatusKind::Warning,
                 format!("config changed but save failed: {e:#}"),
@@ -3590,127 +3569,11 @@ fn persist_mjconfig_selection(
     }
 }
 
-fn mjconfig_section_header(title: &str, focused: bool, theme: TerminalTheme) -> Line<'static> {
-    let style = if focused {
-        Style::default()
-            .fg(theme.header)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-    } else {
-        Style::default().fg(theme.muted)
-    };
-    Line::from(Span::styled(title.to_string(), style))
-}
-
-fn mjconfig_option_line(
-    selected: bool,
-    focused: bool,
-    label: String,
-    theme: TerminalTheme,
-) -> Line<'static> {
-    let marker = if selected { "▶ " } else { "  " };
-    let style = if selected && focused {
-        Style::default()
-            .fg(theme.selection_fg)
-            .bg(theme.selection_bg)
-            .add_modifier(Modifier::BOLD)
-    } else if selected {
-        Style::default().fg(theme.accent)
-    } else {
-        Style::default().fg(theme.text)
-    };
-    Line::from(Span::styled(format!("{marker}{label}"), style))
-}
-
 fn draw_mjconfig_menu(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let Some(menu) = state.mjconfig_menu.as_ref() else {
         return;
     };
-    let theme = state.theme;
-
-    if area.width.min(90) < 24 || area.height.min(18) < 8 {
-        return;
-    }
-    let desired_height = (menu.agents.len() as u16).saturating_add(7).max(18);
-    let rect = crate::term::centered_rect(area, 90, desired_height);
-    f.render_widget(Clear, rect);
-
-    let block = Block::default()
-        .title(" mj config ")
-        .borders(Borders::ALL)
-        .style(Style::default().fg(theme.text));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(4),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-
-    let intro =
-        Paragraph::new("Changes preview live. In Agents, Space toggles; Enter saves all settings.")
-            .style(Style::default().fg(theme.muted));
-    f.render_widget(intro, rows[0]);
-
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(24),
-            Constraint::Percentage(30),
-            Constraint::Percentage(46),
-        ])
-        .split(rows[1]);
-
-    let theme_focused = menu.section == MjConfigSection::Theme;
-    let mut theme_lines = vec![mjconfig_section_header("Theme", theme_focused, theme)];
-    for (idx, kind) in TerminalThemeKind::ALL.iter().enumerate() {
-        theme_lines.push(mjconfig_option_line(
-            idx == menu.theme_idx,
-            theme_focused,
-            kind.to_string(),
-            theme,
-        ));
-    }
-    f.render_widget(Paragraph::new(theme_lines), cols[0]);
-
-    let spinner_focused = menu.section == MjConfigSection::Spinner;
-    let mut spinner_lines = vec![mjconfig_section_header("Spinner", spinner_focused, theme)];
-    for (idx, style) in SpinnerStyle::ALL.iter().enumerate() {
-        // Each row previews its own style, animating from wall-clock time.
-        let label = format!("{:<8}{}", style.to_string(), style.current_frame());
-        spinner_lines.push(mjconfig_option_line(
-            idx == menu.spinner_idx,
-            spinner_focused,
-            label,
-            theme,
-        ));
-    }
-    f.render_widget(Paragraph::new(spinner_lines), cols[1]);
-
-    let agents_focused = menu.section == MjConfigSection::Agents;
-    let mut agent_lines = vec![mjconfig_section_header("Agents", agents_focused, theme)];
-    for (idx, agent) in menu.agents.iter().enumerate() {
-        let enabled = if agent.enabled { "on " } else { "off" };
-        let label = format!("[{enabled}] {} — {}", agent.label, agent.validation);
-        agent_lines.push(mjconfig_option_line(
-            idx == menu.agent_idx,
-            agents_focused,
-            label,
-            theme,
-        ));
-    }
-    f.render_widget(
-        Paragraph::new(agent_lines).wrap(Wrap { trim: false }),
-        cols[2],
-    );
-
-    let footer =
-        Paragraph::new("↑/↓ change · Tab section · Space toggle agent · Enter save · Esc cancel")
-            .style(Style::default().fg(theme.muted));
-    f.render_widget(footer, rows[2]);
+    draw_settings_panel(f, area, &menu.editor, "mj config");
 }
 
 fn loki_identity_label(actor: &LokiIdentity) -> String {
@@ -12325,38 +12188,55 @@ mod tests {
     }
 
     #[test]
+    fn slash_models_opens_shared_menu_on_council_tab() {
+        let mut state = AppState::new();
+        state.input = "/models".to_string();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        let menu = state.mjconfig_menu.as_ref().expect("menu should be open");
+        assert_eq!(menu.editor.tab, crate::settings::SettingsTab::Council);
+        assert!(state.input.is_empty(), "input should be consumed");
+    }
+
+    #[test]
     fn mjconfig_menu_previews_live_and_persists_on_accept() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let mut state = AppState::new();
         state.config_path = Some(path.clone());
         state.open_mjconfig_menu();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
-        // Toggle Codex off, then continue cycling through the appearance sections.
-        state.mjconfig_menu_toggle_section();
-        state.mjconfig_menu_toggle_section();
+        // ACP Servers tab: toggle Codex off.
+        state.mjconfig_menu_key(KeyCode::Tab);
         handle_mjconfig_menu_key(
             &mut state,
+            &cmd_tx,
             KeyModifiers::NONE,
             KeyCode::Char(' '),
             UiMode::FullscreenTui,
         );
-        state.mjconfig_menu_toggle_section();
 
-        // Spinner section: move once to preview the next style live.
-        state.mjconfig_menu_toggle_section();
-        let before = state.spinner_style;
-        state.mjconfig_menu_move(1);
-        assert_ne!(state.spinner_style, before, "preview should apply live");
+        // Appearance tab: preview theme and spinner live.
+        state.mjconfig_menu_key(KeyCode::Tab);
+        state.mjconfig_menu_key(KeyCode::Right);
+        let previewed_theme = state.theme_kind;
+        state.mjconfig_menu_key(KeyCode::Down);
+        state.mjconfig_menu_key(KeyCode::Right);
         let previewed = state.spinner_style;
 
-        // Theme section: preview a different theme live.
-        state.mjconfig_menu_toggle_section();
-        state.mjconfig_menu_move(1);
-        let previewed_theme = state.theme_kind;
+        // Council tab: toggle Thor review and apply it to the running session.
+        state.mjconfig_menu_key(KeyCode::Tab);
+        for _ in 0..3 {
+            state.mjconfig_menu_key(KeyCode::Down);
+        }
+        state.mjconfig_menu_key(KeyCode::Char(' '));
 
         handle_mjconfig_menu_key(
             &mut state,
+            &cmd_tx,
             KeyModifiers::NONE,
             KeyCode::Enter,
             UiMode::FullscreenTui,
@@ -12367,6 +12247,14 @@ mod tests {
         assert_eq!(saved.spinner, previewed);
         assert_eq!(saved.theme, previewed_theme);
         assert!(!saved.acp.codex);
+        assert!(!saved.thor.discrete_review);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(UiCommand::SetReviewPolicy {
+                role: crate::event::ReviewRole::Thor,
+                enabled: false
+            })
+        ));
     }
 
     #[test]
@@ -12375,15 +12263,19 @@ mod tests {
         let orig_theme = state.theme_kind;
         let orig_spinner = state.spinner_style;
         state.open_mjconfig_menu();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         // Preview different values in both sections.
-        state.mjconfig_menu_move(1);
-        state.mjconfig_menu_toggle_section();
-        state.mjconfig_menu_move(1);
+        state.mjconfig_menu_key(KeyCode::Tab);
+        state.mjconfig_menu_key(KeyCode::Tab);
+        state.mjconfig_menu_key(KeyCode::Right);
+        state.mjconfig_menu_key(KeyCode::Down);
+        state.mjconfig_menu_key(KeyCode::Right);
         assert!(state.theme_kind != orig_theme || state.spinner_style != orig_spinner);
 
         handle_mjconfig_menu_key(
             &mut state,
+            &cmd_tx,
             KeyModifiers::NONE,
             KeyCode::Esc,
             UiMode::FullscreenTui,
@@ -12428,7 +12320,7 @@ mod tests {
     }
 
     #[test]
-    fn mjconfig_menu_renders_both_sections() {
+    fn mjconfig_menu_renders_shared_tabbed_settings() {
         let backend = TestBackend::new(90, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut state = AppState::new();
@@ -12448,17 +12340,13 @@ mod tests {
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(rendered.contains("mj config"), "rendered:\n{rendered}");
-        assert!(rendered.contains("Theme"), "rendered:\n{rendered}");
-        assert!(rendered.contains("Spinner"), "rendered:\n{rendered}");
-        assert!(rendered.contains("Agents"), "rendered:\n{rendered}");
-        assert!(rendered.contains("Codex"), "rendered:\n{rendered}");
-        // Every spinner style name is listed as a row.
-        for style in SpinnerStyle::ALL {
-            assert!(
-                rendered.contains(style.as_str()),
-                "missing {style} in:\n{rendered}"
-            );
-        }
+        assert!(rendered.contains("Council"), "rendered:\n{rendered}");
+        assert!(rendered.contains("ACP Servers"), "rendered:\n{rendered}");
+        assert!(rendered.contains("Appearance"), "rendered:\n{rendered}");
+        assert!(
+            rendered.contains("primary model; plans and reviews work"),
+            "rendered:\n{rendered}"
+        );
     }
 
     #[test]
