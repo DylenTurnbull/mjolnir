@@ -3649,7 +3649,10 @@ mod tests {
             .raw_input(serde_json::json!({
                 "server": "mj-code-agent",
                 "tool": "explore_agent",
-                "arguments": { "prompt": "very thorough: trace startup" }
+                "arguments": {
+                    "prompt": "trace startup",
+                    "thoroughness": "very_thorough"
+                }
             }));
 
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)));
