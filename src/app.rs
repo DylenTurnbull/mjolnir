@@ -42,6 +42,7 @@ const BUILTIN_FORK_COMMAND: &str = "fork";
 const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
 const BUILTIN_MODELS_COMMAND: &str = "models";
+const BUILTIN_COUNCIL_COMMAND: &str = "council";
 const BUILTIN_REVIEWS_COMMAND: &str = "reviews";
 const BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
@@ -83,6 +84,13 @@ fn builtin_models_command() -> AvailableCommand {
     AvailableCommand::new(BUILTIN_MODELS_COMMAND, "open Council model settings")
 }
 
+fn builtin_council_command() -> AvailableCommand {
+    AvailableCommand::new(
+        BUILTIN_COUNCIL_COMMAND,
+        "show active Council model selections",
+    )
+}
+
 fn builtin_reviews_command() -> AvailableCommand {
     AvailableCommand::new(
         BUILTIN_REVIEWS_COMMAND,
@@ -106,6 +114,7 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
             && command.name != BUILTIN_EXPORT_COMMAND
             && command.name != BUILTIN_MJCONFIG_COMMAND
             && command.name != BUILTIN_MODELS_COMMAND
+            && command.name != BUILTIN_COUNCIL_COMMAND
             && command.name != BUILTIN_REVIEWS_COMMAND
             && command.name != BUILTIN_RAGNAROK_COMMAND
     });
@@ -115,6 +124,7 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
     commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_mjconfig_command());
     commands.insert(0, builtin_reviews_command());
+    commands.insert(0, builtin_council_command());
     commands.insert(0, builtin_models_command());
     commands.insert(0, builtin_export_command());
     commands.insert(0, builtin_load_command());
@@ -5467,7 +5477,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "load", "export", "models", "reviews", "mjconfig", "ragnarok"
+                "new", "clear", "load", "export", "models", "council", "reviews", "mjconfig",
+                "ragnarok"
             ]
         );
     }
@@ -5494,8 +5505,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "load", "export", "models", "reviews", "mjconfig", "ragnarok",
-                "fork"
+                "new", "clear", "load", "export", "models", "council", "reviews", "mjconfig",
+                "ragnarok", "fork"
             ]
         );
     }
@@ -5516,6 +5527,7 @@ mod tests {
                 AvailableCommand::new("clear", "agent-provided command"),
                 AvailableCommand::new("load", "agent-provided command"),
                 AvailableCommand::new("fork", "agent-provided command"),
+                AvailableCommand::new("council", "agent-provided command"),
             ])),
         ));
 
@@ -5532,6 +5544,7 @@ mod tests {
                 "load",
                 "export",
                 "models",
+                "council",
                 "reviews",
                 "mjconfig",
                 "ragnarok",
@@ -5557,7 +5570,11 @@ mod tests {
             "open Council model settings"
         );
         assert_eq!(
-            s.available_commands[8].description,
+            s.available_commands[5].description,
+            "show active Council model selections"
+        );
+        assert_eq!(
+            s.available_commands[9].description,
             "fork the current session (unstable ACP extension)"
         );
     }
@@ -5585,6 +5602,7 @@ mod tests {
                 "load",
                 "export",
                 "models",
+                "council",
                 "reviews",
                 "mjconfig",
                 "ragnarok",

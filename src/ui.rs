@@ -3415,6 +3415,20 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
+    if images.is_empty() && text == "/council" {
+        state.input.clear();
+        clear_attachments(state);
+        state.input_cursor = 0;
+        state.scroll_input_to_bottom();
+        state.push_system_message(format!(
+            "Council models\nThor   {}\nEitri  {}\nLoki   {}",
+            state.active_council_models.thor,
+            state.active_council_models.eitri,
+            state.active_council_models.loki,
+        ));
+        return;
+    }
+
     if images.is_empty() && (text == "/reviews" || text.starts_with("/reviews ")) {
         state.input.clear();
         clear_attachments(state);
@@ -12300,6 +12314,37 @@ mod tests {
         let menu = state.mjconfig_menu.as_ref().expect("menu should be open");
         assert_eq!(menu.editor.tab, crate::settings::SettingsTab::Council);
         assert!(state.input.is_empty(), "input should be consumed");
+    }
+
+    #[test]
+    fn slash_council_adds_active_models_system_entry() {
+        let mut state = AppState::new();
+        state.active_council_models = crate::config::ModelsConfig {
+            thor: "claude-opus".to_string(),
+            eitri: "gpt-5.5".to_string(),
+            loki: "off".to_string(),
+        };
+        state.input = "/council".to_string();
+        state.input_cursor = 2;
+        state.attachments.push(crate::app::PastedAttachment {
+            id: 1,
+            position: state.input.chars().count(),
+            content: String::new(),
+        });
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert!(cmd_rx.try_recv().is_err(), "command must remain local");
+        assert!(state.input.is_empty());
+        assert!(state.attachments.is_empty());
+        assert!(state.image_attachments.is_empty());
+        assert_eq!(state.input_cursor, 0);
+        assert!(matches!(
+            state.transcript.last(),
+            Some(Entry::System(text))
+                if text == "Council models\nThor   claude-opus\nEitri  gpt-5.5\nLoki   off"
+        ));
     }
 
     #[test]
