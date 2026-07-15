@@ -27,6 +27,7 @@ mod menu;
 mod model_resolve;
 mod notifications;
 mod onboarding;
+mod openrouter_balance;
 mod palette;
 mod paths;
 mod probe;

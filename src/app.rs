@@ -13,6 +13,7 @@ use crate::bedrock_credits::BedrockCreditsStatus;
 use crate::claude_usage::ClaudeUsageStatus;
 use crate::clipboard::ClipboardLease;
 use crate::codex_usage::CodexUsageStatus;
+use crate::openrouter_balance::OpenRouterBalanceStatus;
 use agent_client_protocol::schema::v1::{
     AvailableCommand, Diff, ElicitationContentValue, ElicitationMode, ElicitationPropertySchema,
     EnumOption, Plan, PlanEntry, SessionConfigKind, SessionConfigOption,
@@ -35,6 +36,12 @@ use crate::theme::TerminalThemeKind;
 /// Maximum width of the queued-prompt preview shown above the input.
 /// Beyond this we truncate with an ellipsis.
 pub const QUEUED_PROMPT_PREVIEW_WIDTH: usize = 40;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnvilQuotaSource {
+    Bedrock,
+    OpenRouter,
+}
 
 const BUILTIN_NEW_COMMAND: &str = "new";
 const BUILTIN_CLEAR_COMMAND: &str = "clear";
@@ -738,6 +745,10 @@ pub struct AppState {
     pub codex_usage: Option<CodexUsageStatus>,
     /// AWS promotional/account credits applicable to the active Bedrock route.
     pub bedrock_credits: Option<BedrockCreditsStatus>,
+    /// OpenRouter balance supplied by Anvil for the active OpenRouter route.
+    pub openrouter_balance: Option<OpenRouterBalanceStatus>,
+    /// The active provider reported in Anvil metadata.
+    pub anvil_quota_source: Option<AnvilQuotaSource>,
     /// Slash-command autocomplete state, recomputed on every input edit.
     pub autocomplete: Autocomplete,
     /// True while the keyboard help overlay is visible.
@@ -1053,6 +1064,8 @@ impl AppState {
             claude_usage: None,
             codex_usage: None,
             bedrock_credits: None,
+            openrouter_balance: None,
+            anvil_quota_source: None,
             autocomplete: Autocomplete::default(),
             help_overlay: false,
             help_scroll: 0,
@@ -1070,6 +1083,33 @@ impl AppState {
             clipboard_lease: None,
             queued_prompts: VecDeque::new(),
         }
+    }
+
+    /// Select the Anvil provider reported by valid metadata and clear its stale peer.
+    fn select_anvil_quota_source(&mut self, source: AnvilQuotaSource) {
+        match source {
+            AnvilQuotaSource::Bedrock => self.openrouter_balance = None,
+            AnvilQuotaSource::OpenRouter => self.bedrock_credits = None,
+        }
+        self.anvil_quota_source = Some(source);
+    }
+
+    pub(crate) fn set_bedrock_credits(&mut self, status: BedrockCreditsStatus) {
+        self.select_anvil_quota_source(AnvilQuotaSource::Bedrock);
+        self.bedrock_credits = Some(status);
+    }
+
+    pub(crate) fn set_openrouter_balance(&mut self, status: OpenRouterBalanceStatus) {
+        self.select_anvil_quota_source(AnvilQuotaSource::OpenRouter);
+        self.openrouter_balance = Some(status);
+    }
+
+    pub(crate) fn set_codex_usage(&mut self, status: CodexUsageStatus) {
+        self.codex_usage = Some(status);
+    }
+
+    pub(crate) fn set_claude_usage(&mut self, status: ClaudeUsageStatus) {
+        self.claude_usage = Some(status);
     }
 
     pub fn set_theme(&mut self, theme_kind: TerminalThemeKind) {
@@ -2210,10 +2250,10 @@ impl AppState {
                 self.update_autocomplete();
             }
             UiEvent::ClaudeUsage(report) => {
-                self.claude_usage = Some(report);
+                self.set_claude_usage(report);
             }
             UiEvent::CodexUsage(status) => {
-                self.codex_usage = Some(status);
+                self.set_codex_usage(status);
             }
             UiEvent::PromptFailed { message } => {
                 self.finalize_thinking(EntryKind::Thought);
@@ -2674,7 +2714,10 @@ impl AppState {
             }
             SessionUpdate::UsageUpdate(u) => {
                 if let Some(status) = crate::bedrock_credits::from_usage_meta(u.meta.as_ref()) {
-                    self.bedrock_credits = Some(status);
+                    self.set_bedrock_credits(status);
+                }
+                if let Some(status) = crate::openrouter_balance::from_usage_meta(u.meta.as_ref()) {
+                    self.set_openrouter_balance(status);
                 }
                 if let Some(rate_limit) = self.token_usage.apply_usage_update(u) {
                     // The line is self-describing ("Current session: …"), so
@@ -5038,9 +5081,92 @@ mod tests {
     }
 
     #[test]
+    fn usage_update_openrouter_balance_replaces_available_with_unavailable() {
+        let mut state = AppState::new();
+        let available = serde_json::json!({"anvil":{"openrouterBalance":{"status":"available","remainingUsd":12.5,"totalCreditsUsd":20.0,"totalUsageUsd":7.5,"asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(available.as_object().unwrap().clone()),
+        )));
+        assert!(matches!(
+            state.openrouter_balance,
+            Some(OpenRouterBalanceStatus::Available(_))
+        ));
+
+        let unavailable = serde_json::json!({"anvil":{"openrouterBalance":{"status":"unavailable","reason":"billing credentials are unavailable","asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(unavailable.as_object().unwrap().clone()),
+        )));
+        assert_eq!(
+            state.openrouter_balance,
+            Some(OpenRouterBalanceStatus::Unavailable(
+                "billing credentials are unavailable".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn malformed_openrouter_metadata_preserves_last_known_status() {
+        let mut state = AppState::new();
+        state.set_openrouter_balance(OpenRouterBalanceStatus::Unavailable(
+            "request timed out".into(),
+        ));
+        let invalid = serde_json::json!({"anvil":{"openrouterBalance":{"status":"future"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(1, 2).meta(invalid.as_object().unwrap().clone()),
+        )));
+
+        assert_eq!(
+            state.openrouter_balance,
+            Some(OpenRouterBalanceStatus::Unavailable(
+                "request timed out".into()
+            ))
+        );
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::OpenRouter));
+    }
+
+    #[test]
+    fn valid_anvil_provider_observations_clear_only_their_stale_peer() {
+        let mut state = AppState::new();
+        let bedrock = serde_json::json!({"anvil":{"bedrockCredits":{"status":"available","amounts":[],"asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(1, 2).meta(bedrock.as_object().unwrap().clone()),
+        )));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::Bedrock));
+        assert!(state.openrouter_balance.is_none());
+
+        let openrouter = serde_json::json!({"anvil":{"openrouterBalance":{"status":"available","remainingUsd":0.0,"totalCreditsUsd":20.0,"totalUsageUsd":20.0,"asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(1, 2).meta(openrouter.as_object().unwrap().clone()),
+        )));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::OpenRouter));
+        assert!(state.bedrock_credits.is_none());
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(1, 2).meta(bedrock.as_object().unwrap().clone()),
+        )));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::Bedrock));
+        assert!(state.openrouter_balance.is_none());
+
+        state.apply_event(UiEvent::CodexUsage(CodexUsageStatus::Unavailable(
+            "not signed in".to_string(),
+        )));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::Bedrock));
+        assert!(state.bedrock_credits.is_some());
+        assert!(state.codex_usage.is_some());
+
+        state.apply_event(UiEvent::ClaudeUsage(ClaudeUsageStatus::Unavailable(
+            "not signed in".to_string(),
+        )));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::Bedrock));
+        assert!(state.bedrock_credits.is_some());
+        assert!(state.codex_usage.is_some());
+        assert!(state.claude_usage.is_some());
+    }
+
+    #[test]
     fn malformed_bedrock_credit_metadata_preserves_last_known_status() {
         let mut state = AppState::new();
-        state.bedrock_credits = Some(BedrockCreditsStatus::Unavailable(
+        state.set_bedrock_credits(BedrockCreditsStatus::Unavailable(
             "request timed out".into(),
         ));
         let invalid =
@@ -5054,6 +5180,7 @@ mod tests {
                 "request timed out".into()
             ))
         );
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::Bedrock));
     }
 
     #[test]

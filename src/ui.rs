@@ -8035,21 +8035,30 @@ fn draw_usage_quota_row(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
 }
 
 fn usage_quota_label(state: &AppState) -> Option<String> {
-    state
-        .bedrock_credits
-        .as_ref()
-        .map(crate::bedrock_credits::BedrockCreditsStatus::compact_label)
+    let anvil_label = match state.anvil_quota_source {
+        Some(crate::app::AnvilQuotaSource::Bedrock) => state
+            .bedrock_credits
+            .as_ref()
+            .map(crate::bedrock_credits::BedrockCreditsStatus::compact_label),
+        Some(crate::app::AnvilQuotaSource::OpenRouter) => state
+            .openrouter_balance
+            .as_ref()
+            .map(crate::openrouter_balance::OpenRouterBalanceStatus::compact_label),
+        None => None,
+    };
+
+    anvil_label
         .or_else(|| {
             state
                 .codex_usage
                 .as_ref()
                 .map(crate::codex_usage::CodexUsageStatus::compact_label)
-                .or_else(|| {
-                    state
-                        .claude_usage
-                        .as_ref()
-                        .map(crate::claude_usage::ClaudeUsageStatus::compact_label)
-                })
+        })
+        .or_else(|| {
+            state
+                .claude_usage
+                .as_ref()
+                .map(crate::claude_usage::ClaudeUsageStatus::compact_label)
         })
 }
 
@@ -16610,7 +16619,7 @@ mod tests {
     #[test]
     fn usage_quota_row_renders_between_input_and_config_shortcuts() {
         let mut state = AppState::new();
-        state.claude_usage = Some(ClaudeUsageStatus::Available(ClaudeUsageReport {
+        state.set_claude_usage(ClaudeUsageStatus::Available(ClaudeUsageReport {
             five_hour: Some(crate::claude_usage::ClaudeUsageWindow {
                 remaining_percent: 88,
                 reset_context: None,
@@ -16648,7 +16657,7 @@ mod tests {
     #[test]
     fn usage_quota_row_renders_claude_unavailable_reason() {
         let mut state = AppState::new();
-        state.claude_usage = Some(ClaudeUsageStatus::Unavailable("not signed in".to_string()));
+        state.set_claude_usage(ClaudeUsageStatus::Unavailable("not signed in".to_string()));
 
         let backend = TestBackend::new(100, 1);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -16663,7 +16672,7 @@ mod tests {
     #[test]
     fn usage_quota_row_renders_bedrock_available_and_unavailable() {
         let mut state = AppState::new();
-        state.bedrock_credits = Some(crate::bedrock_credits::BedrockCreditsStatus::Available(
+        state.set_bedrock_credits(crate::bedrock_credits::BedrockCreditsStatus::Available(
             crate::bedrock_credits::BedrockCreditsReport {
                 amounts: vec![crate::bedrock_credits::CreditAmount {
                     currency: "USD".to_string(),
@@ -16686,7 +16695,7 @@ mod tests {
             buffer_lines(terminal.backend().buffer())[0].contains("Bedrock credits: USD 12.50")
         );
 
-        state.bedrock_credits = Some(crate::bedrock_credits::BedrockCreditsStatus::Unavailable(
+        state.set_bedrock_credits(crate::bedrock_credits::BedrockCreditsStatus::Unavailable(
             "request timed out".to_string(),
         ));
         assert_eq!(
@@ -16699,6 +16708,111 @@ mod tests {
         assert!(
             buffer_lines(terminal.backend().buffer())[0]
                 .contains("Bedrock credits unavailable: request timed out")
+        );
+    }
+
+    #[test]
+    fn usage_quota_row_renders_openrouter_available_zero_and_unavailable() {
+        let mut state = AppState::new();
+        state.set_openrouter_balance(
+            crate::openrouter_balance::OpenRouterBalanceStatus::Available(
+                crate::openrouter_balance::OpenRouterBalanceReport {
+                    remaining_usd: 12.5,
+                    total_credits_usd: 20.0,
+                    total_usage_usd: 7.5,
+                    as_of: "2026-07-15T18:42:00Z".to_string(),
+                },
+            ),
+        );
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("OpenRouter balance: USD 12.50 remaining · as of 2026-07-15T18:42:00Z")
+        );
+
+        state.set_openrouter_balance(
+            crate::openrouter_balance::OpenRouterBalanceStatus::Available(
+                crate::openrouter_balance::OpenRouterBalanceReport {
+                    remaining_usd: 0.0,
+                    total_credits_usd: 20.0,
+                    total_usage_usd: 20.0,
+                    as_of: "2026-07-15T18:43:00Z".to_string(),
+                },
+            ),
+        );
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("OpenRouter balance: USD 0.00 remaining · as of 2026-07-15T18:43:00Z")
+        );
+
+        state.set_openrouter_balance(
+            crate::openrouter_balance::OpenRouterBalanceStatus::Unavailable(
+                "billing credentials are unavailable".to_string(),
+            ),
+        );
+        let backend = TestBackend::new(100, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_usage_quota_row(frame, frame.area(), &state))
+            .expect("draw");
+        assert!(
+            buffer_lines(terminal.backend().buffer())[0]
+                .contains("OpenRouter balance unavailable: billing credentials are unavailable")
+        );
+    }
+
+    #[test]
+    fn usage_quota_label_prefers_selected_anvil_provider_over_council_pollers() {
+        let mut state = AppState::new();
+        state.set_bedrock_credits(crate::bedrock_credits::BedrockCreditsStatus::Unavailable(
+            "bedrock unavailable".to_string(),
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("Bedrock credits unavailable: bedrock unavailable")
+        );
+
+        state.set_openrouter_balance(
+            crate::openrouter_balance::OpenRouterBalanceStatus::Unavailable(
+                "openrouter unavailable".to_string(),
+            ),
+        );
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("OpenRouter balance unavailable: openrouter unavailable")
+        );
+
+        state.set_bedrock_credits(crate::bedrock_credits::BedrockCreditsStatus::Unavailable(
+            "newer bedrock unavailable".to_string(),
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("Bedrock credits unavailable: newer bedrock unavailable")
+        );
+
+        state.set_codex_usage(crate::codex_usage::CodexUsageStatus::Unavailable(
+            "codex unavailable".to_string(),
+        ));
+        state.set_claude_usage(ClaudeUsageStatus::Unavailable(
+            "claude unavailable".to_string(),
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("Bedrock credits unavailable: newer bedrock unavailable")
+        );
+    }
+
+    #[test]
+    fn usage_quota_label_prefers_codex_over_claude_without_anvil_provider() {
+        let mut state = AppState::new();
+        state.set_claude_usage(ClaudeUsageStatus::Unavailable(
+            "claude unavailable".to_string(),
+        ));
+        state.set_codex_usage(crate::codex_usage::CodexUsageStatus::Unavailable(
+            "codex unavailable".to_string(),
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("Codex usage unavailable: codex unavailable")
         );
     }
 
