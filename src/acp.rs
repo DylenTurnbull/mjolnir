@@ -44,6 +44,7 @@ use crate::event::{
     PromptImage, SessionConfigTarget, TerminalOutputSnapshot, UiCommand, UiEvent,
 };
 use crate::paths::{WorkspaceRoots, normalize_spawn_program, path_is_under_any_root};
+use crate::{deepswe, model_resolve};
 
 pub struct AcpRuntimeConfig {
     pub command: PathBuf,
@@ -85,7 +86,9 @@ pub struct AcpRuntimeConfig {
 #[derive(Debug, Clone)]
 pub struct RuntimeRoleConfig {
     pub label: String,
+    pub model_id: String,
     pub model_value: String,
+    pub adapter_source_id: String,
     pub force_high_reasoning: bool,
 }
 
@@ -821,10 +824,10 @@ async fn prepare_agent_command(
     })
 }
 
-/// Resolve an agent launch command for spawning **without triggering any
-/// install**. Used by the startup validation probe, which must never kick
-/// off a multi-hundred-megabyte uv/Node/binary download just to check
-/// whether an agent is reachable.
+/// Resolve an agent launch command without installing the launcher itself.
+/// Used by startup validation probes. A user-configured package launcher may
+/// still resolve its own package arguments, so built-in discovery must not use
+/// `npx` or `uvx` probes.
 ///
 /// Returns `None` when the launcher (`uvx`/`npx`) or the program itself is
 /// not already present, so the caller can mark the agent "not installed"
@@ -3809,6 +3812,47 @@ fn select_option_named(
     }
 }
 
+fn select_role_model(
+    option: &SessionConfigOption,
+    role: &RuntimeRoleConfig,
+) -> Option<SessionConfigValueId> {
+    if let Some(value) = select_option_named(option, Some(&role.model_value), &role.model_value) {
+        return Some(value);
+    }
+
+    let wanted: HashSet<_> =
+        model_resolve::catalog_keys_ranked(&role.model_id, deepswe::model_provider(&role.model_id))
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+    let matches = |choice: &SessionConfigSelectOption| {
+        model_resolve::agent_keys(
+            &role.adapter_source_id,
+            &choice.value.to_string(),
+            &choice.name,
+            choice.description.as_deref().unwrap_or_default(),
+            &HashMap::new(),
+        )
+        .into_iter()
+        .any(|key| wanted.contains(&key))
+    };
+    match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => options
+            .iter()
+            .find(|choice| matches(choice))
+            .map(|choice| choice.value.clone()),
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .find(|choice| matches(choice))
+            .map(|choice| choice.value.clone()),
+        _ => None,
+    }
+}
+
 async fn apply_runtime_role_config(
     conn: &ConnectionTo<Agent>,
     session_id: &SessionId,
@@ -3823,17 +3867,13 @@ async fn apply_runtime_role_config(
     let Some(model_index) = model_index else {
         anyhow::bail!("ACP adapter did not advertise a model configuration control");
     };
-    let model_value = select_option_named(
-        &session_config.options[model_index],
-        Some(&role.model_value),
-        &role.model_value,
-    )
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "ACP adapter no longer advertises selected model '{}'",
-            role.model_value
-        )
-    })?;
+    let model_value =
+        select_role_model(&session_config.options[model_index], role).ok_or_else(|| {
+            anyhow::anyhow!(
+                "ACP adapter no longer advertises selected model '{}'",
+                role.model_id
+            )
+        })?;
     let target = session_config.targets[model_index].clone();
     if config_option_current_value(&session_config.options[model_index]) != Some(&model_value) {
         match send_config_update(conn, session_id, target.clone(), model_value.clone()).await? {
@@ -5506,6 +5546,55 @@ mod tests {
             vec![SessionConfigTarget::ConfigOption {
                 config_id: "model".into()
             }]
+        );
+    }
+
+    #[test]
+    fn runtime_role_model_resolves_adapter_aliases() {
+        let claude_model = SessionConfigOption::select(
+            "model",
+            "Model",
+            "opus",
+            vec![
+                SessionConfigSelectOption::new("opus", "Opus")
+                    .description("Opus 5 with extended context"),
+                SessionConfigSelectOption::new("sonnet", "Sonnet")
+                    .description("Sonnet 5 with extended context"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model);
+        let claude_role = RuntimeRoleConfig {
+            label: "Thor".to_string(),
+            model_id: "claude-sonnet-5".to_string(),
+            model_value: "claude-sonnet-5".to_string(),
+            adapter_source_id: "claude-acp".to_string(),
+            force_high_reasoning: true,
+        };
+        assert_eq!(
+            select_role_model(&claude_model, &claude_role).map(|value| value.to_string()),
+            Some("sonnet".to_string())
+        );
+
+        let codex_model = SessionConfigOption::select(
+            "model",
+            "Model",
+            "gpt-5.5",
+            vec![
+                SessionConfigSelectOption::new("gpt-5.5", "GPT-5.5"),
+                SessionConfigSelectOption::new("gpt-5.6-sol", "GPT-5.6 Sol"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model);
+        let codex_role = RuntimeRoleConfig {
+            label: "Eitri".to_string(),
+            model_id: "gpt-5-6-sol".to_string(),
+            model_value: "gpt-5-6-sol".to_string(),
+            adapter_source_id: "codex-acp".to_string(),
+            force_high_reasoning: true,
+        };
+        assert_eq!(
+            select_role_model(&codex_model, &codex_role).map(|value| value.to_string()),
+            Some("gpt-5.6-sol".to_string())
         );
     }
 

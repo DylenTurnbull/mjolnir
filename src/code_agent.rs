@@ -37,6 +37,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::acp::{self, AcpRuntimeConfig, RuntimeAccessMode};
+use crate::council::ResolvedRole;
 use crate::event::{
     CodeAgentEvent, CodeAgentOutcome, InternalMessage, InternalMessageKind, UiCommand, UiEvent,
     content_block_text,
@@ -143,23 +144,21 @@ impl Config {
     }
 
     pub fn council(
-        command: PathBuf,
-        args: Vec<String>,
-        env: HashMap<String, String>,
+        role: ResolvedRole,
         agent_stderr: Option<PathBuf>,
-        model_id: String,
-        model_value: String,
         loki: Option<loki::Handle>,
     ) -> Self {
         Self {
-            display_label: format!("Eitri · {model_id}"),
-            command,
-            args,
-            env,
+            display_label: format!("Eitri · {}", role.model.model),
+            command: role.launch.command,
+            args: role.launch.args,
+            env: role.launch.env,
             agent_stderr,
             role_config: Some(acp::RuntimeRoleConfig {
                 label: LABEL.to_string(),
-                model_value,
+                model_id: role.model.model,
+                model_value: role.model_value,
+                adapter_source_id: role.launch.source_id,
                 force_high_reasoning: true,
             }),
             loki,

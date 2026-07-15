@@ -2095,21 +2095,15 @@ fn start_server_agent_session(
     });
     let role_config = council.as_ref().map(|resolved| acp::RuntimeRoleConfig {
         label: "Thor".to_string(),
+        model_id: resolved.thor.model.model.clone(),
         model_value: resolved.thor.model_value.clone(),
+        adapter_source_id: resolved.thor.launch.source_id.clone(),
         force_high_reasoning: true,
     });
     let implementation_handoffs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let code_agent = isolated_eitri.as_ref().map(|eitri| {
-        code_agent::Config::council(
-            eitri.launch.command.clone(),
-            eitri.launch.args.clone(),
-            eitri.launch.env.clone(),
-            None,
-            eitri.model.model.clone(),
-            eitri.model_value.clone(),
-            loki_handle.clone(),
-        )
-        .with_implementation_handoff_counter(implementation_handoffs.clone())
+        code_agent::Config::council(eitri.clone(), None, loki_handle.clone())
+            .with_implementation_handoff_counter(implementation_handoffs.clone())
     });
     let provenance_thor = council.as_ref().map(|resolved| resolved.thor.clone());
     let provenance_cwd = cwd.clone();

@@ -211,20 +211,14 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         saved_session_config: HashMap::new(),
         role_config: Some(acp::RuntimeRoleConfig {
             label: "Thor".to_string(),
+            model_id: thor.model.model.clone(),
             model_value: thor.model_value.clone(),
+            adapter_source_id: thor.launch.source_id.clone(),
             force_high_reasoning: true,
         }),
         code_agent: eitri.map(|eitri| {
-            code_agent::Config::council(
-                eitri.launch.command,
-                eitri.launch.args,
-                eitri.launch.env,
-                cfg.agent_stderr.clone(),
-                eitri.model.model,
-                eitri.model_value,
-                loki_handle.clone(),
-            )
-            .with_implementation_handoff_counter(implementation_handoffs.clone())
+            code_agent::Config::council(eitri, cfg.agent_stderr.clone(), loki_handle.clone())
+                .with_implementation_handoff_counter(implementation_handoffs.clone())
         }),
     };
 

@@ -929,7 +929,9 @@ async fn connect(
         HashMap::new(),
         Some(RuntimeRoleConfig {
             label: "Loki".to_string(),
+            model_id: role.model.model.clone(),
             model_value: role.model_value.clone(),
+            adapter_source_id: role.launch.source_id.clone(),
             force_high_reasoning: true,
         }),
         vec![advise_server],

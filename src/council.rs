@@ -79,6 +79,7 @@ pub struct ModelChoice {
 pub struct Availability {
     pub codex: Option<PathBuf>,
     pub claude: Option<PathBuf>,
+    pub anvil: Option<PathBuf>,
     pub opencode: Option<PathBuf>,
 }
 
@@ -87,6 +88,7 @@ impl Availability {
         Self {
             codex: find_on_path("codex"),
             claude: find_on_path("claude"),
+            anvil: find_on_path("anvil"),
             opencode: find_on_path("opencode"),
         }
     }
@@ -98,6 +100,9 @@ impl Availability {
             }
             AdapterKind::Claude if self.claude.is_none() => {
                 Some("claude executable not found on PATH")
+            }
+            AdapterKind::Anvil if self.anvil.is_none() => {
+                Some("anvil executable not found on PATH")
             }
             AdapterKind::OpenCode if self.opencode.is_none() => {
                 Some("opencode executable not found on PATH")
@@ -166,8 +171,8 @@ fn launch_for(kind: AdapterKind) -> AdapterLaunch {
         AdapterKind::Anvil => AdapterLaunch {
             kind,
             source_id: "anvil".to_string(),
-            command: PathBuf::from("uvx"),
-            args: vec!["brokk".to_string(), "acp".to_string()],
+            command: PathBuf::from("anvil"),
+            args: Vec::new(),
             env: HashMap::new(),
         },
         AdapterKind::OpenCode => AdapterLaunch {
@@ -356,7 +361,7 @@ fn configured_launches(config: &Config, availability: &Availability) -> Vec<Adap
     if config.acp.claude && availability.claude.is_some() {
         launches.push(launch_for(AdapterKind::Claude));
     }
-    if config.acp.anvil {
+    if config.acp.anvil && availability.anvil.is_some() {
         launches.push(launch_for(AdapterKind::Anvil));
     }
     if config.acp.opencode && availability.opencode.is_some() {
@@ -384,6 +389,12 @@ fn missing_enabled_adapter_errors(
             "claude executable not found on PATH",
         ),
         (
+            config.acp.anvil,
+            availability.anvil.is_none(),
+            AdapterKind::Anvil,
+            "anvil executable not found on PATH",
+        ),
+        (
             config.acp.opencode,
             availability.opencode.is_none(),
             AdapterKind::OpenCode,
@@ -402,6 +413,26 @@ fn custom_model_id(source_id: &str, model_value: &str) -> String {
     format!("custom/{name}/{model_value}")
 }
 
+fn installed_provider_capabilities(
+    launch: &AdapterLaunch,
+    rows: &[Row],
+) -> Option<probe::AdapterCapabilities> {
+    matches!(launch.kind, AdapterKind::Codex | AdapterKind::Claude).then(|| {
+        probe::AdapterCapabilities {
+            http_mcp: true,
+            models: rows
+                .iter()
+                .filter(|row| adapter_accepts_model(launch.kind, &row.model))
+                .map(|row| probe::ModelOption {
+                    value: row.model.clone(),
+                    name: row.model.clone(),
+                    description: None,
+                })
+                .collect(),
+        }
+    })
+}
+
 async fn discover_available(
     config: &Config,
     rows: &[Row],
@@ -411,8 +442,15 @@ async fn discover_available(
     let launches = configured_launches(config, availability);
     let probes = stream::iter(launches.into_iter().enumerate().map(|(priority, launch)| {
         let cwd = cwd.to_path_buf();
+        let installed = installed_provider_capabilities(&launch, rows);
         async move {
-            let capabilities = probe_launch(&launch, &cwd).await;
+            // Built-in Codex and Claude discovery is intentionally only a
+            // PATH check. Launching their npx bridges here can download npm
+            // packages before the UI has rendered anything.
+            let capabilities = match installed {
+                Some(capabilities) => Ok(capabilities),
+                None => probe_launch(&launch, &cwd).await,
+            };
             (priority, launch, capabilities)
         }
     }))
@@ -747,6 +785,34 @@ mod tests {
     }
 
     #[test]
+    fn installed_codex_and_claude_use_catalog_without_startup_probe() {
+        let rows = vec![
+            role_at("gpt-5-6-sol", 0.7, 1.0).model,
+            role_at("claude-sonnet-5", 0.6, 1.0).model,
+            role_at("gemini-3-5-flash", 0.5, 1.0).model,
+        ];
+
+        let codex = installed_provider_capabilities(&launch_for(AdapterKind::Codex), &rows)
+            .expect("Codex PATH discovery");
+        assert_eq!(codex.models.len(), 1);
+        assert_eq!(codex.models[0].value, "gpt-5-6-sol");
+
+        let claude = installed_provider_capabilities(&launch_for(AdapterKind::Claude), &rows)
+            .expect("Claude PATH discovery");
+        assert_eq!(claude.models.len(), 1);
+        assert_eq!(claude.models[0].value, "claude-sonnet-5");
+
+        assert!(installed_provider_capabilities(&launch_for(AdapterKind::Anvil), &rows).is_none());
+    }
+
+    #[test]
+    fn anvil_launch_requires_installed_binary() {
+        let launch = launch_for(AdapterKind::Anvil);
+        assert_eq!(launch.command, PathBuf::from("anvil"));
+        assert!(launch.args.is_empty());
+    }
+
+    #[test]
     fn adapter_display_names_match_the_primary_acp_products() {
         assert_eq!(AdapterKind::Codex.display_name(), "Codex");
         assert_eq!(AdapterKind::Claude.display_name(), "Claude Code");
@@ -789,6 +855,7 @@ mod tests {
         let availability = Availability {
             codex: Some(PathBuf::from("codex")),
             claude: Some(PathBuf::from("claude")),
+            anvil: Some(PathBuf::from("anvil")),
             opencode: Some(PathBuf::from("opencode")),
         };
 
@@ -805,6 +872,7 @@ mod tests {
         let availability = Availability {
             codex: None,
             claude: None,
+            anvil: None,
             opencode: None,
         };
 
@@ -818,12 +886,17 @@ mod tests {
             Some("claude executable not found on PATH")
         );
         assert_eq!(
+            errors.get("anvil").map(String::as_str),
+            Some("anvil executable not found on PATH")
+        );
+        assert_eq!(
             errors.get("opencode-acp").map(String::as_str),
             Some("opencode executable not found on PATH")
         );
 
         config.acp.codex = false;
         config.acp.claude = false;
+        config.acp.anvil = false;
         config.acp.opencode = false;
         assert!(missing_enabled_adapter_errors(&config, &availability).is_empty());
     }
@@ -932,13 +1005,17 @@ mod tests {
         let availability = Availability {
             codex: None,
             claude: None,
+            anvil: None,
             opencode: None,
         };
         assert_eq!(
             availability.missing_reason("gpt-5-6-sol"),
             Some("codex executable not found on PATH")
         );
-        assert_eq!(availability.missing_reason("glm-5-2"), None);
+        assert_eq!(
+            availability.missing_reason("glm-5-2"),
+            Some("anvil executable not found on PATH")
+        );
     }
 
     #[test]
@@ -952,6 +1029,7 @@ mod tests {
         let availability = Availability {
             codex: None,
             claude: None,
+            anvil: None,
             opencode: None,
         };
         let error = explicit("Thor", "gpt-5-6-sol", &rows, &[])

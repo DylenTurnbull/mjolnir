@@ -47,13 +47,13 @@ mod worktree;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::app::UiExitReason;
@@ -605,7 +605,11 @@ async fn run_resume(
     let worktree_label = worktree_label(worktree.as_ref());
     let project_label = project_label(&cwd);
     let cfg = Config::load(&config::default_config_path())?;
-    let mut resume_council = council::resolve(&cfg, &cwd).await?;
+    let mut resume_council = if args.list {
+        council::resolve(&cfg, &cwd).await?
+    } else {
+        resolve_council_for_tui(&cfg, &cwd).await?
+    };
     let mut agent = selected_agent_for_role(&resume_council.thor);
     if let Some(session_id) = args.session_id.as_deref()
         && let Some(record) = session_provenance::find(session_id, &cwd)
@@ -982,6 +986,60 @@ fn apply_session_result_to_config(cfg: &mut Config, result: &RunSessionResult) {
     cfg.spinner = result.spinner_style;
 }
 
+async fn resolve_council_for_tui(cfg: &Config, cwd: &Path) -> Result<council::ResolvedCouncil> {
+    let mut stdout = std::io::stdout();
+    if !stdout.is_terminal() {
+        return council::resolve(cfg, cwd).await;
+    }
+
+    let mut resolution = Box::pin(council::resolve(cfg, cwd));
+    let mut tick = tokio::time::interval(Duration::from_millis(125));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let started = Instant::now();
+    let mut frame = 0_usize;
+    let mut status_writable = true;
+    loop {
+        tokio::select! {
+            result = &mut resolution => {
+                if status_writable {
+                    let _ = clear_startup_status(&mut stdout);
+                }
+                return result;
+            }
+            _ = tick.tick() => {
+                if status_writable {
+                    status_writable = write_startup_status(
+                        &mut stdout,
+                        frame,
+                        started.elapsed(),
+                    ).is_ok();
+                }
+                frame = frame.wrapping_add(1);
+            }
+        }
+    }
+}
+
+fn write_startup_status(
+    output: &mut impl Write,
+    frame: usize,
+    elapsed: Duration,
+) -> std::io::Result<()> {
+    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    write!(
+        output,
+        "\r\x1b[2K{} Discovering Council models... {}s",
+        FRAMES[frame % FRAMES.len()],
+        elapsed.as_secs()
+    )?;
+    output.flush()
+}
+
+fn clear_startup_status(output: &mut impl Write) -> std::io::Result<()> {
+    output.write_all(b"\r\x1b[2K")?;
+    output.flush()
+}
+
 async fn run_app(
     cwd: PathBuf,
     runtime_options: RuntimeOptions,
@@ -998,7 +1056,7 @@ async fn run_app(
         initial_agent.as_ref(),
     );
     let mut cfg = Config::load(&config_path)?;
-    let mut council = council::resolve(&cfg, &cwd).await?;
+    let mut council = resolve_council_for_tui(&cfg, &cwd).await?;
     if first_startup {
         let Some((accepted_config, accepted_council)) =
             run_first_startup(cfg, council, &config_path, &cwd).await?
@@ -1062,7 +1120,7 @@ async fn run_app(
             UiExitReason::Quit => return Ok(session_result.session_id),
             UiExitReason::NewSession => {
                 cfg = Config::load(&config_path)?;
-                council = council::resolve(&cfg, &cwd).await?;
+                council = resolve_council_for_tui(&cfg, &cwd).await?;
                 council_agent = selected_agent_for_role(&council.thor);
                 initial_agent = Some(council_agent.clone());
                 pending_new_session_boundary = true;
@@ -1154,7 +1212,7 @@ async fn run_first_startup(
             return Ok(None);
         };
         let next = *next;
-        match council::resolve(&next, cwd).await {
+        match resolve_council_for_tui(&next, cwd).await {
             Ok(resolved) => {
                 next.save(config_path)
                     .with_context(|| format!("save {}", config_path.display()))?;
@@ -1570,17 +1628,15 @@ async fn run_session(
         saved_session_config: std::collections::HashMap::new(),
         role_config: Some(acp::RuntimeRoleConfig {
             label: "Thor".to_string(),
+            model_id: council.thor.model.model.clone(),
             model_value: council.thor.model_value.clone(),
+            adapter_source_id: council.thor.launch.source_id.clone(),
             force_high_reasoning: true,
         }),
         code_agent: eitri_role.map(|eitri_role| {
             code_agent::Config::council(
-                eitri_role.launch.command.clone(),
-                eitri_role.launch.args.clone(),
-                eitri_role.launch.env.clone(),
+                eitri_role,
                 runtime_options.agent_stderr.clone(),
-                eitri_role.model.model.clone(),
-                eitri_role.model_value.clone(),
                 loki_handle.clone(),
             )
             .with_implementation_handoff_counter(implementation_handoffs_this_turn.clone())
@@ -2405,6 +2461,22 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::io::Write;
+
+    #[test]
+    fn startup_status_is_visible_without_taking_terminal_control() {
+        let mut output = Vec::new();
+        write_startup_status(&mut output, 1, Duration::from_secs(12)).expect("status");
+        clear_startup_status(&mut output).expect("clear");
+
+        let rendered = String::from_utf8(output).expect("utf8");
+        assert!(rendered.contains("/ Discovering Council models... 12s"));
+        assert!(!rendered.contains("\x1b[6n"), "must not issue CPR");
+        assert!(
+            !rendered.contains("\x1b[?1049h"),
+            "must not enter the alternate screen"
+        );
+        assert!(rendered.ends_with("\r\x1b[2K"));
+    }
 
     #[test]
     fn prompt_failure_resolves_deferred_intervention_for_current_turn() {

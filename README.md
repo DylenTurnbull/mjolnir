@@ -47,13 +47,15 @@ Mjolnir discovers these built-in routes automatically:
 
 - `codex` on `PATH` enables OpenAI models through `codex-acp`.
 - `claude` on `PATH` enables Anthropic models through `claude-agent-acp`.
-- a non-empty `OPENROUTER_API_KEY` enables Anvil through `uvx brokk acp`.
+- `anvil` on `PATH` enables models exposed by Anvil.
 - `opencode` on `PATH` enables OpenCode through `opencode acp`.
 
 Council adapters must advertise ACP HTTP MCP support because Thor invokes
 Eitri through Mjolnir's embedded `code_agent` and `explore_agent` MCP tools.
-Mjolnir probes each route once per process, never logs API-key values, and
-selects High reasoning when the adapter advertises that control.
+Codex and Claude discovery is a PATH check and does not launch either CLI or
+their npm ACP bridges. Explicit ACP routes are probed once per process; Mjolnir
+never logs API-key values and selects High reasoning when the adapter advertises
+that control.
 
 ## Council configuration
 
