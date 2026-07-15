@@ -118,7 +118,7 @@ impl SettingsEditor {
 
     fn row_count(&self) -> usize {
         match self.tab {
-            SettingsTab::Council => 5,
+            SettingsTab::Council => 4,
             SettingsTab::AcpServers => self.config.acp_server_selections().len(),
             SettingsTab::Appearance => 2,
         }
@@ -163,9 +163,6 @@ impl SettingsEditor {
             SettingsTab::Council if self.selected == 3 => {
                 self.config.thor.discrete_review = !self.config.thor.discrete_review;
             }
-            SettingsTab::Council if self.selected == 4 => {
-                self.config.loki.streaming_review = !self.config.loki.streaming_review;
-            }
             SettingsTab::AcpServers => {
                 let servers = self.config.acp_server_selections();
                 let Some(server) = servers.get(self.selected) else {
@@ -182,7 +179,7 @@ impl SettingsEditor {
     }
 
     fn cycle_model(&mut self, role: usize, delta: i32) {
-        let choices = self.model_choices();
+        let choices = self.model_choices(role);
         let current = match role {
             0 => &self.config.thor.model,
             1 => &self.config.eitri.model,
@@ -202,10 +199,14 @@ impl SettingsEditor {
         }
     }
 
-    fn model_choices(&self) -> Vec<String> {
+    fn model_choices(&self, role: usize) -> Vec<String> {
         let mut seen = HashSet::new();
         let mut choices = vec!["auto".to_string()];
         seen.insert("auto".to_string());
+        if role != 0 {
+            choices.push(crate::config::DISABLED_MODEL.to_string());
+            seen.insert(crate::config::DISABLED_MODEL.to_string());
+        }
         for choice in self.choices.iter().filter(|choice| choice.available) {
             if seen.insert(choice.model.clone()) {
                 choices.push(choice.model.clone());
@@ -217,6 +218,9 @@ impl SettingsEditor {
     fn staged_model_detail(&self, model: &str) -> String {
         if model == "auto" {
             return "automatic selection".to_string();
+        }
+        if model == crate::config::DISABLED_MODEL {
+            return "role disabled".to_string();
         }
         let Some(choice) = self.choices.iter().find(|choice| choice.model == model) else {
             return "saved model; not reported this session".to_string();
@@ -393,14 +397,6 @@ fn draw_council(
         ),
         theme,
     ));
-    lines.push(selected_line(
-        editor.selected == 4,
-        format!(
-            "Loki advice     [{}]",
-            on_off(editor.config.loki.streaming_review)
-        ),
-        theme,
-    ));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
@@ -517,5 +513,40 @@ mod tests {
             SettingsAction::Changed
         );
         assert!(!editor.config.acp.codex);
+    }
+
+    #[test]
+    fn disabled_is_only_available_for_optional_roles() {
+        let editor = SettingsEditor::new(Config::default(), Vec::new(), None);
+        assert!(
+            !editor
+                .model_choices(0)
+                .iter()
+                .any(|choice| choice == "disabled")
+        );
+        assert!(
+            editor
+                .model_choices(1)
+                .iter()
+                .any(|choice| choice == "disabled")
+        );
+        assert!(
+            editor
+                .model_choices(2)
+                .iter()
+                .any(|choice| choice == "disabled")
+        );
+    }
+
+    #[test]
+    fn optional_role_model_selection_can_disable_both_roles() {
+        let mut editor = SettingsEditor::new(Config::default(), Vec::new(), None);
+        editor.selected = 1;
+        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
+        assert_eq!(editor.config.eitri.model, crate::config::DISABLED_MODEL);
+
+        editor.selected = 2;
+        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
+        assert_eq!(editor.config.loki.model, crate::config::DISABLED_MODEL);
     }
 }

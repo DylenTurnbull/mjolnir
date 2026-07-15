@@ -466,9 +466,19 @@ fn resolve_eitri(
     selector: &str,
     rows: &[Row],
     available: &[ResolvedRole],
+    excluded_models: &[&str],
 ) -> Result<Option<ResolvedRole>> {
-    if selector == "auto" {
-        Ok(choose_eitri(rows, available).cloned())
+    if selector == crate::config::DISABLED_MODEL || selector == "none" {
+        Ok(None)
+    } else if selector == "auto" {
+        let distinct = available
+            .iter()
+            .filter(|role| !excluded_models.contains(&role.model.model.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(choose_eitri(rows, &distinct)
+            .or_else(|| choose_eitri(rows, available))
+            .cloned())
     } else {
         explicit("Eitri", selector, rows, available).map(|role| Some(role.clone()))
     }
@@ -485,10 +495,16 @@ fn provider_key(model: &str) -> &str {
 
 fn choose_loki<'a>(thor: &ResolvedRole, available: &'a [ResolvedRole]) -> Option<&'a ResolvedRole> {
     let thor_provider = provider_key(&thor.model.model);
-    available
-        .iter()
-        .filter(|candidate| candidate.ranked)
+    let mut ranked = available.iter().filter(|candidate| candidate.ranked);
+    ranked
+        .clone()
         .find(|candidate| provider_key(&candidate.model.model) != thor_provider)
+        .or_else(|| {
+            ranked
+                .clone()
+                .find(|candidate| candidate.model.model != thor.model.model)
+        })
+        .or_else(|| ranked.next())
 }
 
 fn resolve_loki(
@@ -497,7 +513,9 @@ fn resolve_loki(
     rows: &[Row],
     available: &[ResolvedRole],
 ) -> Result<Option<ResolvedRole>> {
-    if selector == "auto" {
+    if selector == crate::config::DISABLED_MODEL || selector == "none" {
+        Ok(None)
+    } else if selector == "auto" {
         Ok(choose_loki(thor, available).cloned())
     } else {
         explicit("Loki", selector, rows, available).map(|role| Some(role.clone()))
@@ -621,6 +639,12 @@ pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
         );
     }
 
+    if matches!(
+        config.thor.model.as_str(),
+        crate::config::DISABLED_MODEL | "none"
+    ) {
+        bail!("Thor cannot be disabled");
+    }
     let thor = if config.thor.model == "auto" {
         available
             .iter()
@@ -630,7 +654,11 @@ pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
         explicit("Thor", &config.thor.model, &rows, &available)?
     };
     let loki = resolve_loki(&config.loki.model, thor, &rows, &available)?;
-    let eitri = resolve_eitri(&config.eitri.model, &rows, &available)?;
+    let mut occupied = vec![thor.model.model.as_str()];
+    if let Some(loki) = loki.as_ref() {
+        occupied.push(loki.model.model.as_str());
+    }
+    let eitri = resolve_eitri(&config.eitri.model, &rows, &available, &occupied)?;
 
     let mut warned = WARNED_ADAPTERS.lock().await;
     let mut warnings = discovery
@@ -639,7 +667,12 @@ pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
         .filter(|(adapter, _)| warned.insert((*adapter).clone()))
         .map(|(adapter, reason)| format!("{adapter} unavailable: {reason}"))
         .collect::<Vec<_>>();
-    if eitri.is_none() {
+    if eitri.is_none()
+        && !matches!(
+            config.eitri.model.as_str(),
+            crate::config::DISABLED_MODEL | "none"
+        )
+    {
         warnings.push(
             "Eitri/code-agent delegation is disabled: no launchable Eitri model is available. \
              Install and authenticate a supported ACP adapter (for Codex: install `@openai/codex` \
@@ -950,10 +983,29 @@ mod tests {
     }
 
     #[test]
-    fn auto_loki_is_unavailable_when_only_thors_provider_is_launchable() {
+    fn auto_loki_falls_back_to_a_different_same_provider_model() {
         let available = vec![role("gpt-5-6-sol", 0.70), role("gpt-5-5", 0.65)];
 
-        assert!(choose_loki(&available[0], &available).is_none());
+        assert_eq!(
+            choose_loki(&available[0], &available)
+                .expect("fallback Loki")
+                .model
+                .model,
+            "gpt-5-5"
+        );
+    }
+
+    #[test]
+    fn auto_loki_reuses_thor_when_it_is_the_only_ranked_model() {
+        let available = vec![role("gpt-5-6-sol", 0.70)];
+
+        assert_eq!(
+            choose_loki(&available[0], &available)
+                .expect("fallback Loki")
+                .model
+                .model,
+            "gpt-5-6-sol"
+        );
     }
 
     #[test]
@@ -997,13 +1049,74 @@ mod tests {
         let rows = vec![role_at("gpt-5-6-sol", 0.694, 3.47).model];
         let available = vec![role_at("claude-fable-5", 0.64, 4.0)];
 
-        let error = resolve_eitri("gpt-5-6-sol", &rows, &available)
+        let error = resolve_eitri("gpt-5-6-sol", &rows, &available, &[])
             .expect_err("explicit unavailable Eitri must fail");
         assert!(
             error
                 .to_string()
                 .contains("Eitri model 'gpt-5-6-sol' is unavailable"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn optional_roles_accept_disabled_and_none() {
+        let thor = role("gpt-5-6-sol", 0.70);
+        let rows = vec![thor.model.clone()];
+        let available = vec![thor.clone()];
+
+        assert!(
+            resolve_loki("disabled", &thor, &rows, &available)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resolve_eitri("none", &rows, &available, &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn auto_eitri_reuses_an_excluded_model_when_needed() {
+        let eitri = role_at("gpt-5-6-terra", 0.538, 1.13);
+        let rows = vec![
+            role_at("claude-sonnet-5", 0.482, 7.43).model,
+            eitri.model.clone(),
+        ];
+        let available = vec![eitri];
+
+        assert_eq!(
+            resolve_eitri("auto", &rows, &available, &["gpt-5-6-terra"])
+                .unwrap()
+                .unwrap()
+                .model
+                .model,
+            "gpt-5-6-terra"
+        );
+    }
+
+    #[test]
+    fn auto_eitri_prefers_a_model_distinct_from_thor_and_loki() {
+        let rows = vec![
+            role_at("claude-sonnet-5", 0.482, 7.43).model,
+            role_at("gpt-5-6-sol", 0.694, 3.47).model,
+            role_at("gpt-5-6-terra", 0.538, 1.13).model,
+            role_at("claude-fable-5", 0.640, 4.0).model,
+        ];
+        let available = vec![
+            role_at("gpt-5-6-sol", 0.694, 3.47),
+            role_at("gpt-5-6-terra", 0.538, 1.13),
+            role_at("claude-fable-5", 0.640, 4.0),
+        ];
+
+        assert_eq!(
+            resolve_eitri("auto", &rows, &available, &["gpt-5-6-sol", "gpt-5-6-terra"])
+                .unwrap()
+                .unwrap()
+                .model
+                .model,
+            "claude-fable-5"
         );
     }
 }

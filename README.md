@@ -66,22 +66,28 @@ discrete_review = true
 
 [loki]
 model = "auto"
-streaming_review = true
 
 [eitri]
 model = "auto"
 ```
 
 Put this in `~/.config/mj/config.toml`. Automatic Thor selection chooses the
-strongest launchable DeepSWE High/default row. Loki chooses the strongest
-launchable model from a different provider. Eitri chooses a cost-efficient
-model on the DeepSWE Pass@1/cost Pareto frontier at the current Sonnet High
-quality floor.
+strongest launchable DeepSWE High/default row. Loki prefers the strongest model
+from a different provider, then another model, and finally reuses Thor if
+needed. Eitri prefers a distinct cost-efficient model on the DeepSWE Pass@1/cost
+Pareto frontier at the current Sonnet High quality floor, but may reuse a model
+when no distinct qualifying choice exists. Set `model = "disabled"` under
+`[loki]` or `[eitri]` to turn that role off.
 
 Use `/mjconfig` to configure Council models, ACP servers, review policy, and
 appearance. `/models` opens the same editor directly on the Council tab. Model
 and ACP server changes apply to the next session. Use `/reviews`, `/reviews thor
-on|off`, and `/reviews loki on|off` to inspect or change review policy.
+on|off` to inspect or change Thor's discrete review policy.
+
+For one non-interactive invocation, `--thor MODEL`, `--loki MODEL`, and
+`--eitri MODEL` override the saved Council selection when used with `--print`.
+Loki and Eitri also accept `disabled` or `none`; these overrides are never
+written to config.
 
 Thor's remaining ACP session controls appear on F1–F9. Model and Thought Level
 are owned by the Council and therefore omitted from those controls; the other

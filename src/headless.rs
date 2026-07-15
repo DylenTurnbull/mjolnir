@@ -49,6 +49,7 @@ pub struct RunConfig {
     pub fs_max_text_bytes: u64,
     pub output_format: OutputFormat,
     pub permission_mode: PermissionMode,
+    pub role_overrides: config::RoleModelOverrides,
 }
 
 #[derive(Debug, Serialize)]
@@ -135,8 +136,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     }
 
     let config_path = config::default_config_path();
-    let app_config = config::Config::load(&config_path)
+    let mut app_config = config::Config::load(&config_path)
         .with_context(|| format!("load {}", config_path.display()))?;
+    app_config.apply_role_model_overrides(&cfg.role_overrides);
     let mut resolved = council::resolve(&app_config, &cfg.cwd).await?;
     if let Some(session_id) = cfg.resume_session.as_deref()
         && let Some(record) = crate::session_provenance::find(session_id, &cfg.cwd)
@@ -177,19 +179,14 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         }
         None => (None, None),
     };
-    let loki_handle = if app_config.loki.streaming_review {
-        loki_role.map(|role| {
-            loki::Handle::start(
-                role,
-                cfg.cwd.clone(),
-                cfg.additional_directories.clone(),
-                event_tx.clone(),
-                true,
-            )
-        })
-    } else {
-        None
-    };
+    let loki_handle = loki_role.map(|role| {
+        loki::Handle::start(
+            role,
+            cfg.cwd.clone(),
+            cfg.additional_directories.clone(),
+            event_tx.clone(),
+        )
+    });
     let (eitri, _eitri_codex_home) = match resolved.eitri.clone() {
         Some(role) => {
             let (role, guard) = crate::isolated_council_role(role, "eitri")?;

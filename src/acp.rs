@@ -1939,7 +1939,7 @@ async fn drive_session(
                     }
                 }
             }
-            UiCommand::SetReviewPolicy { .. } => {}
+            UiCommand::SetThorReviewPolicy { .. } => {}
             UiCommand::CancelPrompt => {}
             UiCommand::Shutdown => break,
         }
@@ -2179,7 +2179,7 @@ async fn drive_fork_session(
                         });
                     }
                     Some(UiCommand::CancelPrompt) => {}
-                    Some(UiCommand::SetReviewPolicy { .. }) => {}
+                    Some(UiCommand::SetThorReviewPolicy { .. }) => {}
                 }
             }
         }
@@ -3966,7 +3966,7 @@ async fn drive_config_update(
                         });
                     }
                     Some(UiCommand::CancelPrompt) => {}
-                    Some(UiCommand::SetReviewPolicy { .. }) => {}
+                    Some(UiCommand::SetThorReviewPolicy { .. }) => {}
                 }
             }
         }
@@ -4108,7 +4108,7 @@ async fn drive_prompt_turn(
                             message: "prompt already in flight".to_string(),
                         });
                     }
-                    Some(UiCommand::SetReviewPolicy { .. }) => {}
+                    Some(UiCommand::SetThorReviewPolicy { .. }) => {}
                 }
             }
         }

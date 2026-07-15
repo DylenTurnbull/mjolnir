@@ -13,6 +13,15 @@ use crate::paths::{expand_home_shortcut, normalize_spawn_program};
 use crate::spinner::SpinnerStyle;
 use crate::theme::TerminalThemeKind;
 
+pub const DISABLED_MODEL: &str = "disabled";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleModelOverrides {
+    pub thor: Option<String>,
+    pub loki: Option<String>,
+    pub eitri: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Config {
     #[serde(default, skip_serializing_if = "TerminalThemeKind::is_default")]
@@ -29,7 +38,7 @@ pub struct Config {
     /// Thor's coordination and review behavior.
     #[serde(default, skip_serializing_if = "ThorConfig::is_default")]
     pub thor: ThorConfig,
-    /// Loki's streaming review behavior.
+    /// Loki's model preference; `disabled` turns the role off.
     #[serde(default, skip_serializing_if = "LokiConfig::is_default")]
     pub loki: LokiConfig,
     /// Eitri's model preference.
@@ -94,15 +103,16 @@ impl ThorConfig {
 pub struct LokiConfig {
     #[serde(default = "default_auto")]
     pub model: String,
-    #[serde(default = "default_true")]
-    pub streaming_review: bool,
+    /// Removed in favor of `model = "disabled"`; retained only while loading.
+    #[serde(default, rename = "streaming_review", skip_serializing)]
+    legacy_streaming_review: Option<bool>,
 }
 
 impl Default for LokiConfig {
     fn default() -> Self {
         Self {
             model: default_auto(),
-            streaming_review: true,
+            legacy_streaming_review: None,
         }
     }
 }
@@ -241,6 +251,18 @@ pub struct CustomAgent {
 }
 
 impl Config {
+    pub fn apply_role_model_overrides(&mut self, overrides: &RoleModelOverrides) {
+        if let Some(model) = &overrides.thor {
+            self.thor.model.clone_from(model);
+        }
+        if let Some(model) = &overrides.loki {
+            self.loki.model.clone_from(model);
+        }
+        if let Some(model) = &overrides.eitri {
+            self.eitri.model.clone_from(model);
+        }
+    }
+
     pub fn acp_server_selections(&self) -> Vec<AcpServerSelection> {
         let mut selections = vec![
             ("codex-acp", "Codex", self.acp.codex),
@@ -323,6 +345,17 @@ impl Config {
     }
 
     fn normalize(&mut self) -> Result<()> {
+        if self.loki.legacy_streaming_review == Some(false) {
+            self.loki.model = DISABLED_MODEL.to_string();
+        }
+        self.loki.legacy_streaming_review = None;
+        if self.loki.model.eq_ignore_ascii_case("none") {
+            self.loki.model = DISABLED_MODEL.to_string();
+        }
+        if self.eitri.model.eq_ignore_ascii_case("none") {
+            self.eitri.model = DISABLED_MODEL.to_string();
+        }
+
         if self.thor.model == "auto" && self.models.thor != "auto" {
             self.thor.model.clone_from(&self.models.thor);
         }
@@ -553,11 +586,11 @@ mod tests {
         assert_eq!(cfg.theme, TerminalThemeKind::Dark);
         assert_eq!(cfg.role_models(), ModelsConfig::default());
         assert!(cfg.thor.discrete_review);
-        assert!(cfg.loki.streaming_review);
+        assert_eq!(cfg.loki.model, "auto");
     }
 
     #[test]
-    fn council_reviews_default_on_and_can_be_disabled_independently() {
+    fn legacy_disabled_loki_review_migrates_to_disabled_model() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -568,14 +601,15 @@ mod tests {
 
         let cfg = Config::load(&path).expect("load config");
         assert!(!cfg.thor.discrete_review);
-        assert!(!cfg.loki.streaming_review);
+        assert_eq!(cfg.loki.model, DISABLED_MODEL);
 
         cfg.save(&path).expect("save config");
         let saved = std::fs::read_to_string(&path).expect("read saved config");
         assert!(saved.contains("[thor]"), "saved: {saved}");
         assert!(saved.contains("discrete_review = false"), "saved: {saved}");
         assert!(saved.contains("[loki]"), "saved: {saved}");
-        assert!(saved.contains("streaming_review = false"), "saved: {saved}");
+        assert!(saved.contains("model = \"disabled\""), "saved: {saved}");
+        assert!(!saved.contains("streaming_review"), "saved: {saved}");
     }
 
     #[test]
@@ -606,6 +640,22 @@ mod tests {
         assert!(!loaded.thor.discrete_review);
         assert_eq!(loaded.acp.servers[0].name, "company");
         assert_eq!(loaded.acp.servers[0].args, vec!["--stdio"]);
+    }
+
+    #[test]
+    fn role_model_overrides_do_not_mutate_the_source_config() {
+        let saved = Config::default();
+        let mut invocation = saved.clone();
+        invocation.apply_role_model_overrides(&RoleModelOverrides {
+            thor: Some("gpt-test".to_string()),
+            loki: Some(DISABLED_MODEL.to_string()),
+            eitri: Some("qwen-test".to_string()),
+        });
+
+        assert_eq!(saved.role_models(), ModelsConfig::default());
+        assert_eq!(invocation.thor.model, "gpt-test");
+        assert_eq!(invocation.loki.model, DISABLED_MODEL);
+        assert_eq!(invocation.eitri.model, "qwen-test");
     }
 
     #[test]

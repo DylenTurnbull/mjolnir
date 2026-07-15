@@ -2063,21 +2063,17 @@ fn start_server_agent_session(
         }
     }
     let mut council_setup_error = None;
-    let (isolated_loki, loki_codex_home) = match app_config
-        .loki
-        .streaming_review
-        .then(|| council.as_ref().and_then(|resolved| resolved.loki.clone()))
-        .flatten()
-    {
-        Some(role) => match crate::isolated_council_role(role, "loki") {
-            Ok(pair) => (Some(pair.0), pair.1),
-            Err(error) => {
-                council_setup_error = Some(format!("prepare Loki: {error:#}"));
-                (None, None)
-            }
-        },
-        None => (None, None),
-    };
+    let (isolated_loki, loki_codex_home) =
+        match council.as_ref().and_then(|resolved| resolved.loki.clone()) {
+            Some(role) => match crate::isolated_council_role(role, "loki") {
+                Ok(pair) => (Some(pair.0), pair.1),
+                Err(error) => {
+                    council_setup_error = Some(format!("prepare Loki: {error:#}"));
+                    (None, None)
+                }
+            },
+            None => (None, None),
+        };
     let (isolated_eitri, eitri_codex_home) =
         match council.as_ref().and_then(|resolved| resolved.eitri.clone()) {
             Some(role) => match crate::isolated_council_role(role, "eitri") {
@@ -2089,19 +2085,14 @@ fn start_server_agent_session(
             },
             None => (None, None),
         };
-    let loki_handle = if app_config.loki.streaming_review {
-        isolated_loki.map(|role| {
-            loki::Handle::start(
-                role,
-                cwd.clone(),
-                additional_directories.clone(),
-                runtime_event_tx.clone(),
-                true,
-            )
-        })
-    } else {
-        None
-    };
+    let loki_handle = isolated_loki.map(|role| {
+        loki::Handle::start(
+            role,
+            cwd.clone(),
+            additional_directories.clone(),
+            runtime_event_tx.clone(),
+        )
+    });
     let role_config = council.as_ref().map(|resolved| acp::RuntimeRoleConfig {
         label: "Thor".to_string(),
         model_value: resolved.thor.model_value.clone(),

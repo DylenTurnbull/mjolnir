@@ -86,7 +86,7 @@ fn builtin_models_command() -> AvailableCommand {
 fn builtin_reviews_command() -> AvailableCommand {
     AvailableCommand::new(
         BUILTIN_REVIEWS_COMMAND,
-        "show or change Council reviews (usage: /reviews [thor|loki on|off])",
+        "show or change Thor review (usage: /reviews [thor on|off])",
     )
 }
 
@@ -736,7 +736,6 @@ pub struct AppState {
     pub council_models: crate::config::ModelsConfig,
     pub active_council_models: crate::config::ModelsConfig,
     pub thor_review_enabled: bool,
-    pub loki_review_enabled: bool,
     pub ragnarok_models: Vec<crate::council::ResolvedRole>,
     /// Holds the platform clipboard lease so copied text remains available
     /// on Linux/X11 where the owning process must stay alive.
@@ -1031,7 +1030,6 @@ impl AppState {
             council_models: crate::config::ModelsConfig::default(),
             active_council_models: crate::config::ModelsConfig::default(),
             thor_review_enabled: true,
-            loki_review_enabled: true,
             ragnarok_models: Vec::new(),
             clipboard_lease: None,
             queued_prompts: VecDeque::new(),
@@ -1158,40 +1156,27 @@ impl AppState {
 
     pub fn review_summary(&self) -> String {
         format!(
-            "Council reviews · Thor discrete {} · Loki streaming {}",
-            on_off(self.thor_review_enabled),
-            on_off(self.loki_review_enabled)
+            "Council reviews · Thor discrete {}",
+            on_off(self.thor_review_enabled)
         )
     }
 
-    pub fn set_review_policy(
-        &mut self,
-        role: &str,
-        enabled: bool,
-    ) -> Result<crate::event::ReviewRole, String> {
+    pub fn set_review_policy(&mut self, role: &str, enabled: bool) -> Result<(), String> {
         let path = self
             .config_path
             .as_deref()
             .ok_or_else(|| "config path is unavailable".to_string())?;
         let mut config =
             crate::config::Config::load(path).map_err(|error| format!("load config: {error:#}"))?;
-        let review_role = match role.to_ascii_lowercase().as_str() {
-            "thor" => {
-                config.thor.discrete_review = enabled;
-                self.thor_review_enabled = enabled;
-                crate::event::ReviewRole::Thor
-            }
-            "loki" => {
-                config.loki.streaming_review = enabled;
-                self.loki_review_enabled = enabled;
-                crate::event::ReviewRole::Loki
-            }
-            _ => return Err("review role must be thor or loki".to_string()),
-        };
+        if !role.eq_ignore_ascii_case("thor") {
+            return Err("review role must be thor".to_string());
+        }
+        config.thor.discrete_review = enabled;
+        self.thor_review_enabled = enabled;
         config
             .save(path)
             .map_err(|error| format!("save config: {error:#}"))?;
-        Ok(review_role)
+        Ok(())
     }
 
     /// Stage a prompt to fire when the current turn completes.

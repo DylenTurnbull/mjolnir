@@ -235,8 +235,8 @@ pub enum UiCommand {
         target: SessionConfigTarget,
         value: SessionConfigValueId,
     },
-    /// Change Council review policy without replacing Thor's ACP session.
-    SetReviewPolicy { role: ReviewRole, enabled: bool },
+    /// Change Thor's discrete review policy without replacing its ACP session.
+    SetThorReviewPolicy { enabled: bool },
     /// Fork the current ACP session and continue in the forked session.
     ForkSession,
     /// Load another session on the existing ACP connection when supported.
@@ -250,12 +250,6 @@ pub enum UiCommand {
     CancelPrompt,
     /// Tear down: kill the agent child and exit.
     Shutdown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewRole {
-    Thor,
-    Loki,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

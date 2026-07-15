@@ -7,7 +7,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -567,7 +567,6 @@ pub struct Handle {
     epochs: Arc<AtomicU64>,
     abort: watch::Sender<bool>,
     finished: watch::Receiver<bool>,
-    streaming_enabled: Arc<AtomicBool>,
 }
 
 impl Handle {
@@ -576,7 +575,6 @@ impl Handle {
         cwd: PathBuf,
         additional_directories: Vec<PathBuf>,
         ui_tx: mpsc::UnboundedSender<UiEvent>,
-        streaming_enabled: bool,
     ) -> Self {
         let (requests, rx) = mpsc::unbounded_channel();
         let (decisions, _) = broadcast::channel(512);
@@ -589,7 +587,6 @@ impl Handle {
             epochs: Arc::new(AtomicU64::new(1)),
             abort,
             finished,
-            streaming_enabled: Arc::new(AtomicBool::new(streaming_enabled)),
         };
         tokio::spawn(worker(
             role,
@@ -632,14 +629,7 @@ impl Handle {
     }
 
     pub async fn observe(&self, epoch: u64, target: Target, delta: String) -> Option<u64> {
-        if !self.streaming_enabled.load(Ordering::Acquire) {
-            return None;
-        }
         Some(self.submit(epoch, target, delta))
-    }
-
-    pub fn set_streaming_enabled(&self, enabled: bool) {
-        self.streaming_enabled.store(enabled, Ordering::Release);
     }
 
     fn submit(&self, epoch: u64, target: Target, delta: String) -> u64 {
@@ -1004,7 +994,6 @@ mod tests {
                 epochs: Arc::new(AtomicU64::new(epoch.saturating_add(1))),
                 abort,
                 finished,
-                streaming_enabled: Arc::new(AtomicBool::new(true)),
             },
             request_rx,
         )

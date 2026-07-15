@@ -486,7 +486,6 @@ pub struct UiRunOptions<'a> {
     pub council_models: crate::config::ModelsConfig,
     pub active_council_models: crate::config::ModelsConfig,
     pub thor_review_enabled: bool,
-    pub loki_review_enabled: bool,
     pub ragnarok_models: Vec<crate::council::ResolvedRole>,
     pub primary_acp_name: String,
 }
@@ -516,7 +515,6 @@ struct UiInitialState {
     council_models: crate::config::ModelsConfig,
     active_council_models: crate::config::ModelsConfig,
     thor_review_enabled: bool,
-    loki_review_enabled: bool,
     ragnarok_models: Vec<crate::council::ResolvedRole>,
     primary_acp_name: String,
 }
@@ -578,7 +576,6 @@ pub async fn run(
             council_models: options.council_models,
             active_council_models: options.active_council_models,
             thor_review_enabled: options.thor_review_enabled,
-            loki_review_enabled: options.loki_review_enabled,
             ragnarok_models: options.ragnarok_models,
             primary_acp_name: options.primary_acp_name,
         },
@@ -771,7 +768,6 @@ async fn ui_loop(
     state.council_models = initial.council_models;
     state.active_council_models = initial.active_council_models;
     state.thor_review_enabled = initial.thor_review_enabled;
-    state.loki_review_enabled = initial.loki_review_enabled;
     state.ragnarok_models = initial.ragnarok_models;
     state.set_primary_acp_name(initial.primary_acp_name);
     state.transcript_export_dir = initial.transcript_export_dir;
@@ -3367,15 +3363,14 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
             [role, value] if matches!(*value, "on" | "off") => {
                 let enabled = *value == "on";
                 match state.set_review_policy(role, enabled) {
-                    Ok(role) => {
-                        let _ = cmd_tx.send(UiCommand::SetReviewPolicy { role, enabled });
+                    Ok(()) => {
+                        let _ = cmd_tx.send(UiCommand::SetThorReviewPolicy { enabled });
                         state.record_status_message(StatusKind::Info, state.review_summary());
                     }
                     Err(message) => state.record_status_message(StatusKind::Warning, message),
                 }
             }
-            _ => state
-                .record_status_message(StatusKind::Warning, "usage: /reviews [thor|loki on|off]"),
+            _ => state.record_status_message(StatusKind::Warning, "usage: /reviews [thor on|off]"),
         }
         return;
     }
@@ -3535,23 +3530,14 @@ fn persist_mjconfig_selection(
     let theme = config.theme;
     let style = config.spinner;
     let thor_changed = state.thor_review_enabled != config.thor.discrete_review;
-    let loki_changed = state.loki_review_enabled != config.loki.streaming_review;
     if let Some(path) = state.config_path.clone() {
         match config.save(&path) {
             Ok(()) => {
                 state.council_models = config.role_models();
                 state.thor_review_enabled = config.thor.discrete_review;
-                state.loki_review_enabled = config.loki.streaming_review;
                 if thor_changed {
-                    let _ = cmd_tx.send(UiCommand::SetReviewPolicy {
-                        role: crate::event::ReviewRole::Thor,
+                    let _ = cmd_tx.send(UiCommand::SetThorReviewPolicy {
                         enabled: config.thor.discrete_review,
-                    });
-                }
-                if loki_changed {
-                    let _ = cmd_tx.send(UiCommand::SetReviewPolicy {
-                        role: crate::event::ReviewRole::Loki,
-                        enabled: config.loki.streaming_review,
                     });
                 }
                 state.record_status_message(
@@ -12250,10 +12236,7 @@ mod tests {
         assert!(!saved.thor.discrete_review);
         assert!(matches!(
             cmd_rx.try_recv(),
-            Ok(UiCommand::SetReviewPolicy {
-                role: crate::event::ReviewRole::Thor,
-                enabled: false
-            })
+            Ok(UiCommand::SetThorReviewPolicy { enabled: false })
         ));
     }
 

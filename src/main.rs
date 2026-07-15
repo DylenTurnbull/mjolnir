@@ -58,9 +58,7 @@ use tokio::sync::mpsc;
 
 use crate::app::UiExitReason;
 use crate::config::{Config, SelectedAgent, history_path, transcript_export_dir};
-use crate::event::{
-    InternalMessage, InternalMessageKind, LoadSessionResult, ReviewRole, UiCommand, UiEvent,
-};
+use crate::event::{InternalMessage, InternalMessageKind, LoadSessionResult, UiCommand, UiEvent};
 use crate::session::SessionEntryJson;
 use crate::ui::{HeaderLabels, UiMode};
 use crate::worktree::CreatedWorktree;
@@ -79,6 +77,18 @@ struct Cli {
     /// `~/.config/mj/config.toml`; it does not open the interactive picker.
     #[arg(short = 'p', long = "print", value_name = "PROMPT", num_args = 0..=1, default_missing_value = "-")]
     print: Option<String>,
+
+    /// Override Thor's model for this non-interactive invocation.
+    #[arg(long, value_name = "MODEL", requires = "print", value_parser = parse_thor_override)]
+    thor: Option<String>,
+
+    /// Override Loki's model, or disable Loki, for this non-interactive invocation.
+    #[arg(long, value_name = "MODEL|disabled|none", requires = "print", value_parser = parse_optional_role_override)]
+    loki: Option<String>,
+
+    /// Override Eitri's model, or disable Eitri, for this non-interactive invocation.
+    #[arg(long, value_name = "MODEL|disabled|none", requires = "print", value_parser = parse_optional_role_override)]
+    eitri: Option<String>,
 
     /// Output format for `--print`.
     #[arg(long, value_enum, default_value_t = HeadlessOutputFormat::Text)]
@@ -177,6 +187,24 @@ fn parse_fs_max_text_bytes(value: &str) -> std::result::Result<u64, String> {
         ));
     }
     Ok(bytes)
+}
+
+fn parse_thor_override(value: &str) -> std::result::Result<String, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" => Err("--thor requires an explicit model, not 'auto'".to_string()),
+        "disabled" | "none" => Err("Thor cannot be disabled".to_string()),
+        _ if value.trim().is_empty() => Err("--thor requires a model".to_string()),
+        _ => Ok(value.to_string()),
+    }
+}
+
+fn parse_optional_role_override(value: &str) -> std::result::Result<String, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" => Err("role override requires an explicit model or 'disabled'".to_string()),
+        "disabled" | "none" => Ok(config::DISABLED_MODEL.to_string()),
+        _ if value.trim().is_empty() => Err("role override requires a model".to_string()),
+        _ => Ok(value.to_string()),
+    }
 }
 
 #[derive(Debug, clap::Args, Default)]
@@ -366,6 +394,11 @@ async fn main() -> Result<()> {
             fs_max_text_bytes,
             output_format: cli.output_format.into(),
             permission_mode: cli.permission_mode.into(),
+            role_overrides: config::RoleModelOverrides {
+                thor: cli.thor,
+                loki: cli.loki,
+                eitri: cli.eitri,
+            },
         })
         .await;
     }
@@ -1022,7 +1055,6 @@ async fn run_app(
             session_boundary,
             council.clone(),
             cfg.thor.clone(),
-            cfg.loki.clone(),
         )
         .await?;
         apply_session_result_to_config(&mut cfg, &session_result);
@@ -1417,7 +1449,6 @@ async fn run_session(
     mut session_boundary: Option<String>,
     council: council::ResolvedCouncil,
     thor_config: config::ThorConfig,
-    loki_config: config::LokiConfig,
 ) -> Result<RunSessionResult> {
     let mut terminal = SessionTerminal::fresh(mode)?;
     let (eitri_role, _eitri_codex_home) = match council.eitri.clone() {
@@ -1464,15 +1495,8 @@ async fn run_session(
             cwd.clone(),
             runtime_options.additional_directories.clone(),
             ui_event_tx.clone(),
-            loki_config.streaming_review,
         )
     });
-    if loki_config.streaming_review && loki_handle.is_none() {
-        let _ = ui_event_tx.send(crate::event::UiEvent::Warning(
-            "Loki review is enabled, but no launchable model from a provider other than Thor's is available"
-                .to_string(),
-        ));
-    }
     let (usage_turn_tx, usage_shutdown_tx, usage_task) = if agent.source_id == "claude-acp" {
         let (tx, mut rx) = mpsc::unbounded_channel::<()>();
         let usage_ui_tx = ui_event_tx.clone();
@@ -1876,20 +1900,8 @@ async fn run_session(
         let mut local_epoch = 0_u64;
         while let Some(command) = ui_cmd_rx.recv().await {
             cmd_tracker.observe_command(&command);
-            if let UiCommand::SetReviewPolicy { role, enabled } = &command {
-                match role {
-                    ReviewRole::Thor => {
-                        cmd_thor_review_enabled.store(*enabled, Ordering::Release);
-                    }
-                    ReviewRole::Loki => {
-                        if let Some(reviewer) = cmd_loki.as_ref() {
-                            reviewer.set_streaming_enabled(*enabled);
-                            if !*enabled {
-                                reviewer.cancel_turn();
-                            }
-                        }
-                    }
-                }
+            if let UiCommand::SetThorReviewPolicy { enabled } = &command {
+                cmd_thor_review_enabled.store(*enabled, Ordering::Release);
                 continue;
             }
             if let UiCommand::SendPrompt { text, .. } = &command {
@@ -1957,7 +1969,6 @@ async fn run_session(
                         .unwrap_or_else(|| "off".to_string()),
                 },
                 thor_review_enabled: thor_config.discrete_review,
-                loki_review_enabled: loki_config.streaming_review,
                 ragnarok_models: council.available.clone(),
                 primary_acp_name: council.thor.launch.kind.display_name().to_string(),
             },
@@ -2659,6 +2670,36 @@ mod tests {
 
         let cli = Cli::try_parse_from(["mj", "--log-file", "legacy.log"]).expect("parse");
         assert_eq!(cli.log_file, Some(PathBuf::from("legacy.log")));
+    }
+
+    #[test]
+    fn parse_accepts_headless_role_overrides_and_normalizes_none() {
+        let cli = Cli::try_parse_from([
+            "mj", "--print", "hello", "--thor", "gpt-test", "--loki", "none", "--eitri", "disabled",
+        ])
+        .expect("parse role overrides");
+
+        assert_eq!(cli.thor.as_deref(), Some("gpt-test"));
+        assert_eq!(cli.loki.as_deref(), Some(config::DISABLED_MODEL));
+        assert_eq!(cli.eitri.as_deref(), Some(config::DISABLED_MODEL));
+    }
+
+    #[test]
+    fn parse_rejects_role_overrides_without_print() {
+        let error = Cli::try_parse_from(["mj", "--thor", "gpt-test"])
+            .expect_err("--thor must require --print");
+        assert!(error.to_string().contains("--print"), "{error}");
+    }
+
+    #[test]
+    fn parse_rejects_auto_and_disabled_thor_overrides() {
+        for value in ["auto", "disabled", "none"] {
+            assert!(
+                Cli::try_parse_from(["mj", "--print", "hello", "--thor", value]).is_err(),
+                "accepted invalid Thor override {value}"
+            );
+        }
+        assert!(Cli::try_parse_from(["mj", "--print", "hello", "--loki", "auto"]).is_err());
     }
 
     #[test]
