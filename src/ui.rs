@@ -8043,7 +8043,7 @@ fn usage_quota_label(state: &AppState) -> Option<String> {
             state
                 .claude_usage
                 .as_ref()
-                .map(crate::claude_usage::ClaudeUsageReport::compact_label)
+                .map(crate::claude_usage::ClaudeUsageStatus::compact_label)
         })
 }
 
@@ -10762,7 +10762,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::app::StatusKind;
-    use crate::claude_usage::ClaudeUsageReport;
+    use crate::claude_usage::{ClaudeUsageReport, ClaudeUsageStatus};
     use crate::event::{
         CodeAgentEvent, CodeAgentOutcome, ElicitationPrompt, InternalMessage, SessionConfigTarget,
         TerminalOutputSnapshot,
@@ -16604,14 +16604,16 @@ mod tests {
     #[test]
     fn usage_quota_row_renders_between_input_and_config_shortcuts() {
         let mut state = AppState::new();
-        state.claude_usage = Some(ClaudeUsageReport {
+        state.claude_usage = Some(ClaudeUsageStatus::Available(ClaudeUsageReport {
             five_hour: Some(crate::claude_usage::ClaudeUsageWindow {
                 remaining_percent: 88,
+                reset_context: None,
             }),
             week: Some(crate::claude_usage::ClaudeUsageWindow {
                 remaining_percent: 63,
+                reset_context: None,
             }),
-        });
+        }));
         state.session_config_options = vec![SessionConfigOption::select(
             "model",
             "Model",
@@ -16635,6 +16637,21 @@ mod tests {
         let lines = buffer_lines(terminal.backend().buffer());
         assert!(lines[0].contains("Claude usage: 5H 88% left · week 63% left"));
         assert!(lines[1].contains("[F1 Model: Model 1]"));
+    }
+
+    #[test]
+    fn usage_quota_row_renders_claude_unavailable_reason() {
+        let mut state = AppState::new();
+        state.claude_usage = Some(ClaudeUsageStatus::Unavailable("not signed in".to_string()));
+
+        let backend = TestBackend::new(100, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_usage_quota_row(frame, frame.area(), &state))
+            .expect("draw");
+
+        let lines = buffer_lines(terminal.backend().buffer());
+        assert!(lines[0].contains("Claude usage unavailable: not signed in"));
     }
 
     #[test]

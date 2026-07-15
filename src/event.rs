@@ -151,7 +151,7 @@ pub enum UiEvent {
     },
     /// Latest Claude Code `/usage` quota scrape. This is UI-only side-channel
     /// data; it never goes through ACP.
-    ClaudeUsage(crate::claude_usage::ClaudeUsageReport),
+    ClaudeUsage(crate::claude_usage::ClaudeUsageStatus),
     /// Latest Codex subscription quota query. This is UI-only side-channel
     /// data; it never goes through ACP.
     CodexUsage(crate::codex_usage::CodexUsageStatus),

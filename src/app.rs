@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::claude_usage::ClaudeUsageReport;
+use crate::claude_usage::ClaudeUsageStatus;
 use crate::clipboard::ClipboardLease;
 use crate::codex_usage::CodexUsageStatus;
 use agent_client_protocol::schema::v1::{
@@ -732,7 +732,7 @@ pub struct AppState {
     /// Kept separate so the header never presents Thor's context as Eitri's.
     code_agent_token_usage: TokenUsage,
     /// Last Claude Code `/usage` quota scrape, when the active agent is Claude.
-    pub claude_usage: Option<ClaudeUsageReport>,
+    pub claude_usage: Option<ClaudeUsageStatus>,
     /// Last Codex app-server quota query, including explicit unavailable states.
     pub codex_usage: Option<CodexUsageStatus>,
     /// Slash-command autocomplete state, recomputed on every input edit.
@@ -4947,23 +4947,35 @@ mod tests {
     }
 
     #[test]
-    fn claude_usage_event_records_latest_report() {
+    fn claude_usage_event_replaces_available_with_unavailable() {
         let mut s = AppState::new();
 
-        s.apply_event(UiEvent::ClaudeUsage(ClaudeUsageReport {
-            five_hour: Some(crate::claude_usage::ClaudeUsageWindow {
-                remaining_percent: 88,
-            }),
-            week: Some(crate::claude_usage::ClaudeUsageWindow {
-                remaining_percent: 63,
-            }),
-        }));
+        s.apply_event(UiEvent::ClaudeUsage(ClaudeUsageStatus::Available(
+            crate::claude_usage::ClaudeUsageReport {
+                five_hour: Some(crate::claude_usage::ClaudeUsageWindow {
+                    remaining_percent: 88,
+                    reset_context: None,
+                }),
+                week: Some(crate::claude_usage::ClaudeUsageWindow {
+                    remaining_percent: 63,
+                    reset_context: None,
+                }),
+            },
+        )));
 
         assert_eq!(
             s.claude_usage
                 .as_ref()
-                .map(ClaudeUsageReport::compact_label),
+                .map(ClaudeUsageStatus::compact_label),
             Some("Claude usage: 5H 88% left · week 63% left".to_string())
+        );
+
+        s.apply_event(UiEvent::ClaudeUsage(ClaudeUsageStatus::Unavailable(
+            "not signed in".to_string(),
+        )));
+        assert_eq!(
+            s.claude_usage,
+            Some(ClaudeUsageStatus::Unavailable("not signed in".to_string()))
         );
     }
 

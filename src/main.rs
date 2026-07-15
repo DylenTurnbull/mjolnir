@@ -1740,11 +1740,20 @@ async fn run_session(
                 if completed_turns.is_multiple_of(2)
                     && let Some(env) = claude_usage_env.as_ref()
                 {
-                    match claude_usage::query(usage_cwd.clone(), env.clone()).await {
-                        Ok(report) => {
-                            let _ = usage_ui_tx.send(crate::event::UiEvent::ClaudeUsage(report));
+                    let status = match claude_usage::query(usage_cwd.clone(), env.clone()).await {
+                        Ok(report) => claude_usage::ClaudeUsageStatus::Available(report),
+                        Err(error) => {
+                            tracing::warn!("claude /usage failed: {error}");
+                            claude_usage::ClaudeUsageStatus::Unavailable(
+                                error.user_reason().to_string(),
+                            )
                         }
-                        Err(error) => tracing::warn!("claude /usage failed: {error}"),
+                    };
+                    if usage_ui_tx
+                        .send(crate::event::UiEvent::ClaudeUsage(status))
+                        .is_err()
+                    {
+                        break;
                     }
                 }
                 if let Some(env) = codex_usage_env.as_ref() {

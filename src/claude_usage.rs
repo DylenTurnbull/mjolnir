@@ -6,12 +6,28 @@
 //! tested against captured command output without spawning `claude`.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::process::Command;
 
 const USAGE_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeUsageStatus {
+    Available(ClaudeUsageReport),
+    Unavailable(String),
+}
+
+impl ClaudeUsageStatus {
+    pub fn compact_label(&self) -> String {
+        match self {
+            Self::Available(report) => report.compact_label(),
+            Self::Unavailable(reason) => format!("Claude usage unavailable: {reason}"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeUsageReport {
@@ -23,10 +39,10 @@ impl ClaudeUsageReport {
     pub fn compact_label(&self) -> String {
         let mut parts = Vec::new();
         if let Some(window) = &self.five_hour {
-            parts.push(format!("5H {}% left", window.remaining_percent));
+            parts.push(window.compact_label("5H"));
         }
         if let Some(window) = &self.week {
-            parts.push(format!("week {}% left", window.remaining_percent));
+            parts.push(window.compact_label("week"));
         }
 
         if parts.is_empty() {
@@ -40,13 +56,71 @@ impl ClaudeUsageReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeUsageWindow {
     pub remaining_percent: u8,
+    /// Text following `reset` in Claude Code output, without the word itself.
+    pub reset_context: Option<String>,
+}
+
+impl ClaudeUsageWindow {
+    fn compact_label(&self, label: &str) -> String {
+        let mut text = format!("{label} {}% left", self.remaining_percent);
+        if let Some(reset_context) = &self.reset_context {
+            text.push_str(" · resets ");
+            text.push_str(reset_context);
+        }
+        text
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeUsageError {
+    TimedOut,
+    NotInstalled,
+    NotSignedIn,
+    Launch(String),
+    Exit { status: String, detail: String },
+    UnsupportedOutput,
+    Parse,
+}
+
+impl ClaudeUsageError {
+    pub fn user_reason(&self) -> &'static str {
+        match self {
+            Self::TimedOut => "request timed out",
+            Self::NotInstalled => "Claude Code not installed",
+            Self::NotSignedIn => "not signed in",
+            Self::Launch(_) => "could not launch Claude Code",
+            Self::Exit { detail, .. } if is_authentication_error(detail) => "not signed in",
+            Self::Exit { .. } => "Claude /usage failed",
+            Self::UnsupportedOutput => "Claude /usage is unsupported",
+            Self::Parse => "unrecognized Claude /usage response",
+        }
+    }
+}
+
+impl fmt::Display for ClaudeUsageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut => write!(f, "claude /usage timed out"),
+            Self::NotInstalled => write!(f, "Claude Code executable not found"),
+            Self::NotSignedIn => write!(f, "Claude Code is not signed in"),
+            Self::Launch(error) => write!(f, "run claude /usage: {error}"),
+            Self::Exit { status, detail } if detail.is_empty() => {
+                write!(f, "claude /usage exited with {status}")
+            }
+            Self::Exit { status, detail } => {
+                write!(f, "claude /usage exited with {status}: {detail}")
+            }
+            Self::UnsupportedOutput => write!(f, "Claude Code does not support /usage"),
+            Self::Parse => write!(f, "could not parse claude /usage output"),
+        }
+    }
 }
 
 /// Run `claude -p "/usage"` and parse the resulting quota summary.
 pub async fn query(
     cwd: PathBuf,
     env: HashMap<String, String>,
-) -> Result<ClaudeUsageReport, String> {
+) -> Result<ClaudeUsageReport, ClaudeUsageError> {
     let mut cmd = Command::new(claude_program());
     cmd.arg("-p")
         .arg("/usage")
@@ -57,19 +131,30 @@ pub async fn query(
 
     let output = tokio::time::timeout(USAGE_TIMEOUT, cmd.output())
         .await
-        .map_err(|_| "claude /usage timed out".to_string())?
-        .map_err(|e| format!("run claude /usage: {e}"))?;
+        .map_err(|_| ClaudeUsageError::TimedOut)?
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ClaudeUsageError::NotInstalled
+            } else {
+                ClaudeUsageError::Launch(error.to_string())
+            }
+        })?;
 
     if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        if is_authentication_error(&combined) {
+            return Err(ClaudeUsageError::NotSignedIn);
+        }
+        let detail = combined
             .split_whitespace()
             .take(24)
             .collect::<Vec<_>>()
             .join(" ");
-        return Err(if detail.is_empty() {
-            format!("claude /usage exited with {}", output.status)
-        } else {
-            format!("claude /usage exited with {}: {detail}", output.status)
+        return Err(ClaudeUsageError::Exit {
+            status: output.status.to_string(),
+            detail,
         });
     }
 
@@ -83,7 +168,7 @@ pub async fn query(
         format!("{stdout}\n{stderr}")
     };
 
-    parse(&combined).ok_or_else(|| "could not parse claude /usage output".to_string())
+    parse(&combined).ok_or_else(|| classify_unparsed_output(&combined))
 }
 
 fn claude_program() -> &'static str {
@@ -131,7 +216,10 @@ fn parse_window(lines: &[String], kind: UsageWindowKind) -> Option<ClaudeUsageWi
         }
 
         let section = section_around(lines, idx, kind);
-        let parsed = parse_window_section(&section);
+        let parsed = parse_window_section(&section).map(|mut window| {
+            window.reset_context = reset_context(lines, idx, kind);
+            window
+        });
         if parsed.is_some() && preferred_window_line(line, kind) {
             return parsed;
         }
@@ -139,6 +227,31 @@ fn parse_window(lines: &[String], kind: UsageWindowKind) -> Option<ClaudeUsageWi
     }
 
     fallback
+}
+
+fn reset_context(lines: &[String], start: usize, kind: UsageWindowKind) -> Option<String> {
+    lines
+        .iter()
+        .skip(start)
+        .take(5)
+        .take_while(|line| !matches_any_window(line) || matches_window(line, kind))
+        .find_map(|line| reset_context_in_line(line))
+}
+
+fn reset_context_in_line(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let reset_start = lower.find("reset")?;
+    let after_reset = line[reset_start + "reset".len()..].trim_start();
+    let after_plural = after_reset.strip_prefix('s').unwrap_or(after_reset);
+    let after_reset = if after_plural.starts_with(char::is_whitespace) {
+        after_plural
+    } else {
+        after_reset
+    };
+    let context = after_reset
+        .trim_start_matches(|ch: char| ch == ':' || ch == '-' || ch.is_whitespace())
+        .trim();
+    (!context.is_empty()).then(|| context.chars().take(96).collect())
 }
 
 fn section_around(lines: &[String], start: usize, kind: UsageWindowKind) -> String {
@@ -226,6 +339,7 @@ fn parse_window_section(section: &str) -> Option<ClaudeUsageWindow> {
         // `used 12% · remaining 88%`.
         return percents.last().map(|percent| ClaudeUsageWindow {
             remaining_percent: percent.value,
+            reset_context: None,
         });
     }
 
@@ -246,6 +360,7 @@ fn parse_window_section(section: &str) -> Option<ClaudeUsageWindow> {
     {
         return Some(ClaudeUsageWindow {
             remaining_percent: value,
+            reset_context: None,
         });
     }
 
@@ -256,6 +371,7 @@ fn parse_window_section(section: &str) -> Option<ClaudeUsageWindow> {
     }) {
         return Some(ClaudeUsageWindow {
             remaining_percent: 100u8.saturating_sub(used),
+            reset_context: None,
         });
     }
 
@@ -266,12 +382,14 @@ fn parse_window_section(section: &str) -> Option<ClaudeUsageWindow> {
     if lower.contains("remaining") || lower.contains("left") || lower.contains("available") {
         return percents.last().map(|percent| ClaudeUsageWindow {
             remaining_percent: percent.value,
+            reset_context: None,
         });
     }
 
     if lower.contains("used") || lower.contains("usage") || lower.contains("utilization") {
         return percents.first().map(|percent| ClaudeUsageWindow {
             remaining_percent: 100u8.saturating_sub(percent.value),
+            reset_context: None,
         });
     }
 
@@ -280,7 +398,34 @@ fn parse_window_section(section: &str) -> Option<ClaudeUsageWindow> {
     // stale/missing row is worse than showing the scraped value.
     (percents.len() == 1).then(|| ClaudeUsageWindow {
         remaining_percent: percents[0].value,
+        reset_context: None,
     })
+}
+
+fn classify_unparsed_output(output: &str) -> ClaudeUsageError {
+    let lower = output.to_ascii_lowercase();
+    if is_authentication_error(&lower) {
+        ClaudeUsageError::NotSignedIn
+    } else if lower.contains("not supported") || lower.contains("unknown command") {
+        ClaudeUsageError::UnsupportedOutput
+    } else {
+        ClaudeUsageError::Parse
+    }
+}
+
+fn is_authentication_error(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    [
+        "not logged in",
+        "not signed in",
+        "unauthenticated",
+        "unauthorized",
+        "authentication",
+        "please log in",
+        "please login",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -402,8 +547,16 @@ mod tests {
         assert_eq!(report.five_hour.as_ref().unwrap().remaining_percent, 88);
         assert_eq!(report.week.as_ref().unwrap().remaining_percent, 63);
         assert_eq!(
+            report.five_hour.as_ref().unwrap().reset_context.as_deref(),
+            Some("at 4:30pm")
+        );
+        assert_eq!(
+            report.week.as_ref().unwrap().reset_context.as_deref(),
+            Some("Monday")
+        );
+        assert_eq!(
             report.compact_label(),
-            "Claude usage: 5H 88% left · week 63% left"
+            "Claude usage: 5H 88% left · resets at 4:30pm · week 63% left · resets Monday"
         );
     }
 
@@ -454,7 +607,7 @@ mod tests {
         assert_eq!(report.week.as_ref().unwrap().remaining_percent, 73);
         assert_eq!(
             report.compact_label(),
-            "Claude usage: 5H 98% left · week 73% left"
+            "Claude usage: 5H 98% left · resets Jul 1 at 12:40pm (Europe/Paris) · week 73% left · resets Jul 2 at 1am (Europe/Paris)"
         );
     }
 
@@ -491,5 +644,70 @@ mod tests {
         let report = parse("\u{1b}[32m5H quota: 75% left\u{1b}[0m").expect("report");
 
         assert_eq!(report.five_hour.unwrap().remaining_percent, 75);
+    }
+
+    #[test]
+    fn status_labels_and_error_reasons_are_concise() {
+        let available = ClaudeUsageStatus::Available(ClaudeUsageReport {
+            five_hour: Some(ClaudeUsageWindow {
+                remaining_percent: 75,
+                reset_context: Some("at 4:30pm".to_string()),
+            }),
+            week: None,
+        });
+        assert_eq!(
+            available.compact_label(),
+            "Claude usage: 5H 75% left · resets at 4:30pm"
+        );
+        assert_eq!(
+            ClaudeUsageStatus::Unavailable("not signed in".to_string()).compact_label(),
+            "Claude usage unavailable: not signed in"
+        );
+        assert_eq!(
+            ClaudeUsageError::TimedOut.user_reason(),
+            "request timed out"
+        );
+        assert_eq!(
+            ClaudeUsageError::NotInstalled.user_reason(),
+            "Claude Code not installed"
+        );
+        assert_eq!(ClaudeUsageError::NotSignedIn.user_reason(), "not signed in");
+        assert_eq!(
+            ClaudeUsageError::Launch("permission denied".to_string()).user_reason(),
+            "could not launch Claude Code"
+        );
+        assert_eq!(
+            ClaudeUsageError::Exit {
+                status: "exit status: 1".to_string(),
+                detail: "authentication required".to_string(),
+            }
+            .user_reason(),
+            "not signed in"
+        );
+        assert_eq!(
+            ClaudeUsageError::Exit {
+                status: "exit status: 1".to_string(),
+                detail: "temporary failure".to_string(),
+            }
+            .user_reason(),
+            "Claude /usage failed"
+        );
+        assert_eq!(
+            ClaudeUsageError::UnsupportedOutput.user_reason(),
+            "Claude /usage is unsupported"
+        );
+        assert_eq!(
+            ClaudeUsageError::Parse.user_reason(),
+            "unrecognized Claude /usage response"
+        );
+        assert_eq!(
+            classify_unparsed_output("unknown command: /usage"),
+            ClaudeUsageError::UnsupportedOutput
+        );
+        assert_eq!(
+            classify_unparsed_output("Please log in to continue"),
+            ClaudeUsageError::NotSignedIn
+        );
+        assert_eq!(classify_unparsed_output("hello"), ClaudeUsageError::Parse);
     }
 }
