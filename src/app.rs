@@ -42,8 +42,11 @@ const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
 const BUILTIN_MODELS_COMMAND: &str = "models";
 const BUILTIN_REVIEWS_COMMAND: &str = "reviews";
+const BUILTIN_ROLES_COMMAND: &str = "roles";
 const BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
+pub const COUNCIL_ROLES_HINT: &str = "Roles · Thor coordinates each turn and the final response; Eitri explores or implements when delegated; Loki independently reviews safe boundaries when needed. (/roles to turn off)";
+pub const COUNCIL_ROLES_EXPLANATION: &str = "Thor coordinates each turn and the final response; Eitri explores or implements when delegated; Loki independently reviews safe boundaries when needed.";
 
 fn builtin_new_command() -> AvailableCommand {
     AvailableCommand::new(BUILTIN_NEW_COMMAND, "start a new session")
@@ -92,6 +95,13 @@ fn builtin_reviews_command() -> AvailableCommand {
     )
 }
 
+fn builtin_roles_command() -> AvailableCommand {
+    AvailableCommand::new(
+        BUILTIN_ROLES_COMMAND,
+        "show roles inline; toggle the hint in fullscreen",
+    )
+}
+
 fn builtin_ragnarok_command() -> AvailableCommand {
     AvailableCommand::new(
         BUILTIN_RAGNAROK_COMMAND,
@@ -109,6 +119,7 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
             && command.name != BUILTIN_MJCONFIG_COMMAND
             && command.name != BUILTIN_MODELS_COMMAND
             && command.name != BUILTIN_REVIEWS_COMMAND
+            && command.name != BUILTIN_ROLES_COMMAND
             && command.name != BUILTIN_RAGNAROK_COMMAND
     });
     if include_fork {
@@ -116,6 +127,7 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
     }
     commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_mjconfig_command());
+    commands.insert(0, builtin_roles_command());
     commands.insert(0, builtin_reviews_command());
     commands.insert(0, builtin_models_command());
     commands.insert(0, builtin_export_command());
@@ -637,6 +649,9 @@ pub struct AppState {
     pub prompt_images_supported: bool,
     pub session_fork_supported: bool,
     pub transcript: Vec<Entry>,
+    /// Whether the UI-local Council roles hint is rendered. This neither
+    /// changes ACP behavior nor persists across UI runs.
+    council_roles_visible: bool,
     pub tool_calls: HashMap<String, ToolCallView>,
     /// Primary-agent MCP calls that transport an Eitri turn. Their protocol
     /// state remains available, but the redundant parent row is omitted from
@@ -741,6 +756,11 @@ pub struct AppState {
     pub autocomplete: Autocomplete,
     /// True while the keyboard help overlay is visible.
     pub help_overlay: bool,
+    /// Wrapped row offset shown by the keyboard help overlay.
+    pub help_scroll: u16,
+    /// True while the inline-only Council roles dialog owns the mutable viewport.
+    /// This UI-local state never changes the fullscreen roles-hint toggle.
+    inline_roles_overlay: bool,
     /// True while mouse capture is disabled so the terminal can select text.
     pub text_selection_mode: bool,
     /// Project shown in the header so users can tell which checkout this
@@ -1006,6 +1026,7 @@ impl AppState {
             prompt_images_supported: false,
             session_fork_supported: false,
             transcript: Vec::new(),
+            council_roles_visible: true,
             tool_calls: HashMap::new(),
             suppressed_tool_calls: HashSet::new(),
             terminal_outputs: HashMap::new(),
@@ -1047,6 +1068,8 @@ impl AppState {
             codex_usage: None,
             autocomplete: Autocomplete::default(),
             help_overlay: false,
+            help_scroll: 0,
+            inline_roles_overlay: false,
             text_selection_mode: false,
             project_label: String::new(),
             worktree_label: None,
@@ -1545,6 +1568,28 @@ impl AppState {
 
     fn bump_transcript_revision(&mut self) {
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
+    }
+
+    pub fn council_roles_visible(&self) -> bool {
+        self.council_roles_visible
+    }
+
+    pub fn toggle_council_roles_visible(&mut self) -> bool {
+        self.council_roles_visible = !self.council_roles_visible;
+        self.bump_transcript_revision();
+        self.council_roles_visible
+    }
+
+    pub fn inline_roles_overlay_visible(&self) -> bool {
+        self.inline_roles_overlay
+    }
+
+    pub fn open_inline_roles_overlay(&mut self) {
+        self.inline_roles_overlay = true;
+    }
+
+    pub fn close_inline_roles_overlay(&mut self) {
+        self.inline_roles_overlay = false;
     }
 
     fn apply_known_terminal_outputs(&mut self) {
@@ -5696,7 +5741,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "load", "export", "models", "reviews", "mjconfig", "ragnarok"
+                "new", "clear", "load", "export", "models", "reviews", "roles", "mjconfig",
+                "ragnarok"
             ]
         );
     }
@@ -5723,8 +5769,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "load", "export", "models", "reviews", "mjconfig", "ragnarok",
-                "fork"
+                "new", "clear", "load", "export", "models", "reviews", "roles", "mjconfig",
+                "ragnarok", "fork"
             ]
         );
     }
@@ -5762,6 +5808,7 @@ mod tests {
                 "export",
                 "models",
                 "reviews",
+                "roles",
                 "mjconfig",
                 "ragnarok",
                 "fork",
@@ -5786,7 +5833,7 @@ mod tests {
             "show or select Thor/Loki/Eitri models (usage: /models [role model|auto])"
         );
         assert_eq!(
-            s.available_commands[8].description,
+            s.available_commands[9].description,
             "fork the current session (unstable ACP extension)"
         );
     }
@@ -5815,6 +5862,7 @@ mod tests {
                 "export",
                 "models",
                 "reviews",
+                "roles",
                 "mjconfig",
                 "ragnarok",
                 "review_pr"

@@ -41,11 +41,12 @@ use tokio::time::MissedTickBehavior;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    AppState, ArenaPane, ConfigValueChoice, ConnectionState, ElicitationView, Entry,
-    MjConfigSection, PastedAttachment, PastedImageAttachment, PendingElicitation,
-    PendingPermission, QUEUED_PROMPT_PREVIEW_WIDTH, QueuedPrompt, RagnarokDraftPrStatus,
-    RagnarokFighterUi, RagnarokUi, StatusKind, StatusMessage, ToolCallOutput, UiExitReason,
-    classify_elicitation, config_option_choices, config_option_current_value_label,
+    AppState, ArenaPane, COUNCIL_ROLES_EXPLANATION, COUNCIL_ROLES_HINT, ConfigValueChoice,
+    ConnectionState, ElicitationView, Entry, MjConfigSection, PastedAttachment,
+    PastedImageAttachment, PendingElicitation, PendingPermission, QUEUED_PROMPT_PREVIEW_WIDTH,
+    QueuedPrompt, RagnarokDraftPrStatus, RagnarokFighterUi, RagnarokUi, StatusKind, StatusMessage,
+    ToolCallOutput, UiExitReason, classify_elicitation, config_option_choices,
+    config_option_current_value_label,
 };
 use crate::clipboard::{
     ClipboardImage, copy_to_clipboard, load_image_path_as_png, read_clipboard_image_as_png,
@@ -73,6 +74,7 @@ pub const INLINE_CHAT_HEIGHT: u16 = 8;
 const INLINE_EXPANDED_MAX_HEIGHT: u16 = 20;
 const INLINE_TRANSCRIPT_TAIL_MAX_ROWS: usize = 12;
 const INLINE_HELP_HEIGHT: u16 = 18;
+const HELP_SCROLL_PAGE_STEP: u16 = 10;
 /// Inline viewport height for the `/mjconfig` overlay (border + two sections).
 const INLINE_MJCONFIG_HEIGHT: u16 = 24;
 const QUEUED_PROMPT_VISIBLE_ROWS: usize = 3;
@@ -1339,6 +1341,7 @@ fn inline_repair_interval(state: &AppState) -> Duration {
 fn inline_repair_heartbeat_active(state: &AppState) -> bool {
     state.voice_input_active
         || state.help_overlay
+        || state.inline_roles_overlay_visible()
         || state.has_pending_permission()
         || state.has_pending_elicitation()
         || state.agent_picker.is_some()
@@ -1754,6 +1757,8 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
         .lines
         .len()
             + 1
+    } else if state.inline_roles_overlay_visible() {
+        inline_roles_view_lines(width, state.theme).len() + 1
     } else if state.config_picker.is_some() {
         inline_config_view_line_count(state, width)
     } else {
@@ -1793,6 +1798,7 @@ fn handle_crossterm(
             // the input buffer isn't focused and pasted text would land
             // invisibly in the background.
             if state.help_overlay
+                || state.inline_roles_overlay_visible()
                 || state.has_pending_permission()
                 || state.has_pending_elicitation()
                 || state.agent_picker.is_some()
@@ -1840,6 +1846,21 @@ fn handle_crossterm(
             state.help_overlay = false;
             return inline_repair_request(mode);
         }
+        scroll_help_overlay(state, key.code);
+        return TerminalRequest::None;
+    }
+
+    // The inline Roles dialog owns input while visible, but safety prompts
+    // suspend it and remain authoritative until resolved.
+    if mode == UiMode::InlineChat
+        && state.inline_roles_overlay_visible()
+        && !state.has_pending_permission()
+        && !state.has_pending_elicitation()
+    {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+            state.close_inline_roles_overlay();
+            return TerminalRequest::ForceInlineRepair;
+        }
         return TerminalRequest::None;
     }
 
@@ -1855,7 +1876,7 @@ fn handle_crossterm(
     }
 
     if should_open_help(key.modifiers, key.code) {
-        state.help_overlay = true;
+        open_help_overlay(state);
         return TerminalRequest::None;
     }
 
@@ -1878,7 +1899,7 @@ fn handle_crossterm(
                 return TerminalRequest::None;
             }
             (_, code) if should_open_help(key.modifiers, code) => {
-                state.help_overlay = true;
+                open_help_overlay(state);
                 return TerminalRequest::None;
             }
             (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
@@ -1977,6 +1998,30 @@ fn handle_crossterm(
 
     if !is_plain_character_input(key.modifiers, key.code) {
         flush_input_paste_burst_if_due(state, Instant::now(), true);
+    }
+
+    // `/roles` is a UI-local command, so handle its Enter gesture before
+    // autocomplete or the general submission path can consult ACP-owned state.
+    // Autocomplete appends a space; ignore trailing whitespace only so the
+    // completed command remains local without accepting arguments or attachments.
+    // Fullscreen keeps the durable local hint toggle; inline opens a temporary
+    // mutable-viewport dialog without changing or invalidating the transcript.
+    if key.modifiers == KeyModifiers::NONE
+        && key.code == KeyCode::Enter
+        && state.input.trim_end() == "/roles"
+        && attachment_count(state) == 0
+    {
+        state.input.clear();
+        state.input_cursor = 0;
+        state.reset_history_navigation();
+        state.scroll_input_to_bottom();
+        state.autocomplete_dismiss();
+        if mode == UiMode::FullscreenTui {
+            state.toggle_council_roles_visible();
+        } else {
+            state.open_inline_roles_overlay();
+        }
+        return inline_repair_request(mode);
     }
 
     // Slash-command autocomplete owns Tab and Up/Down while it's
@@ -3218,6 +3263,31 @@ fn handle_transcript_viewer_key(
 
 fn is_help_key(modifiers: KeyModifiers, code: KeyCode) -> bool {
     modifiers.is_empty() && matches!(code, KeyCode::F(10))
+}
+
+fn open_help_overlay(state: &mut AppState) {
+    state.help_overlay = true;
+    state.help_scroll = 0;
+}
+
+fn scroll_help_overlay(state: &mut AppState, code: KeyCode) {
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.help_scroll = state.help_scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.help_scroll = state.help_scroll.saturating_add(1);
+        }
+        KeyCode::PageUp => {
+            state.help_scroll = state.help_scroll.saturating_sub(HELP_SCROLL_PAGE_STEP);
+        }
+        KeyCode::PageDown => {
+            state.help_scroll = state.help_scroll.saturating_add(HELP_SCROLL_PAGE_STEP);
+        }
+        KeyCode::Home => state.help_scroll = 0,
+        KeyCode::End => state.help_scroll = u16::MAX,
+        _ => {}
+    }
 }
 
 fn is_text_selection_key(modifiers: KeyModifiers, code: KeyCode) -> bool {
@@ -4687,7 +4757,7 @@ fn draw(
     }
 
     if state.help_overlay {
-        draw_help_modal(f, f.area(), mode, state.theme);
+        draw_help_modal(f, f.area(), mode, state.theme, &mut state.help_scroll);
     }
 
     if state.mjconfig_menu.is_some() {
@@ -4811,6 +4881,11 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
         return;
     }
 
+    if state.inline_roles_overlay_visible() {
+        draw_inline_roles_view(f, f.area(), state.theme);
+        return;
+    }
+
     let has_config_options = !state.selectable_config_options().is_empty();
     let has_usage_quota = usage_quota_label(state).is_some();
     let queued_row = queued_prompt_row_count(state);
@@ -4843,8 +4918,53 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
     }
 
     if state.help_overlay {
-        draw_help_modal(f, f.area(), UiMode::InlineChat, state.theme);
+        draw_help_modal(
+            f,
+            f.area(),
+            UiMode::InlineChat,
+            state.theme,
+            &mut state.help_scroll,
+        );
     }
+}
+
+fn inline_roles_view_lines(width: u16, theme: TerminalTheme) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Council roles",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    lines.extend(
+        wrap_text_to_width(COUNCIL_ROLES_EXPLANATION, width)
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(theme.text)))),
+    );
+    lines
+}
+
+fn draw_inline_roles_view(f: &mut ratatui::Frame, area: Rect, theme: TerminalTheme) {
+    f.render_widget(Clear, area);
+    let content = inline_content_rect(area);
+    if content.width == 0 || content.height < 4 {
+        return;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(content);
+    f.render_widget(
+        Paragraph::new(inline_roles_view_lines(content.width, theme)),
+        layout[0],
+    );
+    f.render_widget(
+        Paragraph::new("Esc/Enter close").style(Style::default().fg(theme.muted)),
+        layout[1],
+    );
 }
 
 fn inline_content_rect(area: Rect) -> Rect {
@@ -5624,8 +5744,22 @@ fn render_transcript_entry_range(
                 }
             }
         }
+        if state.council_roles_visible() && is_council_startup_header(entry) {
+            if out.last().is_some_and(|line| line.spans.is_empty()) {
+                out.pop();
+            }
+            out.push(Line::from(Span::styled(
+                COUNCIL_ROLES_HINT,
+                Style::default().fg(theme.accent),
+            )));
+            out.push(Line::from(""));
+        }
     }
     out
+}
+
+fn is_council_startup_header(entry: &Entry) -> bool {
+    matches!(entry, Entry::System(text) | Entry::EphemeralSystem(text) if text.starts_with("Council · Thor "))
 }
 
 fn tool_entry_is_successful(state: &AppState, entry: &Entry) -> bool {
@@ -8596,10 +8730,16 @@ fn pad_text_to_width(mut line: String, width: u16) -> String {
     line
 }
 
-fn draw_help_modal(f: &mut ratatui::Frame, area: Rect, mode: UiMode, theme: TerminalTheme) {
-    let width = area.width.saturating_sub(8).min(82);
+fn draw_help_modal(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    mode: UiMode,
+    theme: TerminalTheme,
+    help_scroll: &mut u16,
+) {
+    let width = area.width.saturating_sub(2).min(82);
     let height = 23.min(area.height.saturating_sub(4));
-    if width < 40 || height < 10 {
+    if width < 24 || height < 6 {
         return;
     }
     let x = (area.width.saturating_sub(width)) / 2;
@@ -8610,6 +8750,7 @@ fn draw_help_modal(f: &mut ratatui::Frame, area: Rect, mode: UiMode, theme: Term
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" help ")
+        .title_bottom(" Up/Down PgUp/PgDn scroll · F10/Esc close ")
         .style(Style::default().fg(theme.success));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -8619,6 +8760,12 @@ fn draw_help_modal(f: &mut ratatui::Frame, area: Rect, mode: UiMode, theme: Term
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(theme.text))
         .wrap(Wrap { trim: false });
+    let max_scroll = paragraph
+        .line_count(inner.width)
+        .saturating_sub(usize::from(inner.height))
+        .min(u16::MAX as usize) as u16;
+    *help_scroll = (*help_scroll).min(max_scroll);
+    let paragraph = paragraph.scroll((*help_scroll, 0));
     f.render_widget(paragraph, inner);
 }
 
@@ -8627,7 +8774,29 @@ fn help_modal_lines(
     voice_input_supported: bool,
     theme: TerminalTheme,
 ) -> Vec<Line<'static>> {
-    let mut lines = general_help_lines(voice_input_supported, theme);
+    let mut lines = vec![
+        help_section_line("Council roles", theme),
+        help_binding_line_with_color(
+            "Thor",
+            "coordinates each turn and the final response",
+            theme.primary,
+            theme,
+        ),
+        help_binding_line_with_color(
+            "Eitri",
+            "explores or implements when delegated",
+            theme.code,
+            theme,
+        ),
+        help_binding_line_with_color(
+            "Loki",
+            "independently reviews safe boundaries when needed",
+            theme.secondary,
+            theme,
+        ),
+        help_blank_line(),
+    ];
+    lines.extend(general_help_lines(voice_input_supported, theme));
     if mode == UiMode::FullscreenTui {
         lines.extend([
             help_binding_line(
@@ -8760,6 +8929,15 @@ fn help_binding_line(
     description: &'static str,
     theme: TerminalTheme,
 ) -> Line<'static> {
+    help_binding_line_with_color(binding, description, theme.accent, theme)
+}
+
+fn help_binding_line_with_color(
+    binding: &'static str,
+    description: &'static str,
+    binding_color: Color,
+    theme: TerminalTheme,
+) -> Line<'static> {
     const HELP_BINDING_WIDTH: usize = 27;
     let binding_width = binding.width();
     let gap = HELP_BINDING_WIDTH.saturating_sub(binding_width).max(1);
@@ -8768,7 +8946,7 @@ fn help_binding_line(
         Span::styled(
             binding,
             Style::default()
-                .fg(theme.accent)
+                .fg(binding_color)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ".repeat(gap), Style::default().fg(theme.muted)),
