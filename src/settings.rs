@@ -1187,7 +1187,9 @@ mod tests {
 
     #[test]
     fn tabs_share_one_editable_config() {
-        let mut editor = SettingsEditor::new(Config::default(), Vec::new(), None);
+        let mut config = Config::default();
+        config.set_acp_server_policy("codex-acp", AcpServerPolicy::Enabled);
+        let mut editor = SettingsEditor::new(config, Vec::new(), None);
         editor.selected = 3;
         assert_eq!(
             editor.handle_key(KeyCode::Char(' ')),

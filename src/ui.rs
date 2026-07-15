@@ -12351,6 +12351,9 @@ mod tests {
     fn mjconfig_menu_previews_live_and_persists_on_accept() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
+        let mut config = config::Config::default();
+        config.set_acp_server_policy("codex-acp", config::AcpServerPolicy::Enabled);
+        config.save(&path).expect("save initial config");
         let mut state = AppState::new();
         state.config_path = Some(path.clone());
         state.open_mjconfig_menu();

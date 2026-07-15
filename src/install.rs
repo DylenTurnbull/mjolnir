@@ -194,14 +194,13 @@ fn extract(bytes: &[u8], archive: &str, command: &str, destination: &Path) -> Re
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn installed_command_cannot_escape_root() {
         let root = tempfile::tempdir().expect("root");
         let outside = tempfile::NamedTempFile::new().expect("outside");
         let command = root.path().join("escape");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), &command).expect("symlink");
-        #[cfg(unix)]
         assert!(resolve_command(root.path(), "escape").is_err());
     }
 
