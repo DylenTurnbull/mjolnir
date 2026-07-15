@@ -74,6 +74,7 @@ pub const INLINE_CHAT_HEIGHT: u16 = 8;
 const INLINE_EXPANDED_MAX_HEIGHT: u16 = 20;
 const INLINE_TRANSCRIPT_TAIL_MAX_ROWS: usize = 12;
 const INLINE_HELP_HEIGHT: u16 = 18;
+const HELP_SCROLL_PAGE_STEP: u16 = 10;
 /// Inline viewport height for the `/mjconfig` overlay (border + two sections).
 const INLINE_MJCONFIG_HEIGHT: u16 = 24;
 const QUEUED_PROMPT_VISIBLE_ROWS: usize = 3;
@@ -1837,6 +1838,7 @@ fn handle_crossterm(
             state.help_overlay = false;
             return inline_repair_request(mode);
         }
+        scroll_help_overlay(state, key.code);
         return TerminalRequest::None;
     }
 
@@ -1852,7 +1854,7 @@ fn handle_crossterm(
     }
 
     if should_open_help(key.modifiers, key.code) {
-        state.help_overlay = true;
+        open_help_overlay(state);
         return TerminalRequest::None;
     }
 
@@ -1875,7 +1877,7 @@ fn handle_crossterm(
                 return TerminalRequest::None;
             }
             (_, code) if should_open_help(key.modifiers, code) => {
-                state.help_overlay = true;
+                open_help_overlay(state);
                 return TerminalRequest::None;
             }
             (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
@@ -3217,6 +3219,31 @@ fn is_help_key(modifiers: KeyModifiers, code: KeyCode) -> bool {
     modifiers.is_empty() && matches!(code, KeyCode::F(10))
 }
 
+fn open_help_overlay(state: &mut AppState) {
+    state.help_overlay = true;
+    state.help_scroll = 0;
+}
+
+fn scroll_help_overlay(state: &mut AppState, code: KeyCode) {
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.help_scroll = state.help_scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.help_scroll = state.help_scroll.saturating_add(1);
+        }
+        KeyCode::PageUp => {
+            state.help_scroll = state.help_scroll.saturating_sub(HELP_SCROLL_PAGE_STEP);
+        }
+        KeyCode::PageDown => {
+            state.help_scroll = state.help_scroll.saturating_add(HELP_SCROLL_PAGE_STEP);
+        }
+        KeyCode::Home => state.help_scroll = 0,
+        KeyCode::End => state.help_scroll = u16::MAX,
+        _ => {}
+    }
+}
+
 fn is_text_selection_key(modifiers: KeyModifiers, code: KeyCode) -> bool {
     modifiers.is_empty() && matches!(code, KeyCode::F(12))
 }
@@ -4520,7 +4547,7 @@ fn draw(
     }
 
     if state.help_overlay {
-        draw_help_modal(f, f.area(), mode, state.theme);
+        draw_help_modal(f, f.area(), mode, state.theme, &mut state.help_scroll);
     }
 
     if state.mjconfig_menu.is_some() {
@@ -4676,7 +4703,13 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
     }
 
     if state.help_overlay {
-        draw_help_modal(f, f.area(), UiMode::InlineChat, state.theme);
+        draw_help_modal(
+            f,
+            f.area(),
+            UiMode::InlineChat,
+            state.theme,
+            &mut state.help_scroll,
+        );
     }
 }
 
@@ -8429,10 +8462,16 @@ fn pad_text_to_width(mut line: String, width: u16) -> String {
     line
 }
 
-fn draw_help_modal(f: &mut ratatui::Frame, area: Rect, mode: UiMode, theme: TerminalTheme) {
-    let width = area.width.saturating_sub(8).min(82);
+fn draw_help_modal(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    mode: UiMode,
+    theme: TerminalTheme,
+    help_scroll: &mut u16,
+) {
+    let width = area.width.saturating_sub(2).min(82);
     let height = 23.min(area.height.saturating_sub(4));
-    if width < 40 || height < 10 {
+    if width < 24 || height < 6 {
         return;
     }
     let x = (area.width.saturating_sub(width)) / 2;
@@ -8443,6 +8482,7 @@ fn draw_help_modal(f: &mut ratatui::Frame, area: Rect, mode: UiMode, theme: Term
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" help ")
+        .title_bottom(" Up/Down PgUp/PgDn scroll · F10/Esc close ")
         .style(Style::default().fg(theme.success));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -8452,6 +8492,12 @@ fn draw_help_modal(f: &mut ratatui::Frame, area: Rect, mode: UiMode, theme: Term
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(theme.text))
         .wrap(Wrap { trim: false });
+    let max_scroll = paragraph
+        .line_count(inner.width)
+        .saturating_sub(usize::from(inner.height))
+        .min(u16::MAX as usize) as u16;
+    *help_scroll = (*help_scroll).min(max_scroll);
+    let paragraph = paragraph.scroll((*help_scroll, 0));
     f.render_widget(paragraph, inner);
 }
 
@@ -8460,7 +8506,29 @@ fn help_modal_lines(
     voice_input_supported: bool,
     theme: TerminalTheme,
 ) -> Vec<Line<'static>> {
-    let mut lines = general_help_lines(voice_input_supported, theme);
+    let mut lines = vec![
+        help_section_line("Council roles", theme),
+        help_binding_line_with_color(
+            "Thor",
+            "coordinates each turn and the final response",
+            theme.primary,
+            theme,
+        ),
+        help_binding_line_with_color(
+            "Eitri",
+            "explores or implements when delegated",
+            theme.code,
+            theme,
+        ),
+        help_binding_line_with_color(
+            "Loki",
+            "independently reviews safe boundaries when needed",
+            theme.secondary,
+            theme,
+        ),
+        help_blank_line(),
+    ];
+    lines.extend(general_help_lines(voice_input_supported, theme));
     if mode == UiMode::FullscreenTui {
         lines.extend([
             help_binding_line(
@@ -8593,6 +8661,15 @@ fn help_binding_line(
     description: &'static str,
     theme: TerminalTheme,
 ) -> Line<'static> {
+    help_binding_line_with_color(binding, description, theme.accent, theme)
+}
+
+fn help_binding_line_with_color(
+    binding: &'static str,
+    description: &'static str,
+    binding_color: Color,
+    theme: TerminalTheme,
+) -> Line<'static> {
     const HELP_BINDING_WIDTH: usize = 27;
     let binding_width = binding.width();
     let gap = HELP_BINDING_WIDTH.saturating_sub(binding_width).max(1);
@@ -8601,7 +8678,7 @@ fn help_binding_line(
         Span::styled(
             binding,
             Style::default()
-                .fg(theme.accent)
+                .fg(binding_color)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ".repeat(gap), Style::default().fg(theme.muted)),

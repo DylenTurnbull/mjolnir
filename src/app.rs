@@ -715,6 +715,8 @@ pub struct AppState {
     pub autocomplete: Autocomplete,
     /// True while the keyboard help overlay is visible.
     pub help_overlay: bool,
+    /// Wrapped row offset shown by the keyboard help overlay.
+    pub help_scroll: u16,
     /// True while mouse capture is disabled so the terminal can select text.
     pub text_selection_mode: bool,
     /// Project shown in the header so users can tell which checkout this
@@ -1020,6 +1022,7 @@ impl AppState {
             codex_usage: None,
             autocomplete: Autocomplete::default(),
             help_overlay: false,
+            help_scroll: 0,
             text_selection_mode: false,
             project_label: String::new(),
             worktree_label: None,
