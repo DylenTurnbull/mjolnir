@@ -911,7 +911,7 @@ impl TrackerState {
             | UiEvent::CodeAgent(_)
             | UiEvent::Info(_) => {}
             UiEvent::Warning(message) => {
-                self.push_system_notice(message.clone());
+                self.record_system_notice(message.clone());
             }
             UiEvent::LokiActivity(activity) => {
                 let (kind, text) = match activity {
@@ -1085,12 +1085,16 @@ impl TrackerState {
         index
     }
 
+    fn record_system_notice(&mut self, text: impl Into<String>) {
+        self.push_transcript_entry("system", text.into());
+        self.touch();
+    }
+
     fn push_system_notice(&mut self, text: impl Into<String>) {
         self.agent_message_open = false;
         self.prompt_in_flight = false;
         self.prompt_turn_started_at = None;
-        self.push_transcript_entry("system", text.into());
-        self.touch();
+        self.record_system_notice(text);
     }
 
     fn observe_prompt_text(&mut self, text: String, submitted_at: Option<String>) {
@@ -5173,6 +5177,34 @@ mod tests {
         assert_eq!(snapshot.transcript[0].kind, "system");
         assert_eq!(snapshot.transcript[0].text, "Loki is unavailable");
         assert_eq!(snapshot.transcript[0].actor, None);
+    }
+
+    #[test]
+    fn tracker_preserves_active_prompt_state_when_warning_arrives() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.observe_command(&UiCommand::SendPrompt {
+            text: "hello".to_string(),
+            images: Vec::new(),
+        });
+        let (_, started_at) = state
+            .prompt_cancel_claim()
+            .expect("active prompt should expose cancellation");
+
+        state.observe_event(&UiEvent::Warning("prompt already in flight".to_string()));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert!(snapshot.prompt_in_flight);
+        assert_eq!(
+            state.prompt_cancel_claim(),
+            Some(("sess-1".to_string(), started_at))
+        );
+        assert_eq!(snapshot.transcript.len(), 2);
+        assert_eq!(snapshot.transcript[1].kind, "system");
+        assert_eq!(snapshot.transcript[1].text, "prompt already in flight");
     }
 
     #[test]
