@@ -13391,7 +13391,7 @@ mod tests {
             source: "Thor".to_string(),
             target: "Eitri".to_string(),
             kind: crate::event::InternalMessageKind::Exploration,
-            text: "very thorough: trace startup".to_string(),
+            text: "trace startup".to_string(),
         }));
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
             label: "Eitri · explorer".to_string(),

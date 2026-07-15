@@ -50,7 +50,7 @@ pub const MCP_SERVER_NAME: &str = "mj-code-agent";
 pub const PRIMARY_SESSION_DIRECTIVE: &str = r#"<mj-code-agent-policy>
 You are Thor, the primary coordinator and owner of the user's outcome. You are responsible for understanding the request, doing necessary research and context gathering, forming the plan, coordinating implementation, reviewing and verifying the result, and delivering the final answer. You are not a thin handoff between the user and Eitri. This policy applies to every subsequent user request in this ACP session.
 
-Eitri is available through two optional MCP tools. explore_agent is a read-only scout that can offload bounded, multi-step codebase research at any point in ongoing work, especially when affected locations are unknown, the question crosses multiple areas, or tracing architecture or execution flow requires several search rounds. It is not a required phase or gate before implementation. Direct tools are usually faster for a known path, known symbol, exact definition, work confined to roughly two or three known files, or a trivial single-step lookup; use your judgment. Because every Eitri call starts with fresh context, an explore_agent prompt must be a complete standalone brief that states the current task state and work already completed, the specific question, known context, scope, stopping condition, expected report, and the lowest adequate thoroughness: quick, medium, or very thorough.
+Eitri is available through two optional MCP tools. explore_agent is a read-only scout that can offload bounded, multi-step codebase research at any point in ongoing work, especially when affected locations are unknown, the question crosses multiple areas, or tracing architecture or execution flow requires several search rounds. It is not a required phase or gate before implementation. Direct tools are usually faster for a known path, known symbol, exact definition, work confined to roughly two or three known files, or a trivial single-step lookup; use your judgment. Because every Eitri call starts with fresh context, an explore_agent prompt must be a complete standalone brief that states the current task state and work already completed, the specific question, known context, scope, stopping condition, and expected report.
 
 Treat code_agent as delegation to a strong coding engineer with fresh context. Give Eitri one forgeable unit at a time: a substantial, self-contained implementation slice that can be completed in one focused pass and returned as one coherent, reviewable diff. A good handoff has one clear outcome, enough context and decisions to begin immediately, explicit constraints and acceptance checks, and leaves the workspace in a coherent, testable state. Delegate when implementing the change is clearly more work than writing the handoff and reviewing the result. Do not delegate trivial local edits, investigation better handled with direct tools or explore_agent, unresolved architectural questions, or an entire open-ended project. Split large work into sequential, independently verifiable units. You may personally make small, local code changes when describing and delegating them would take more effort than simply doing them; use judgment rather than delegating mechanically. Pass code_agent complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. Its result includes the bounded full workspace diff attributable to that invocation. After Eitri returns, independently review its result and diff, inspect or verify the work as needed, and delegate a substantial corrective follow-up if implementation changes remain. If a request requires no code changes and no open-ended exploration, handle it yourself.
 
@@ -68,11 +68,6 @@ Work efficiently:
 - If a search is empty, try one materially different pattern, name, or path before concluding the target is absent.
 - Parallelize only independent, targeted searches or reads when supported.
 - Stop as soon as the requested question and stopping condition are satisfied. Do not inventory adjacent systems.
-
-Thoroughness levels:
-- quick: targeted lookups and key files only.
-- medium: follow the central call path and critical imports, then inspect the nearest relevant tests or types.
-- very thorough: trace relevant dependencies, variants, tests, and configuration across multiple locations.
 
 Return one concise final report with:
 - a direct answer or summary;
@@ -113,12 +108,7 @@ impl EitriPurpose {
     fn standalone_prompt(self, task: &str) -> String {
         match self {
             Self::Code => format!("{CODE_PREAMBLE}{task}"),
-            Self::Explore => {
-                let thoroughness = exploration_thoroughness(task);
-                format!(
-                    "{EXPLORE_PREAMBLE}Thoroughness level: {thoroughness}.\n\nSearch request:\n{task}"
-                )
-            }
+            Self::Explore => format!("{EXPLORE_PREAMBLE}Search request:\n{task}"),
         }
     }
 
@@ -131,17 +121,6 @@ impl EitriPurpose {
                 format!("Eitri received this standalone read-only exploration request:\n{task}")
             }
         }
-    }
-}
-
-fn exploration_thoroughness(prompt: &str) -> &'static str {
-    let prompt = prompt.to_ascii_lowercase();
-    if prompt.contains("very thorough") {
-        "very thorough"
-    } else if prompt.contains("quick") {
-        "quick"
-    } else {
-        "medium"
     }
 }
 
@@ -285,7 +264,7 @@ impl McpHandler {
 
     #[tool(
         name = "explore_agent",
-        description = "OPTIONAL READ-ONLY EXPLORATION DELEGATE (EITRI). Use this at any point in ongoing work to offload bounded, multi-step codebase research, especially when affected locations are unknown or the question requires multiple search rounds. It is not a required phase before implementation. Direct tools are usually faster for a known path, known symbol, exact definition, work confined to roughly 2-3 known files, or a trivial lookup. Use your judgment. Every call starts with fresh context, so the complete standalone prompt must state the current task state and work already completed, the specific question, known context, scope, stopping condition, expected report, and lowest adequate thoroughness: quick, medium, or very thorough. Returns one concise research report."
+        description = "OPTIONAL READ-ONLY EXPLORATION DELEGATE (EITRI). Use this at any point in ongoing work to offload bounded, multi-step codebase research, especially when affected locations are unknown or the question requires multiple search rounds. It is not a required phase before implementation. Direct tools are usually faster for a known path, known symbol, exact definition, work confined to roughly 2-3 known files, or a trivial lookup. Use your judgment. Every call starts with fresh context, so the complete standalone prompt must state the current task state and work already completed, the specific question, known context, scope, stopping condition, and expected report. Returns one concise research report."
     )]
     async fn explore_agent(
         &self,
@@ -1008,9 +987,8 @@ mod tests {
         assert!(serde_json::from_str::<CodeAgentArgs>("{}").is_err());
 
         let parsed: ExploreAgentArgs =
-            serde_json::from_str(r#"{"prompt":"very thorough: trace it"}"#)
-                .expect("valid explore arguments");
-        assert_eq!(parsed.prompt, "very thorough: trace it");
+            serde_json::from_str(r#"{"prompt":"trace it"}"#).expect("valid explore arguments");
+        assert_eq!(parsed.prompt, "trace it");
         assert!(
             serde_json::from_str::<ExploreAgentArgs>(
                 r#"{"prompt":"trace it","instructions":"wrong field"}"#
@@ -1021,13 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn explore_defaults_to_medium_and_forces_read_only_without_marking_delegation() {
-        assert_eq!(exploration_thoroughness("trace the flow"), "medium");
-        assert_eq!(exploration_thoroughness("Quick: find callers"), "quick");
-        assert_eq!(
-            exploration_thoroughness("Very thorough: trace the flow"),
-            "very thorough"
-        );
+    fn explore_forces_read_only_without_marking_implementation_delegation() {
         assert_eq!(
             EitriPurpose::Explore.access_mode(RuntimeAccessMode::Full),
             RuntimeAccessMode::ReadOnly
@@ -1038,11 +1010,6 @@ mod tests {
         );
         assert!(!EitriPurpose::Explore.marks_implementation_delegation());
         assert!(EitriPurpose::Code.marks_implementation_delegation());
-        assert!(
-            EitriPurpose::Explore
-                .standalone_prompt("trace it")
-                .contains("Thoroughness level: medium")
-        );
     }
 
     #[test]
