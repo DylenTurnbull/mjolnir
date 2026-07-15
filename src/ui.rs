@@ -711,7 +711,6 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::PromptDone { .. }
         | UiEvent::ClaudeUsage(_)
         | UiEvent::CodexUsage(_)
-        | UiEvent::BedrockCredits(_)
         | UiEvent::CouncilUsage(_)
         | UiEvent::PromptFailed { .. }
         | UiEvent::SessionForkFailed { .. }

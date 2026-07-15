@@ -2215,9 +2215,6 @@ impl AppState {
             UiEvent::CodexUsage(status) => {
                 self.codex_usage = Some(status);
             }
-            UiEvent::BedrockCredits(status) => {
-                self.bedrock_credits = Some(status);
-            }
             UiEvent::PromptFailed { message } => {
                 self.finalize_thinking(EntryKind::Thought);
                 self.finish_prompt_turn(true);
@@ -2676,6 +2673,9 @@ impl AppState {
                 }
             }
             SessionUpdate::UsageUpdate(u) => {
+                if let Some(status) = crate::bedrock_credits::from_usage_meta(u.meta.as_ref()) {
+                    self.bedrock_credits = Some(status);
+                }
                 if let Some(rate_limit) = self.token_usage.apply_usage_update(u) {
                     // The line is self-describing ("Current session: …"), so
                     // surface it verbatim rather than wrapping it.
@@ -5014,32 +5014,44 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_credits_event_replaces_available_with_unavailable() {
+    fn usage_update_bedrock_credits_replaces_available_with_unavailable() {
         let mut state = AppState::new();
-        state.apply_event(UiEvent::BedrockCredits(
-            crate::bedrock_credits::BedrockCreditsStatus::Available(
-                crate::bedrock_credits::BedrockCreditsReport {
-                    amounts: vec![crate::bedrock_credits::CreditAmount {
-                        currency: "USD".to_string(),
-                        amount: 12.5,
-                    }],
-                    earliest_expiration: Some("2026-12-31".to_string()),
-                    as_of: "2026-07-15".to_string(),
-                },
-            ),
-        ));
+        let available = serde_json::json!({"anvil":{"bedrockCredits":{"status":"available","amounts":[{"currency":"USD","amount":12.5}],"earliestExpiration":"2026-12-31","asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(available.as_object().unwrap().clone()),
+        )));
         assert!(matches!(
             state.bedrock_credits,
             Some(BedrockCreditsStatus::Available(_))
         ));
 
-        state.apply_event(UiEvent::BedrockCredits(BedrockCreditsStatus::Unavailable(
-            "billing credentials are unavailable".to_string(),
+        let unavailable = serde_json::json!({"anvil":{"bedrockCredits":{"status":"unavailable","reason":"billing credentials are unavailable","asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(unavailable.as_object().unwrap().clone()),
         )));
         assert_eq!(
             state.bedrock_credits,
             Some(BedrockCreditsStatus::Unavailable(
                 "billing credentials are unavailable".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn malformed_bedrock_credit_metadata_preserves_last_known_status() {
+        let mut state = AppState::new();
+        state.bedrock_credits = Some(BedrockCreditsStatus::Unavailable(
+            "request timed out".into(),
+        ));
+        let invalid =
+            serde_json::json!({"anvil":{"bedrockCredits":{"status":"future","amounts":[]}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(1, 2).meta(invalid.as_object().unwrap().clone()),
+        )));
+        assert_eq!(
+            state.bedrock_credits,
+            Some(BedrockCreditsStatus::Unavailable(
+                "request timed out".into()
             ))
         );
     }

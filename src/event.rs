@@ -155,9 +155,6 @@ pub enum UiEvent {
     /// Latest Codex subscription quota query. This is UI-only side-channel
     /// data; it never goes through ACP.
     CodexUsage(crate::codex_usage::CodexUsageStatus),
-    /// Latest AWS promotional/account credit balance applicable to Amazon
-    /// Bedrock for an active Bedrock-through-Anvil Council route.
-    BedrockCredits(crate::bedrock_credits::BedrockCreditsStatus),
     /// The prompt request failed before returning a stop reason. UI can
     /// re-enable the input prompt and surface the error.
     PromptFailed { message: String },

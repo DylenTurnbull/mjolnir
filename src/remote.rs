@@ -902,7 +902,7 @@ impl TrackerState {
                 self.prompt_turn_started_at = None;
                 self.touch();
             }
-            UiEvent::ClaudeUsage(_) | UiEvent::CodexUsage(_) | UiEvent::BedrockCredits(_) => {}
+            UiEvent::ClaudeUsage(_) | UiEvent::CodexUsage(_) => {}
             UiEvent::CouncilUsage(record) => {
                 let actor = match record.role {
                     crate::council_usage::Role::Thor => "thor",
