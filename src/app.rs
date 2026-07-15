@@ -2112,6 +2112,10 @@ impl AppState {
             UiEvent::SessionConfigOptions { options, targets } => {
                 self.apply_session_config_options(options, targets);
             }
+            UiEvent::CouncilUpdate { choices, inventory } => {
+                self.council_choices = choices;
+                self.council_inventory = inventory;
+            }
             UiEvent::LokiActivity(activity) => self.apply_loki_activity(activity),
             UiEvent::InternalMessage(message) => {
                 // A Loki interjection starts a fresh council-initiated Thor
@@ -3573,6 +3577,29 @@ mod tests {
             state.transcript.as_slice(),
             [Entry::CodeAgentMessage(text)] if text == "done"
         ));
+    }
+
+    #[test]
+    fn council_update_refreshes_choices_and_inventory() {
+        let mut state = AppState::new();
+        assert!(state.council_choices.is_empty());
+
+        state.apply_event(UiEvent::CouncilUpdate {
+            choices: vec![crate::council::ModelChoice {
+                model: "glm-5-2".to_string(),
+                pass_at_1: 0.5,
+                mean_cost_usd: 1.0,
+                available: true,
+                disabled_reason: None,
+                adapter: Some("anvil".to_string()),
+                ranked: true,
+            }],
+            inventory: crate::council::AcpInventory::default(),
+        });
+
+        assert_eq!(state.council_choices.len(), 1);
+        assert_eq!(state.council_choices[0].model, "glm-5-2");
+        assert!(state.transcript.is_empty(), "catalog refreshes are silent");
     }
 
     #[test]

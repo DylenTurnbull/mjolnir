@@ -91,6 +91,13 @@ pub enum UiEvent {
         options: Vec<SessionConfigOption>,
         targets: Vec<SessionConfigTarget>,
     },
+    /// A background ACP adapter probe finished after startup: refreshed model
+    /// choices and server inventory for the /models and /mjconfig editors.
+    /// Never rebinds the running session's Council roles.
+    CouncilUpdate {
+        choices: Vec<crate::council::ModelChoice>,
+        inventory: crate::council::AcpInventory,
+    },
     /// Structured nested-agent activity projected from an MCP tool result.
     LokiActivity(LokiActivity),
     /// Hidden council coordination made inspectable in the shared transcript.

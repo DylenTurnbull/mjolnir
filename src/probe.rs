@@ -87,7 +87,7 @@ where
 }
 
 /// One model an agent exposes as a selectable session config value.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelOption {
     pub value: String,
     pub name: String,

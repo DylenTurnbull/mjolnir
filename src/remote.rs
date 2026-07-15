@@ -909,6 +909,7 @@ impl TrackerState {
             | UiEvent::ElicitationRequest(_)
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::CodeAgent(_)
+            | UiEvent::CouncilUpdate { .. }
             | UiEvent::Info(_) => {}
             UiEvent::Warning(message) => {
                 self.record_system_notice(message.clone());

@@ -400,8 +400,8 @@ type ProbeCell = Arc<tokio::sync::OnceCell<ProbeResult>>;
 
 static PROBE_CACHE: LazyLock<tokio::sync::Mutex<HashMap<String, ProbeCell>>> =
     LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
-static WARNED_ADAPTERS: LazyLock<tokio::sync::Mutex<HashSet<String>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(HashSet::new()));
+static WARNED_ADAPTERS: LazyLock<std::sync::Mutex<HashSet<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
 fn probe_key(launch: &AdapterLaunch) -> String {
     format!(
@@ -419,20 +419,52 @@ async fn probe_launch(
     let key = probe_key(launch);
     let cell = {
         let mut cache = PROBE_CACHE.lock().await;
-        cache.entry(key).or_default().clone()
+        cache.entry(key.clone()).or_default().clone()
     };
     cell.get_or_init(|| async {
-        probe::adapter_capabilities(
+        let result = probe::adapter_capabilities(
             launch.command.clone(),
             launch.args.clone(),
             launch.env.clone(),
             cwd.to_path_buf(),
             PROBE_TIMEOUT,
         )
-        .await
+        .await;
+        if let Ok(capabilities) = &result {
+            crate::probe_cache::store(
+                &crate::probe_cache::default_cache_path(),
+                &key,
+                &launch.command,
+                capabilities,
+            );
+        }
+        result
     })
     .await
     .clone()
+}
+
+/// Capabilities available without launching the adapter: an already-completed
+/// in-process probe, or a fresh disk cache entry (which then seeds the
+/// in-process cache so this resolution and later ones agree).
+async fn cached_probe_result(launch: &AdapterLaunch) -> Option<ProbeResult> {
+    let key = probe_key(launch);
+    let cell = {
+        let mut cache = PROBE_CACHE.lock().await;
+        cache.entry(key.clone()).or_default().clone()
+    };
+    if let Some(result) = cell.get() {
+        return Some(result.clone());
+    }
+    let cached = crate::probe_cache::load(
+        &crate::probe_cache::default_cache_path(),
+        &key,
+        &launch.command,
+        crate::probe_cache::CACHE_TTL,
+    )?;
+    let result: ProbeResult = Ok(cached);
+    let _ = cell.set(result.clone());
+    Some(result)
 }
 
 fn row_keys(row: &Row) -> HashSet<String> {
@@ -595,7 +627,10 @@ async fn discover_available(rows: &[Row], inventory: &AcpInventory, cwd: &Path) 
             // npm packages before the UI has rendered anything.
             let capabilities = match credentialed {
                 Some(capabilities) => Ok(capabilities),
-                None => probe_launch(&launch, &cwd).await,
+                None => match cached_probe_result(&launch).await {
+                    Some(result) => result,
+                    None => probe_launch(&launch, &cwd).await,
+                },
             };
             (priority, launch, capabilities)
         }
@@ -800,6 +835,145 @@ pub async fn resolve_waiting_for_installs(config: &Config, cwd: &Path) -> Result
     resolve_inner(config, cwd).await
 }
 
+/// A council bound from instantly-known adapters, plus a stream of refreshed
+/// councils as the remaining adapters finish probing in the background.
+pub struct StreamingResolution {
+    pub council: ResolvedCouncil,
+    /// New council snapshots as background probes land. `None` when every
+    /// adapter resolved instantly. Snapshots never rebind the running
+    /// session's roles; they refresh choices, inventory, and warnings.
+    pub updates: Option<tokio::sync::watch::Receiver<ResolvedCouncil>>,
+    /// Adapters still probing when the initial council was returned.
+    pub pending_servers: Vec<String>,
+}
+
+/// Resolve the council without waiting on adapter launches when possible.
+///
+/// Adapters whose capabilities are known instantly (credentialed built-ins,
+/// completed in-process probes, fresh disk cache entries) bind immediately;
+/// the rest are probed in the background and delivered as update snapshots.
+/// Only when the initial set cannot bind the configured council does this
+/// wait, and then only until the earliest set of probe results that can.
+pub async fn resolve_streaming(config: &Config, cwd: &Path) -> Result<StreamingResolution> {
+    let leaderboard = deepswe::load(
+        &deepswe::default_cache_path(),
+        deepswe::CACHE_TTL,
+        deepswe::DEFAULT_URL,
+    )
+    .await;
+    let rows = deepswe::eligible_high(&leaderboard.rows);
+    let availability = Availability::detect();
+    let inventory = discover_inventory(config);
+    let anvil_installing = inventory
+        .servers
+        .iter()
+        .any(|server| server.id == "anvil" && server.selected && server.installing);
+
+    let mut results: Vec<(usize, AdapterLaunch, ProbeResult)> = Vec::new();
+    let mut pending: Vec<(usize, AdapterLaunch)> = Vec::new();
+    for (priority, launch) in configured_launches(&inventory).into_iter().enumerate() {
+        let instant = match credentialed_provider_capabilities(&launch, &rows) {
+            Some(capabilities) => Some(Ok(capabilities)),
+            None => cached_probe_result(&launch).await,
+        };
+        match instant {
+            Some(result) => results.push((priority, launch, result)),
+            None => pending.push((priority, launch)),
+        }
+    }
+
+    let assemble = |results: Vec<(usize, AdapterLaunch, ProbeResult)>,
+                    config: &Config,
+                    rows: &[Row],
+                    availability: &Availability,
+                    inventory: &AcpInventory| {
+        let discovery = resolve_probes(rows, results);
+        assemble_council(config, rows, availability, inventory.clone(), discovery)
+    };
+
+    if pending.is_empty() {
+        let council = assemble(results, config, &rows, &availability, &inventory)?;
+        return Ok(StreamingResolution {
+            council,
+            updates: None,
+            pending_servers: Vec::new(),
+        });
+    }
+
+    let pending_servers = pending
+        .iter()
+        .map(|(_, launch)| launch.source_id.clone())
+        .collect::<Vec<_>>();
+    let (probe_tx, mut probe_rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let cwd = cwd.to_path_buf();
+        let jobs = pending
+            .into_iter()
+            .map(|(priority, launch)| {
+                let cwd = cwd.clone();
+                async move {
+                    // A managed Anvil install already running in the
+                    // background becomes probe-able once it lands.
+                    if launch.kind == AdapterKind::Anvil && anvil_installing {
+                        let _ = crate::anvil::wait_until_ready().await;
+                    }
+                    let result = probe_launch(&launch, &cwd).await;
+                    (priority, launch, result)
+                }
+            })
+            .collect::<Vec<_>>();
+        tokio::spawn(async move {
+            let mut probes = stream::iter(jobs).buffer_unordered(probe::PROBE_CONCURRENCY);
+            while let Some(item) = probes.next().await {
+                if probe_tx.send(item).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    // Wait only while the instantly-known adapters cannot bind the council.
+    let mut council = assemble(results.clone(), config, &rows, &availability, &inventory);
+    while council.is_err() {
+        let Some(item) = probe_rx.recv().await else {
+            return council.map(|council| StreamingResolution {
+                council,
+                updates: None,
+                pending_servers: Vec::new(),
+            });
+        };
+        results.push(item);
+        council = assemble(results.clone(), config, &rows, &availability, &inventory);
+    }
+    let council = council.expect("council bound");
+
+    let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(council.clone());
+    {
+        let config = config.clone();
+        let inventory = inventory.clone();
+        let availability = availability.clone();
+        let rows = rows.clone();
+        let mut results = results;
+        tokio::spawn(async move {
+            while let Some(item) = probe_rx.recv().await {
+                results.push(item);
+                let discovery = resolve_probes(&rows, results.clone());
+                if let Ok(snapshot) =
+                    assemble_council(&config, &rows, &availability, inventory.clone(), discovery)
+                    && snapshot_tx.send(snapshot).is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+    Ok(StreamingResolution {
+        council,
+        updates: Some(snapshot_rx),
+        pending_servers,
+    })
+}
+
 async fn resolve_inner(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
     let leaderboard = deepswe::load(
         &deepswe::default_cache_path(),
@@ -809,8 +983,21 @@ async fn resolve_inner(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
     .await;
     let rows = deepswe::eligible_high(&leaderboard.rows);
     let availability = Availability::detect();
-    let mut inventory = discover_inventory(config);
+    let inventory = discover_inventory(config);
     let discovery = discover_available(&rows, &inventory, cwd).await;
+    assemble_council(config, &rows, &availability, inventory, discovery)
+}
+
+/// Bind Thor, Loki, and Eitri plus the model catalog from one set of probe
+/// results. Pure with respect to probing: callable repeatedly as additional
+/// adapters finish probing in the background.
+fn assemble_council(
+    config: &Config,
+    rows: &[Row],
+    availability: &Availability,
+    mut inventory: AcpInventory,
+    discovery: Discovery,
+) -> Result<ResolvedCouncil> {
     for server in &mut inventory.servers {
         server.model_count = discovery
             .available
@@ -828,7 +1015,7 @@ async fn resolve_inner(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
                 .find(|candidate| candidate.model.model == row.model);
             let launchable = candidate.is_some();
             let disabled_reason = (!launchable)
-                .then(|| unavailable_reason(row, config, &availability, &discovery.adapter_errors));
+                .then(|| unavailable_reason(row, config, availability, &discovery.adapter_errors));
             ModelChoice {
                 model: row.model.clone(),
                 pass_at_1: row.pass_at_1,
@@ -878,22 +1065,25 @@ async fn resolve_inner(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
             .find(|candidate| candidate.ranked)
             .ok_or_else(|| anyhow!("Thor Auto requires at least one ranked DeepSWE model"))?
     } else {
-        explicit("Thor", &config.thor.model, &rows, &available)?
+        explicit("Thor", &config.thor.model, rows, &available)?
     };
-    let loki = resolve_loki(&config.loki.model, thor, &rows, &available)?;
+    let loki = resolve_loki(&config.loki.model, thor, rows, &available)?;
     let mut occupied = vec![thor.model.model.as_str()];
     if let Some(loki) = loki.as_ref() {
         occupied.push(loki.model.model.as_str());
     }
-    let eitri = resolve_eitri(&config.eitri.model, &rows, &available, &occupied)?;
+    let eitri = resolve_eitri(&config.eitri.model, rows, &available, &occupied)?;
 
-    let mut warned = WARNED_ADAPTERS.lock().await;
+    let mut warned = WARNED_ADAPTERS
+        .lock()
+        .expect("adapter warning set poisoned");
     let mut warnings = discovery
         .adapter_errors
         .iter()
         .filter(|(adapter, _)| warned.insert((*adapter).clone()))
         .map(|(adapter, reason)| format!("{adapter} unavailable: {reason}"))
         .collect::<Vec<_>>();
+    drop(warned);
     if eitri.is_none()
         && !matches!(
             config.eitri.model.as_str(),

@@ -696,7 +696,9 @@ async fn run(
                             break Err(anyhow!("send prompt to Eitri"));
                         }
                     }
-                    UiEvent::SessionStarted { .. } | UiEvent::SessionConfigOptions { .. } => {}
+                    UiEvent::SessionStarted { .. }
+                    | UiEvent::SessionConfigOptions { .. }
+                    | UiEvent::CouncilUpdate { .. } => {}
                     UiEvent::SessionUpdate(update) => {
                         collector.observe(&update);
                         let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(update)));

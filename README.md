@@ -54,8 +54,15 @@ Council adapters must advertise ACP HTTP MCP support because Thor invokes
 Eitri through Mjolnir's embedded `code_agent` and `explore_agent` MCP tools.
 Codex and Claude discovery checks local credential files and supported token
 environment variables without launching either CLI or their npm ACP bridges.
-Explicit ACP routes are probed once per process; Mjolnir never logs API-key
-values and selects High reasoning when the adapter advertises that control.
+Other ACP routes are probed once and the results are cached on disk for 24
+hours (invalidated when the adapter binary changes), so interactive startup
+binds the Council instantly from credentials and cached capabilities. Adapters
+without a fresh cache entry are probed in the background: their models appear
+in `/models` and the ACP Servers tab when the probe lands, and take effect for
+role selection in the next session. Startup only waits on a probe when the
+configured Council cannot be bound any other way, so a wedged ACP server never
+blocks an otherwise-launchable session. Mjolnir never logs API-key values and
+selects High reasoning when the adapter advertises that control.
 Interactive startup installs pinned Anvil in the background when no development
 override, bundled sibling, or managed copy is available. Resolution precedence
 is `--anvil-path`, `MJ_ANVIL_PATH`, an `anvil` sibling beside `mj`, then the
@@ -233,6 +240,7 @@ Persistent data includes:
   preferences.
 - the platform state directory's `mj/session-provenance.json`: resume routing.
 - `~/.cache/mj/deepswe-v1.1.json`: 24-hour DeepSWE cache.
+- `~/.cache/mj/acp-probes-v1.json`: 24-hour ACP adapter capability cache.
 - `<project>/.mjolnir/worktrees/`: linked worktrees created by Mjolnir.
 
 ## Development

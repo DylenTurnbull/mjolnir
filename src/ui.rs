@@ -719,6 +719,7 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::Info(_)
         | UiEvent::InternalMessage(_)
         | UiEvent::Fatal(_)
+        | UiEvent::CouncilUpdate { .. }
         | UiEvent::CodeAgent(_) => RedrawCause::Interactive,
     }
 }
