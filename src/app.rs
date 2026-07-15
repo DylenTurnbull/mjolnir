@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::bedrock_credits::BedrockCreditsStatus;
 use crate::claude_usage::ClaudeUsageStatus;
 use crate::clipboard::ClipboardLease;
 use crate::codex_usage::CodexUsageStatus;
@@ -735,6 +736,8 @@ pub struct AppState {
     pub claude_usage: Option<ClaudeUsageStatus>,
     /// Last Codex app-server quota query, including explicit unavailable states.
     pub codex_usage: Option<CodexUsageStatus>,
+    /// AWS promotional/account credits applicable to the active Bedrock route.
+    pub bedrock_credits: Option<BedrockCreditsStatus>,
     /// Slash-command autocomplete state, recomputed on every input edit.
     pub autocomplete: Autocomplete,
     /// True while the keyboard help overlay is visible.
@@ -1049,6 +1052,7 @@ impl AppState {
             code_agent_token_usage: TokenUsage::default(),
             claude_usage: None,
             codex_usage: None,
+            bedrock_credits: None,
             autocomplete: Autocomplete::default(),
             help_overlay: false,
             help_scroll: 0,
@@ -2210,6 +2214,9 @@ impl AppState {
             }
             UiEvent::CodexUsage(status) => {
                 self.codex_usage = Some(status);
+            }
+            UiEvent::BedrockCredits(status) => {
+                self.bedrock_credits = Some(status);
             }
             UiEvent::PromptFailed { message } => {
                 self.finalize_thinking(EntryKind::Thought);
@@ -5003,6 +5010,37 @@ mod tests {
         assert_eq!(
             state.codex_usage,
             Some(CodexUsageStatus::Unavailable("not signed in".to_string()))
+        );
+    }
+
+    #[test]
+    fn bedrock_credits_event_replaces_available_with_unavailable() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::BedrockCredits(
+            crate::bedrock_credits::BedrockCreditsStatus::Available(
+                crate::bedrock_credits::BedrockCreditsReport {
+                    amounts: vec![crate::bedrock_credits::CreditAmount {
+                        currency: "USD".to_string(),
+                        amount: 12.5,
+                    }],
+                    earliest_expiration: Some("2026-12-31".to_string()),
+                    as_of: "2026-07-15".to_string(),
+                },
+            ),
+        ));
+        assert!(matches!(
+            state.bedrock_credits,
+            Some(BedrockCreditsStatus::Available(_))
+        ));
+
+        state.apply_event(UiEvent::BedrockCredits(BedrockCreditsStatus::Unavailable(
+            "billing credentials are unavailable".to_string(),
+        )));
+        assert_eq!(
+            state.bedrock_credits,
+            Some(BedrockCreditsStatus::Unavailable(
+                "billing credentials are unavailable".to_string()
+            ))
         );
     }
 

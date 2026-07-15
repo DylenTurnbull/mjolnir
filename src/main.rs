@@ -8,6 +8,7 @@ mod acp;
 mod anvil;
 mod app;
 mod archive;
+mod bedrock_credits;
 mod claude_usage;
 mod clipboard;
 mod code_agent;
@@ -1697,6 +1698,7 @@ async fn run_session(
         .chain(loki_role.as_ref());
     let mut claude_usage_env = None;
     let mut codex_usage_env = None;
+    let mut has_anvil_bedrock_route = false;
     for role in usage_roles {
         match role.launch.source_id.as_str() {
             "claude-acp" if claude_usage_env.is_none() => {
@@ -1704,6 +1706,9 @@ async fn run_session(
             }
             "codex-acp" if codex_usage_env.is_none() => {
                 codex_usage_env = Some(role.launch.env.clone());
+            }
+            "anvil" if role.model_value.starts_with("bedrock::") => {
+                has_anvil_bedrock_route = true;
             }
             _ => {}
         }
@@ -1717,14 +1722,14 @@ async fn run_session(
             council_session.clone(),
         )
     });
-    let (usage_turn_tx, usage_shutdown_tx, usage_task) = if claude_usage_env.is_some()
-        || codex_usage_env.is_some()
-    {
+    let has_usage_poller =
+        claude_usage_env.is_some() || codex_usage_env.is_some() || has_anvil_bedrock_route;
+    let (usage_turn_tx, usage_shutdown_tx, usage_task) = if has_usage_poller {
         let (tx, mut rx) = mpsc::unbounded_channel::<()>();
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
         let usage_ui_tx = ui_event_tx.clone();
         let usage_cwd = cwd.clone();
-        if codex_usage_env.is_some() {
+        if codex_usage_env.is_some() || has_anvil_bedrock_route {
             let _ = tx.send(());
         }
         let handle = tokio::spawn(async move {
@@ -1762,6 +1767,23 @@ async fn run_session(
                             .await;
                     if usage_ui_tx
                         .send(crate::event::UiEvent::CodexUsage(status))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                if has_anvil_bedrock_route {
+                    let status = match bedrock_credits::query().await {
+                        Ok(report) => bedrock_credits::BedrockCreditsStatus::Available(report),
+                        Err(error) => {
+                            tracing::warn!("Bedrock credit query failed: {error}");
+                            bedrock_credits::BedrockCreditsStatus::Unavailable(
+                                error.user_reason().to_string(),
+                            )
+                        }
+                    };
+                    if usage_ui_tx
+                        .send(crate::event::UiEvent::BedrockCredits(status))
                         .is_err()
                     {
                         break;

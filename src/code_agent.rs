@@ -877,6 +877,7 @@ async fn run(
                     }
                     UiEvent::ClaudeUsage(_)
                     | UiEvent::CodexUsage(_)
+                    | UiEvent::BedrockCredits(_)
                     | UiEvent::CouncilUsage(_)
                     | UiEvent::RemotePermissionDecision { .. }
                     | UiEvent::LokiActivity(_)

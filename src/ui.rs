@@ -711,6 +711,7 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::PromptDone { .. }
         | UiEvent::ClaudeUsage(_)
         | UiEvent::CodexUsage(_)
+        | UiEvent::BedrockCredits(_)
         | UiEvent::CouncilUsage(_)
         | UiEvent::PromptFailed { .. }
         | UiEvent::SessionForkFailed { .. }
@@ -8036,14 +8037,20 @@ fn draw_usage_quota_row(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
 
 fn usage_quota_label(state: &AppState) -> Option<String> {
     state
-        .codex_usage
+        .bedrock_credits
         .as_ref()
-        .map(crate::codex_usage::CodexUsageStatus::compact_label)
+        .map(crate::bedrock_credits::BedrockCreditsStatus::compact_label)
         .or_else(|| {
             state
-                .claude_usage
+                .codex_usage
                 .as_ref()
-                .map(crate::claude_usage::ClaudeUsageStatus::compact_label)
+                .map(crate::codex_usage::CodexUsageStatus::compact_label)
+                .or_else(|| {
+                    state
+                        .claude_usage
+                        .as_ref()
+                        .map(crate::claude_usage::ClaudeUsageStatus::compact_label)
+                })
         })
 }
 
@@ -16652,6 +16659,48 @@ mod tests {
 
         let lines = buffer_lines(terminal.backend().buffer());
         assert!(lines[0].contains("Claude usage unavailable: not signed in"));
+    }
+
+    #[test]
+    fn usage_quota_row_renders_bedrock_available_and_unavailable() {
+        let mut state = AppState::new();
+        state.bedrock_credits = Some(crate::bedrock_credits::BedrockCreditsStatus::Available(
+            crate::bedrock_credits::BedrockCreditsReport {
+                amounts: vec![crate::bedrock_credits::CreditAmount {
+                    currency: "USD".to_string(),
+                    amount: 12.5,
+                }],
+                earliest_expiration: Some("2026-12-31".to_string()),
+                as_of: "2026-07-15".to_string(),
+            },
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("Bedrock credits: USD 12.50 · expires 2026-12-31 · as of 2026-07-15")
+        );
+        let backend = TestBackend::new(100, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_usage_quota_row(frame, frame.area(), &state))
+            .expect("draw");
+        assert!(
+            buffer_lines(terminal.backend().buffer())[0].contains("Bedrock credits: USD 12.50")
+        );
+
+        state.bedrock_credits = Some(crate::bedrock_credits::BedrockCreditsStatus::Unavailable(
+            "request timed out".to_string(),
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("Bedrock credits unavailable: request timed out")
+        );
+        terminal
+            .draw(|frame| draw_usage_quota_row(frame, frame.area(), &state))
+            .expect("draw");
+        assert!(
+            buffer_lines(terminal.backend().buffer())[0]
+                .contains("Bedrock credits unavailable: request timed out")
+        );
     }
 
     #[test]
