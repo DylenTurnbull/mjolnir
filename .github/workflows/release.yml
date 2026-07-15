@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  ANVIL_VERSION: "0.22.0"
+
 jobs:
   build-linux:
     name: Build x86_64-unknown-linux-gnu
@@ -31,6 +34,15 @@ jobs:
       - name: Build voice worker
         run: cargo build --release --locked -p brokk-mj-voice-worker --target x86_64-unknown-linux-gnu
 
+      - name: Download pinned Anvil
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="brokk-anvil-v${ANVIL_VERSION}-x86_64-unknown-linux-gnu.zip"
+          gh release download "v${ANVIL_VERSION}" --repo BrokkAi/anvil --pattern "$asset" --pattern "$asset.sha256"
+          sha256sum -c "$asset.sha256"
+          unzip -j "$asset" '*/anvil' -d target/x86_64-unknown-linux-gnu/release
+
       - name: Package archive
         shell: bash
         run: |
@@ -38,6 +50,7 @@ jobs:
           mkdir "$name"
           cp "target/x86_64-unknown-linux-gnu/release/mj" "$name/"
           cp "target/x86_64-unknown-linux-gnu/release/mj-voice-worker" "$name/"
+          cp "target/x86_64-unknown-linux-gnu/release/anvil" "$name/"
           cp README.md LICENSE "$name/"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
@@ -80,6 +93,15 @@ jobs:
       - name: Build voice worker
         run: cargo build --release --locked -p brokk-mj-voice-worker --target aarch64-unknown-linux-gnu
 
+      - name: Download pinned Anvil
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="brokk-anvil-v${ANVIL_VERSION}-aarch64-unknown-linux-gnu.zip"
+          gh release download "v${ANVIL_VERSION}" --repo BrokkAi/anvil --pattern "$asset" --pattern "$asset.sha256"
+          sha256sum -c "$asset.sha256"
+          unzip -j "$asset" '*/anvil' -d target/aarch64-unknown-linux-gnu/release
+
       - name: Package archive
         shell: bash
         run: |
@@ -87,6 +109,7 @@ jobs:
           mkdir "$name"
           cp "target/aarch64-unknown-linux-gnu/release/mj" "$name/"
           cp "target/aarch64-unknown-linux-gnu/release/mj-voice-worker" "$name/"
+          cp "target/aarch64-unknown-linux-gnu/release/anvil" "$name/"
           cp README.md LICENSE "$name/"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
@@ -130,12 +153,22 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target aarch64-linux-android
 
+      - name: Download pinned Anvil
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="brokk-anvil-v${ANVIL_VERSION}-aarch64-linux-android.zip"
+          gh release download "v${ANVIL_VERSION}" --repo BrokkAi/anvil --pattern "$asset" --pattern "$asset.sha256"
+          sha256sum -c "$asset.sha256"
+          unzip -j "$asset" '*/anvil' -d target/aarch64-linux-android/release
+
       - name: Package archive
         shell: bash
         run: |
           name="brokk-mjolnir-${GITHUB_REF_NAME}-aarch64-linux-android"
           mkdir "$name"
           cp "target/aarch64-linux-android/release/mj" "$name/"
+          cp "target/aarch64-linux-android/release/anvil" "$name/"
           cp README.md LICENSE "$name/"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
@@ -166,6 +199,19 @@ jobs:
       - name: Build voice worker
         run: cargo build --release --locked -p brokk-mj-voice-worker --target x86_64-pc-windows-msvc
 
+      - name: Download pinned Anvil
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $asset = "brokk-anvil-v${env:ANVIL_VERSION}-x86_64-pc-windows-msvc.zip"
+          gh release download "v${env:ANVIL_VERSION}" --repo BrokkAi/anvil --pattern $asset --pattern "$asset.sha256"
+          $expected = (Get-Content "$asset.sha256").Split()[0].ToLower()
+          $actual = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLower()
+          if ($actual -ne $expected) { throw "Anvil checksum mismatch" }
+          Expand-Archive -Path $asset -DestinationPath anvil-dist
+          Copy-Item (Get-ChildItem anvil-dist -Recurse -Filter anvil.exe | Select-Object -First 1).FullName -Destination "target\x86_64-pc-windows-msvc\release\anvil.exe"
+
       - name: Package archive
         shell: pwsh
         run: |
@@ -173,6 +219,7 @@ jobs:
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target\x86_64-pc-windows-msvc\release\mj.exe" -Destination $name
           Copy-Item "target\x86_64-pc-windows-msvc\release\mj-voice-worker.exe" -Destination $name
+          Copy-Item "target\x86_64-pc-windows-msvc\release\anvil.exe" -Destination $name
           Copy-Item "README.md" -Destination $name
           Copy-Item "LICENSE" -Destination $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
@@ -225,12 +272,22 @@ jobs:
             -output target/universal-apple-darwin/release/mj-voice-worker
           lipo -info target/universal-apple-darwin/release/mj-voice-worker
 
+      - name: Download pinned Anvil
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="brokk-anvil-v${ANVIL_VERSION}-universal-apple-darwin.zip"
+          gh release download "v${ANVIL_VERSION}" --repo BrokkAi/anvil --pattern "$asset" --pattern "$asset.sha256"
+          shasum -a 256 -c "$asset.sha256"
+          unzip -j "$asset" '*/anvil' -d target/universal-apple-darwin/release
+
       - name: Package archive
         run: |
           name="brokk-mjolnir-${GITHUB_REF_NAME}-universal-apple-darwin"
           mkdir "$name"
           cp target/universal-apple-darwin/release/mj "$name/"
           cp target/universal-apple-darwin/release/mj-voice-worker "$name/"
+          cp target/universal-apple-darwin/release/anvil "$name/"
           cp README.md LICENSE "$name/"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"

@@ -1,7 +1,4 @@
-//! Startup self-update for the `mj` binary.
-//!
-//! This intentionally updates only mjolnir itself. ACP adapters remain
-//! separately managed external commands.
+//! Startup self-update for `mj` and its bundled sidecar binaries.
 
 use std::ffi::OsString;
 use std::io::{self, Cursor, IsTerminal, Read, Write};
@@ -20,6 +17,8 @@ const BIN_NAME: &str = "mj";
 const WINDOWS_BIN_NAME: &str = "mj.exe";
 const VOICE_WORKER_NAME: &str = "mj-voice-worker";
 const WINDOWS_VOICE_WORKER_NAME: &str = "mj-voice-worker.exe";
+const ANVIL_NAME: &str = "anvil";
+const WINDOWS_ANVIL_NAME: &str = "anvil.exe";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupUpdateResult {
@@ -168,6 +167,9 @@ async fn download_apply_and_restart(update: &UpdateInfo) -> Result<()> {
     let new_binary =
         extract_mj_binary(&update.asset.name, &archive).context("extract mj binary")?;
     let current_exe = std::env::current_exe().context("resolve current executable")?;
+    let anvil = extract_anvil_binary(&update.asset.name, &archive).context("extract Anvil")?;
+    install_sibling_binary(&current_exe, ANVIL_NAME, WINDOWS_ANVIL_NAME, &anvil)
+        .context("install bundled Anvil")?;
     if !cfg!(target_os = "android") {
         let worker = extract_voice_worker_binary(&update.asset.name, &archive)
             .context("extract voice worker")?;
@@ -244,6 +246,10 @@ fn extract_voice_worker_binary(archive_name: &str, archive_bytes: &[u8]) -> Resu
     )
 }
 
+fn extract_anvil_binary(archive_name: &str, archive_bytes: &[u8]) -> Result<Vec<u8>> {
+    extract_named_binary(archive_name, archive_bytes, ANVIL_NAME, WINDOWS_ANVIL_NAME)
+}
+
 fn extract_named_binary(
     archive_name: &str,
     archive_bytes: &[u8],
@@ -302,6 +308,20 @@ fn extract_named_binary_from_zip(archive_bytes: &[u8], expected_name: &str) -> R
 }
 
 fn install_voice_worker(current_exe: &Path, bytes: &[u8]) -> Result<()> {
+    install_sibling_binary(
+        current_exe,
+        VOICE_WORKER_NAME,
+        WINDOWS_VOICE_WORKER_NAME,
+        bytes,
+    )
+}
+
+fn install_sibling_binary(
+    current_exe: &Path,
+    unix_name: &str,
+    windows_name: &str,
+    bytes: &[u8],
+) -> Result<()> {
     let current_exe = current_exe
         .canonicalize()
         .with_context(|| format!("resolve executable target {}", current_exe.display()))?;
@@ -309,9 +329,9 @@ fn install_voice_worker(current_exe: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("executable has no parent: {}", current_exe.display()))?;
     let name = if cfg!(windows) {
-        WINDOWS_VOICE_WORKER_NAME
+        windows_name
     } else {
-        VOICE_WORKER_NAME
+        unix_name
     };
     let target = parent.join(name);
     let tmp = parent.join(format!(".{name}.self-update.{}.tmp", std::process::id()));
@@ -818,6 +838,17 @@ mod tests {
         .expect("extract voice worker");
 
         assert_eq!(binary, b"windows voice worker bytes");
+    }
+
+    #[test]
+    fn extract_anvil_finds_bundled_sibling() {
+        let archive = make_tar_gz("brokk-mjolnir/anvil", b"anvil bytes");
+        let binary = extract_anvil_binary(
+            "brokk-mjolnir-v0.5.0-x86_64-unknown-linux-gnu.tar.gz",
+            &archive,
+        )
+        .expect("extract Anvil");
+        assert_eq!(binary, b"anvil bytes");
     }
 
     #[cfg(unix)]
