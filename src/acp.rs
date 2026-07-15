@@ -90,7 +90,6 @@ pub struct RuntimeRoleConfig {
     pub model_id: String,
     pub model_value: String,
     pub adapter_source_id: String,
-    pub force_high_reasoning: bool,
     /// Correlates Thor, Eitri, and Loki records in one interactive session.
     pub council_session: Option<String>,
 }
@@ -1867,7 +1866,7 @@ async fn drive_session(
     };
     if let Some(role) = role_config.as_ref()
         && let Err(error) =
-            apply_runtime_role_config(&conn, &session_id, &mut session_config, role, ui_tx).await
+            apply_runtime_role_config(&conn, &session_id, &mut session_config, role).await
     {
         let text = format!("{} configuration failed: {error}", role.label);
         emit_fatal(ui_tx, &fatal_emitted, text.clone());
@@ -4003,7 +4002,6 @@ async fn apply_runtime_role_config(
     session_id: &SessionId,
     session_config: &mut SessionConfigCache,
     role: &RuntimeRoleConfig,
-    ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
     let model_index = session_config
         .options
@@ -4035,42 +4033,6 @@ async fn apply_runtime_role_config(
         }
     }
 
-    if role.force_high_reasoning {
-        let high = session_config
-            .options
-            .iter()
-            .enumerate()
-            .find_map(|(index, option)| {
-                matches!(
-                    option.category,
-                    Some(SessionConfigOptionCategory::ThoughtLevel)
-                )
-                .then(|| select_option_named(option, None, "High").map(|value| (index, value)))
-                .flatten()
-            });
-        if let Some((index, value)) = high {
-            let target = session_config.targets[index].clone();
-            if config_option_current_value(&session_config.options[index]) != Some(&value) {
-                match send_config_update(conn, session_id, target.clone(), value.clone()).await? {
-                    Some(options) => {
-                        session_config.targets = config_option_targets(&options);
-                        session_config.options = options;
-                    }
-                    None => set_current_config_value(
-                        &mut session_config.options,
-                        &session_config.targets,
-                        &target,
-                        &value,
-                    ),
-                }
-            }
-        } else {
-            let _ = ui_tx.send(UiEvent::Warning(format!(
-                "{} · {} does not advertise a High reasoning control; retaining its native setting",
-                role.label, role.model_value
-            )));
-        }
-    }
     Ok(())
 }
 
@@ -5714,7 +5676,6 @@ mod tests {
             model_id: "claude-sonnet-5".to_string(),
             model_value: "claude-sonnet-5".to_string(),
             adapter_source_id: "claude-acp".to_string(),
-            force_high_reasoning: true,
             council_session: None,
         };
         assert_eq!(
@@ -5737,7 +5698,6 @@ mod tests {
             model_id: "gpt-5-6-sol".to_string(),
             model_value: "gpt-5-6-sol".to_string(),
             adapter_source_id: "codex-acp".to_string(),
-            force_high_reasoning: true,
             council_session: None,
         };
         assert_eq!(

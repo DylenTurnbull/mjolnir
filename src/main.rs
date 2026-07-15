@@ -1710,7 +1710,6 @@ async fn run_session(
             model_id: council.thor.model.model.clone(),
             model_value: council.thor.model_value.clone(),
             adapter_source_id: council.thor.launch.source_id.clone(),
-            force_high_reasoning: true,
             council_session: Some(council_session.clone()),
         }),
         code_agent: eitri_role.map(|eitri_role| {
@@ -1780,10 +1779,10 @@ async fn run_session(
         let mut runtime_event_rx = runtime_event_rx;
         let mut decisions = event_loki.as_ref().map(loki::Handle::subscribe);
         let mut trajectory = loki::BoundaryTracker::default();
-        let mut pending = std::collections::HashSet::new();
         let mut held_completion = None;
         let mut intervention = loki::DeferredIntervention::default();
         let mut discrete_review_started = false;
+        let mut loki_followup_started = false;
         loop {
             tokio::select! {
                 event = runtime_event_rx.recv() => {
@@ -1804,6 +1803,9 @@ async fn run_session(
                     let boundary = (epoch > 0).then(|| trajectory.observe(&event)).flatten();
                     let boundary_observed = boundary.is_some();
                     let target_completed = council_target_completed(&event);
+                    if target_completed && let Some(reviewer) = event_loki.as_ref() {
+                        reviewer.target_completed(epoch, loki::Target::Thor, None);
+                    }
                     let interrupting = boundary_observed
                         && !target_completed
                         && intervention.interrupt_at_boundary();
@@ -1816,12 +1818,10 @@ async fn run_session(
                     if let Some(boundary) = boundary
                         && !interrupting
                         && !(target_completed && intervention.is_pending())
+                        && !loki_followup_started
                         && let Some(reviewer) = event_loki.as_ref()
-                        && let Some(id) = reviewer
-                            .observe(epoch, loki::Target::Thor, boundary)
-                            .await
                     {
-                        pending.insert(id);
+                        reviewer.observe(epoch, loki::Target::Thor, None, boundary);
                     }
 
                     if let crate::event::UiEvent::PromptDone { stop_reason, .. } = &event {
@@ -1836,9 +1836,10 @@ async fn run_session(
                             // Do not turn a user's cancellation into a Loki
                             // continuation before the deferred boundary arrives.
                             intervention.clear();
-                            pending.clear();
                         } else if let Some(critique) = intervention.take() {
-                            pending.clear();
+                            if let Some(reviewer) = event_loki.as_ref() {
+                                reviewer.target_resumed(epoch, loki::Target::Thor, None);
+                            }
                             held_completion = None;
                             trajectory.reset_attempt();
                             let _ = ui_event_tx.send(crate::event::UiEvent::Info(
@@ -1874,7 +1875,9 @@ async fn run_session(
                     } else if let Some(critique) =
                         take_failed_prompt_intervention(&event, &mut intervention)
                     {
-                        pending.clear();
+                        if let Some(reviewer) = event_loki.as_ref() {
+                            reviewer.target_resumed(epoch, loki::Target::Thor, None);
+                        }
                         held_completion = None;
                         trajectory.reset_attempt();
                         let _ = ui_event_tx.send(crate::event::UiEvent::Info(
@@ -1922,10 +1925,11 @@ async fn run_session(
                 } => {
                     let Some(decision) = decision else { continue; };
                     let (epoch, task, _) = event_turn_state.lock().await.clone();
-                    if decision.epoch != epoch || decision.target != loki::Target::Thor || !pending.remove(&decision.id) {
+                    if decision.epoch != epoch || decision.target != loki::Target::Thor {
                         continue;
                     }
-                    if let loki::Verdict::Intervention(critique) = decision.verdict {
+                    {
+                        let critique = decision.critique;
                         tracing::info!(
                             event = "advice_received",
                             council_session = %event_council_session,
@@ -1938,8 +1942,10 @@ async fn run_session(
                         );
                         intervention.push(decision.id, critique);
                         if held_completion.is_some() {
+                            if let Some(reviewer) = event_loki.as_ref() {
+                                reviewer.target_resumed(epoch, loki::Target::Thor, None);
+                            }
                             held_completion = None;
-                            pending.clear();
                             trajectory.reset_attempt();
                             let critique = intervention.take().expect("intervention queued");
                             let _ = ui_event_tx.send(crate::event::UiEvent::Info(
@@ -1970,7 +1976,7 @@ async fn run_session(
                 }
             }
 
-            if held_completion.is_some() && pending.is_empty() && !intervention.is_pending() {
+            if held_completion.is_some() && !intervention.is_pending() {
                 let implementation_handoffs = event_handoffs.load(Ordering::Acquire);
                 let discrete_review_enabled = event_thor_review_enabled.load(Ordering::Acquire);
                 let workspace_delta = if discrete_review_enabled
@@ -2004,6 +2010,9 @@ async fn run_session(
                     held_completion = None;
                     trajectory.reset_attempt();
                     discrete_review_started = true;
+                    if let Some(reviewer) = event_loki.as_ref() {
+                        reviewer.target_resumed(epoch, loki::Target::Thor, None);
+                    }
                     let _ = ui_event_tx.send(crate::event::UiEvent::Info(
                         "reviewing the completed work…".to_string(),
                     ));
@@ -2022,6 +2031,33 @@ async fn run_session(
                     });
                     continue;
                 }
+                if !loki_followup_started && let Some(reviewer) = event_loki.as_ref() {
+                    let (epoch, task, _) = event_turn_state.lock().await.clone();
+                    let deferred = reviewer.take_deferred(epoch);
+                    if !deferred.is_empty() {
+                        let advice = loki::format_deferred(&deferred);
+                        held_completion = None;
+                        trajectory.reset_attempt();
+                        loki_followup_started = true;
+                        emit_internal_message(
+                            &ui_event_tx,
+                            "Loki",
+                            "Thor",
+                            InternalMessageKind::Continuation,
+                            &advice,
+                        );
+                        let _ = review_commands.send(UiCommand::SendPrompt {
+                            text: council_continuation_prompt(
+                                &task,
+                                &advice,
+                                &trajectory.trajectory(),
+                            ),
+                            images: Vec::new(),
+                        });
+                        continue;
+                    }
+                }
+                let (epoch, _, _) = event_turn_state.lock().await.clone();
                 let event = held_completion.take().expect("completion held");
                 event_tracker.observe_event(&event);
                 if let Some(tx) = event_usage_turn_tx.as_ref() {
@@ -2031,7 +2067,11 @@ async fn run_session(
                     break;
                 }
                 event_turn_state.lock().await.2 = None;
+                if let Some(reviewer) = event_loki.as_ref() {
+                    reviewer.end_turn(epoch);
+                }
                 discrete_review_started = false;
+                loki_followup_started = false;
                 intervention.clear();
                 trajectory = loki::BoundaryTracker::default();
             }

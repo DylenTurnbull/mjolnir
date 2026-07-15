@@ -2,7 +2,7 @@
 //! deltas into one Loki ACP session; only calls to Loki's `advise` MCP tool are
 //! projected back into the visible transcript and steering machinery.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
@@ -52,36 +52,100 @@ const MCP_SERVER_NAME: &str = "mj-loki-advisor";
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct AdviseArgs {
+    /// Agent whose reviewed work this advice concerns.
+    target: Target,
+    /// True only when waiting for a natural turn boundary risks material harm.
+    urgent: bool,
     /// One concrete, material, actionable suggestion for the watched agent.
     note: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewedSpan {
+    pub target: Target,
+    pub invocation: Option<u64>,
+    pub first_step: u64,
+    pub last_step: u64,
+    pub activities: Vec<String>,
+}
+
+impl ReviewedSpan {
+    fn marker(&self) -> String {
+        let actor = match self.invocation {
+            Some(invocation) => format!("{} #{invocation}", self.target.label()),
+            None => self.target.label().to_string(),
+        };
+        let steps = if self.first_step == self.last_step {
+            format!("step {}", self.first_step)
+        } else {
+            format!("steps {}-{}", self.first_step, self.last_step)
+        };
+        format!("{actor} · {steps}: {}", self.activities.join(", "))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Advice {
+    pub id: u64,
+    pub epoch: u64,
+    pub target: Target,
+    pub urgent: bool,
+    pub note: String,
+    pub span: ReviewedSpan,
+}
+
+impl Advice {
+    pub fn immediate_text(&self) -> String {
+        format!("[reviewed {}]\n{}", self.span.marker(), self.note)
+    }
+
+    fn deferred_text(&self) -> String {
+        format!(
+            "[reviewed {}]\n{}\n\nThis was not urgent enough to interrupt at that point; later work may have superseded it.",
+            self.span.marker(),
+            self.note
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct AdviceState {
+    active_thor: Option<u64>,
+    active_eitri: Option<(u64, u64)>,
+    deferred: VecDeque<Advice>,
+    seen: HashSet<(u64, String)>,
+}
+
+type SharedAdviceState = Arc<std::sync::Mutex<AdviceState>>;
 
 #[derive(Debug, Clone)]
 struct ActiveAdvice {
     id: u64,
     epoch: u64,
-    target: Target,
+    spans: Vec<ReviewedSpan>,
     accepted: bool,
-    note: Option<String>,
+    accepted_advice: Option<Advice>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct AdviceSlot {
     active: Arc<Mutex<Option<ActiveAdvice>>>,
+    state: SharedAdviceState,
+    decisions: Option<broadcast::Sender<Decision>>,
 }
 
 impl AdviceSlot {
-    async fn begin(&self, id: u64, epoch: u64, target: Target) {
+    async fn begin(&self, id: u64, epoch: u64, spans: Vec<ReviewedSpan>) {
         *self.active.lock().await = Some(ActiveAdvice {
             id,
             epoch,
-            target,
+            spans,
             accepted: false,
-            note: None,
+            accepted_advice: None,
         });
     }
 
-    async fn accept(&self, note: String) -> std::result::Result<Decision, &'static str> {
+    async fn accept(&self, args: AdviseArgs) -> std::result::Result<Advice, &'static str> {
         let mut active = self.active.lock().await;
         let Some(active) = active.as_mut() else {
             return Err("no advisor update is active");
@@ -89,20 +153,70 @@ impl AdviceSlot {
         if active.accepted {
             return Err("only one advice note is allowed per advisor update");
         }
-        active.accepted = true;
-        active.note = Some(note.clone());
-        Ok(Decision {
+        let Some(span) = active
+            .spans
+            .iter()
+            .find(|span| span.target == args.target)
+            .cloned()
+        else {
+            return Err("target was not present in this advisor update");
+        };
+        let advice = Advice {
             id: active.id,
             epoch: active.epoch,
-            target: active.target,
-            verdict: Verdict::Intervention(note),
-        })
+            target: args.target,
+            urgent: args.urgent,
+            note: args.note,
+            span,
+        };
+        let mut state = self.state.lock().expect("Loki advice state poisoned");
+        let dedupe = (advice.epoch, advice.note.to_ascii_lowercase());
+        if !state.seen.insert(dedupe) {
+            return Err("duplicate advice was ignored");
+        }
+        active.accepted = true;
+        active.accepted_advice = Some(advice.clone());
+        let active_target = match advice.target {
+            Target::Thor => state.active_thor == Some(advice.epoch),
+            Target::Eitri => state.active_eitri.is_some_and(|(epoch, invocation)| {
+                epoch == advice.epoch && Some(invocation) == advice.span.invocation
+            }),
+        };
+        if advice.urgent && active_target {
+            tracing::info!(
+                event = "advice_routed",
+                review_target = advice.target.label(),
+                urgency = "urgent",
+                reviewed_span = %advice.span.marker(),
+                delivery_route = "interrupt",
+                "Loki advice routed"
+            );
+            if let Some(decisions) = self.decisions.as_ref() {
+                let _ = decisions.send(Decision {
+                    id: advice.id,
+                    epoch: advice.epoch,
+                    target: advice.target,
+                    critique: advice.immediate_text(),
+                });
+            }
+        } else {
+            tracing::info!(
+                event = "advice_routed",
+                review_target = advice.target.label(),
+                urgency = if advice.urgent { "urgent_late" } else { "nonurgent" },
+                reviewed_span = %advice.span.marker(),
+                delivery_route = "deferred_to_thor",
+                "Loki advice routed"
+            );
+            state.deferred.push_back(advice.clone());
+        }
+        Ok(advice)
     }
 
-    async fn finish(&self, id: u64) -> Option<String> {
+    async fn finish(&self, id: u64) -> Option<Advice> {
         let mut active = self.active.lock().await;
         if active.as_ref().is_some_and(|active| active.id == id) {
-            return active.take().and_then(|active| active.note);
+            return active.take().and_then(|active| active.accepted_advice);
         }
         None
     }
@@ -111,21 +225,15 @@ impl AdviceSlot {
 #[derive(Clone)]
 struct McpHandler {
     advice: AdviceSlot,
-    decisions: broadcast::Sender<Decision>,
     tools_listed: watch::Sender<bool>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router(router = tool_router)]
 impl McpHandler {
-    fn new(
-        advice: AdviceSlot,
-        decisions: broadcast::Sender<Decision>,
-        tools_listed: watch::Sender<bool>,
-    ) -> Self {
+    fn new(advice: AdviceSlot, tools_listed: watch::Sender<bool>) -> Self {
         Self {
             advice,
-            decisions,
             tools_listed,
             tool_router: Self::tool_router(),
         }
@@ -133,7 +241,7 @@ impl McpHandler {
 
     #[tool(
         name = "advise",
-        description = "Send one material advisory suggestion to the agent you are currently watching. Calling this tool forces Mjolnir to cancel that agent at the next safe step boundary and re-prompt it with your note. Use it only for a material correctness, safety, scope, or strategy concern; otherwise do not call it. Phrase most notes as questions, such as 'Would it be better to...' or 'Have you thought about...?'"
+        description = "Send at most one material advisory note about Thor or Eitri. Mark urgent only when waiting for a natural turn boundary risks a material correctness, safety, scope, or strategy failure; urgent advice cancels and re-prompts the active target, while non-urgent advice is delivered to Thor at a natural boundary. Otherwise do not call this tool."
     )]
     async fn advise(
         &self,
@@ -143,13 +251,20 @@ impl McpHandler {
         if note.is_empty() {
             return Err(McpError::invalid_params("note must not be empty", None));
         }
-        match self.advice.accept(note.to_string()).await {
-            Ok(decision) => {
-                let _ = self.decisions.send(decision);
-                Ok(CallToolResult::success(vec![Content::text(
-                    "Advice queued for the watched agent.",
-                )]))
-            }
+        if is_content_free(note) {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Content-free advice was ignored.",
+            )]));
+        }
+        let args = AdviseArgs {
+            target: args.target,
+            urgent: args.urgent,
+            note: note.to_string(),
+        };
+        match self.advice.accept(args).await {
+            Ok(_) => Ok(CallToolResult::success(vec![Content::text(
+                "Advice accepted.",
+            )])),
             Err(message) => Ok(CallToolResult::error(vec![Content::text(message)])),
         }
     }
@@ -163,7 +278,7 @@ impl ServerHandler for McpHandler {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "You are a pure advisor. The advise tool is your only channel back to the watched agent. Any call forces cancellation and re-prompting, so stay silent unless a material suggestion is necessary. Prefer advice framed as questions rather than corrections.",
+                "You are a read-only advisor. The advise tool is your only channel back to Thor or Eitri. Stay silent unless a concrete material suggestion is necessary.",
             )
     }
 
@@ -200,14 +315,14 @@ struct HttpServer {
 }
 
 impl HttpServer {
-    async fn start(advice: AdviceSlot, decisions: broadcast::Sender<Decision>) -> Result<Self> {
+    async fn start(advice: AdviceSlot) -> Result<Self> {
         let mut token_bytes = [0_u8; 32];
         getrandom::fill(&mut token_bytes)
             .map_err(|error| anyhow!("generate Loki advisor MCP bearer token: {error}"))?;
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
         let authorization = format!("Bearer {token}");
         let (tools_listed_tx, tools_listed) = watch::channel(false);
-        let handler = McpHandler::new(advice, decisions, tools_listed_tx);
+        let handler = McpHandler::new(advice, tools_listed_tx);
         let cancellation = CancellationToken::new();
         let mut config = StreamableHttpServerConfig::default();
         config.cancellation_token = cancellation.clone();
@@ -345,6 +460,13 @@ impl DeferredIntervention {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Checkpoint {
+    pub step: u64,
+    pub text: String,
+    pub activities: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct BoundaryTracker {
     trajectory: String,
@@ -352,6 +474,8 @@ pub struct BoundaryTracker {
     segment: String,
     lane: Option<SegmentLane>,
     tools: HashMap<String, agent_client_protocol::schema::v1::ToolCall>,
+    terminals: HashMap<String, String>,
+    next_step: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -361,41 +485,53 @@ enum SegmentLane {
 }
 
 impl BoundaryTracker {
-    pub fn observe(&mut self, event: &UiEvent) -> Option<String> {
-        use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall, ToolCallStatus};
+    pub fn observe(&mut self, event: &UiEvent) -> Option<Checkpoint> {
+        use agent_client_protocol::schema::v1::{
+            SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus,
+        };
         let flush = |this: &mut Self| {
-            let lane = this.lane.take()?;
+            this.lane.take()?;
             if this.segment.trim().is_empty() {
                 this.segment.clear();
                 return None;
             }
-            let kind = match lane {
-                SegmentLane::Message => "message",
-                SegmentLane::Thought => "thinking",
-            };
-            Some(format!("{kind}:\n{}", std::mem::take(&mut this.segment)))
+            Some(std::mem::take(&mut this.segment))
         };
-        let boundary = match event {
+        let append = |this: &mut Self, lane: SegmentLane, text: &str| {
+            if this.lane != Some(lane) {
+                if !this.segment.is_empty() {
+                    this.segment.push('\n');
+                }
+                this.segment.push_str(match lane {
+                    SegmentLane::Message => "message:\n",
+                    SegmentLane::Thought => "thinking:\n",
+                });
+                this.lane = Some(lane);
+            }
+            this.segment.push_str(text);
+        };
+        let boundary: Option<(String, Vec<String>)> = match event {
             UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(chunk)) => {
                 let text = crate::event::content_block_text(&chunk.content);
-                let previous = (self.lane == Some(SegmentLane::Thought))
-                    .then(|| flush(self))
-                    .flatten();
-                self.lane = Some(SegmentLane::Message);
-                self.segment.push_str(&text);
+                append(self, SegmentLane::Message, &text);
                 self.final_message.push_str(&text);
-                previous
+                None
             }
             UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(chunk)) => {
-                let previous = (self.lane == Some(SegmentLane::Message))
-                    .then(|| flush(self))
-                    .flatten();
-                self.lane = Some(SegmentLane::Thought);
-                self.segment
-                    .push_str(&crate::event::content_block_text(&chunk.content));
-                previous
+                append(
+                    self,
+                    SegmentLane::Thought,
+                    &crate::event::content_block_text(&chunk.content),
+                );
+                None
             }
             UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)) => {
+                for content in &call.content {
+                    if let ToolCallContent::Terminal(terminal) = content {
+                        self.terminals
+                            .insert(terminal.terminal_id.to_string(), tool_activity(call));
+                    }
+                }
                 let complete = matches!(
                     call.status,
                     ToolCallStatus::Completed | ToolCallStatus::Failed
@@ -404,7 +540,11 @@ impl BoundaryTracker {
                     .insert(call.tool_call_id.to_string(), call.clone());
                 complete.then(|| {
                     self.final_message.clear();
-                    join_boundary(flush(self), render_tool_delta(call))
+                    let activity = tool_activity(call);
+                    (
+                        join_boundary(flush(self), render_tool_delta(call)),
+                        vec![activity],
+                    )
                 })
             }
             UiEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(update)) => {
@@ -417,47 +557,58 @@ impl BoundaryTracker {
                     let tool = self
                         .tools
                         .entry(id.clone())
-                        .or_insert_with(|| ToolCall::new(id, "tool"));
+                        .or_insert_with(|| ToolCall::new(id.clone(), "tool"));
                     tool.update(update.fields.clone());
                     completed.then(|| render_tool_delta(tool))
                 };
                 rendered.map(|rendered| {
                     self.final_message.clear();
-                    join_boundary(flush(self), rendered)
+                    let activity = self
+                        .tools
+                        .get(&id)
+                        .map_or_else(|| "tool".to_string(), tool_activity);
+                    (join_boundary(flush(self), rendered), vec![activity])
                 })
             }
             UiEvent::SessionUpdate(SessionUpdate::Plan(plan)) => {
                 self.final_message.clear();
-                Some(join_boundary(
-                    flush(self),
-                    bounded_item(format!("plan:\n{plan:?}")),
+                Some((
+                    join_boundary(flush(self), bounded_item(format!("plan update:\n{plan:?}"))),
+                    vec!["plan update".to_string()],
                 ))
             }
             UiEvent::TerminalOutput(snapshot) if snapshot.exit_status.is_some() => {
-                Some(join_boundary(
-                    flush(self),
-                    bounded_item(format!(
-                        "terminal {} [{:?}]:\n{}",
-                        snapshot.terminal_id, snapshot.exit_status, snapshot.output
-                    )),
+                let activity = self
+                    .terminals
+                    .get(&snapshot.terminal_id)
+                    .cloned()
+                    .unwrap_or_else(|| "terminal".to_string());
+                let lines = snapshot.output.lines().count();
+                Some((
+                    join_boundary(
+                        flush(self),
+                        bounded_item(format!(
+                            "terminal: {activity} [{:?}], {lines} output lines",
+                            snapshot.exit_status
+                        )),
+                    ),
+                    vec![activity],
                 ))
             }
-            UiEvent::PromptDone { stop_reason, .. } => Some(join_boundary(
-                flush(self),
-                format!("turn finished: {stop_reason:?}"),
-            )),
-            UiEvent::PromptFailed { message } => Some(join_boundary(
-                flush(self),
-                format!("turn failed: {message}"),
-            )),
+            UiEvent::PromptDone { .. } | UiEvent::PromptFailed { .. } => None,
             _ => None,
         };
-        if let Some(boundary) = boundary.as_ref() {
-            self.trajectory.push_str(boundary);
+        boundary.map(|(text, activities)| {
+            self.next_step += 1;
+            self.trajectory.push_str(&text);
             self.trajectory.push('\n');
             self.trajectory = bounded(std::mem::take(&mut self.trajectory));
-        }
-        boundary
+            Checkpoint {
+                step: self.next_step,
+                text,
+                activities,
+            }
+        })
     }
 
     pub fn trajectory(&self) -> String {
@@ -473,30 +624,131 @@ impl BoundaryTracker {
         self.segment.clear();
         self.lane = None;
         self.tools.clear();
+        self.terminals.clear();
     }
 }
 
 fn render_tool_delta(tool: &agent_client_protocol::schema::v1::ToolCall) -> String {
-    let mut text = format!("tool: {} [{:?}]", tool.title, tool.status);
-    if let Some(input) = tool.raw_input.as_ref() {
-        append_json_section(&mut text, "input", input);
+    use agent_client_protocol::schema::v1::{ToolCallContent, ToolCallStatus};
+    let activity = tool_activity(tool);
+    let primary = tool.raw_input.as_ref().and_then(primary_arg);
+    let output = tool_output_text(tool);
+    let lines = output.lines().count();
+    let mut text = format!("tool: {activity}");
+    if let Some(primary) = primary {
+        text.push_str(&format!(" ({primary})"));
     }
-    if !tool.content.is_empty()
-        && let Ok(content) = serde_json::to_value(&tool.content)
+    text.push_str(&format!(" [{:?}], {lines} result lines", tool.status));
+    if matches!(tool.status, ToolCallStatus::Failed)
+        && let Some(first) = tool
+            .raw_output
+            .as_ref()
+            .and_then(first_error_value)
+            .or_else(|| {
+                output
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .map(str::to_string)
+            })
     {
-        append_json_section(&mut text, "content", &content);
+        text.push_str("\nerror: ");
+        text.push_str(first.trim());
     }
-    if let Some(output) = tool.raw_output.as_ref() {
-        append_json_section(&mut text, "output", output);
+    for content in &tool.content {
+        if let ToolCallContent::Diff(diff) = content {
+            text.push_str(&format!(
+                "\ndiff {}:\n--- old\n{}\n+++ new\n{}",
+                diff.path.display(),
+                diff.old_text.as_deref().unwrap_or(""),
+                diff.new_text
+            ));
+        }
     }
     bounded_item(text)
 }
 
-fn append_json_section(text: &mut String, label: &str, value: &serde_json::Value) {
-    text.push('\n');
-    text.push_str(label);
-    text.push_str(":\n");
-    text.push_str(&serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()));
+fn first_error_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => ["error", "stderr", "message"]
+            .iter()
+            .find_map(|key| map.get(*key))
+            .and_then(|value| match value {
+                serde_json::Value::String(text) => text.lines().next().map(str::to_string),
+                value => Some(value.to_string()),
+            })
+            .or_else(|| map.values().find_map(first_error_value)),
+        serde_json::Value::Array(values) => values.iter().find_map(first_error_value),
+        _ => None,
+    }
+}
+
+fn tool_output_text(tool: &agent_client_protocol::schema::v1::ToolCall) -> String {
+    use agent_client_protocol::schema::v1::ToolCallContent;
+    let mut parts = Vec::new();
+    for content in &tool.content {
+        if let ToolCallContent::Content(content) = content {
+            parts.push(crate::event::content_block_text(&content.content));
+        }
+    }
+    if let Some(output) = tool.raw_output.as_ref() {
+        collect_json_text(output, &mut parts);
+    }
+    parts.join("\n")
+}
+
+fn collect_json_text(value: &serde_json::Value, parts: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) => parts.push(value.clone()),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_text(value, parts);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                collect_json_text(value, parts);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn tool_activity(tool: &agent_client_protocol::schema::v1::ToolCall) -> String {
+    let metadata = tool
+        .meta
+        .as_ref()
+        .and_then(|meta| serde_json::to_value(meta).ok());
+    metadata
+        .as_ref()
+        .and_then(|value| find_json_string(value, &["toolName", "tool_name", "name"]))
+        .or_else(|| {
+            tool.raw_input
+                .as_ref()
+                .and_then(|value| find_json_string(value, &["toolName", "tool_name"]))
+        })
+        .unwrap_or_else(|| tool.title.clone())
+}
+
+fn find_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in keys {
+                if let Some(value) = map.get(*key).and_then(serde_json::Value::as_str) {
+                    return Some(value.to_string());
+                }
+            }
+            map.values().find_map(|value| find_json_string(value, keys))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_json_string(value, keys)),
+        _ => None,
+    }
+}
+
+fn primary_arg(value: &serde_json::Value) -> Option<String> {
+    find_json_string(value, &["command", "path", "file_path", "pattern", "query"])
+        .map(|value| value.chars().take(160).collect())
 }
 
 fn bounded_item(mut text: String) -> String {
@@ -513,7 +765,8 @@ fn join_boundary(previous: Option<String>, current: String) -> String {
     previous.map_or(current.clone(), |previous| format!("{previous}\n{current}"))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum Target {
     Thor,
     Eitri,
@@ -529,18 +782,11 @@ impl Target {
 }
 
 #[derive(Debug, Clone)]
-pub enum Verdict {
-    NoIntervention,
-    Intervention(String),
-    Failed(String),
-}
-
-#[derive(Debug, Clone)]
 pub struct Decision {
     pub id: u64,
     pub epoch: u64,
     pub target: Target,
-    pub verdict: Verdict,
+    pub critique: String,
 }
 
 enum Request {
@@ -551,13 +797,20 @@ enum Request {
     TargetContext {
         epoch: u64,
         target: Target,
+        invocation: Option<u64>,
         text: String,
+    },
+    EndTarget {
+        epoch: u64,
+        target: Target,
+        invocation: Option<u64>,
     },
     Review {
         id: u64,
         epoch: u64,
         target: Target,
-        delta: String,
+        invocation: Option<u64>,
+        checkpoint: Checkpoint,
     },
     Shutdown,
 }
@@ -568,6 +821,8 @@ pub struct Handle {
     decisions: broadcast::Sender<Decision>,
     ids: Arc<AtomicU64>,
     epochs: Arc<AtomicU64>,
+    eitri_invocations: Arc<AtomicU64>,
+    advice_state: SharedAdviceState,
     abort: watch::Sender<bool>,
     finished: watch::Receiver<bool>,
 }
@@ -584,11 +839,14 @@ impl Handle {
         let (decisions, _) = broadcast::channel(512);
         let (abort, abort_rx) = watch::channel(false);
         let (finished_tx, finished) = watch::channel(false);
+        let advice_state = SharedAdviceState::default();
         let handle = Self {
             requests,
             decisions: decisions.clone(),
             ids: Arc::new(AtomicU64::new(1)),
             epochs: Arc::new(AtomicU64::new(1)),
+            eitri_invocations: Arc::new(AtomicU64::new(1)),
+            advice_state: advice_state.clone(),
             abort,
             finished,
         };
@@ -599,6 +857,7 @@ impl Handle {
             ui_tx,
             rx,
             decisions,
+            advice_state,
             abort_rx,
             finished_tx,
             council_session,
@@ -613,16 +872,109 @@ impl Handle {
     pub fn begin_turn(&self, task: String) -> u64 {
         let _ = self.abort.send(false);
         let epoch = self.epochs.fetch_add(1, Ordering::Relaxed);
+        self.eitri_invocations.store(1, Ordering::Relaxed);
+        {
+            let mut state = self
+                .advice_state
+                .lock()
+                .expect("Loki advice state poisoned");
+            state.active_thor = Some(epoch);
+            state.active_eitri = None;
+            state.deferred.clear();
+            state.seen.retain(|(seen_epoch, _)| *seen_epoch == epoch);
+        }
         let _ = self.requests.send(Request::Begin { epoch, task });
         epoch
     }
 
-    pub fn begin_eitri(&self, epoch: u64, context: String) {
+    pub fn begin_eitri(&self, epoch: u64, context: String) -> u64 {
+        let invocation = self.eitri_invocations.fetch_add(1, Ordering::Relaxed);
+        self.advice_state
+            .lock()
+            .expect("Loki advice state poisoned")
+            .active_eitri = Some((epoch, invocation));
         let _ = self.requests.send(Request::TargetContext {
             epoch,
             target: Target::Eitri,
+            invocation: Some(invocation),
             text: context,
         });
+        invocation
+    }
+
+    pub fn end_eitri(&self, epoch: u64, invocation: u64) {
+        let mut state = self
+            .advice_state
+            .lock()
+            .expect("Loki advice state poisoned");
+        if state.active_eitri == Some((epoch, invocation)) {
+            state.active_eitri = None;
+        }
+        drop(state);
+        let _ = self.requests.send(Request::EndTarget {
+            epoch,
+            target: Target::Eitri,
+            invocation: Some(invocation),
+        });
+    }
+
+    pub fn target_completed(&self, epoch: u64, target: Target, invocation: Option<u64>) {
+        let mut state = self
+            .advice_state
+            .lock()
+            .expect("Loki advice state poisoned");
+        match target {
+            Target::Thor if state.active_thor == Some(epoch) => state.active_thor = None,
+            Target::Eitri if state.active_eitri == invocation.map(|value| (epoch, value)) => {
+                state.active_eitri = None;
+            }
+            Target::Thor | Target::Eitri => {}
+        }
+    }
+
+    pub fn target_resumed(&self, epoch: u64, target: Target, invocation: Option<u64>) {
+        let mut state = self
+            .advice_state
+            .lock()
+            .expect("Loki advice state poisoned");
+        match target {
+            Target::Thor => state.active_thor = Some(epoch),
+            Target::Eitri => state.active_eitri = invocation.map(|value| (epoch, value)),
+        }
+    }
+
+    pub fn end_turn(&self, epoch: u64) {
+        let mut state = self
+            .advice_state
+            .lock()
+            .expect("Loki advice state poisoned");
+        if state.active_thor == Some(epoch) {
+            state.active_thor = None;
+        }
+        state.deferred.retain(|advice| advice.epoch != epoch);
+        drop(state);
+        let _ = self.requests.send(Request::EndTarget {
+            epoch,
+            target: Target::Thor,
+            invocation: None,
+        });
+    }
+
+    pub fn take_deferred(&self, epoch: u64) -> Vec<Advice> {
+        let mut state = self
+            .advice_state
+            .lock()
+            .expect("Loki advice state poisoned");
+        let mut selected = Vec::new();
+        state.deferred.retain(|advice| {
+            if advice.epoch == epoch {
+                selected.push(advice.clone());
+                false
+            } else {
+                true
+            }
+        });
+        selected
     }
 
     pub fn current_epoch(&self) -> u64 {
@@ -633,19 +985,25 @@ impl Handle {
         let _ = self.abort.send(true);
     }
 
-    pub async fn observe(&self, epoch: u64, target: Target, delta: String) -> Option<u64> {
-        Some(self.submit(epoch, target, delta))
+    pub fn observe(
+        &self,
+        epoch: u64,
+        target: Target,
+        invocation: Option<u64>,
+        checkpoint: Checkpoint,
+    ) {
+        self.submit(epoch, target, invocation, checkpoint);
     }
 
-    fn submit(&self, epoch: u64, target: Target, delta: String) -> u64 {
+    fn submit(&self, epoch: u64, target: Target, invocation: Option<u64>, checkpoint: Checkpoint) {
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
         let _ = self.requests.send(Request::Review {
             id,
             epoch,
             target,
-            delta: bounded(delta),
+            invocation,
+            checkpoint,
         });
-        id
     }
 
     pub async fn shutdown_and_wait(&self) {
@@ -676,16 +1034,22 @@ async fn worker(
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     mut requests: mpsc::UnboundedReceiver<Request>,
     decisions: broadcast::Sender<Decision>,
+    advice_state: SharedAdviceState,
     abort_rx: watch::Receiver<bool>,
     finished: watch::Sender<bool>,
     council_session: String,
 ) {
     let mut epoch = 0;
-    let mut pending_context: HashMap<Target, String> = HashMap::new();
-    let mut deferred = VecDeque::new();
+    let mut outer_task = String::new();
+    let mut recent_trajectory = String::new();
+    let mut pending_context: HashMap<(Target, Option<u64>), String> = HashMap::new();
     let mut session: Option<AgentHandle> = None;
-    let advice = AdviceSlot::default();
-    let server = match HttpServer::start(advice.clone(), decisions.clone()).await {
+    let advice = AdviceSlot {
+        active: Arc::default(),
+        state: advice_state,
+        decisions: Some(decisions),
+    };
+    let server = match HttpServer::start(advice.clone()).await {
         Ok(server) => Some(server),
         Err(error) => {
             emit_warning(
@@ -697,265 +1061,212 @@ async fn worker(
         }
     };
     let mut primed = false;
-    loop {
-        let request = match deferred.pop_front() {
-            Some(request) => request,
-            None => match requests.recv().await {
-                Some(request) => request,
-                None => break,
-            },
+    'worker: loop {
+        let Some(request) = requests.recv().await else {
+            break;
         };
-        match request {
-            Request::Begin {
-                epoch: next,
-                task: next_task,
-            } => {
-                epoch = next;
-                pending_context.clear();
-                pending_context.insert(
-                    Target::Thor,
-                    format!("New outer user request:\n{next_task}"),
-                );
-            }
-            Request::TargetContext {
-                epoch: request_epoch,
-                target,
-                text,
-            } if request_epoch == epoch => {
-                pending_context
-                    .entry(target)
-                    .and_modify(|pending| {
-                        pending.push_str("\n\n");
-                        pending.push_str(&text);
-                    })
-                    .or_insert(text);
-            }
-            Request::Review {
-                id,
-                epoch: request_epoch,
-                target,
-                mut delta,
-            } if request_epoch == epoch => {
-                tracing::info!(
-                    event = "review_started",
-                    council_session = %council_session,
-                    god = "Loki",
-                    model = %role.model.model,
-                    adapter = %role.launch.source_id,
-                    target = target.label(),
-                    review_id = id,
-                    epoch,
-                    delta = %delta,
-                    "Loki review started"
-                );
-                let mut review_ids = vec![id];
-                while let Ok(next) = requests.try_recv() {
-                    match next {
-                        Request::Review {
-                            id: next_id,
-                            epoch: next_epoch,
-                            target: next_target,
-                            delta: next_delta,
-                        } if next_epoch == request_epoch && next_target == target => {
-                            review_ids.push(next_id);
-                            delta.push_str("\n\n--- next completed step ---\n\n");
-                            delta.push_str(&next_delta);
-                            delta = bounded(delta);
-                        }
-                        other => {
-                            deferred.push_back(other);
-                            break;
-                        }
-                    }
-                }
-                if *abort_rx.borrow() {
-                    for id in review_ids {
-                        let _ = decisions.send(Decision {
-                            id,
-                            epoch,
-                            target,
-                            verdict: Verdict::NoIntervention,
-                        });
-                    }
-                    continue;
-                }
-                let Some(server) = server.as_ref() else {
-                    for id in review_ids {
-                        let _ = decisions.send(Decision {
-                            id,
-                            epoch,
-                            target,
-                            verdict: Verdict::Failed(
-                                "Loki advisor tool is unavailable".to_string(),
-                            ),
-                        });
-                    }
-                    continue;
-                };
-                if session.is_none() {
-                    match connect(
-                        &role,
-                        &cwd,
-                        &additional_directories,
-                        abort_rx.clone(),
-                        server.advertised.clone(),
-                        &council_session,
-                    )
-                    .await
-                    {
-                        Ok(agent) => {
-                            session = Some(agent);
-                            if let Err(error) = server.wait_until_tools_listed().await {
-                                emit_warning(
-                                    &ui_tx,
-                                    &role,
-                                    format!("Loki could not load advise: {error:#}"),
-                                );
-                                if let Some(old) = session.take() {
-                                    old.dismiss().await;
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            if *abort_rx.borrow() {
-                                for id in review_ids {
-                                    let _ = decisions.send(Decision {
-                                        id,
-                                        epoch,
-                                        target,
-                                        verdict: Verdict::NoIntervention,
-                                    });
-                                }
-                                continue;
-                            }
-                            let message = format!("Loki could not start: {error:#}");
-                            emit_warning(&ui_tx, &role, message.clone());
-                            for id in review_ids {
-                                let _ = decisions.send(Decision {
-                                    id,
-                                    epoch,
-                                    target,
-                                    verdict: Verdict::Failed(message.clone()),
-                                });
-                            }
-                            continue;
-                        }
-                    }
-                }
-                let Some(agent) = session.as_mut() else {
-                    for id in review_ids {
-                        let _ = decisions.send(Decision {
-                            id,
-                            epoch,
-                            target,
-                            verdict: Verdict::Failed(
-                                "Loki could not load the advise tool".to_string(),
-                            ),
-                        });
-                    }
-                    continue;
-                };
-                let context = pending_context.remove(&target);
-                let prompt = review_prompt(target, context.as_deref(), &delta, !primed);
-                primed = true;
-                advice.begin(id, epoch, target).await;
-                let result = agent
-                    .prompt(prompt, REVIEW_TIMEOUT, |event| match event {
-                        TurnEvent::Permission {
-                            prompt,
-                            access_mode,
-                        } => {
-                            let decision = crate::ragnarok::permission_decision_for_access(
-                                access_mode,
-                                &prompt,
-                            );
-                            let _ = prompt.responder.send(decision);
-                        }
-                        TurnEvent::Message(_)
-                        | TurnEvent::Thought(_)
-                        | TurnEvent::Tool { .. }
-                        | TurnEvent::Note(_) => {}
-                    })
-                    .await;
-                let advice_note = advice.finish(id).await;
-                if advice_note.is_none() {
-                    let verdict = match result {
-                        Ok(_) => Verdict::NoIntervention,
-                        Err(_) if *abort_rx.borrow() => Verdict::NoIntervention,
-                        Err(error) => {
-                            let message = error.to_string();
-                            emit_warning(
-                                &ui_tx,
-                                &role,
-                                format!("Loki review failed open: {message}"),
-                            );
-                            primed = false;
-                            Verdict::Failed(message)
-                        }
-                    };
-                    for id in review_ids {
-                        let _ = decisions.send(Decision {
-                            id,
-                            epoch,
-                            target,
-                            verdict: verdict.clone(),
-                        });
-                    }
-                    tracing::info!(
-                        event = "review_finished",
-                        council_session = %council_session,
-                        god = "Loki",
-                        model = %role.model.model,
-                        adapter = %role.launch.source_id,
-                        target = target.label(),
-                        review_id = id,
-                        verdict = match &verdict {
-                            Verdict::NoIntervention => "no_intervention",
-                            Verdict::Intervention(_) => "intervention",
-                            Verdict::Failed(_) => "failed",
-                        },
-                        error = ?match &verdict {
-                            Verdict::Failed(message) => Some(message.as_str()),
-                            _ => None,
-                        },
-                        "Loki review finished"
+        let mut batch = Vec::new();
+        let mut incoming = VecDeque::from([request]);
+        while let Some(request) = incoming.pop_front() {
+            match request {
+                Request::Begin {
+                    epoch: next,
+                    task: next_task,
+                } => {
+                    epoch = next;
+                    outer_task = next_task.clone();
+                    recent_trajectory.clear();
+                    pending_context.clear();
+                    pending_context.insert(
+                        (Target::Thor, None),
+                        format!("New outer user request:\n{next_task}"),
                     );
-                    if matches!(verdict, Verdict::Failed(_))
-                        && let Some(old) = session.take()
-                    {
-                        old.dismiss().await;
-                    }
-                } else {
-                    tracing::info!(
-                        event = "review_finished",
-                        council_session = %council_session,
-                        god = "Loki",
-                        model = %role.model.model,
-                        adapter = %role.launch.source_id,
-                        target = target.label(),
-                        review_id = id,
-                        verdict = "intervention",
-                        advice = %advice_note.as_deref().unwrap_or_default(),
-                        "Loki review finished"
-                    );
-                    for id in review_ids.into_iter().skip(1) {
-                        let _ = decisions.send(Decision {
-                            id,
-                            epoch,
-                            target,
-                            verdict: Verdict::NoIntervention,
-                        });
+                }
+                Request::TargetContext {
+                    epoch: request_epoch,
+                    target,
+                    invocation,
+                    text,
+                } if request_epoch == epoch => {
+                    pending_context
+                        .entry((target, invocation))
+                        .and_modify(|pending| {
+                            pending.push_str("\n\n");
+                            pending.push_str(&text);
+                        })
+                        .or_insert(text);
+                }
+                Request::EndTarget {
+                    epoch: request_epoch,
+                    target,
+                    invocation,
+                } if request_epoch == epoch => {
+                    pending_context.remove(&(target, invocation));
+                    batch.retain(|item: &ReviewItem| {
+                        item.target != target || item.invocation != invocation
+                    });
+                }
+                Request::Review {
+                    id,
+                    epoch: request_epoch,
+                    target,
+                    invocation,
+                    checkpoint,
+                } if request_epoch == epoch => {
+                    batch.push(ReviewItem {
+                        id,
+                        target,
+                        invocation,
+                        checkpoint,
+                    });
+                    while let Ok(next) = requests.try_recv() {
+                        incoming.push_back(next);
                     }
                 }
+                Request::TargetContext { .. }
+                | Request::EndTarget { .. }
+                | Request::Review { .. } => {}
+                Request::Shutdown => break 'worker,
             }
-            Request::TargetContext { .. } | Request::Review { .. } => {}
-            Request::Shutdown => break,
         }
+        if batch.is_empty() || *abort_rx.borrow() {
+            continue;
+        }
+        let Some(server) = server.as_ref() else {
+            continue;
+        };
+        if session.is_none() {
+            match connect(
+                &role,
+                &cwd,
+                &additional_directories,
+                abort_rx.clone(),
+                server.advertised.clone(),
+                &council_session,
+            )
+            .await
+            {
+                Ok(agent) => {
+                    session = Some(agent);
+                    if let Err(error) = server.wait_until_tools_listed().await {
+                        emit_warning(
+                            &ui_tx,
+                            &role,
+                            format!("Loki could not load advise: {error:#}"),
+                        );
+                        if let Some(old) = session.take() {
+                            old.dismiss().await;
+                        }
+                    }
+                }
+                Err(error) => {
+                    if !*abort_rx.borrow() {
+                        emit_warning(&ui_tx, &role, format!("Loki could not start: {error:#}"));
+                    }
+                    continue;
+                }
+            }
+        }
+        let Some(agent) = session.as_mut() else {
+            continue;
+        };
+        let spans = reviewed_spans(&batch);
+        let mut context = Vec::new();
+        for span in &spans {
+            if let Some(value) = pending_context.remove(&(span.target, span.invocation)) {
+                context.push(value);
+            }
+        }
+        if !primed && !recent_trajectory.is_empty() {
+            context.push(format!(
+                "Current outer user request:\n{outer_task}\n\nRecent semantic trajectory before reconnect:\n{recent_trajectory}"
+            ));
+        }
+        let prompt = review_prompt(&batch, &spans, &context, !primed);
+        primed = true;
+        let id = batch[0].id;
+        tracing::info!(event = "review_started", council_session = %council_session, god = "Loki", model = %role.model.model, adapter = %role.launch.source_id, review_id = id, epoch, batch_size = batch.len(), review_target = %spans.iter().map(ReviewedSpan::marker).collect::<Vec<_>>().join(" | "), "Loki review started");
+        advice.begin(id, epoch, spans.clone()).await;
+        let result = agent
+            .prompt(prompt, REVIEW_TIMEOUT, |event| match event {
+                TurnEvent::Permission {
+                    prompt,
+                    access_mode,
+                } => {
+                    let decision =
+                        crate::ragnarok::permission_decision_for_access(access_mode, &prompt);
+                    let _ = prompt.responder.send(decision);
+                }
+                TurnEvent::Message(_)
+                | TurnEvent::Thought(_)
+                | TurnEvent::Tool { .. }
+                | TurnEvent::Note(_) => {}
+            })
+            .await;
+        let accepted = advice.finish(id).await;
+        for item in &batch {
+            recent_trajectory.push_str(&format!(
+                "[{}]\n{}\n",
+                spans
+                    .iter()
+                    .find(|span| {
+                        span.target == item.target && span.invocation == item.invocation
+                    })
+                    .expect("batch span")
+                    .marker(),
+                item.checkpoint.text
+            ));
+        }
+        recent_trajectory = bounded(recent_trajectory);
+        if let Err(error) = result {
+            if !*abort_rx.borrow() {
+                emit_warning(&ui_tx, &role, format!("Loki review failed open: {error}"));
+            }
+            primed = false;
+            if let Some(old) = session.take() {
+                old.dismiss().await;
+            }
+        }
+        tracing::info!(event = "review_finished", council_session = %council_session, god = "Loki", model = %role.model.model, adapter = %role.launch.source_id, review_id = id, epoch, batch_size = batch.len(), advice_target = accepted.as_ref().map(|a| a.target.label()), urgency = accepted.as_ref().map(|a| a.urgent), advice = accepted.as_ref().map(|a| a.note.as_str()), "Loki review finished");
     }
     if let Some(agent) = session {
         agent.dismiss().await;
     }
     let _ = finished.send(true);
+}
+
+struct ReviewItem {
+    id: u64,
+    target: Target,
+    invocation: Option<u64>,
+    checkpoint: Checkpoint,
+}
+
+fn reviewed_spans(batch: &[ReviewItem]) -> Vec<ReviewedSpan> {
+    let mut spans: Vec<ReviewedSpan> = Vec::new();
+    for item in batch {
+        if let Some(span) = spans
+            .iter_mut()
+            .find(|span| span.target == item.target && span.invocation == item.invocation)
+        {
+            span.first_step = span.first_step.min(item.checkpoint.step);
+            span.last_step = span.last_step.max(item.checkpoint.step);
+            for activity in &item.checkpoint.activities {
+                if !span.activities.contains(activity) {
+                    span.activities.push(activity.clone());
+                }
+            }
+        } else {
+            spans.push(ReviewedSpan {
+                target: item.target,
+                invocation: item.invocation,
+                first_step: item.checkpoint.step,
+                last_step: item.checkpoint.step,
+                activities: item.checkpoint.activities.clone(),
+            });
+        }
+    }
+    spans
 }
 
 async fn connect(
@@ -983,7 +1294,6 @@ async fn connect(
             model_id: role.model.model.clone(),
             model_value: role.model_value.clone(),
             adapter_source_id: role.launch.source_id.clone(),
-            force_high_reasoning: true,
             council_session: Some(council_session.to_string()),
         }),
         vec![advise_server],
@@ -992,25 +1302,51 @@ async fn connect(
 }
 
 fn review_prompt(
-    target: Target,
-    context: Option<&str>,
-    delta: &str,
+    batch: &[ReviewItem],
+    spans: &[ReviewedSpan],
+    context: &[String],
     include_contract: bool,
 ) -> String {
     let mut prompt = String::new();
     if include_contract {
-        prompt.push_str("You are Loki, Mjolnir's persistent pure advisor. You observe Thor and Eitri through incremental transcript updates. Your own messages are hidden. The advise MCP tool is your only channel back to the watched agent, and calling it forces Mjolnir to cancel that agent at the next safe step boundary and re-prompt it. Call advise at most once per update and only for a material correctness, safety, scope, or strategy concern. Your role is to make suggestions, not to issue review corrections. Phrase most advice as a question, such as \"Would it be better to...?\" or \"Have you thought about...?\" Stay silent for style, optional improvements, uncertainty, facts already visible to the target, and any update that is on track. Never implement changes yourself.\n\n");
+        prompt.push_str("You are Loki, Mjolnir's persistent read-only advisor. Take a different, user-aligned angle from Thor and Eitri and verify assumptions when useful. Do not restate failures they already know. Stay silent for style, uncertainty, optional improvements, incomplete work, or activity that is on track. The advise tool accepts one note per update. Mark it urgent only when waiting risks a material correctness, safety, scope, or strategy failure: urgent advice cancels and re-prompts the active target; non-urgent advice waits and is delivered to Thor at a natural turn boundary. Never implement changes yourself.\n\n");
     }
-    if let Some(context) = context {
+    for context in context {
         prompt.push_str(context);
         prompt.push_str("\n\n");
     }
-    prompt.push_str("### ");
-    prompt.push_str(target.label());
-    prompt.push_str(" session update\n\n");
-    prompt.push_str(delta);
-    prompt.push_str("\n\nConsider only this new update in light of your existing context. Use advise only if an advisory intervention is materially necessary; otherwise finish without commentary.");
+    prompt.push_str("### Chronological session update\n\n");
+    for item in batch {
+        let span = spans
+            .iter()
+            .find(|span| span.target == item.target && span.invocation == item.invocation)
+            .expect("batch span");
+        prompt.push_str(&format!(
+            "[{}]\n{}\n\n",
+            span.marker(),
+            item.checkpoint.text
+        ));
+    }
+    prompt.push_str("Consider only these new checkpoints in light of your existing context. Use advise at most once, selecting a target present above, only for material actionable guidance; otherwise finish silently.");
     bounded(prompt)
+}
+
+fn is_content_free(note: &str) -> bool {
+    matches!(
+        note.trim()
+            .trim_end_matches(['.', '!'])
+            .to_ascii_lowercase()
+            .as_str(),
+        "looks good" | "good" | "no issues" | "no issue" | "nothing to add" | "all good" | "lgtm"
+    )
+}
+
+pub fn format_deferred(advice: &[Advice]) -> String {
+    advice
+        .iter()
+        .map(Advice::deferred_text)
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn identity(role: &ResolvedRole) -> LokiIdentity {
@@ -1046,6 +1382,8 @@ mod tests {
                 decisions,
                 ids: Arc::new(AtomicU64::new(1)),
                 epochs: Arc::new(AtomicU64::new(epoch.saturating_add(1))),
+                eitri_invocations: Arc::new(AtomicU64::new(1)),
+                advice_state: SharedAdviceState::default(),
                 abort,
                 finished,
             },
@@ -1056,16 +1394,36 @@ mod tests {
     #[tokio::test]
     async fn advice_tool_slot_accepts_one_material_note_per_update() {
         let slot = AdviceSlot::default();
-        slot.begin(4, 2, Target::Eitri).await;
-        let decision = slot.accept("fix the race".to_string()).await.unwrap();
-        assert_eq!(decision.id, 4);
-        assert_eq!(decision.epoch, 2);
-        assert_eq!(decision.target, Target::Eitri);
+        let span = ReviewedSpan {
+            target: Target::Eitri,
+            invocation: Some(1),
+            first_step: 4,
+            last_step: 4,
+            activities: vec!["cargo test".to_string()],
+        };
+        slot.begin(4, 2, vec![span]).await;
+        let advice = slot
+            .accept(AdviseArgs {
+                target: Target::Eitri,
+                urgent: false,
+                note: "fix the race".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(advice.id, 4);
+        assert_eq!(advice.epoch, 2);
+        assert_eq!(advice.target, Target::Eitri);
+        assert_eq!(advice.note, "fix the race");
         assert!(
-            matches!(decision.verdict, Verdict::Intervention(ref note) if note == "fix the race")
+            slot.accept(AdviseArgs {
+                target: Target::Eitri,
+                urgent: true,
+                note: "second note".to_string(),
+            })
+            .await
+            .is_err()
         );
-        assert!(slot.accept("second note".to_string()).await.is_err());
-        assert_eq!(slot.finish(4).await.as_deref(), Some("fix the race"));
+        assert_eq!(slot.finish(4).await.unwrap().note, "fix the race");
     }
 
     #[test]
@@ -1141,44 +1499,142 @@ mod tests {
                 .status(ToolCallStatus::Failed),
         ));
         let delta = tracker.observe(&event).expect("completed tool boundary");
-        assert!(delta.contains("tool: run tests [Failed]"));
-        assert!(delta.contains("cargo test"));
-        assert!(delta.contains("boom"));
+        assert!(delta.text.contains("tool: run tests (cargo test) [Failed]"));
+        assert!(delta.text.contains("boom"));
+        assert!(!delta.text.contains("stderr"));
     }
 
-    #[tokio::test]
-    async fn every_completed_step_is_submitted_without_a_workspace_change_gate() {
+    #[test]
+    fn every_completed_step_is_submitted_without_a_workspace_change_gate() {
         let (handle, mut requests) = test_handle(7);
-        assert!(
-            handle
-                .observe(7, Target::Thor, "planning only".to_string())
-                .await
-                .is_some()
+        handle.observe(
+            7,
+            Target::Thor,
+            None,
+            Checkpoint {
+                step: 1,
+                text: "planning only".to_string(),
+                activities: vec!["plan update".to_string()],
+            },
         );
-        let Request::Review { target, delta, .. } = requests.try_recv().expect("review request")
+        let Request::Review {
+            target, checkpoint, ..
+        } = requests.try_recv().expect("review request")
         else {
             panic!("expected review request");
         };
         assert_eq!(target, Target::Thor);
-        assert_eq!(delta, "planning only");
+        assert_eq!(checkpoint.text, "planning only");
     }
 
     #[test]
-    fn advisor_prompt_primes_once_and_keeps_updates_hidden_and_incremental() {
-        let first = review_prompt(
-            Target::Thor,
-            Some("New outer user request:\nfix it"),
-            "tool: inspect [Completed]",
-            true,
-        );
-        assert!(first.contains("persistent pure advisor"));
-        assert!(first.contains("suggestions, not to issue review corrections"));
-        assert!(first.contains("Phrase most advice as a question"));
-        assert!(first.contains("New outer user request"));
-        assert!(first.contains("### Thor session update"));
-        let later = review_prompt(Target::Eitri, None, "thinking:\nchecking", false);
-        assert!(!later.contains("persistent pure advisor"));
-        assert!(later.contains("### Eitri session update"));
-        assert!(!later.contains("fix it"));
+    fn reviewed_spans_combine_steps_and_deduplicate_activities() {
+        let batch = vec![
+            ReviewItem {
+                id: 1,
+                target: Target::Eitri,
+                invocation: Some(2),
+                checkpoint: Checkpoint {
+                    step: 4,
+                    text: "a".into(),
+                    activities: vec!["rg".into()],
+                },
+            },
+            ReviewItem {
+                id: 2,
+                target: Target::Eitri,
+                invocation: Some(2),
+                checkpoint: Checkpoint {
+                    step: 5,
+                    text: "b".into(),
+                    activities: vec!["rg".into(), "cargo test".into()],
+                },
+            },
+        ];
+        let spans = reviewed_spans(&batch);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].first_step, 4);
+        assert_eq!(spans[0].last_step, 5);
+        assert_eq!(spans[0].activities, ["rg", "cargo test"]);
+        assert_eq!(spans[0].marker(), "Eitri #2 · steps 4-5: rg, cargo test");
+    }
+
+    #[test]
+    fn message_and_thought_transitions_wait_for_a_semantic_checkpoint() {
+        use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
+
+        let mut tracker = BoundaryTracker::default();
+        let message = UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new("checking")),
+        )));
+        let thought = UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(" next")),
+        )));
+        assert!(tracker.observe(&message).is_none());
+        assert!(tracker.observe(&thought).is_none());
+
+        let tool = UiEvent::SessionUpdate(SessionUpdate::ToolCall(
+            ToolCall::new("tool", "cargo test").status(ToolCallStatus::Completed),
+        ));
+        let checkpoint = tracker.observe(&tool).expect("tool checkpoint");
+        assert!(checkpoint.text.contains("message:\nchecking"));
+        assert!(checkpoint.text.contains("thinking:\n next"));
+        assert_eq!(checkpoint.step, 1);
+    }
+
+    #[test]
+    fn successful_tool_projects_shape_without_raw_result_body() {
+        let tool = ToolCall::new("tool", "search")
+            .raw_input(serde_json::json!({
+                "action": {"type": "mcpToolCall", "toolName": "explore_agent"},
+                "query": "find config"
+            }))
+            .raw_output(serde_json::json!({"result": "large successful body\nsecond line"}))
+            .status(ToolCallStatus::Completed);
+        let projected = render_tool_delta(&tool);
+        assert!(projected.contains("tool: explore_agent (find config) [Completed]"));
+        assert!(projected.contains("2 result lines"));
+        assert!(!projected.contains("large successful body"));
+    }
+
+    #[tokio::test]
+    async fn urgent_active_advice_interrupts_while_nonurgent_advice_defers() {
+        let state = SharedAdviceState::default();
+        state.lock().unwrap().active_thor = Some(3);
+        let (decisions, mut receiver) = broadcast::channel(4);
+        let slot = AdviceSlot {
+            active: Arc::default(),
+            state: state.clone(),
+            decisions: Some(decisions),
+        };
+        let span = ReviewedSpan {
+            target: Target::Thor,
+            invocation: None,
+            first_step: 2,
+            last_step: 2,
+            activities: vec!["cargo test".into()],
+        };
+        slot.begin(8, 3, vec![span.clone()]).await;
+        slot.accept(AdviseArgs {
+            target: Target::Thor,
+            urgent: true,
+            note: "the test is destructive".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(receiver.try_recv().unwrap().target, Target::Thor);
+
+        slot.begin(9, 3, vec![span]).await;
+        slot.accept(AdviseArgs {
+            target: Target::Thor,
+            urgent: false,
+            note: "mention the compatibility impact".into(),
+        })
+        .await
+        .unwrap();
+        assert!(receiver.try_recv().is_err());
+        let deferred = &state.lock().unwrap().deferred;
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].note, "mention the compatibility impact");
     }
 }

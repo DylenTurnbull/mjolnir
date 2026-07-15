@@ -174,7 +174,6 @@ impl Config {
                 model_id: role.model.model,
                 model_value: role.model_value,
                 adapter_source_id: role.launch.source_id,
-                force_high_reasoning: true,
                 council_session: None,
             }),
             loki,
@@ -678,15 +677,15 @@ async fn run(
     let mut prompt_sent = false;
     let mut collector = AgentMessageCollector::new();
     let epoch = loki.as_ref().map_or(0, loki::Handle::current_epoch);
-    if epoch > 0
+    let eitri_invocation = if epoch > 0
         && let Some(reviewer) = loki.as_ref()
     {
-        reviewer.begin_eitri(epoch, purpose.loki_context(&task));
-    }
+        Some(reviewer.begin_eitri(epoch, purpose.loki_context(&task)))
+    } else {
+        None
+    };
     let mut decisions = loki.as_ref().map(loki::Handle::subscribe);
     let mut tracker = loki::BoundaryTracker::default();
-    let mut pending_reviews = std::collections::HashSet::new();
-    let mut completed: Option<Result<String>> = None;
     let mut intervention = loki::DeferredIntervention::default();
     let result = loop {
         tokio::select! {
@@ -710,6 +709,9 @@ async fn run(
                         | UiEvent::SessionForkFailed { .. }
                         | UiEvent::Fatal(_)
                 );
+                if target_completed && let Some(reviewer) = loki.as_ref() {
+                    reviewer.target_completed(epoch, loki::Target::Eitri, eitri_invocation);
+                }
                 let interrupting = boundary_observed
                     && !target_completed
                     && intervention.interrupt_at_boundary();
@@ -720,11 +722,8 @@ async fn run(
                     && !interrupting
                     && !(target_completed && intervention.is_pending())
                     && let Some(reviewer) = loki.as_ref()
-                    && let Some(id) = reviewer
-                        .observe(epoch, loki::Target::Eitri, boundary)
-                        .await
                 {
-                    pending_reviews.insert(id);
+                    reviewer.observe(epoch, loki::Target::Eitri, eitri_invocation, boundary);
                 }
                 match event {
                     UiEvent::Connected { .. } => {}
@@ -768,14 +767,14 @@ async fn run(
                                 // A user cancellation wins if Loki had not yet
                                 // reached the deferred interruption boundary.
                                 intervention.clear();
-                                pending_reviews.clear();
                                 break Err(anyhow!("Eitri cancelled"));
                             }
                             if let Some(critique) = intervention.take() {
+                                if let Some(reviewer) = loki.as_ref() {
+                                    reviewer.target_resumed(epoch, loki::Target::Eitri, eitri_invocation);
+                                }
                                 collector = AgentMessageCollector::new();
                                 tracker.reset_attempt();
-                                pending_reviews.clear();
-                                completed = None;
                                 let continuation = continuation_prompt(purpose, &critique);
                                 emit_continuation(&ui_tx, &critique);
                                 if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
@@ -786,10 +785,11 @@ async fn run(
                             break Err(anyhow!("Eitri cancelled"));
                         }
                         if let Some(critique) = intervention.take() {
+                            if let Some(reviewer) = loki.as_ref() {
+                                reviewer.target_resumed(epoch, loki::Target::Eitri, eitri_invocation);
+                            }
                             collector = AgentMessageCollector::new();
                             tracker.reset_attempt();
-                            pending_reviews.clear();
-                            completed = None;
                             let continuation = continuation_prompt(purpose, &critique);
                             emit_continuation(&ui_tx, &critique);
                             if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
@@ -797,19 +797,17 @@ async fn run(
                             }
                             continue;
                         }
-                        completed = Some(collector.finish());
-                        if pending_reviews.is_empty() {
-                            break completed.take().expect("completion stored");
-                        }
+                        break collector.finish();
                     }
                     UiEvent::PromptFailed { message }
                     | UiEvent::SessionForkFailed { message }
                     | UiEvent::Fatal(message) => {
                         if let Some(critique) = intervention.take() {
+                            if let Some(reviewer) = loki.as_ref() {
+                                reviewer.target_resumed(epoch, loki::Target::Eitri, eitri_invocation);
+                            }
                             collector = AgentMessageCollector::new();
                             tracker.reset_attempt();
-                            pending_reviews.clear();
-                            completed = None;
                             let continuation = continuation_prompt(purpose, &critique);
                             emit_continuation(&ui_tx, &critique);
                             if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
@@ -817,10 +815,7 @@ async fn run(
                             }
                             continue;
                         }
-                        completed = Some(Err(anyhow!(message)));
-                        if pending_reviews.is_empty() {
-                            break completed.take().expect("completion stored");
-                        }
+                        break Err(anyhow!(message));
                     }
                     UiEvent::ClaudeUsage(_)
                     | UiEvent::CodexUsage(_)
@@ -839,11 +834,11 @@ async fn run(
                 }
             } => {
                 let Some(decision) = decision else { continue; };
-                if decision.epoch != epoch || decision.target != loki::Target::Eitri || !pending_reviews.remove(&decision.id) {
+                if decision.epoch != epoch || decision.target != loki::Target::Eitri {
                     continue;
                 }
-                match decision.verdict {
-                    loki::Verdict::Intervention(critique) => {
+                {
+                    let critique = decision.critique;
                         if let Some(role) = log_role.as_ref()
                             && let Some(council_session) = role.council_session.as_deref()
                         {
@@ -859,32 +854,27 @@ async fn run(
                             );
                         }
                         intervention.push(decision.id, critique);
-                        if completed.is_some() {
-                            completed = None;
-                            collector = AgentMessageCollector::new();
-                            tracker.reset_attempt();
-                            pending_reviews.clear();
-                            let critique = intervention.take().expect("intervention queued");
-                            let continuation = continuation_prompt(purpose, &critique);
-                            emit_continuation(&ui_tx, &critique);
-                            if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
-                                break Err(anyhow!("re-prompt Eitri after Loki intervention"));
-                            }
-                        }
-                    }
-                    loki::Verdict::NoIntervention => {}
-                    loki::Verdict::Failed(message) => {
-                        tracing::debug!("Loki Eitri review failed open: {message}");
-                    }
-                }
-                if pending_reviews.is_empty() && !intervention.is_pending()
-                    && let Some(result) = completed.take()
-                {
-                    break result;
                 }
             }
         }
     };
+
+    if let (Some(reviewer), Some(invocation)) = (loki.as_ref(), eitri_invocation) {
+        reviewer.end_eitri(epoch, invocation);
+    }
+    let mut result = result;
+    if result.is_ok()
+        && let Some(reviewer) = loki.as_ref()
+    {
+        let deferred = reviewer.take_deferred(epoch);
+        if !deferred.is_empty()
+            && let Ok(message) = result.as_mut()
+        {
+            message.push_str("\n\n<loki_advice target=\"thor\">\n");
+            message.push_str(&loki::format_deferred(&deferred));
+            message.push_str("\n</loki_advice>");
+        }
+    }
 
     let _ = nested_cmd_tx.send(UiCommand::Shutdown);
     if !runtime.is_finished()
