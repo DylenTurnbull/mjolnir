@@ -1,8 +1,10 @@
 //! Persistent read-only council advisor. Thor and Eitri stream hidden transcript
-//! deltas into one Loki ACP session; only calls to Loki's `advise` MCP tool are
-//! projected back into the visible transcript and steering machinery.
+//! deltas into one long-lived Loki ACP session; Loki reviews them asynchronously
+//! at his own pace. Advice accumulates in a queue and is pulled by the
+//! orchestrators at natural turn boundaries — Loki never interrupts a running
+//! target and nothing ever waits on him.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
@@ -34,7 +36,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -55,8 +57,6 @@ const MCP_SERVER_NAME: &str = "mj-loki-advisor";
 struct AdviseArgs {
     /// Agent whose reviewed work this advice concerns.
     target: Target,
-    /// True only when waiting for a natural turn boundary risks material harm.
-    urgent: bool,
     /// One concrete, material, actionable suggestion for the watched agent.
     note: String,
 }
@@ -87,32 +87,25 @@ impl ReviewedSpan {
 
 #[derive(Debug, Clone)]
 pub struct Advice {
-    pub id: u64,
     pub epoch: u64,
     pub target: Target,
-    pub urgent: bool,
     pub note: String,
     pub span: ReviewedSpan,
 }
 
 impl Advice {
-    pub fn immediate_text(&self) -> String {
-        format!("[reviewed {}]\n{}", self.span.marker(), self.note)
-    }
-
-    fn deferred_text(&self) -> String {
-        format!(
-            "[reviewed {}]\n{}\n\nThis was not urgent enough to interrupt at that point; later work may have superseded it.",
-            self.span.marker(),
-            self.note
-        )
+    fn deferred_text(&self, current_epoch: u64) -> String {
+        let provenance = if self.epoch == current_epoch {
+            format!("[reviewed {}]", self.span.marker())
+        } else {
+            format!("[reviewed in an earlier turn: {}]", self.span.marker())
+        };
+        format!("{provenance}\n{}", self.note)
     }
 }
 
 #[derive(Debug, Default)]
 struct AdviceState {
-    active_thor: Option<u64>,
-    active_eitri: Option<(u64, u64)>,
     deferred: VecDeque<Advice>,
     seen: HashSet<(u64, String)>,
 }
@@ -132,7 +125,9 @@ struct ActiveAdvice {
 struct AdviceSlot {
     active: Arc<Mutex<Option<ActiveAdvice>>>,
     state: SharedAdviceState,
-    decisions: Option<broadcast::Sender<Decision>>,
+    /// Incremented for every queued note so idle orchestrators can wake up
+    /// and interject advice that became ready after their turn completed.
+    posted: Option<watch::Sender<u64>>,
 }
 
 impl AdviceSlot {
@@ -163,10 +158,8 @@ impl AdviceSlot {
             return Err("target was not present in this advisor update");
         };
         let advice = Advice {
-            id: active.id,
             epoch: active.epoch,
             target: args.target,
-            urgent: args.urgent,
             note: args.note,
             span,
         };
@@ -177,43 +170,19 @@ impl AdviceSlot {
         }
         active.accepted = true;
         active.accepted_advice = Some(advice.clone());
-        let active_target = match advice.target {
-            Target::Thor => state.active_thor == Some(advice.epoch),
-            Target::Eitri => state.active_eitri.is_some_and(|(epoch, invocation)| {
-                epoch == advice.epoch && Some(invocation) == advice.span.invocation
-            }),
-        };
-        if advice.urgent && active_target {
-            tracing::info!(
-                event = "advice_routed",
-                advice_id = advice.id,
-                epoch = advice.epoch,
-                review_target = advice.target.label(),
-                urgency = "urgent",
-                reviewed_span = %advice.span.marker(),
-                delivery_route = "interrupt",
-                "Loki advice routed"
-            );
-            if let Some(decisions) = self.decisions.as_ref() {
-                let _ = decisions.send(Decision {
-                    id: advice.id,
-                    epoch: advice.epoch,
-                    target: advice.target,
-                    critique: advice.immediate_text(),
-                });
-            }
-        } else {
-            tracing::info!(
-                event = "advice_routed",
-                advice_id = advice.id,
-                epoch = advice.epoch,
-                review_target = advice.target.label(),
-                urgency = if advice.urgent { "urgent_late" } else { "nonurgent" },
-                reviewed_span = %advice.span.marker(),
-                delivery_route = "deferred_to_thor",
-                "Loki advice routed"
-            );
-            state.deferred.push_back(advice.clone());
+        tracing::info!(
+            event = "advice_routed",
+            advice_id = active.id,
+            epoch = advice.epoch,
+            review_target = advice.target.label(),
+            reviewed_span = %advice.span.marker(),
+            delivery_route = "queued_for_boundary",
+            "Loki advice routed"
+        );
+        state.deferred.push_back(advice.clone());
+        drop(state);
+        if let Some(posted) = self.posted.as_ref() {
+            posted.send_modify(|count| *count += 1);
         }
         Ok(advice)
     }
@@ -246,7 +215,7 @@ impl McpHandler {
 
     #[tool(
         name = "advise",
-        description = "Send at most one material advisory note about Thor or Eitri. Mark urgent only when waiting for a natural turn boundary risks a material correctness, safety, scope, or strategy failure; urgent advice cancels and re-prompts the active target, while non-urgent advice is delivered to Thor at a natural boundary. Otherwise do not call this tool."
+        description = "Queue at most one material advisory note about Thor or Eitri. Advice is asynchronous: it is delivered to Thor at the next natural turn boundary and never interrupts running work, so later work may have superseded it by delivery time. Reserve it for material correctness, safety, scope, or strategy problems; otherwise do not call this tool."
     )]
     async fn advise(
         &self,
@@ -263,7 +232,6 @@ impl McpHandler {
         }
         let args = AdviseArgs {
             target: args.target,
-            urgent: args.urgent,
             note: note.to_string(),
         };
         match self.advice.accept(args).await {
@@ -400,68 +368,6 @@ async fn require_bearer(
         Ok(next.run(request).await)
     } else {
         Err((StatusCode::UNAUTHORIZED, "unauthorized"))
-    }
-}
-
-/// Loki critiques waiting to be delivered to a target at a safe step boundary.
-///
-/// Review decisions arrive asynchronously, often after the target has already
-/// started its next operation. Keep them ordered by review id and request at
-/// most one cancellation when the next boundary is observed.
-#[derive(Default)]
-pub struct DeferredIntervention {
-    critiques: BTreeMap<u64, String>,
-    cancel_requested: bool,
-}
-
-impl DeferredIntervention {
-    pub fn push(&mut self, id: u64, critique: String) {
-        self.critiques.insert(id, critique);
-    }
-
-    pub fn is_pending(&self) -> bool {
-        !self.critiques.is_empty()
-    }
-
-    /// Mark the next observed non-terminal step boundary for interruption.
-    pub fn interrupt_at_boundary(&mut self) -> bool {
-        if self.critiques.is_empty() || self.cancel_requested {
-            return false;
-        }
-        self.cancel_requested = true;
-        true
-    }
-
-    pub fn cancellation_was_requested(&self) -> bool {
-        self.cancel_requested
-    }
-
-    /// Drain queued critiques in observation order for one continuation prompt.
-    pub fn take(&mut self) -> Option<String> {
-        if self.critiques.is_empty() {
-            return None;
-        }
-        self.cancel_requested = false;
-        let critiques = std::mem::take(&mut self.critiques);
-        Some(
-            critiques
-                .into_values()
-                .enumerate()
-                .map(|(index, critique)| {
-                    if index == 0 {
-                        critique
-                    } else {
-                        format!("Additional Loki critique: {critique}")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        )
-    }
-
-    pub fn clear(&mut self) {
-        self.critiques.clear();
-        self.cancel_requested = false;
     }
 }
 
@@ -604,7 +510,23 @@ impl BoundaryTracker {
                     vec![activity],
                 ))
             }
-            UiEvent::PromptDone { .. } | UiEvent::PromptFailed { .. } => None,
+            UiEvent::PromptDone { stop_reason, .. } => {
+                use agent_client_protocol::schema::v1::StopReason;
+                // The concluding message otherwise never reaches a tool
+                // boundary, so flush it as its own reviewable checkpoint.
+                // Cancelled turns are either user aborts or Loki interrupts;
+                // both discard the partial segment through reset_attempt.
+                (!matches!(stop_reason, StopReason::Cancelled))
+                    .then(|| flush(self))
+                    .flatten()
+                    .map(|segment| {
+                        (
+                            bounded_item(format!("final response:\n{segment}")),
+                            vec!["final response".to_string()],
+                        )
+                    })
+            }
+            UiEvent::PromptFailed { .. } => None,
             _ => None,
         };
         boundary.map(|(text, activities)| {
@@ -797,14 +719,6 @@ impl Target {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Decision {
-    pub id: u64,
-    pub epoch: u64,
-    pub target: Target,
-    pub critique: String,
-}
-
 enum Request {
     Begin {
         epoch: u64,
@@ -815,11 +729,6 @@ enum Request {
         target: Target,
         invocation: Option<u64>,
         text: String,
-    },
-    EndTarget {
-        epoch: u64,
-        target: Target,
-        invocation: Option<u64>,
     },
     Review {
         id: u64,
@@ -834,13 +743,13 @@ enum Request {
 #[derive(Debug, Clone)]
 pub struct Handle {
     requests: mpsc::UnboundedSender<Request>,
-    decisions: broadcast::Sender<Decision>,
     ids: Arc<AtomicU64>,
     epochs: Arc<AtomicU64>,
     eitri_invocations: Arc<AtomicU64>,
     advice_state: SharedAdviceState,
     abort: watch::Sender<bool>,
     finished: watch::Receiver<bool>,
+    posted: watch::Receiver<u64>,
 }
 
 impl Handle {
@@ -852,19 +761,19 @@ impl Handle {
         council_session: String,
     ) -> Self {
         let (requests, rx) = mpsc::unbounded_channel();
-        let (decisions, _) = broadcast::channel(512);
         let (abort, abort_rx) = watch::channel(false);
         let (finished_tx, finished) = watch::channel(false);
+        let (posted_tx, posted) = watch::channel(0_u64);
         let advice_state = SharedAdviceState::default();
         let handle = Self {
             requests,
-            decisions: decisions.clone(),
             ids: Arc::new(AtomicU64::new(1)),
             epochs: Arc::new(AtomicU64::new(1)),
             eitri_invocations: Arc::new(AtomicU64::new(1)),
             advice_state: advice_state.clone(),
             abort,
             finished,
+            posted,
         };
         tokio::spawn(worker(
             role,
@@ -872,17 +781,19 @@ impl Handle {
             additional_directories,
             ui_tx,
             rx,
-            decisions,
             advice_state,
             abort_rx,
             finished_tx,
+            posted_tx,
             council_session,
         ));
         handle
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Decision> {
-        self.decisions.subscribe()
+    /// Watch that ticks whenever Loki queues a new advice note. Idle
+    /// orchestrators use it to interject late advice between user turns.
+    pub fn subscribe_advice(&self) -> watch::Receiver<u64> {
+        self.posted.clone()
     }
 
     pub fn begin_turn(&self, task: String) -> u64 {
@@ -890,13 +801,12 @@ impl Handle {
         let epoch = self.epochs.fetch_add(1, Ordering::Relaxed);
         self.eitri_invocations.store(1, Ordering::Relaxed);
         {
+            // Advice queued in earlier turns stays deliverable; only the
+            // exact-duplicate guard is scoped to the new turn.
             let mut state = self
                 .advice_state
                 .lock()
                 .expect("Loki advice state poisoned");
-            state.active_thor = Some(epoch);
-            state.active_eitri = None;
-            state.deferred.clear();
             state.seen.retain(|(seen_epoch, _)| *seen_epoch == epoch);
         }
         let _ = self.requests.send(Request::Begin { epoch, task });
@@ -905,10 +815,6 @@ impl Handle {
 
     pub fn begin_eitri(&self, epoch: u64, context: String) -> u64 {
         let invocation = self.eitri_invocations.fetch_add(1, Ordering::Relaxed);
-        self.advice_state
-            .lock()
-            .expect("Loki advice state poisoned")
-            .active_eitri = Some((epoch, invocation));
         let _ = self.requests.send(Request::TargetContext {
             epoch,
             target: Target::Eitri,
@@ -918,79 +824,14 @@ impl Handle {
         invocation
     }
 
-    pub fn end_eitri(&self, epoch: u64, invocation: u64) {
+    /// Drain every queued advice note, oldest first, regardless of the turn
+    /// it was produced in. Callers deliver the result at a turn boundary.
+    pub fn take_deferred(&self) -> Vec<Advice> {
         let mut state = self
             .advice_state
             .lock()
             .expect("Loki advice state poisoned");
-        if state.active_eitri == Some((epoch, invocation)) {
-            state.active_eitri = None;
-        }
-        drop(state);
-        let _ = self.requests.send(Request::EndTarget {
-            epoch,
-            target: Target::Eitri,
-            invocation: Some(invocation),
-        });
-    }
-
-    pub fn target_completed(&self, epoch: u64, target: Target, invocation: Option<u64>) {
-        let mut state = self
-            .advice_state
-            .lock()
-            .expect("Loki advice state poisoned");
-        match target {
-            Target::Thor if state.active_thor == Some(epoch) => state.active_thor = None,
-            Target::Eitri if state.active_eitri == invocation.map(|value| (epoch, value)) => {
-                state.active_eitri = None;
-            }
-            Target::Thor | Target::Eitri => {}
-        }
-    }
-
-    pub fn target_resumed(&self, epoch: u64, target: Target, invocation: Option<u64>) {
-        let mut state = self
-            .advice_state
-            .lock()
-            .expect("Loki advice state poisoned");
-        match target {
-            Target::Thor => state.active_thor = Some(epoch),
-            Target::Eitri => state.active_eitri = invocation.map(|value| (epoch, value)),
-        }
-    }
-
-    pub fn end_turn(&self, epoch: u64) {
-        let mut state = self
-            .advice_state
-            .lock()
-            .expect("Loki advice state poisoned");
-        if state.active_thor == Some(epoch) {
-            state.active_thor = None;
-        }
-        state.deferred.retain(|advice| advice.epoch != epoch);
-        drop(state);
-        let _ = self.requests.send(Request::EndTarget {
-            epoch,
-            target: Target::Thor,
-            invocation: None,
-        });
-    }
-
-    pub fn take_deferred(&self, epoch: u64) -> Vec<Advice> {
-        let mut state = self
-            .advice_state
-            .lock()
-            .expect("Loki advice state poisoned");
-        let mut selected = Vec::new();
-        state.deferred.retain(|advice| {
-            if advice.epoch == epoch {
-                selected.push(advice.clone());
-                false
-            } else {
-                true
-            }
-        });
-        selected
+        state.deferred.drain(..).collect()
     }
 
     pub fn current_epoch(&self) -> u64 {
@@ -1049,10 +890,10 @@ async fn worker(
     additional_directories: Vec<PathBuf>,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     mut requests: mpsc::UnboundedReceiver<Request>,
-    decisions: broadcast::Sender<Decision>,
     advice_state: SharedAdviceState,
     abort_rx: watch::Receiver<bool>,
     finished: watch::Sender<bool>,
+    posted: watch::Sender<u64>,
     council_session: String,
 ) {
     let mut epoch = 0;
@@ -1063,7 +904,7 @@ async fn worker(
     let advice = AdviceSlot {
         active: Arc::default(),
         state: advice_state,
-        decisions: Some(decisions),
+        posted: Some(posted),
     };
     let server = match HttpServer::start(advice.clone()).await {
         Ok(server) => Some(server),
@@ -1112,16 +953,6 @@ async fn worker(
                         })
                         .or_insert(text);
                 }
-                Request::EndTarget {
-                    epoch: request_epoch,
-                    target,
-                    invocation,
-                } if request_epoch == epoch => {
-                    pending_context.remove(&(target, invocation));
-                    batch.retain(|item: &ReviewItem| {
-                        item.target != target || item.invocation != invocation
-                    });
-                }
                 Request::Review {
                     id,
                     epoch: request_epoch,
@@ -1139,9 +970,7 @@ async fn worker(
                         incoming.push_back(next);
                     }
                 }
-                Request::TargetContext { .. }
-                | Request::EndTarget { .. }
-                | Request::Review { .. } => {}
+                Request::TargetContext { .. } | Request::Review { .. } => {}
                 Request::Shutdown => break 'worker,
             }
         }
@@ -1251,7 +1080,7 @@ async fn worker(
                 old.dismiss().await;
             }
         }
-        tracing::info!(event = "review_finished", council_session = %council_session, god = "Loki", model = %role.model.model, adapter = %role.launch.source_id, review_id = id, epoch, batch_size = batch.len(), advice_accepted = accepted.is_some(), advice_id = accepted.as_ref().map(|a| a.id), advice_target = accepted.as_ref().map(|a| a.target.label()), urgency = accepted.as_ref().map(|a| a.urgent), advice = accepted.as_ref().map(|a| a.note.as_str()), "Loki review finished");
+        tracing::info!(event = "review_finished", council_session = %council_session, god = "Loki", model = %role.model.model, adapter = %role.launch.source_id, review_id = id, epoch, batch_size = batch.len(), advice_accepted = accepted.is_some(), advice_id = accepted.as_ref().map(|_| id), advice_target = accepted.as_ref().map(|a| a.target.label()), advice = accepted.as_ref().map(|a| a.note.as_str()), "Loki review finished");
     }
     if let Some(agent) = session {
         agent.dismiss().await;
@@ -1333,7 +1162,7 @@ fn review_prompt(
 ) -> String {
     let mut prompt = String::new();
     if include_contract {
-        prompt.push_str("You are Loki, Mjolnir's persistent read-only advisor. Take a different, user-aligned angle from Thor and Eitri and verify assumptions when useful. Do not restate failures they already know. Stay silent for style, uncertainty, optional improvements, incomplete work, or activity that is on track. The advise tool accepts one note per update. Mark it urgent only when waiting risks a material correctness, safety, scope, or strategy failure: urgent advice cancels and re-prompts the active target; non-urgent advice waits and is delivered to Thor at a natural turn boundary. Never implement changes yourself.\n\n");
+        prompt.push_str("You are Loki, Mjolnir's persistent read-only advisor. Take a different, user-aligned angle from Thor and Eitri and verify assumptions when useful. Do not restate failures they already know. Stay silent for style, uncertainty, optional improvements, incomplete work, or activity that is on track. The advise tool accepts one note per update and is fully asynchronous: your note is queued and delivered to Thor at the next natural turn boundary, never as an interruption, so reserve it for material correctness, safety, scope, or strategy problems that remain worth raising even if later work may have already addressed them. Never implement changes yourself.\n\n");
     }
     for context in context {
         prompt.push_str(context);
@@ -1365,10 +1194,10 @@ fn is_content_free(note: &str) -> bool {
     )
 }
 
-pub fn format_deferred(advice: &[Advice]) -> String {
+pub fn format_deferred(advice: &[Advice], current_epoch: u64) -> String {
     advice
         .iter()
-        .map(Advice::deferred_text)
+        .map(|advice| advice.deferred_text(current_epoch))
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -1397,19 +1226,19 @@ mod tests {
 
     fn test_handle(epoch: u64) -> (Handle, mpsc::UnboundedReceiver<Request>) {
         let (requests, request_rx) = mpsc::unbounded_channel();
-        let (decisions, _) = broadcast::channel(8);
         let (abort, _) = watch::channel(false);
         let (_, finished) = watch::channel(false);
+        let (_, posted) = watch::channel(0_u64);
         (
             Handle {
                 requests,
-                decisions,
                 ids: Arc::new(AtomicU64::new(1)),
                 epochs: Arc::new(AtomicU64::new(epoch.saturating_add(1))),
                 eitri_invocations: Arc::new(AtomicU64::new(1)),
                 advice_state: SharedAdviceState::default(),
                 abort,
                 finished,
+                posted,
             },
             request_rx,
         )
@@ -1429,73 +1258,22 @@ mod tests {
         let advice = slot
             .accept(AdviseArgs {
                 target: Target::Eitri,
-                urgent: false,
                 note: "fix the race".to_string(),
             })
             .await
             .unwrap();
-        assert_eq!(advice.id, 4);
         assert_eq!(advice.epoch, 2);
         assert_eq!(advice.target, Target::Eitri);
         assert_eq!(advice.note, "fix the race");
         assert!(
             slot.accept(AdviseArgs {
                 target: Target::Eitri,
-                urgent: true,
                 note: "second note".to_string(),
             })
             .await
             .is_err()
         );
         assert_eq!(slot.finish(4).await.unwrap().note, "fix the race");
-    }
-
-    #[test]
-    fn intervention_waits_for_boundary_and_requests_one_cancellation() {
-        let mut intervention = DeferredIntervention::default();
-
-        intervention.push(7, "inspect the generated config".to_string());
-
-        assert!(intervention.is_pending());
-        assert!(!intervention.cancellation_was_requested());
-        assert!(intervention.interrupt_at_boundary());
-        assert!(intervention.cancellation_was_requested());
-        assert!(!intervention.interrupt_at_boundary());
-        assert_eq!(
-            intervention.take().as_deref(),
-            Some("inspect the generated config")
-        );
-        assert!(!intervention.is_pending());
-        assert!(!intervention.cancellation_was_requested());
-    }
-
-    #[test]
-    fn completed_target_can_be_reprompted_without_cancellation() {
-        let mut intervention = DeferredIntervention::default();
-        intervention.push(3, "fix the final answer".to_string());
-
-        assert_eq!(intervention.take().as_deref(), Some("fix the final answer"));
-        assert!(!intervention.cancellation_was_requested());
-    }
-
-    #[test]
-    fn queued_critiques_are_ordered_and_clear_resets_boundary_state() {
-        let mut intervention = DeferredIntervention::default();
-        intervention.push(20, "second observed review".to_string());
-        intervention.push(10, "first observed review".to_string());
-        assert!(intervention.interrupt_at_boundary());
-
-        assert_eq!(
-            intervention.take().as_deref(),
-            Some("first observed review\n\nAdditional Loki critique: second observed review")
-        );
-
-        intervention.push(30, "stale review".to_string());
-        assert!(intervention.interrupt_at_boundary());
-        intervention.clear();
-        assert!(!intervention.is_pending());
-        assert!(!intervention.cancellation_was_requested());
-        assert!(!intervention.interrupt_at_boundary());
     }
 
     #[test]
@@ -1584,6 +1362,62 @@ mod tests {
     }
 
     #[test]
+    fn prompt_done_flushes_the_final_message_as_a_checkpoint() {
+        use agent_client_protocol::schema::v1::{
+            ContentBlock, ContentChunk, StopReason, TextContent,
+        };
+
+        let mut tracker = BoundaryTracker::default();
+        let message = UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new("done: the fix is in place")),
+        )));
+        assert!(tracker.observe(&message).is_none());
+
+        let done = UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        };
+        let checkpoint = tracker.observe(&done).expect("final response checkpoint");
+        assert!(
+            checkpoint
+                .text
+                .contains("final response:\nmessage:\ndone: the fix is in place")
+        );
+        assert_eq!(checkpoint.activities, ["final response"]);
+
+        // Nothing pending afterwards: a second completion yields no checkpoint.
+        assert!(
+            tracker
+                .observe(&UiEvent::PromptDone {
+                    stop_reason: StopReason::EndTurn,
+                    usage: None,
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cancelled_prompt_done_does_not_flush_a_final_checkpoint() {
+        use agent_client_protocol::schema::v1::{
+            ContentBlock, ContentChunk, StopReason, TextContent,
+        };
+
+        let mut tracker = BoundaryTracker::default();
+        let message = UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new("partial")),
+        )));
+        assert!(tracker.observe(&message).is_none());
+        assert!(
+            tracker
+                .observe(&UiEvent::PromptDone {
+                    stop_reason: StopReason::Cancelled,
+                    usage: None,
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
     fn message_and_thought_transitions_wait_for_a_semantic_checkpoint() {
         use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
 
@@ -1652,14 +1486,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn urgent_active_advice_interrupts_while_nonurgent_advice_defers() {
+    async fn accepted_advice_queues_and_notifies_the_posted_watch() {
         let state = SharedAdviceState::default();
-        state.lock().unwrap().active_thor = Some(3);
-        let (decisions, mut receiver) = broadcast::channel(4);
+        let (posted_tx, mut posted) = watch::channel(0_u64);
         let slot = AdviceSlot {
             active: Arc::default(),
             state: state.clone(),
-            decisions: Some(decisions),
+            posted: Some(posted_tx),
         };
         let span = ReviewedSpan {
             target: Target::Thor,
@@ -1668,27 +1501,78 @@ mod tests {
             last_step: 2,
             activities: vec!["cargo test".into()],
         };
-        slot.begin(8, 3, vec![span.clone()]).await;
+        slot.begin(8, 3, vec![span]).await;
         slot.accept(AdviseArgs {
             target: Target::Thor,
-            urgent: true,
             note: "the test is destructive".into(),
         })
         .await
         .unwrap();
-        assert_eq!(receiver.try_recv().unwrap().target, Target::Thor);
 
-        slot.begin(9, 3, vec![span]).await;
-        slot.accept(AdviseArgs {
-            target: Target::Thor,
-            urgent: false,
-            note: "mention the compatibility impact".into(),
-        })
-        .await
-        .unwrap();
-        assert!(receiver.try_recv().is_err());
+        assert!(posted.has_changed().unwrap());
+        assert_eq!(*posted.borrow_and_update(), 1);
         let deferred = &state.lock().unwrap().deferred;
         assert_eq!(deferred.len(), 1);
-        assert_eq!(deferred[0].note, "mention the compatibility impact");
+        assert_eq!(deferred[0].note, "the test is destructive");
+    }
+
+    #[test]
+    fn take_deferred_drains_advice_across_turns_with_provenance_labels() {
+        let (handle, _requests) = test_handle(4);
+        {
+            let mut state = handle.advice_state.lock().unwrap();
+            let advice = |epoch, note: &str| Advice {
+                epoch,
+                target: Target::Thor,
+                note: note.to_string(),
+                span: ReviewedSpan {
+                    target: Target::Thor,
+                    invocation: None,
+                    first_step: 1,
+                    last_step: 1,
+                    activities: vec!["cargo test".into()],
+                },
+            };
+            state.deferred.push_back(advice(2, "old turn advice"));
+            state.deferred.push_back(advice(4, "current turn advice"));
+        }
+
+        let taken = handle.take_deferred();
+        assert_eq!(taken.len(), 2);
+        assert!(handle.take_deferred().is_empty());
+
+        let formatted = format_deferred(&taken, 4);
+        assert!(formatted.contains("[reviewed in an earlier turn: Thor · step 1: cargo test]"));
+        assert!(formatted.contains("old turn advice"));
+        assert!(formatted.contains("[reviewed Thor · step 1: cargo test]"));
+        assert!(formatted.contains("current turn advice"));
+    }
+
+    #[test]
+    fn begin_turn_preserves_queued_advice_from_earlier_turns() {
+        let (handle, mut requests) = test_handle(1);
+        {
+            let mut state = handle.advice_state.lock().unwrap();
+            state.deferred.push_back(Advice {
+                epoch: 1,
+                target: Target::Thor,
+                note: "still relevant".to_string(),
+                span: ReviewedSpan {
+                    target: Target::Thor,
+                    invocation: None,
+                    first_step: 1,
+                    last_step: 1,
+                    activities: vec!["edit".into()],
+                },
+            });
+        }
+
+        let epoch = handle.begin_turn("next task".to_string());
+        assert_eq!(epoch, 2);
+        assert!(matches!(
+            requests.try_recv().expect("begin request"),
+            Request::Begin { epoch: 2, .. }
+        ));
+        assert_eq!(handle.take_deferred().len(), 1);
     }
 }

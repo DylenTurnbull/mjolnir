@@ -54,8 +54,15 @@ Council adapters must advertise ACP HTTP MCP support because Thor invokes
 Eitri through Mjolnir's embedded `code_agent` and `explore_agent` MCP tools.
 Codex and Claude discovery checks local credential files and supported token
 environment variables without launching either CLI or their npm ACP bridges.
-Explicit ACP routes are probed once per process; Mjolnir never logs API-key
-values and selects High reasoning when the adapter advertises that control.
+Other ACP routes are probed once and the results are cached on disk for 24
+hours (invalidated when the adapter binary changes), so interactive startup
+binds the Council instantly from credentials and cached capabilities. Adapters
+without a fresh cache entry are probed in the background: their models appear
+in `/models` and the ACP Servers tab when the probe lands, and take effect for
+role selection in the next session. Startup only waits on a probe when the
+configured Council cannot be bound any other way, so a wedged ACP server never
+blocks an otherwise-launchable session. Mjolnir never logs API-key values and
+selects High reasoning when the adapter advertises that control.
 Interactive startup installs pinned Anvil in the background when no development
 override, bundled sibling, or managed copy is available. Resolution precedence
 is `--anvil-path`, `MJ_ANVIL_PATH`, an `anvil` sibling beside `mj`, then the
@@ -134,8 +141,10 @@ reported as unavailable.
 ## Delegation and review
 
 Mjolnir appends Thor's session-level coordinator policy to the first user
-message of a new session. It is not sent as a standalone turn or injected into
-resumed or compacted sessions. Thor should use direct tools for small, tightly
+message of a session, including resumed and loaded sessions. It is never sent
+as a standalone turn. A drop in the agent's reported context usage is treated
+as history compaction and re-arms the policy for the next user message, so the
+delegation contract survives context replacement. Thor should use direct tools for small, tightly
 coupled edits and delegate self-contained implementation tasks with clear inputs
 and acceptance criteria to `code_agent`. It uses `explore_agent` for open-ended,
 multi-file research where locations or execution flow are not yet known.
@@ -148,14 +157,21 @@ session streams directly through the normal Mjolnir UI. Ctrl-C cancels the
 currently active Eitri request, not the paused Thor request. Eitri's final
 message and invocation diff return to Thor through MCP, then Thor resumes.
 
-Loki runs in its own fresh, best-effort read-only ACP session. Per-role token
-and cost telemetry is shown in the header and `/council` status. A streaming Loki
-intervention is intentionally expensive: it causes Mjolnir to cancel at the next
-safe step boundary and re-prompt the target with the critique. Loki's prompt
-therefore requires intervention only for material correctness, safety, scope,
-or strategy problems. Thor performs the optional discrete workspace review at
-the end of a turn; a turn containing only one implementation handoff skips that
-extra review.
+Loki runs in one long-lived, best-effort read-only ACP session and reviews
+asynchronously at his own pace: transcript checkpoints — including each turn's
+concluding message — stream into his queue, and his advice is pulled off at
+natural turn boundaries. Loki never interrupts running work and nothing ever
+waits on him. Advice ready when an Eitri invocation returns rides back inside
+the tool result; advice ready when Thor's turn completes either folds into the
+discrete review brief or starts one follow-up Thor turn; and advice that lands
+after the turn already finished interjects one council-initiated follow-up
+("thoughts on the work you just did") unless the user has started a new prompt,
+in which case it waits for that turn's boundary. Delivered advice is always
+labeled with the turn and span it reviewed, since later work may have
+superseded it. Thor performs the optional discrete workspace review at the end
+of a turn; a turn containing only one implementation handoff skips that extra
+review. Per-role token and cost telemetry is shown in the header and
+`/council` status.
 
 ## Worktrees and resume
 
@@ -228,6 +244,7 @@ Persistent data includes:
   preferences.
 - the platform state directory's `mj/session-provenance.json`: resume routing.
 - `~/.cache/mj/deepswe-v1.1.json`: 24-hour DeepSWE cache.
+- `~/.cache/mj/acp-probes-v1.json`: 24-hour ACP adapter capability cache.
 - `<project>/.mjolnir/worktrees/`: linked worktrees created by Mjolnir.
 
 ## Development

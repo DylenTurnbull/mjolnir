@@ -2119,8 +2119,23 @@ impl AppState {
             UiEvent::SessionConfigOptions { options, targets } => {
                 self.apply_session_config_options(options, targets);
             }
+            UiEvent::CouncilUpdate { choices, inventory } => {
+                self.council_choices = choices;
+                self.council_inventory = inventory;
+            }
             UiEvent::LokiActivity(activity) => self.apply_loki_activity(activity),
             UiEvent::InternalMessage(message) => {
+                // A Loki interjection starts a fresh council-initiated Thor
+                // turn after the user's turn already completed. Re-enter the
+                // streaming state so submissions queue behind it instead of
+                // racing the in-flight prompt.
+                if message.kind == crate::event::InternalMessageKind::Interjection
+                    && self.connection_state == ConnectionState::Ready
+                {
+                    self.set_connection_state(ConnectionState::Streaming);
+                    self.turn_started_at = Some(Instant::now());
+                    self.last_turn_elapsed = None;
+                }
                 self.transcript.push(Entry::InternalMessage(message));
                 self.bump_transcript_revision();
             }
@@ -3604,6 +3619,62 @@ mod tests {
     }
 
     #[test]
+    fn council_update_refreshes_choices_and_inventory() {
+        let mut state = AppState::new();
+        assert!(state.council_choices.is_empty());
+
+        state.apply_event(UiEvent::CouncilUpdate {
+            choices: vec![crate::council::ModelChoice {
+                model: "glm-5-2".to_string(),
+                pass_at_1: 0.5,
+                mean_cost_usd: 1.0,
+                available: true,
+                disabled_reason: None,
+                adapter: Some("anvil".to_string()),
+                ranked: true,
+            }],
+            inventory: crate::council::AcpInventory::default(),
+        });
+
+        assert_eq!(state.council_choices.len(), 1);
+        assert_eq!(state.council_choices[0].model, "glm-5-2");
+        assert!(state.transcript.is_empty(), "catalog refreshes are silent");
+    }
+
+    #[test]
+    fn loki_interjection_reenters_streaming_so_submissions_queue() {
+        let mut state = AppState::new();
+        state.set_connection_state(ConnectionState::Ready);
+
+        state.apply_event(UiEvent::InternalMessage(InternalMessage {
+            source: "Loki".to_string(),
+            target: "Thor".to_string(),
+            kind: crate::event::InternalMessageKind::Continuation,
+            text: "boundary advice".to_string(),
+        }));
+        assert_eq!(
+            state.connection_state,
+            ConnectionState::Ready,
+            "continuations ride held completions and must not change state"
+        );
+
+        state.apply_event(UiEvent::InternalMessage(InternalMessage {
+            source: "Loki".to_string(),
+            target: "Thor".to_string(),
+            kind: crate::event::InternalMessageKind::Interjection,
+            text: "post-turn thoughts".to_string(),
+        }));
+        assert_eq!(state.connection_state, ConnectionState::Streaming);
+        assert!(state.is_busy());
+
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        assert_eq!(state.connection_state, ConnectionState::Ready);
+    }
+
+    #[test]
     fn internal_coordination_stays_inline_in_transcript_order() {
         let mut state = AppState::new();
         state.apply_event(UiEvent::InternalMessage(InternalMessage {
@@ -3688,10 +3759,7 @@ mod tests {
             .raw_input(serde_json::json!({
                 "server": "mj-code-agent",
                 "tool": "explore_agent",
-                "arguments": {
-                    "prompt": "trace startup",
-                    "thoroughness": "very_thorough"
-                }
+                "arguments": { "prompt": "trace startup" }
             }));
 
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)));

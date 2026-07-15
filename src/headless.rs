@@ -337,6 +337,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             }
             UiEvent::TerminalOutput(_) => {}
             UiEvent::SessionConfigOptions { .. } => {}
+            UiEvent::CouncilUpdate { .. } => {}
             UiEvent::PermissionRequest(prompt) => {
                 let decision =
                     permission_decision(cfg.permission_mode, &prompt.tool_call, &prompt.options);
@@ -490,6 +491,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                         crate::event::InternalMessageKind::Exploration => "exploration",
                         crate::event::InternalMessageKind::DiscreteReview => "discrete_review",
                         crate::event::InternalMessageKind::Continuation => "continuation",
+                        crate::event::InternalMessageKind::Interjection => "interjection",
                     };
                     emit_json(&StreamRecord::Review {
                         actor: &message.source.to_ascii_lowercase(),

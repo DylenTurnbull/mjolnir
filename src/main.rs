@@ -29,6 +29,7 @@ mod onboarding;
 mod palette;
 mod paths;
 mod probe;
+mod probe_cache;
 mod qr;
 mod ragnarok;
 mod ragnarok_sprites;
@@ -1001,19 +1002,33 @@ async fn resolve_council_for_tui(
     cwd: &Path,
     wait_for_installs: bool,
 ) -> Result<council::ResolvedCouncil> {
-    let resolve = || async {
+    with_startup_spinner(async {
         if wait_for_installs {
             council::resolve_waiting_for_installs(cfg, cwd).await
         } else {
             council::resolve(cfg, cwd).await
         }
-    };
+    })
+    .await
+}
+
+/// Resolve the Council for interactive startup without blocking on adapter
+/// probes; the spinner only appears in the rare case where the instantly
+/// known adapters cannot bind the configured roles.
+async fn resolve_council_streaming_for_tui(
+    cfg: &Config,
+    cwd: &Path,
+) -> Result<council::StreamingResolution> {
+    with_startup_spinner(council::resolve_streaming(cfg, cwd)).await
+}
+
+async fn with_startup_spinner<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     let mut stdout = std::io::stdout();
     if !stdout.is_terminal() {
-        return resolve().await;
+        return future.await;
     }
 
-    let mut resolution = Box::pin(resolve());
+    let mut resolution = Box::pin(future);
     let mut tick = tokio::time::interval(Duration::from_millis(125));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let started = Instant::now();
@@ -1078,8 +1093,12 @@ async fn run_app(
         initial_agent.as_ref(),
     );
     let mut cfg = Config::load(&config_path)?;
-    let initial_resolution = resolve_council_for_tui(&cfg, &cwd, false).await;
+    let mut council_updates = None;
+    let mut pending_probe_servers = Vec::new();
     let mut council = if first_startup {
+        // Onboarding wants a fully settled catalog to preview, so first
+        // startup keeps the blocking resolution.
+        let initial_resolution = resolve_council_for_tui(&cfg, &cwd, false).await;
         let Some((accepted_config, accepted_council)) =
             run_first_startup(cfg, initial_resolution.ok(), &config_path, &cwd).await?
         else {
@@ -1088,7 +1107,10 @@ async fn run_app(
         cfg = accepted_config;
         accepted_council
     } else {
-        initial_resolution?
+        let resolution = resolve_council_streaming_for_tui(&cfg, &cwd).await?;
+        council_updates = resolution.updates;
+        pending_probe_servers = resolution.pending_servers;
+        resolution.council
     };
     if let Some(agent) = initial_agent.as_ref()
         && let Some(pinned) = council.available.iter().find(|role| {
@@ -1138,6 +1160,8 @@ async fn run_app(
             council.clone(),
             cfg.thor.clone(),
             cfg.eitri.clone(),
+            council_updates.take(),
+            std::mem::take(&mut pending_probe_servers),
         )
         .await?;
         apply_session_result_to_config(&mut cfg, &session_result);
@@ -1145,7 +1169,10 @@ async fn run_app(
             UiExitReason::Quit => return Ok(session_result.session_id),
             UiExitReason::NewSession => {
                 cfg = Config::load(&config_path)?;
-                council = resolve_council_for_tui(&cfg, &cwd, true).await?;
+                let resolution = resolve_council_streaming_for_tui(&cfg, &cwd).await?;
+                council = resolution.council;
+                council_updates = resolution.updates;
+                pending_probe_servers = resolution.pending_servers;
                 council_agent = selected_agent_for_role(&council.thor);
                 initial_agent = Some(council_agent.clone());
                 pending_new_session_boundary = true;
@@ -1534,6 +1561,8 @@ async fn run_session(
     council: council::ResolvedCouncil,
     thor_config: config::ThorConfig,
     eitri_config: config::EitriConfig,
+    council_updates: Option<tokio::sync::watch::Receiver<council::ResolvedCouncil>>,
+    pending_probe_servers: Vec<String>,
 ) -> Result<RunSessionResult> {
     let mut terminal = SessionTerminal::fresh(mode)?;
     let council_session = format!(
@@ -1629,6 +1658,40 @@ async fn run_session(
     for warning in &council.warnings {
         let _ = ui_event_tx.send(crate::event::UiEvent::Warning(warning.clone()));
     }
+    if !pending_probe_servers.is_empty() {
+        let _ = ui_event_tx.send(crate::event::UiEvent::Info(format!(
+            "probing ACP servers in the background: {}",
+            pending_probe_servers.join(", ")
+        )));
+    }
+    let council_update_task = council_updates.map(|mut updates| {
+        let tx = ui_event_tx.clone();
+        let mut surfaced: std::collections::HashSet<String> =
+            council.warnings.iter().cloned().collect();
+        tokio::spawn(async move {
+            while updates.changed().await.is_ok() {
+                let snapshot = updates.borrow_and_update().clone();
+                for warning in &snapshot.warnings {
+                    if surfaced.insert(warning.clone())
+                        && tx
+                            .send(crate::event::UiEvent::Warning(warning.clone()))
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+                if tx
+                    .send(crate::event::UiEvent::CouncilUpdate {
+                        choices: snapshot.choices,
+                        inventory: snapshot.inventory,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+    });
     let usage_roles = std::iter::once(&council.thor)
         .chain(eitri_role.as_ref())
         .chain(loki_role.as_ref());
@@ -2083,6 +2146,9 @@ async fn run_session(
         );
     } else {
         tokio::join!(event_proxy_wait, cmd_proxy_wait);
+    }
+    if let Some(task) = council_update_task {
+        task.abort();
     }
 
     // Restore the terminal only now, after the runtime has finished tearing

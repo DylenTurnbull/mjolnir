@@ -937,6 +937,7 @@ impl TrackerState {
             | UiEvent::ElicitationRequest(_)
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::CodeAgent(_)
+            | UiEvent::CouncilUpdate { .. }
             | UiEvent::Info(_) => {}
             UiEvent::Warning(message) => {
                 self.record_system_notice(message.clone());
@@ -2236,6 +2237,11 @@ fn start_server_agent_session(
                         thor_orchestrator
                             .begin_turn(epoch, text.clone(), snapshot)
                             .await;
+                    }
+                    if matches!(command, UiCommand::CancelPrompt)
+                        && let Some(reviewer) = loki.as_ref()
+                    {
+                        reviewer.cancel_turn();
                     }
                     let shutdown = matches!(command, UiCommand::Shutdown);
                     if runtime_cmd_tx.send(command).is_err() || shutdown {

@@ -1,0 +1,184 @@
+//! Disk-persisted ACP adapter probe results. Warm startups bind the Council
+//! from this cache instead of relaunching every adapter; entries are keyed by
+//! the launch identity and invalidated by TTL or a changed adapter binary.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::probe::{AdapterCapabilities, ModelOption};
+
+pub const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+pub fn default_cache_path() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from(".cache"))
+        .join("mj")
+        .join("acp-probes-v1.json")
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CacheFile {
+    entries: HashMap<String, Entry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Entry {
+    captured_at_unix: u64,
+    fingerprint: Option<Fingerprint>,
+    http_mcp: bool,
+    models: Vec<ModelOption>,
+}
+
+/// Identity of the adapter binary the entry was captured from. `None` when
+/// the command cannot be stat'ed (e.g. resolved through an interpreter); such
+/// entries are valid on TTL alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Fingerprint {
+    modified_unix: u64,
+    len: u64,
+}
+
+fn command_fingerprint(command: &Path) -> Option<Fingerprint> {
+    let metadata = std::fs::metadata(command).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(Fingerprint {
+        modified_unix: modified,
+        len: metadata.len(),
+    })
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+fn read(path: &Path) -> CacheFile {
+    std::fs::read(path)
+        .ok()
+        .and_then(|contents| serde_json::from_slice(&contents).ok())
+        .unwrap_or_default()
+}
+
+/// Fresh cached capabilities for `key`, or `None` when the entry is missing,
+/// older than `ttl`, or captured from a different adapter binary.
+pub fn load(path: &Path, key: &str, command: &Path, ttl: Duration) -> Option<AdapterCapabilities> {
+    let entry = read(path).entries.remove(key)?;
+    let age = now_unix().saturating_sub(entry.captured_at_unix);
+    if age >= ttl.as_secs() {
+        return None;
+    }
+    if entry.fingerprint != command_fingerprint(command) {
+        return None;
+    }
+    Some(AdapterCapabilities {
+        http_mcp: entry.http_mcp,
+        models: entry.models,
+    })
+}
+
+/// Record freshly probed capabilities. Failures are never cached, so a broken
+/// adapter is re-probed on the next resolution instead of staying broken for
+/// a full TTL. Best-effort: cache write errors are ignored.
+pub fn store(path: &Path, key: &str, command: &Path, capabilities: &AdapterCapabilities) {
+    let mut file = read(path);
+    file.entries.insert(
+        key.to_string(),
+        Entry {
+            captured_at_unix: now_unix(),
+            fingerprint: command_fingerprint(command),
+            http_mcp: capabilities.http_mcp,
+            models: capabilities.models.clone(),
+        },
+    );
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(serialized) = serde_json::to_vec_pretty(&file) else {
+        return;
+    };
+    // Atomic replace so concurrent mj processes never observe a torn file.
+    let Ok(temp) = tempfile::NamedTempFile::new_in(parent) else {
+        return;
+    };
+    if std::io::Write::write_all(&mut temp.as_file(), &serialized).is_ok() {
+        let _ = temp.persist(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capabilities(model: &str) -> AdapterCapabilities {
+        AdapterCapabilities {
+            http_mcp: true,
+            models: vec![ModelOption {
+                value: model.to_string(),
+                name: model.to_string(),
+                description: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn cached_probe_roundtrips_for_an_unchanged_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path().join("probes.json");
+        let command = dir.path().join("agent");
+        std::fs::write(&command, b"binary").expect("command");
+
+        store(&cache, "custom:company", &command, &capabilities("m1"));
+        let loaded =
+            load(&cache, "custom:company", &command, CACHE_TTL).expect("fresh cache entry");
+        assert!(loaded.http_mcp);
+        assert_eq!(loaded.models[0].value, "m1");
+
+        assert!(load(&cache, "other-key", &command, CACHE_TTL).is_none());
+    }
+
+    #[test]
+    fn expired_entries_are_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path().join("probes.json");
+        let command = dir.path().join("agent");
+        std::fs::write(&command, b"binary").expect("command");
+
+        store(&cache, "anvil", &command, &capabilities("m1"));
+        assert!(load(&cache, "anvil", &command, Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn changed_binary_invalidates_the_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path().join("probes.json");
+        let command = dir.path().join("agent");
+        std::fs::write(&command, b"binary").expect("command");
+
+        store(&cache, "anvil", &command, &capabilities("m1"));
+        std::fs::write(&command, b"binary-upgraded").expect("replace command");
+        assert!(load(&cache, "anvil", &command, CACHE_TTL).is_none());
+    }
+
+    #[test]
+    fn unstatable_commands_cache_on_ttl_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path().join("probes.json");
+        let command = dir.path().join("missing-binary");
+
+        store(&cache, "custom:npx", &command, &capabilities("m1"));
+        assert!(load(&cache, "custom:npx", &command, CACHE_TTL).is_some());
+    }
+}

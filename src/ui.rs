@@ -720,6 +720,7 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::Info(_)
         | UiEvent::InternalMessage(_)
         | UiEvent::Fatal(_)
+        | UiEvent::CouncilUpdate { .. }
         | UiEvent::CodeAgent(_) => RedrawCause::Interactive,
     }
 }
@@ -3791,6 +3792,9 @@ fn transcript_export_markdown(state: &AppState) -> String {
                     crate::event::InternalMessageKind::Continuation => {
                         format!("{} → {} continuation", message.source, message.target)
                     }
+                    crate::event::InternalMessageKind::Interjection => {
+                        format!("{} → {} interjection", message.source, message.target)
+                    }
                 };
                 push_export_text(&mut out, &heading, &message.text);
             }
@@ -5472,6 +5476,13 @@ fn render_transcript_entry_range(
                     crate::event::InternalMessageKind::Continuation => {
                         format!(
                             "continuation for {} · {}",
+                            message.target,
+                            message_size_label(chars)
+                        )
+                    }
+                    crate::event::InternalMessageKind::Interjection => {
+                        format!(
+                            "post-turn thoughts for {} · {}",
                             message.target,
                             message_size_label(chars)
                         )
@@ -13422,7 +13433,7 @@ mod tests {
             source: "Thor".to_string(),
             target: "Eitri".to_string(),
             kind: crate::event::InternalMessageKind::Exploration,
-            text: "very thorough: trace startup".to_string(),
+            text: "trace startup".to_string(),
         }));
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
             label: "Eitri · explorer".to_string(),

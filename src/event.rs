@@ -58,6 +58,9 @@ pub enum InternalMessageKind {
     Exploration,
     DiscreteReview,
     Continuation,
+    /// Loki finished reviewing after the turn already completed; the council
+    /// starts a fresh Thor turn to surface the late advice to the user.
+    Interjection,
 }
 
 /// Events flowing from the ACP runtime into the UI task.
@@ -87,6 +90,13 @@ pub enum UiEvent {
     SessionConfigOptions {
         options: Vec<SessionConfigOption>,
         targets: Vec<SessionConfigTarget>,
+    },
+    /// A background ACP adapter probe finished after startup: refreshed model
+    /// choices and server inventory for the /models and /mjconfig editors.
+    /// Never rebinds the running session's Council roles.
+    CouncilUpdate {
+        choices: Vec<crate::council::ModelChoice>,
+        inventory: crate::council::AcpInventory,
     },
     /// Structured nested-agent activity projected from an MCP tool result.
     LokiActivity(LokiActivity),
