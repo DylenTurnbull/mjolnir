@@ -5498,7 +5498,7 @@ fn render_transcript_entry_range(
                 }
             }
             Entry::AgentMessage(text) | Entry::CodeAgentMessage(text) => {
-                push_markdown_message(&mut out, text, collapse_message, theme)
+                push_markdown_message(&mut out, text, collapse_message, width, theme)
             }
             Entry::AgentThought(text) | Entry::CodeAgentThought(text) => {
                 push_thinking(&mut out, text, theme)
@@ -5548,7 +5548,7 @@ fn render_transcript_entry_range(
                         .fg(theme.muted)
                         .add_modifier(Modifier::BOLD),
                 )));
-                push_markdown_message(&mut out, &message.text, collapse_message, theme);
+                push_markdown_message(&mut out, &message.text, collapse_message, width, theme);
             }
             Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
                 out.push(Line::from(Span::styled(
@@ -5831,10 +5831,11 @@ fn push_markdown_message(
     out: &mut Vec<Line<'static>>,
     text: &str,
     collapse: bool,
+    width: u16,
     theme: TerminalTheme,
 ) {
     let (preview, collapsed) = message_preview(text, collapse);
-    push_markdown_lines(out, preview, 0, theme);
+    push_markdown_lines(out, preview, 0, width, theme);
     if collapsed {
         push_message_collapse_hint(out, theme);
     }
@@ -5897,25 +5898,27 @@ fn push_markdown_lines(
     out: &mut Vec<Line<'static>>,
     text: String,
     indent: usize,
+    width: u16,
     theme: TerminalTheme,
 ) {
-    push_markdown_lines_limited_inner(out, text, indent, None, theme, false);
+    push_markdown_lines_limited_inner(out, text, indent, width, None, theme, false);
 }
 
 fn push_tool_markdown_lines_limited(
     out: &mut Vec<Line<'static>>,
     text: String,
     indent: usize,
+    width: u16,
     collapse_limit: Option<usize>,
     theme: TerminalTheme,
 ) {
     let (_, hidden) = tool_output_preview(&text, collapse_limit);
     if let Some(ToolOutputHidden::Lines(lines)) = hidden {
         push_tool_collapse_hint(out, indent, ToolOutputHidden::Lines(lines), theme);
-        push_markdown_lines_limited_inner(out, text, indent, collapse_limit, theme, true);
+        push_markdown_lines_limited_inner(out, text, indent, width, collapse_limit, theme, true);
     } else {
         let (preview, hidden) = tool_output_preview(&text, collapse_limit);
-        push_markdown_lines_limited_inner(out, preview, indent, None, theme, true);
+        push_markdown_lines_limited_inner(out, preview, indent, width, None, theme, true);
         if let Some(ToolOutputHidden::Details) = hidden {
             push_tool_collapse_hint(out, indent, ToolOutputHidden::Details, theme);
         }
@@ -5983,6 +5986,7 @@ fn push_markdown_lines_limited_inner(
     out: &mut Vec<Line<'static>>,
     text: String,
     indent: usize,
+    width: u16,
     collapse_limit: Option<usize>,
     theme: TerminalTheme,
     use_tool_output_style: bool,
@@ -6015,24 +6019,29 @@ fn push_markdown_lines_limited_inner(
     if hidden > 0 {
         push_collapse_hint(out, indent, hidden, theme);
     }
-    for original in &lines[hidden..] {
+    let mut line_index = hidden;
+    while line_index < lines.len() {
+        let original = lines[line_index];
         if let Some((marker, length)) = code_fence {
             if markdown_fence(original)
                 .is_some_and(|(next, count, _)| next == marker && count >= length)
             {
                 code_fence = None;
                 code_lang.clear();
+                line_index += 1;
                 continue;
             }
             out.push(Line::from(Span::styled(
                 format!("{prefix}  {original}"),
                 Style::default().fg(theme.quote),
             )));
+            line_index += 1;
             continue;
         }
 
         let filtered = strip_html_comments(original, &mut in_html_comment);
         if filtered.trim().is_empty() && !original.trim().is_empty() {
+            line_index += 1;
             continue;
         }
         let raw = filtered.as_str();
@@ -6050,12 +6059,14 @@ fn push_markdown_lines_limited_inner(
                     .fg(theme.muted)
                     .add_modifier(Modifier::BOLD),
             )));
+            line_index += 1;
             continue;
         }
         let trimmed = raw.trim_start();
 
         if raw.trim().is_empty() {
             out.push(Line::from(""));
+            line_index += 1;
             continue;
         }
 
@@ -6065,26 +6076,44 @@ fn push_markdown_lines_limited_inner(
             Style::default()
         };
 
+        if let Some(header) = markdown_table_header(raw, lines.get(line_index + 1)) {
+            push_markdown_table_row(out, &prefix, &header, true, theme, base_style);
+            line_index += 2;
+            while let Some(row) = lines
+                .get(line_index)
+                .and_then(|row| markdown_table_row(row))
+            {
+                push_markdown_table_row(out, &prefix, &row, false, theme, base_style);
+                line_index += 1;
+            }
+            continue;
+        }
+
         if let Some((level, heading)) = markdown_heading(raw) {
             let marker = "#".repeat(level);
+            let heading_style =
+                markdown_heading_style(level, theme, base_style, use_tool_output_style);
             out.push(Line::from(vec![
-                Span::styled(
-                    format!("{prefix}{marker} "),
-                    Style::default().fg(theme.muted),
-                ),
-                Span::styled(
-                    heading.to_string(),
-                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(format!("{prefix}{marker} "), heading_style),
+                Span::styled(heading.to_string(), heading_style),
             ]));
+            line_index += 1;
             continue;
         }
 
         if markdown_rule(raw) {
             out.push(Line::from(Span::styled(
-                format!("{prefix}--------"),
-                Style::default().fg(theme.muted),
+                format!(
+                    "{prefix}{}",
+                    "─".repeat(usize::from(width).saturating_sub(indent).max(1))
+                ),
+                base_style.fg(if use_tool_output_style {
+                    theme.subtle
+                } else {
+                    theme.muted
+                }),
             )));
+            line_index += 1;
             continue;
         }
 
@@ -6093,32 +6122,36 @@ fn push_markdown_lines_limited_inner(
                 Span::styled(format!("{prefix}> "), Style::default().fg(theme.muted)),
                 Span::styled(quoted.to_string(), Style::default().fg(theme.quote)),
             ]));
+            line_index += 1;
             continue;
         }
 
-        if let Some(item) = markdown_unordered_item(raw) {
+        if let Some((source_indent, item)) = markdown_unordered_item(raw) {
             let mut spans = vec![Span::styled(
-                format!("{prefix}- "),
+                format!("{prefix}{source_indent}- "),
                 Style::default().fg(theme.muted),
             )];
             spans.extend(inline_markdown_spans_with_style(item, theme, base_style));
             out.push(Line::from(spans));
+            line_index += 1;
             continue;
         }
 
-        if let Some((number, item)) = markdown_ordered_item(raw) {
+        if let Some((source_indent, number, item)) = markdown_ordered_item(raw) {
             let mut spans = vec![Span::styled(
-                format!("{prefix}{number}. "),
+                format!("{prefix}{source_indent}{number}. "),
                 Style::default().fg(theme.muted),
             )];
             spans.extend(inline_markdown_spans_with_style(item, theme, base_style));
             out.push(Line::from(spans));
+            line_index += 1;
             continue;
         }
 
         let mut spans = vec![Span::styled(prefix.clone(), base_style)];
         spans.extend(inline_markdown_spans_with_style(raw, theme, base_style));
         out.push(Line::from(spans));
+        line_index += 1;
     }
 }
 
@@ -6195,19 +6228,105 @@ fn markdown_rule(raw: &str) -> bool {
             || trimmed.chars().all(|c| c == '_'))
 }
 
-fn markdown_unordered_item(raw: &str) -> Option<&str> {
+fn markdown_table_header<'a>(raw: &'a str, next: Option<&&str>) -> Option<Vec<&'a str>> {
+    let header = markdown_table_row(raw)?;
+    let separator = markdown_table_row(next?)?;
+    (header.len() == separator.len()
+        && header.len() >= 2
+        && separator
+            .iter()
+            .all(|cell| markdown_table_separator_cell(cell)))
+    .then_some(header)
+}
+
+fn markdown_table_row(raw: &str) -> Option<Vec<&str>> {
+    let trimmed = raw.trim();
+    trimmed.contains('|').then(|| {
+        trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect()
+    })
+}
+
+fn markdown_table_separator_cell(cell: &str) -> bool {
+    let content = cell.trim_matches(':');
+    content.len() >= 3 && content.chars().all(|ch| ch == '-')
+}
+
+fn push_markdown_table_row(
+    out: &mut Vec<Line<'static>>,
+    prefix: &str,
+    cells: &[&str],
+    header: bool,
+    theme: TerminalTheme,
+    base_style: Style,
+) {
+    let mut spans = vec![Span::styled(prefix.to_string(), base_style)];
+    for (index, cell) in cells.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" | ", base_style.fg(theme.muted)));
+        }
+        let style = if header {
+            base_style.add_modifier(Modifier::BOLD)
+        } else {
+            base_style
+        };
+        spans.extend(inline_markdown_spans_with_style(cell, theme, style));
+    }
+    out.push(Line::from(spans));
+}
+
+fn markdown_heading_style(
+    level: usize,
+    theme: TerminalTheme,
+    base_style: Style,
+    tool_output: bool,
+) -> Style {
+    if tool_output {
+        return base_style.add_modifier(match level {
+            1 | 2 => Modifier::BOLD,
+            3 | 4 => Modifier::UNDERLINED,
+            _ => Modifier::ITALIC,
+        });
+    }
+    match level {
+        1 => Style::default()
+            .fg(theme.primary)
+            .add_modifier(Modifier::BOLD),
+        2 => Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+        3 => Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        4 => Style::default()
+            .fg(theme.secondary)
+            .add_modifier(Modifier::BOLD),
+        5 => Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::UNDERLINED),
+        _ => Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::ITALIC),
+    }
+}
+
+fn markdown_unordered_item(raw: &str) -> Option<(&str, &str)> {
+    let source_indent = &raw[..raw.len() - raw.trim_start().len()];
     let trimmed = raw.trim_start();
     trimmed
         .strip_prefix("- ")
         .or_else(|| trimmed.strip_prefix("* "))
+        .map(|item| (source_indent, item))
 }
 
-fn markdown_ordered_item(raw: &str) -> Option<(&str, &str)> {
+fn markdown_ordered_item(raw: &str) -> Option<(&str, &str, &str)> {
+    let source_indent = &raw[..raw.len() - raw.trim_start().len()];
     let trimmed = raw.trim_start();
     let dot = trimmed.find(". ")?;
     let number = &trimmed[..dot];
     if number.chars().all(|c| c.is_ascii_digit()) {
-        Some((number, &trimmed[dot + 2..]))
+        Some((source_indent, number, &trimmed[dot + 2..]))
     } else {
         None
     }
@@ -6222,6 +6341,22 @@ fn inline_markdown_spans_with_style(
     let mut rest = raw;
     let mut previous = None;
     while !rest.is_empty() {
+        if let Some(after_label) = rest.strip_prefix('[')
+            && let Some(label_end) = after_label.find("](")
+            && let Some(url_end) = after_label[label_end + 2..].find(')')
+        {
+            let label = &after_label[..label_end];
+            let url_start = label_end + 2;
+            let url = &after_label[url_start..url_start + url_end];
+            spans.extend(inline_markdown_spans_with_style(label, theme, base_style));
+            spans.push(Span::styled(
+                format!(" ({url})"),
+                base_style.fg(theme.muted),
+            ));
+            rest = &after_label[url_start + url_end + 1..];
+            previous = url.chars().next_back();
+            continue;
+        }
         if let Some(after) = rest.strip_prefix("`")
             && let Some(end) = after.find('`')
         {
@@ -6289,7 +6424,7 @@ fn inline_markdown_spans_with_style(
         let next = rest
             .char_indices()
             .skip(1)
-            .find_map(|(idx, ch)| (ch == '`' || ch == '*' || ch == '_').then_some(idx))
+            .find_map(|(idx, ch)| (ch == '`' || ch == '*' || ch == '_' || ch == '[').then_some(idx))
             .unwrap_or(rest.len());
         let (plain, tail) = rest.split_at(next);
         spans.push(Span::styled(plain.to_string(), base_style));
@@ -6449,7 +6584,7 @@ fn push_tool_outputs(
     for output in outputs {
         match output {
             ToolCallOutput::Text(text) => {
-                push_tool_markdown_lines_limited(out, text.clone(), 2, collapse_limit, theme)
+                push_tool_markdown_lines_limited(out, text.clone(), 2, width, collapse_limit, theme)
             }
             ToolCallOutput::Diff {
                 path,
@@ -15389,6 +15524,145 @@ mod tests {
                 .any(|line| line == "│   - visible from anvil"),
             "rendered lines: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn transcript_markdown_links_tables_lists_headings_and_rules_share_reader_rendering() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state.transcript.push(Entry::AgentMessage(
+            "# Top\n###### Bottom\n[docs](https://example.test/docs) and [more](https://example.test/more)\nname | value\n--- | :---:\n**alpha** | `beta`\n  - nested bullet\n    2. nested number\n---"
+                .to_string(),
+        ));
+        state.expand_transcript_details = true;
+
+        let width = 26;
+        let normal = render_transcript_lines(&state, width);
+        let full = render_full_transcript_lines(&state, width);
+        let signature = |lines: &[Line<'static>]| {
+            lines
+                .iter()
+                .map(|line| {
+                    (
+                        line_text(line),
+                        line.spans
+                            .iter()
+                            .map(|span| (span.content.to_string(), span.style))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(signature(&normal), signature(&full));
+
+        let rendered: Vec<String> = normal.iter().map(line_text).collect();
+        assert!(
+            rendered.iter().any(|line| line
+                == "docs (https://example.test/docs) and more (https://example.test/more)")
+        );
+        assert!(rendered.iter().any(|line| line == "name | value"));
+        assert!(rendered.iter().any(|line| line == "alpha | beta"));
+        assert!(!rendered.iter().any(|line| line.contains(":---:")));
+        assert!(rendered.iter().any(|line| line == "  - nested bullet"));
+        assert!(rendered.iter().any(|line| line == "    2. nested number"));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == &"─".repeat(width as usize))
+        );
+
+        let top = normal
+            .iter()
+            .find(|line| line_text(line) == "# Top")
+            .unwrap();
+        let bottom = normal
+            .iter()
+            .find(|line| line_text(line) == "###### Bottom")
+            .unwrap();
+        assert_ne!(top.spans[0].style, bottom.spans[0].style);
+        assert_eq!(top.spans[0].style.fg, Some(theme.primary));
+        assert_eq!(bottom.spans[0].style.fg, Some(theme.muted));
+
+        let paragraph = Paragraph::new(normal).wrap(Wrap { trim: false });
+        let height = paragraph.line_count(width);
+        let area = Rect::new(0, 0, width, height as u16);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        paragraph.render(area, &mut buffer);
+        let narrow = buffer_lines(&buffer).join("");
+        for content in [
+            "docs",
+            "example.test/docs",
+            "name",
+            "value",
+            "alpha",
+            "beta",
+            "nested bullet",
+            "nested number",
+        ] {
+            assert!(
+                narrow.contains(content),
+                "narrow Markdown rendering lost {content:?}: {narrow:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_markdown_constructs_stay_desaturated_and_fit_narrow_gutter() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state.tool_calls.insert(
+            "call-343".to_string(),
+            crate::app::ToolCallView {
+                title: "log".to_string(),
+                kind: ToolKind::Execute,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Text(
+                    "# heading\n[label](https://example.test/a-very-long-path)\nkey | value\n--- | ---\n**left** | *right*\n  - nested\n---"
+                        .to_string(),
+                )],
+            },
+        );
+        state
+            .transcript
+            .push(Entry::ToolCall("call-343".to_string()));
+
+        let width = 24u16;
+        let lines = render_transcript_lines(&state, width);
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        let tool_content = lines
+            .iter()
+            .filter(|line| line_text(line).starts_with(TOOL_GUTTER))
+            .flat_map(|line| line.spans.iter().skip(1))
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            tool_content.contains("label (https://example.test/a-very-long-path)"),
+            "wrapped tool rows lost link content: {rendered:?}"
+        );
+        assert!(rendered.iter().any(|line| line == "│   key | value"));
+        assert!(rendered.iter().any(|line| line == "│     - nested"));
+        for line in lines
+            .iter()
+            .filter(|line| line_text(line).starts_with(TOOL_GUTTER))
+        {
+            assert!(
+                line_text(line).width() <= width as usize,
+                "too wide: {line:?}"
+            );
+            for span in line.spans.iter().skip(1) {
+                assert!(
+                    span.style.fg == Some(theme.subtle) || span.style.fg == Some(theme.muted),
+                    "tool markdown recolored content: {line:?}"
+                );
+            }
+        }
+        let emphasis = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.as_ref() == "left")
+            .expect("bold table cell");
+        assert_eq!(emphasis.style.fg, Some(theme.subtle));
+        assert!(emphasis.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
