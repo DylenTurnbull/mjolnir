@@ -623,6 +623,9 @@ pub struct AppState {
     pub session_fork_supported: bool,
     pub transcript: Vec<Entry>,
     pub tool_calls: HashMap<String, ToolCallView>,
+    /// Workspace diffs observed locally after prompt turns. These deliberately
+    /// remain outside ACP tool-call and transcript state.
+    pub workspace_diffs: Vec<crate::event::WorkspaceDiffEvent>,
     /// Primary-agent MCP calls that transport an Eitri turn. Their protocol
     /// state remains available, but the redundant parent row is omitted from
     /// the transcript so it cannot pin nested activity behind a pending tool.
@@ -998,6 +1001,7 @@ impl AppState {
             session_fork_supported: false,
             transcript: Vec::new(),
             tool_calls: HashMap::new(),
+            workspace_diffs: Vec::new(),
             suppressed_tool_calls: HashSet::new(),
             terminal_outputs: HashMap::new(),
             transcript_revision: 0,
@@ -2104,6 +2108,9 @@ impl AppState {
                 if self.connection_state == ConnectionState::Forking {
                     self.finish_turn_timer();
                 }
+                if self.session_id.as_deref() != Some(&session_id) {
+                    self.workspace_diffs.clear();
+                }
                 self.session_id = Some(session_id);
                 self.set_connection_state(ConnectionState::Ready);
             }
@@ -2140,6 +2147,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             UiEvent::CouncilUsage(record) => self.council_usage.observe(record),
+            UiEvent::WorkspaceDiff(diff) => self.workspace_diffs.push(diff),
             UiEvent::PermissionRequest(prompt) => {
                 // Append to the queue rather than replacing the current
                 // pending prompt: overwriting would drop the prior
@@ -3549,6 +3557,40 @@ mod tests {
             Entry::AgentMessage(s) => assert_eq!(s, "hello world"),
             other => panic!("unexpected entry: {other:?}"),
         }
+    }
+
+    #[test]
+    fn workspace_diffs_are_retained_without_transcript_or_tool_call_entries() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::SessionStarted {
+            session_id: "first-session".to_string(),
+            resumed: false,
+        });
+        let revision = state.transcript_revision;
+
+        state.apply_event(UiEvent::WorkspaceDiff(crate::event::WorkspaceDiffEvent {
+            turn_id: 7,
+            diffs: vec![crate::event::WorkspaceDiff {
+                path: PathBuf::from("src/lib.rs"),
+                old_text: Some("before\n".to_string()),
+                new_text: "after\n".to_string(),
+            }],
+            total_files: 1,
+            max_files: 20,
+            truncated: false,
+        }));
+
+        assert_eq!(state.workspace_diffs.len(), 1);
+        assert_eq!(state.workspace_diffs[0].turn_id, 7);
+        assert!(state.transcript.is_empty());
+        assert!(state.tool_calls.is_empty());
+        assert_eq!(state.transcript_revision, revision);
+
+        state.apply_event(UiEvent::SessionStarted {
+            session_id: "next-session".to_string(),
+            resumed: false,
+        });
+        assert!(state.workspace_diffs.is_empty());
     }
 
     #[test]

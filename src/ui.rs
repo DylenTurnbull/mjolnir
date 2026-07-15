@@ -706,6 +706,7 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         UiEvent::Connected { .. }
         | UiEvent::SessionStarted { .. }
         | UiEvent::SessionConfigOptions { .. }
+        | UiEvent::WorkspaceDiff(_)
         | UiEvent::PermissionRequest(_)
         | UiEvent::ElicitationRequest(_)
         | UiEvent::CancelPendingPermissions
