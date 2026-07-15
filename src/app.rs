@@ -1240,35 +1240,16 @@ impl AppState {
         config: crate::config::Config,
         choices: &[crate::council::ModelChoice],
     ) -> Vec<MjConfigAgent> {
-        let mut agents = vec![
-            ("codex-acp", "Codex", config.acp.codex),
-            ("claude-acp", "Claude Code", config.acp.claude),
-            ("anvil", "Anvil", config.acp.anvil),
-            ("opencode-acp", "OpenCode", config.acp.opencode),
-        ]
-        .into_iter()
-        .map(|(id, label, enabled)| MjConfigAgent {
-            id: id.to_string(),
-            label: label.to_string(),
-            enabled,
-            validation: "not available in this session".to_string(),
-        })
-        .collect::<Vec<_>>();
-
-        for agent in &mut agents {
-            agent.validation = Self::agent_validation(choices, &agent.id, agent.enabled);
-        }
-        agents.extend(config.acp.servers.into_iter().map(|server| {
-            let id = format!("custom:{}", server.name);
-            let validation = Self::agent_validation(choices, &id, server.enabled);
-            MjConfigAgent {
-                id,
-                label: server.name,
-                enabled: server.enabled,
-                validation,
-            }
-        }));
-        agents
+        config
+            .acp_server_selections()
+            .into_iter()
+            .map(|selection| MjConfigAgent {
+                validation: Self::agent_validation(choices, &selection.id, selection.enabled),
+                id: selection.id,
+                label: selection.label,
+                enabled: selection.enabled,
+            })
+            .collect()
     }
 
     fn agent_validation(

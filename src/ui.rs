@@ -3572,23 +3572,7 @@ fn persist_mjconfig_selection(
             cfg.theme = theme;
             cfg.spinner = style;
             for (id, enabled) in agents {
-                match id.as_str() {
-                    "codex-acp" => cfg.acp.codex = *enabled,
-                    "claude-acp" => cfg.acp.claude = *enabled,
-                    "anvil" => cfg.acp.anvil = *enabled,
-                    "opencode-acp" => cfg.acp.opencode = *enabled,
-                    custom if custom.starts_with("custom:") => {
-                        if let Some(server) = cfg
-                            .acp
-                            .servers
-                            .iter_mut()
-                            .find(|server| server.name == custom[7..])
-                        {
-                            server.enabled = *enabled;
-                        }
-                    }
-                    _ => {}
-                }
+                cfg.set_acp_server_enabled(id, *enabled);
             }
             cfg.save(&path)
         }) {

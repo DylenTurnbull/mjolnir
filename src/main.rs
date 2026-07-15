@@ -21,6 +21,7 @@ mod loki;
 mod menu;
 mod model_resolve;
 mod notifications;
+mod onboarding;
 mod palette;
 mod paths;
 mod probe;
@@ -957,8 +958,22 @@ async fn run_app(
     mode: UiMode,
 ) -> Result<Option<String>> {
     let config_path = config::default_config_path();
+    let first_startup = should_open_first_startup(
+        config_path.exists(),
+        resume_target.as_ref(),
+        initial_agent.as_ref(),
+    );
     let mut cfg = Config::load(&config_path)?;
     let mut council = council::resolve(&cfg, &cwd).await?;
+    if first_startup {
+        let Some((accepted_config, accepted_council)) =
+            run_first_startup(cfg, council, &config_path, &cwd).await?
+        else {
+            return Ok(None);
+        };
+        cfg = accepted_config;
+        council = accepted_council;
+    }
     if let Some(agent) = initial_agent.as_ref()
         && let Some(pinned) = council.available.iter().find(|role| {
             role.launch.command == agent.program
@@ -1082,6 +1097,63 @@ async fn run_app(
             }
         }
     }
+}
+
+fn should_open_first_startup(
+    config_exists: bool,
+    resume_target: Option<&ResumeTarget>,
+    initial_agent: Option<&SelectedAgent>,
+) -> bool {
+    !config_exists && resume_target.is_none() && initial_agent.is_none()
+}
+
+async fn run_first_startup(
+    mut candidate: Config,
+    preview: council::ResolvedCouncil,
+    config_path: &Path,
+    cwd: &Path,
+) -> Result<Option<(Config, council::ResolvedCouncil)>> {
+    let mut notice = None;
+    loop {
+        let outcome =
+            run_onboarding_once(candidate.clone(), preview.clone(), notice.take()).await?;
+        let onboarding::Outcome::Accept(next) = outcome else {
+            return Ok(None);
+        };
+        let next = *next;
+        match council::resolve(&next, cwd).await {
+            Ok(resolved) => {
+                next.save(config_path)
+                    .with_context(|| format!("save {}", config_path.display()))?;
+                return Ok(Some((next, resolved)));
+            }
+            Err(error) => {
+                candidate = next;
+                notice = Some(format!("Configuration is not launchable: {error:#}"));
+            }
+        }
+    }
+}
+
+async fn run_onboarding_once(
+    config: Config,
+    council: council::ResolvedCouncil,
+    notice: Option<String>,
+) -> Result<onboarding::Outcome> {
+    let mut terminal = ui::setup_fullscreen_terminal().context("setup onboarding terminal")?;
+    let outcome = onboarding::run(
+        &mut terminal,
+        config.theme.palette(),
+        config,
+        council,
+        notice,
+    )
+    .await;
+    if let Err(error) = ui::restore_fullscreen_terminal(&mut terminal) {
+        tracing::warn!("restore terminal (onboarding) failed: {error}");
+    }
+    settle_after_fullscreen_picker_restore().await;
+    outcome
 }
 
 async fn run_session_picker_action_for_agent(
@@ -2422,6 +2494,25 @@ mod tests {
         assert!(select_primary_agent(&mut council, 1));
         assert_eq!(council.thor.launch.source_id, "claude-acp");
         assert!(!select_primary_agent(&mut council, 2));
+    }
+
+    #[test]
+    fn first_startup_only_opens_for_a_fresh_unpinned_session() {
+        let agent = SelectedAgent {
+            source_id: "council:test".to_string(),
+            program: PathBuf::from("test-acp"),
+            args: Vec::new(),
+            env: Default::default(),
+        };
+        let resume = ResumeTarget {
+            session_id: "session-1".to_string(),
+            title: None,
+        };
+
+        assert!(should_open_first_startup(false, None, None));
+        assert!(!should_open_first_startup(true, None, None));
+        assert!(!should_open_first_startup(false, Some(&resume), None));
+        assert!(!should_open_first_startup(false, None, Some(&agent)));
     }
 
     #[test]

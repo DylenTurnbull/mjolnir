@@ -141,6 +141,13 @@ pub struct AcpConfig {
     pub servers: Vec<CustomAcpServer>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpServerSelection {
+    pub id: String,
+    pub label: String,
+    pub enabled: bool,
+}
+
 impl Default for AcpConfig {
     fn default() -> Self {
         Self {
@@ -234,6 +241,50 @@ pub struct CustomAgent {
 }
 
 impl Config {
+    pub fn acp_server_selections(&self) -> Vec<AcpServerSelection> {
+        let mut selections = vec![
+            ("codex-acp", "Codex", self.acp.codex),
+            ("claude-acp", "Claude Code", self.acp.claude),
+            ("anvil", "Anvil", self.acp.anvil),
+            ("opencode-acp", "OpenCode", self.acp.opencode),
+        ]
+        .into_iter()
+        .map(|(id, label, enabled)| AcpServerSelection {
+            id: id.to_string(),
+            label: label.to_string(),
+            enabled,
+        })
+        .collect::<Vec<_>>();
+        selections.extend(self.acp.servers.iter().map(|server| AcpServerSelection {
+            id: format!("custom:{}", server.name),
+            label: server.name.clone(),
+            enabled: server.enabled,
+        }));
+        selections
+    }
+
+    pub fn set_acp_server_enabled(&mut self, id: &str, enabled: bool) -> bool {
+        match id {
+            "codex-acp" => self.acp.codex = enabled,
+            "claude-acp" => self.acp.claude = enabled,
+            "anvil" => self.acp.anvil = enabled,
+            "opencode-acp" => self.acp.opencode = enabled,
+            custom if custom.starts_with("custom:") => {
+                let Some(server) = self
+                    .acp
+                    .servers
+                    .iter_mut()
+                    .find(|server| server.name == custom[7..])
+                else {
+                    return false;
+                };
+                server.enabled = enabled;
+            }
+            _ => return false,
+        }
+        true
+    }
+
     pub fn role_models(&self) -> ModelsConfig {
         ModelsConfig {
             thor: self.thor.model.clone(),
@@ -774,6 +825,31 @@ mode = "ask"
         assert!(body.contains("claude = false"), "saved: {body}");
         assert!(body.contains("enabled = false"), "saved: {body}");
         assert!(!body.contains("codex = true"), "saved: {body}");
+    }
+
+    #[test]
+    fn shared_acp_server_selections_update_builtins_and_custom_servers() {
+        let mut config = Config {
+            acp: AcpConfig {
+                servers: vec![CustomAcpServer {
+                    name: "company".to_string(),
+                    command: PathBuf::from("company-acp"),
+                    args: Vec::new(),
+                    enabled: true,
+                }],
+                ..AcpConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let selections = config.acp_server_selections();
+        assert_eq!(selections[0].id, "codex-acp");
+        assert_eq!(selections[4].id, "custom:company");
+        assert!(config.set_acp_server_enabled("codex-acp", false));
+        assert!(config.set_acp_server_enabled("custom:company", false));
+        assert!(!config.set_acp_server_enabled("custom:missing", false));
+        assert!(!config.acp.codex);
+        assert!(!config.acp.servers[0].enabled);
     }
 
     #[test]
