@@ -36,6 +36,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::archive;
 use crate::code_agent;
@@ -82,6 +83,10 @@ pub struct AcpRuntimeConfig {
     /// Optional model-visible code-agent MCP service. Interactive TUI sessions
     /// set this; nested and non-interactive runtimes leave it absent.
     pub code_agent: Option<code_agent::Config>,
+    /// Forces the runtime through its normal process-tree teardown path. This
+    /// is used by supervised nested Eitri runs; ordinary runtimes get a fresh,
+    /// never-cancelled token.
+    pub termination: Option<CancellationToken>,
 }
 
 #[derive(Debug, Clone)]
@@ -842,6 +847,7 @@ pub async fn run(
     // outcome, not a spurious "agent exited unexpectedly" Fatal. The wait
     // branch only wins when drive is still pending.
     let result: Result<()> = {
+        let termination = cfg.termination.clone().unwrap_or_default();
         let drive = drive_client_with_fs_limit(
             transport,
             cfg.cwd.clone(),
@@ -863,6 +869,10 @@ pub async fn run(
         tokio::select! {
             biased;
             drive_result = &mut drive => drive_result,
+            () = termination.cancelled() => {
+                tracing::info!(event = "agent_termination_observed", pid = ?agent_pid, "ACP runtime entering process-tree teardown");
+                Ok(())
+            }
             wait_result = child.wait() => {
                 let detail = match wait_result {
                     Ok(status) => format!("exit status {status}"),
@@ -884,7 +894,7 @@ pub async fn run(
     // Wrappers like `uvx brokk acp` fork a Python interpreter as a
     // grandchild; killing only the wrapper PID orphans the grandchild
     // and leaks the actual agent across mjolnir sessions.
-    kill_agent_tree(&mut child, agent_pid).await;
+    let teardown = kill_agent_tree(&mut child, agent_pid).await;
     // Generic catch-all: anything that escaped the launch-phase classifier
     // (e.g. a transport error after initialize succeeded) gets a plain
     // fatal so the user sees *something*. Launch-phase failures and the
@@ -902,6 +912,10 @@ pub async fn run(
         };
         emit_fatal(&ui_tx, &fatal_emitted, msg);
     }
+    if let Err(error) = &teardown {
+        let message = format!("acp agent teardown failed: {error:#}");
+        emit_fatal(&ui_tx, &fatal_emitted, message);
+    }
     if let Some(role) = cfg.role_config.as_ref()
         && let Some(council_session) = role.council_session.as_deref()
     {
@@ -911,11 +925,16 @@ pub async fn run(
             god = %role.label,
             model = %role.model_id,
             adapter = %role.adapter_source_id,
-            outcome = if result.is_ok() { "completed" } else { "failed" },
-            error = result.as_ref().err().map(|error| format!("{error:#}")),
+            outcome = if result.is_ok() && teardown.is_ok() { "completed" } else { "failed" },
+            error = result
+                .as_ref()
+                .err()
+                .map(|error| format!("{error:#}"))
+                .or_else(|| teardown.as_ref().err().map(|error| format!("{error:#}"))),
             "Council agent runtime finished"
         );
     }
+    teardown.map_err(|error| anyhow::anyhow!("reap agent process tree: {error:#}"))?;
     result
 }
 
@@ -1683,7 +1702,7 @@ where
         })
         .await;
 
-    code_agent_controller.shutdown().await;
+    code_agent_controller.shutdown_and_wait().await;
     terminals.shutdown_all().await;
     result.map_err(|e| anyhow::anyhow!("acp client error: {e}"))?;
     Ok(())
@@ -2531,10 +2550,11 @@ pub(crate) fn spawn_agent(
 ///
 /// The trailing `child.kill().await` is a belt-and-braces step: it
 /// reaps the immediate child if it survived the group/tree kill, and
-/// is a no-op (ESRCH / "process not found") when it didn't. Failures
-/// are logged but not propagated — by the time we reach shutdown the
-/// caller has no meaningful recovery action.
-pub(crate) async fn kill_agent_tree(child: &mut Child, agent_pid: Option<u32>) {
+/// is a no-op (ESRCH / "process not found") when it didn't. Teardown is
+/// intentionally fallible: a caller must not report a completed delegation
+/// while a worker that can still mutate the workspace may be alive.
+pub(crate) async fn kill_agent_tree(child: &mut Child, agent_pid: Option<u32>) -> Result<()> {
+    let mut failures = Vec::new();
     if let Some(pid) = agent_pid {
         #[cfg(unix)]
         {
@@ -2547,7 +2567,7 @@ pub(crate) async fn kill_agent_tree(child: &mut Child, agent_pid: Option<u32>) {
                     let errno = std::io::Error::last_os_error();
                     // ESRCH just means the group is already gone.
                     if errno.raw_os_error() != Some(libc::ESRCH) {
-                        tracing::warn!("killpg SIGTERM agent group {pid}: {errno}");
+                        failures.push(format!("killpg SIGTERM agent group {pid}: {errno}"));
                     }
                 }
             }
@@ -2555,8 +2575,13 @@ pub(crate) async fn kill_agent_tree(child: &mut Child, agent_pid: Option<u32>) {
             // we SIGKILL. Keeps the exit fast while still giving
             // agents that flush state on SIGTERM a chance to do so.
             for _ in 0..5 {
-                if matches!(child.try_wait(), Ok(Some(_))) {
-                    break;
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {}
+                    Err(error) => {
+                        failures.push(format!("observe agent child during teardown: {error}"));
+                        break;
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -2564,7 +2589,7 @@ pub(crate) async fn kill_agent_tree(child: &mut Child, agent_pid: Option<u32>) {
                 if libc::killpg(pid as libc::pid_t, libc::SIGKILL) != 0 {
                     let errno = std::io::Error::last_os_error();
                     if errno.raw_os_error() != Some(libc::ESRCH) {
-                        tracing::warn!("killpg SIGKILL agent group {pid}: {errno}");
+                        failures.push(format!("killpg SIGKILL agent group {pid}: {errno}"));
                     }
                 }
             }
@@ -2580,14 +2605,59 @@ pub(crate) async fn kill_agent_tree(child: &mut Child, agent_pid: Option<u32>) {
                 .stderr(std::process::Stdio::null())
                 .status()
                 .await;
-            if let Err(e) = status {
-                tracing::warn!("taskkill agent pid {pid}: {e}");
+            match status {
+                Ok(status) if !status.success() => {
+                    failures.push(format!("taskkill agent pid {pid} exited with {status}"));
+                }
+                Ok(_) => {}
+                Err(error) => failures.push(format!("taskkill agent pid {pid}: {error}")),
             }
         }
     }
 
-    if let Err(e) = child.kill().await {
-        tracing::warn!("kill child: {e}");
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) => match child.kill().await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("kill and reap agent child: {error}")),
+        },
+        Err(error) => failures.push(format!("observe agent child before reap: {error}")),
+    }
+
+    #[cfg(unix)]
+    if let Some(pid) = agent_pid {
+        for _ in 0..10 {
+            if !unix_process_group_exists(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if unix_process_group_exists(pid) {
+            failures.push(format!(
+                "agent process group {pid} still exists after SIGKILL"
+            ));
+        }
+    }
+
+    teardown_result(failures)
+}
+
+#[cfg(unix)]
+fn unix_process_group_exists(pid: u32) -> bool {
+    // Signal 0 performs existence/permission checking without changing state.
+    let result = unsafe { libc::killpg(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn teardown_result(failures: Vec<String>) -> Result<()> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(failures.join("; ")))
     }
 }
 
@@ -4756,7 +4826,9 @@ mod tests {
         }
         assert_eq!(sid, pid, "detached child should be its own session leader");
 
-        kill_agent_tree(&mut child, Some(pid as u32)).await;
+        kill_agent_tree(&mut child, Some(pid as u32))
+            .await
+            .expect("reap detached child");
     }
 
     #[cfg(unix)]
@@ -4779,7 +4851,63 @@ mod tests {
         assert_eq!(child_sid, our_sid, "process-group child shares our session");
         assert_ne!(pid, child_sid, "and is not a session leader");
 
-        kill_agent_tree(&mut child, Some(pid as u32)).await;
+        kill_agent_tree(&mut child, Some(pid as u32))
+            .await
+            .expect("reap process-group child");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_tree_reap_prevents_delayed_descendant_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ready = dir.path().join("ready");
+        let sentinel = dir.path().join("late-mutation");
+        let env = HashMap::from([
+            ("READY".to_string(), ready.display().to_string()),
+            ("SENTINEL".to_string(), sentinel.display().to_string()),
+        ]);
+        let script = "(trap '' TERM; touch \"$READY\"; sleep 0.4; touch \"$SENTINEL\") & wait";
+        let (mut child, _stdin, _stdout) = spawn_agent(
+            &PathBuf::from("sh"),
+            &["-c".to_string(), script.to_string()],
+            &env,
+            None,
+            SpawnIsolation::ProcessGroup,
+        )
+        .expect("spawn delayed mutator");
+        let pid = child.id().expect("pid");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant ready");
+
+        kill_agent_tree(&mut child, Some(pid))
+            .await
+            .expect("terminate and reap delayed mutator tree");
+        assert!(child.try_wait().expect("observe child").is_some());
+        assert!(!unix_process_group_exists(pid));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !sentinel.exists(),
+            "a descendant mutated after the teardown boundary"
+        );
+    }
+
+    #[test]
+    fn teardown_failures_are_returned_to_the_caller() {
+        let error = teardown_result(vec![
+            "SIGKILL failed".to_string(),
+            "child was not reaped".to_string(),
+        ])
+        .expect_err("teardown failure");
+        let message = error.to_string();
+        assert!(message.contains("SIGKILL failed"));
+        assert!(message.contains("child was not reaped"));
     }
 
     #[test]
@@ -8156,6 +8284,7 @@ mod tests {
             saved_session_config: HashMap::new(),
             role_config: None,
             code_agent: None,
+            termination: None,
         };
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
@@ -8215,6 +8344,7 @@ mod tests {
             saved_session_config: HashMap::new(),
             role_config: None,
             code_agent: None,
+            termination: None,
         };
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
@@ -8353,6 +8483,7 @@ mod tests {
             saved_session_config: HashMap::new(),
             role_config: None,
             code_agent: None,
+            termination: None,
         };
         assert_run_reports_agent_exited(cfg).await;
     }
@@ -8381,6 +8512,7 @@ mod tests {
             saved_session_config: HashMap::new(),
             role_config: None,
             code_agent: None,
+            termination: None,
         };
         assert_run_reports_agent_exited(cfg).await;
     }

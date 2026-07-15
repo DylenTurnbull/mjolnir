@@ -9,6 +9,7 @@ use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, UsageUpdate};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::{
+    code_agent::ActiveCodeWorkers,
     council_usage::{Record, Role},
     event::{InternalMessage, InternalMessageKind, UiCommand, UiEvent},
     loki,
@@ -46,6 +47,7 @@ pub struct Config {
     pub reviewer: Option<loki::Handle>,
     pub runtime_commands: mpsc::UnboundedSender<UiCommand>,
     pub implementation_handoffs: Arc<AtomicUsize>,
+    pub active_implementation_workers: ActiveCodeWorkers,
     pub discrete_review: bool,
     pub log_context: Option<LogContext>,
 }
@@ -72,6 +74,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
         review_enabled: review_enabled.clone(),
     };
     let task = tokio::spawn(async move {
+        let mut active_worker_updates = config.active_implementation_workers.subscribe();
         let mut advice_watch = config.reviewer.as_ref().map(loki::Handle::subscribe_advice);
         let mut trajectory = loki::BoundaryTracker::default();
         let mut held_completion = None;
@@ -186,9 +189,17 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                         images: Vec::new(),
                     });
                 }
+                changed = active_worker_updates.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
             }
 
             if held_completion.is_none() {
+                continue;
+            }
+            if *active_worker_updates.borrow() > 0 {
                 continue;
             }
             let active = turn.lock().await.clone();
@@ -391,5 +402,52 @@ mod tests {
         let advice = "turn 3, Thor step 2: verify the fallback";
         assert!(loki_advice_prompt(advice).contains("may be superseded"));
         assert!(loki_interjection_prompt(advice).contains("previous answer"));
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_waits_for_code_worker_reap() {
+        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let workers = ActiveCodeWorkers::default();
+        workers.set(1);
+        let mut running = spawn(
+            runtime_rx,
+            Config {
+                reviewer: None,
+                runtime_commands: command_tx,
+                implementation_handoffs: Arc::new(AtomicUsize::new(1)),
+                active_implementation_workers: workers.clone(),
+                discrete_review: false,
+                log_context: None,
+            },
+        );
+
+        runtime_tx
+            .send(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+            .expect("send completion");
+        assert!(matches!(
+            running.events.recv().await,
+            Some(UiEvent::CouncilUsage(_))
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), running.events.recv())
+                .await
+                .is_err(),
+            "completion escaped while Eitri could still mutate"
+        );
+
+        workers.set(0);
+        let completion =
+            tokio::time::timeout(std::time::Duration::from_secs(1), running.events.recv())
+                .await
+                .expect("completion after reap")
+                .expect("orchestrated event");
+        assert!(matches!(completion, UiEvent::PromptDone { .. }));
+
+        drop(runtime_tx);
+        running.task.await.expect("orchestrator task");
     }
 }

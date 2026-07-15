@@ -142,7 +142,9 @@ pub async fn list_sessions_with_capabilities(
 
     let sessions = list_sessions_via_transport(transport, cwd).await;
 
-    acp::kill_agent_tree(&mut child, agent_pid).await;
+    acp::kill_agent_tree(&mut child, agent_pid)
+        .await
+        .context("reap agent after session listing")?;
 
     sessions
 }
@@ -173,7 +175,9 @@ pub async fn delete_session(
     let transport = ByteStreams::new(child_stdin.compat_write(), child_stdout.compat());
     let result = delete_session_via_transport(transport, session_id).await;
 
-    acp::kill_agent_tree(&mut child, agent_pid).await;
+    acp::kill_agent_tree(&mut child, agent_pid)
+        .await
+        .context("reap agent after session deletion")?;
 
     result
 }

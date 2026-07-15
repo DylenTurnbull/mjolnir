@@ -1593,6 +1593,7 @@ async fn run_session(
     let (runtime_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel();
     let implementation_handoffs_this_turn = Arc::new(AtomicUsize::new(0));
+    let active_implementation_workers = code_agent::ActiveCodeWorkers::default();
     tracing::info!(
         event = "council_setup",
         council_session = %council_session,
@@ -1801,8 +1802,10 @@ async fn run_session(
             }
             config
                 .with_implementation_handoff_counter(implementation_handoffs_this_turn.clone())
+                .with_active_implementation_workers(active_implementation_workers.clone())
                 .with_max_parallel_explores(eitri_config.max_parallel_explores)
         }),
+        termination: None,
     };
 
     // Drive the ACP runtime on its own task so the UI can own the
@@ -1843,6 +1846,7 @@ async fn run_session(
             reviewer: loki_handle.clone(),
             runtime_commands: runtime_cmd_tx.clone(),
             implementation_handoffs: implementation_handoffs_this_turn.clone(),
+            active_implementation_workers: active_implementation_workers.clone(),
             discrete_review: thor_config.discrete_review,
             log_context: Some(council_orchestrator::LogContext {
                 council_session: council_session.clone(),

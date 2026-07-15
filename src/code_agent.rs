@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
@@ -135,6 +135,7 @@ pub struct Config {
     pub role_config: Option<acp::RuntimeRoleConfig>,
     pub loki: Option<loki::Handle>,
     pub implementation_handoff_counter: Option<Arc<AtomicUsize>>,
+    pub active_implementation_workers: ActiveCodeWorkers,
     pub max_parallel_explores: usize,
 }
 
@@ -159,6 +160,7 @@ impl Config {
             }),
             loki,
             implementation_handoff_counter: None,
+            active_implementation_workers: ActiveCodeWorkers::default(),
             max_parallel_explores: 6,
         }
     }
@@ -168,9 +170,39 @@ impl Config {
         self
     }
 
+    pub fn with_active_implementation_workers(mut self, workers: ActiveCodeWorkers) -> Self {
+        self.active_implementation_workers = workers;
+        self
+    }
+
     pub fn with_max_parallel_explores(mut self, max: usize) -> Self {
         self.max_parallel_explores = max.min(16);
         self
+    }
+}
+
+/// Observable lifetime of implementation workers. The count reaches zero
+/// only after the supervisor has reaped its ACP process tree and released its
+/// controller lease.
+#[derive(Clone, Debug)]
+pub struct ActiveCodeWorkers {
+    updates: watch::Sender<usize>,
+}
+
+impl Default for ActiveCodeWorkers {
+    fn default() -> Self {
+        let (updates, _) = watch::channel(0);
+        Self { updates }
+    }
+}
+
+impl ActiveCodeWorkers {
+    pub fn subscribe(&self) -> watch::Receiver<usize> {
+        self.updates.subscribe()
+    }
+
+    pub(crate) fn set(&self, count: usize) {
+        self.updates.send_replace(count);
     }
 }
 
@@ -245,7 +277,7 @@ impl McpHandler {
             )]));
         };
 
-        let result = run_boxed(
+        let result = await_supervisor(
             self.config.clone(),
             self.context.clone(),
             args.instructions,
@@ -255,18 +287,14 @@ impl McpHandler {
             run_id,
         )
         .await;
-        let workspace_delta = result
-            .workspace_delta
-            .as_ref()
-            .expect("code_agent always captures a workspace delta");
         Ok(match result.outcome {
             Ok(message) => CallToolResult::success(vec![Content::text(with_workspace_diff(
                 &message,
-                workspace_delta,
+                result.workspace_delta.as_ref(),
             ))]),
             Err(error) => CallToolResult::error(vec![Content::text(with_workspace_diff(
                 &error.to_string(),
-                workspace_delta,
+                result.workspace_delta.as_ref(),
             ))]),
         })
     }
@@ -289,7 +317,7 @@ impl McpHandler {
             )]));
         };
 
-        let result = run_boxed(
+        let result = await_supervisor(
             self.config.clone(),
             self.context.clone(),
             prompt.to_string(),
@@ -356,7 +384,12 @@ impl HttpServer {
         ui_tx: mpsc::UnboundedSender<UiEvent>,
         controller: Controller,
     ) -> Result<Self> {
-        controller.configure(config.max_parallel_explores).await;
+        controller
+            .configure(
+                config.max_parallel_explores,
+                config.active_implementation_workers.clone(),
+            )
+            .await;
         let mut token_bytes = [0_u8; 32];
         getrandom::fill(&mut token_bytes)
             .map_err(|error| anyhow!("generate code-agent MCP bearer token: {error}"))?;
@@ -455,10 +488,12 @@ enum ActiveRun {
         kind: RunKind,
         cancel_requested: bool,
         shutdown_requested: bool,
+        termination: RunTermination,
     },
     Running {
         kind: RunKind,
         commands: mpsc::UnboundedSender<UiCommand>,
+        termination: RunTermination,
     },
 }
 
@@ -467,14 +502,19 @@ struct ControllerState {
     next_id: u64,
     max_parallel_explores: usize,
     runs: HashMap<u64, ActiveRun>,
+    active_implementation_workers: ActiveCodeWorkers,
+    active_runs: watch::Sender<usize>,
 }
 
 impl Default for ControllerState {
     fn default() -> Self {
+        let (active_runs, _) = watch::channel(0);
         Self {
             next_id: 1,
             max_parallel_explores: 6,
             runs: HashMap::new(),
+            active_implementation_workers: ActiveCodeWorkers::default(),
+            active_runs,
         }
     }
 }
@@ -486,8 +526,14 @@ pub struct Controller {
 }
 
 impl Controller {
-    async fn configure(&self, max_parallel_explores: usize) {
-        self.state.lock().await.max_parallel_explores = max_parallel_explores.min(16);
+    async fn configure(
+        &self,
+        max_parallel_explores: usize,
+        active_implementation_workers: ActiveCodeWorkers,
+    ) {
+        let mut state = self.state.lock().await;
+        state.max_parallel_explores = max_parallel_explores.min(16);
+        state.active_implementation_workers = active_implementation_workers;
     }
 
     async fn begin(&self, kind: RunKind) -> Option<u64> {
@@ -514,8 +560,14 @@ impl Controller {
                 kind,
                 cancel_requested: false,
                 shutdown_requested: false,
+                termination: RunTermination::default(),
             },
         );
+        if matches!(kind, RunKind::Code) {
+            state.active_implementation_workers.set(1);
+        }
+        let active = state.runs.len();
+        state.active_runs.send_replace(active);
         Some(id)
     }
 
@@ -529,6 +581,7 @@ impl Controller {
             kind,
             cancel_requested,
             shutdown_requested,
+            termination,
         } = run
         else {
             return;
@@ -538,6 +591,7 @@ impl Controller {
             ActiveRun::Running {
                 kind,
                 commands: commands.clone(),
+                termination,
             },
         );
         if shutdown_requested {
@@ -554,10 +608,20 @@ impl Controller {
             active = true;
             match run {
                 ActiveRun::Starting {
-                    cancel_requested, ..
-                } => *cancel_requested = true,
-                ActiveRun::Running { commands, .. } => {
+                    cancel_requested,
+                    termination,
+                    ..
+                } => {
+                    *cancel_requested = true;
+                    termination.request(TerminationCause::UserCancelled);
+                }
+                ActiveRun::Running {
+                    commands,
+                    termination,
+                    ..
+                } => {
                     let _ = commands.send(UiCommand::CancelPrompt);
+                    termination.request(TerminationCause::UserCancelled);
                 }
             }
         }
@@ -571,18 +635,53 @@ impl Controller {
             active = true;
             match run {
                 ActiveRun::Starting {
-                    shutdown_requested, ..
-                } => *shutdown_requested = true,
-                ActiveRun::Running { commands, .. } => {
+                    shutdown_requested,
+                    termination,
+                    ..
+                } => {
+                    *shutdown_requested = true;
+                    termination.request(TerminationCause::RuntimeShutdown);
+                }
+                ActiveRun::Running {
+                    commands,
+                    termination,
+                    ..
+                } => {
                     let _ = commands.send(UiCommand::Shutdown);
+                    termination.request(TerminationCause::RuntimeShutdown);
                 }
             }
         }
         active
     }
 
+    pub async fn shutdown_and_wait(&self) -> bool {
+        let mut active_runs = self.state.lock().await.active_runs.subscribe();
+        let active = self.shutdown().await;
+        while *active_runs.borrow_and_update() > 0 {
+            if active_runs.changed().await.is_err() {
+                break;
+            }
+        }
+        active
+    }
+
+    async fn termination(&self, id: u64) -> Option<RunTermination> {
+        self.state
+            .lock()
+            .await
+            .runs
+            .get(&id)
+            .map(ActiveRun::termination)
+    }
+
     async fn finish(&self, id: u64) {
-        self.state.lock().await.runs.remove(&id);
+        let mut state = self.state.lock().await;
+        if matches!(state.runs.remove(&id), Some(run) if run.kind() == RunKind::Code) {
+            state.active_implementation_workers.set(0);
+        }
+        let active = state.runs.len();
+        state.active_runs.send_replace(active);
     }
 }
 
@@ -591,6 +690,81 @@ impl ActiveRun {
         match self {
             Self::Starting { kind, .. } | Self::Running { kind, .. } => *kind,
         }
+    }
+
+    fn termination(&self) -> RunTermination {
+        match self {
+            Self::Starting { termination, .. } | Self::Running { termination, .. } => {
+                termination.clone()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum TerminationCause {
+    None = 0,
+    UserCancelled = 1,
+    RuntimeShutdown = 2,
+    RequestDisconnected = 3,
+    RunCompleted = 4,
+}
+
+impl TerminationCause {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::UserCancelled,
+            2 => Self::RuntimeShutdown,
+            3 => Self::RequestDisconnected,
+            4 => Self::RunCompleted,
+            _ => Self::None,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::None => "unspecified",
+            Self::UserCancelled => "user cancellation",
+            Self::RuntimeShutdown => "runtime shutdown",
+            Self::RequestDisconnected => "MCP request timeout or disconnect",
+            Self::RunCompleted => "normal completion",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RunTermination {
+    token: CancellationToken,
+    cause: Arc<AtomicU8>,
+}
+
+impl Default for RunTermination {
+    fn default() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            cause: Arc::new(AtomicU8::new(TerminationCause::None as u8)),
+        }
+    }
+}
+
+impl RunTermination {
+    fn request(&self, cause: TerminationCause) {
+        let _ = self.cause.compare_exchange(
+            TerminationCause::None as u8,
+            cause as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.token.cancel();
+    }
+
+    fn cause(&self) -> TerminationCause {
+        TerminationCause::from_u8(self.cause.load(Ordering::Acquire))
+    }
+
+    async fn cancelled(&self) {
+        self.token.cancelled().await;
     }
 }
 struct AgentMessageCollector {
@@ -650,21 +824,29 @@ struct EitriRunResult {
     workspace_delta: Option<WorkspaceDelta>,
 }
 
+#[derive(Clone)]
+struct RunLease {
+    controller: Controller,
+    run_id: u64,
+    termination: RunTermination,
+}
+
 fn run_boxed(
     config: Config,
     context: RunContext,
     task: String,
     purpose: EitriPurpose,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
-    controller: Controller,
-    run_id: u64,
+    lease: RunLease,
 ) -> futures::future::BoxFuture<'static, EitriRunResult> {
-    Box::pin(run(
-        config, context, task, purpose, ui_tx, controller, run_id,
-    ))
+    Box::pin(run(config, context, task, purpose, ui_tx, lease))
 }
 
-async fn run(
+/// Keep the per-run supervisor independent from the HTTP request future.
+/// rmcp drops that future when a client times out or disconnects; dropping a
+/// JoinHandle detaches the supervisor, while this guard tells it to terminate
+/// and reap before it can release the controller lease.
+async fn await_supervisor(
     config: Config,
     context: RunContext,
     task: String,
@@ -673,7 +855,108 @@ async fn run(
     controller: Controller,
     run_id: u64,
 ) -> EitriRunResult {
+    let termination = self_termination(&controller, run_id).await;
+    let supervisor_controller = controller.clone();
+    let lease = RunLease {
+        controller: controller.clone(),
+        run_id,
+        termination: termination.clone(),
+    };
+    let mut supervisor = tokio::spawn(async move {
+        let worker = tokio::spawn(run_boxed(config, context, task, purpose, ui_tx, lease));
+        let result = match worker.await {
+            Ok(result) => result,
+            Err(error) => EitriRunResult {
+                outcome: Err(anyhow!("Eitri worker task failed: {error}")),
+                workspace_delta: None,
+            },
+        };
+        supervisor_controller.finish(run_id).await;
+        tracing::info!(
+            event = "eitri_slot_released",
+            run_id,
+            purpose = ?purpose,
+            "Eitri controller slot released after reap"
+        );
+        result
+    });
+    let mut request_guard = RequestDropGuard::new(termination, run_id, purpose);
+    let result = match (&mut supervisor).await {
+        Ok(result) => result,
+        Err(error) => EitriRunResult {
+            outcome: Err(anyhow!("Eitri supervisor failed: {error}")),
+            workspace_delta: None,
+        },
+    };
+    request_guard.disarm();
+    result
+}
+
+async fn self_termination(controller: &Controller, run_id: u64) -> RunTermination {
+    controller
+        .termination(run_id)
+        .await
+        .expect("controller retains the run lease until supervisor finalization")
+}
+
+struct RequestDropGuard {
+    termination: RunTermination,
+    run_id: u64,
+    purpose: EitriPurpose,
+    armed: bool,
+}
+
+impl RequestDropGuard {
+    fn new(termination: RunTermination, run_id: u64, purpose: EitriPurpose) -> Self {
+        Self {
+            termination,
+            run_id,
+            purpose,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RequestDropGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        tracing::warn!(
+            event = "eitri_request_disconnected",
+            run_id = self.run_id,
+            purpose = ?self.purpose,
+            "Eitri MCP request timed out or disconnected; terminating worker"
+        );
+        self.termination
+            .request(TerminationCause::RequestDisconnected);
+    }
+}
+
+async fn run(
+    config: Config,
+    context: RunContext,
+    task: String,
+    purpose: EitriPurpose,
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
+    lease: RunLease,
+) -> EitriRunResult {
+    let RunLease {
+        controller,
+        run_id,
+        termination,
+    } = lease;
     let log_role = config.role_config.clone();
+    tracing::info!(
+        event = "eitri_worker_started",
+        run_id,
+        purpose = ?purpose,
+        "Eitri supervised worker started"
+    );
     if purpose.marks_implementation_delegation()
         && let Some(counter) = config.implementation_handoff_counter.as_ref()
     {
@@ -691,6 +974,7 @@ async fn run(
             model = %role.model_id,
             adapter = %role.adapter_source_id,
             purpose = ?purpose,
+            run_id,
             task = %task,
             "Thor delegated work to Eitri"
         );
@@ -748,6 +1032,7 @@ async fn run(
         saved_session_config: HashMap::new(),
         role_config: config.role_config,
         code_agent: None,
+        termination: Some(termination.token.clone()),
     };
     let mut runtime = tokio::spawn(acp::run(runtime_config, nested_event_tx, nested_cmd_rx));
 
@@ -763,14 +1048,40 @@ async fn run(
     };
     let mut tracker = loki::BoundaryTracker::default();
     let mut latest_usage_update: Option<UsageUpdate> = None;
+    let mut joined_runtime_result = None;
     let result = loop {
         tokio::select! {
+            biased;
+            () = termination.cancelled() => {
+                let cause = termination.cause();
+                break Err(match cause {
+                    TerminationCause::UserCancelled => anyhow!("Eitri cancelled"),
+                    TerminationCause::RuntimeShutdown => anyhow!("Eitri shutdown requested"),
+                    TerminationCause::RequestDisconnected => {
+                        anyhow!("Eitri MCP request timed out or disconnected")
+                    }
+                    TerminationCause::RunCompleted | TerminationCause::None => {
+                        anyhow!("Eitri termination requested")
+                    }
+                });
+            }
             joined = &mut runtime => {
-                break match joined {
-                    Ok(Ok(())) => Err(anyhow!("Eitri runtime closed before completing")),
-                    Ok(Err(error)) => Err(error).context("Eitri runtime"),
-                    Err(error) => Err(anyhow!("Eitri task failed: {error}")),
+                let (runtime_result, run_result) = match joined {
+                    Ok(Ok(())) => (
+                        Ok(()),
+                        Err(anyhow!("Eitri runtime closed before completing")),
+                    ),
+                    Ok(Err(error)) => {
+                        let message = format!("{error:#}");
+                        (Err(error), Err(anyhow!("Eitri runtime: {message}")))
+                    }
+                    Err(error) => {
+                        let message = format!("Eitri task failed: {error}");
+                        (Err(anyhow!(message.clone())), Err(anyhow!(message)))
+                    }
                 };
+                joined_runtime_result = Some(runtime_result);
+                break run_result;
             }
             event = nested_event_rx.recv() => {
                 let Some(event) = event else {
@@ -905,16 +1216,31 @@ async fn run(
         }
     }
 
-    let _ = nested_cmd_tx.send(UiCommand::Shutdown);
-    if !runtime.is_finished()
-        && tokio::time::timeout(Duration::from_secs(2), &mut runtime)
-            .await
-            .is_err()
-    {
-        runtime.abort();
-        let _ = runtime.await;
+    // Never abort `acp::run`: its tail owns process-tree termination and
+    // reaping. Cancelling this token drives that tail even when the MCP request
+    // disappeared, and the supervisor retains the slot until the join returns.
+    termination.request(TerminationCause::RunCompleted);
+    let cause = termination.cause();
+    tracing::info!(
+        event = "eitri_termination_requested",
+        run_id,
+        purpose = ?purpose,
+        reason = cause.description(),
+        "terminating Eitri worker process tree"
+    );
+    let runtime_result = match joined_runtime_result {
+        Some(result) => result,
+        None => match runtime.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow!("Eitri runtime task failed: {error}")),
+        },
+    };
+    if let Err(error) = runtime_result {
+        tracing::error!(event = "eitri_teardown_failure", run_id, purpose = ?purpose, error = %error, "Eitri runtime failed while terminating or reaping");
+        result = Err(error.context("Eitri teardown"));
+    } else {
+        tracing::info!(event = "eitri_reaped", run_id, purpose = ?purpose, "Eitri worker process tree reaped");
     }
-    controller.finish(run_id).await;
     let workspace_delta = match invocation_snapshot {
         Some(snapshot) => Some(snapshot.delta().await),
         None => None,
@@ -941,6 +1267,7 @@ async fn run(
             model = %role.model_id,
             adapter = %role.adapter_source_id,
             purpose = ?purpose,
+            run_id,
             outcome = if result.is_ok() { "completed" } else { "failed" },
             workspace_changed = workspace_delta.as_ref().is_some_and(WorkspaceDelta::changed),
             error = ?result.as_ref().err().map(|error| format!("{error:#}")),
@@ -953,7 +1280,12 @@ async fn run(
     }
 }
 
-fn with_workspace_diff(message: &str, delta: &WorkspaceDelta) -> String {
+fn with_workspace_diff(message: &str, delta: Option<&WorkspaceDelta>) -> String {
+    let Some(delta) = delta else {
+        return format!(
+            "{message}\n\n<workspace_diff scope=\"eitri-invocation\" authored_by=\"Eitri\">\n[workspace delta unavailable because the supervisor failed]\n</workspace_diff>"
+        );
+    };
     let diff = delta.review_patch().unwrap_or_else(|| delta.receipt());
     let mut result = format!(
         "{message}\n\n<workspace_diff scope=\"eitri-invocation\" authored_by=\"Eitri\">\n{diff}\n</workspace_diff>"
@@ -993,7 +1325,7 @@ mod tests {
     #[tokio::test]
     async fn controller_allows_code_and_bounded_explores_concurrently() {
         let controller = Controller::default();
-        controller.configure(2).await;
+        controller.configure(2, ActiveCodeWorkers::default()).await;
         let code = controller.begin(RunKind::Code).await.expect("code");
         assert!(controller.begin(RunKind::Code).await.is_none());
         let first = controller.begin(RunKind::Explore).await.expect("explore 1");
@@ -1015,6 +1347,100 @@ mod tests {
         let (commands, mut receiver) = mpsc::unbounded_channel();
         controller.attach(run_id, commands).await;
         assert!(matches!(receiver.recv().await, Some(UiCommand::Shutdown)));
+    }
+
+    #[tokio::test]
+    async fn request_timeout_holds_code_slot_until_supervisor_finishes_teardown() {
+        let controller = Controller::default();
+        let workers = ActiveCodeWorkers::default();
+        let worker_count = workers.subscribe();
+        controller.configure(1, workers).await;
+        let run_id = controller.begin(RunKind::Code).await.expect("code run");
+        let termination = controller
+            .termination(run_id)
+            .await
+            .expect("termination signal");
+        let supervisor_termination = termination.clone();
+        let supervisor_controller = controller.clone();
+        let (teardown_started_tx, teardown_started_rx) = tokio::sync::oneshot::channel();
+        let (release_teardown_tx, release_teardown_rx) = tokio::sync::oneshot::channel();
+        let supervisor = tokio::spawn(async move {
+            supervisor_termination.cancelled().await;
+            let _ = teardown_started_tx.send(());
+            let _ = release_teardown_rx.await;
+            supervisor_controller.finish(run_id).await;
+        });
+
+        {
+            let _request = RequestDropGuard::new(termination.clone(), run_id, EitriPurpose::Code);
+        }
+        teardown_started_rx.await.expect("teardown started");
+
+        assert_eq!(termination.cause(), TerminationCause::RequestDisconnected);
+        assert_eq!(*worker_count.borrow(), 1);
+        assert!(
+            controller.begin(RunKind::Code).await.is_none(),
+            "a replacement run must wait for reap"
+        );
+
+        release_teardown_tx.send(()).expect("release teardown");
+        supervisor.await.expect("supervisor");
+        assert_eq!(*worker_count.borrow(), 0);
+        let replacement = controller
+            .begin(RunKind::Code)
+            .await
+            .expect("slot released after reap");
+        controller.finish(replacement).await;
+    }
+
+    #[tokio::test]
+    async fn controller_records_user_cancel_and_runtime_shutdown_causes() {
+        let controller = Controller::default();
+        let cancelled = controller
+            .begin(RunKind::Code)
+            .await
+            .expect("cancelled run");
+        let cancelled_signal = controller
+            .termination(cancelled)
+            .await
+            .expect("cancel signal");
+        assert!(controller.cancel().await);
+        assert_eq!(cancelled_signal.cause(), TerminationCause::UserCancelled);
+        controller.finish(cancelled).await;
+
+        let shutdown = controller.begin(RunKind::Code).await.expect("shutdown run");
+        let shutdown_signal = controller
+            .termination(shutdown)
+            .await
+            .expect("shutdown signal");
+        assert!(controller.shutdown().await);
+        assert_eq!(shutdown_signal.cause(), TerminationCause::RuntimeShutdown);
+        controller.finish(shutdown).await;
+    }
+
+    #[tokio::test]
+    async fn outer_runtime_shutdown_waits_for_supervisor_slot_release() {
+        let controller = Controller::default();
+        let run_id = controller.begin(RunKind::Code).await.expect("code run");
+        let termination = controller
+            .termination(run_id)
+            .await
+            .expect("termination signal");
+        let shutdown_controller = controller.clone();
+        let mut shutdown =
+            tokio::spawn(async move { shutdown_controller.shutdown_and_wait().await });
+
+        termination.cancelled().await;
+        assert_eq!(termination.cause(), TerminationCause::RuntimeShutdown);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "outer runtime returned before the worker supervisor"
+        );
+
+        controller.finish(run_id).await;
+        assert!(shutdown.await.expect("shutdown task"));
     }
 
     #[test]
