@@ -42,6 +42,7 @@ use crate::code_agent;
 use crate::event::{
     ElicitationOutcome, ElicitationPrompt, LoadSessionResult, PermissionDecision, PermissionPrompt,
     PromptImage, SessionConfigTarget, TerminalOutputSnapshot, UiCommand, UiEvent,
+    content_block_text,
 };
 use crate::paths::{WorkspaceRoots, normalize_spawn_program, path_is_under_any_root};
 use crate::{deepswe, model_resolve};
@@ -92,6 +93,74 @@ pub struct RuntimeRoleConfig {
     pub force_high_reasoning: bool,
     /// Correlates Thor, Eitri, and Loki records in one interactive session.
     pub council_session: Option<String>,
+}
+
+const MAX_LOGGED_UPDATE_BYTES: usize = 4096;
+
+fn bounded_log_text(mut text: String) -> String {
+    if text.len() <= MAX_LOGGED_UPDATE_BYTES {
+        return text;
+    }
+    let mut end = MAX_LOGGED_UPDATE_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(" [truncated]");
+    text
+}
+
+fn session_update_summary(update: &SessionUpdate) -> (&'static str, String) {
+    match update {
+        SessionUpdate::UserMessageChunk(chunk) => (
+            "user_message",
+            bounded_log_text(content_block_text(&chunk.content)),
+        ),
+        SessionUpdate::AgentMessageChunk(chunk) => (
+            "agent_message",
+            bounded_log_text(content_block_text(&chunk.content)),
+        ),
+        SessionUpdate::AgentThoughtChunk(chunk) => (
+            "agent_thought",
+            bounded_log_text(content_block_text(&chunk.content)),
+        ),
+        SessionUpdate::ToolCall(call) => (
+            "tool_call",
+            format!(
+                "id={} title={:?} kind={:?} status={:?}",
+                call.tool_call_id, call.title, call.kind, call.status
+            ),
+        ),
+        SessionUpdate::ToolCallUpdate(update) => (
+            "tool_call_update",
+            format!(
+                "id={} title={:?} kind={:?} status={:?} content_items={}",
+                update.tool_call_id,
+                update.fields.title,
+                update.fields.kind,
+                update.fields.status,
+                update.fields.content.as_ref().map_or(0, Vec::len)
+            ),
+        ),
+        SessionUpdate::Plan(plan) => ("plan", format!("entries={}", plan.entries.len())),
+        SessionUpdate::AvailableCommandsUpdate(update) => (
+            "available_commands",
+            format!("commands={}", update.available_commands.len()),
+        ),
+        SessionUpdate::CurrentModeUpdate(update) => {
+            ("current_mode", update.current_mode_id.to_string())
+        }
+        SessionUpdate::ConfigOptionUpdate(update) => (
+            "config_options",
+            format!("options={}", update.config_options.len()),
+        ),
+        SessionUpdate::SessionInfoUpdate(_) => ("session_info", "metadata changed".to_string()),
+        SessionUpdate::UsageUpdate(update) => (
+            "usage",
+            format!("used={} size={}", update.used, update.size),
+        ),
+        _ => ("unknown", "unsupported update type".to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1399,6 +1468,8 @@ where
                     if let Some(role) = notification_role.as_ref()
                         && let Some(council_session) = role.council_session.as_deref()
                     {
+                        let (update_kind, summary) =
+                            session_update_summary(&notification.update);
                         tracing::debug!(
                             event = "agent_update",
                             council_session,
@@ -1406,7 +1477,8 @@ where
                             model = %role.model_id,
                             adapter = %role.adapter_source_id,
                             acp_session = %notification.session_id,
-                            update = ?notification.update,
+                            update_kind,
+                            summary,
                             "Council agent update"
                         );
                     }
