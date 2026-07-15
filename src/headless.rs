@@ -244,78 +244,20 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let mut terminal_error = None;
     let mut prompt_sent = false;
     let mut collecting_turn_output = false;
-    let mut decisions = loki_handle.as_ref().map(loki::Handle::subscribe);
     let mut trajectory = loki::BoundaryTracker::default();
-    let mut intervention = loki::DeferredIntervention::default();
     let mut held_completion: Option<(StopReason, Option<Usage>)> = None;
     let mut review_epoch = 0_u64;
     let mut outer_snapshot = None;
     let mut discrete_review_started = false;
-    let mut loki_followup_started = false;
+    let mut advice_turn_started = false;
 
     loop {
-        let event = tokio::select! {
-            event = event_rx.recv() => event,
-            decision = async {
-                match decisions.as_mut() {
-                    Some(rx) => rx.recv().await.ok(),
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(decision) = decision
-                    && decision.epoch == review_epoch
-                    && decision.target == loki::Target::Thor
-                {
-                    let critique = decision.critique;
-                    intervention.push(decision.id, critique);
-                    if held_completion.take().is_some() {
-                        if let Some(reviewer) = loki_handle.as_ref() {
-                            reviewer.target_resumed(review_epoch, loki::Target::Thor, None);
-                        }
-                        trajectory.reset_attempt();
-                        state.final_text.clear();
-                        collecting_turn_output = false;
-                        let critique = intervention.take().expect("queued intervention");
-                        if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                            emit_json(&StreamRecord::Review {
-                                actor: "loki",
-                                target: "thor",
-                                kind: "intervention",
-                                text: &critique,
-                            })?;
-                        }
-                        cmd_tx.send(UiCommand::SendPrompt {
-                            text: crate::council_continuation_prompt(
-                                &cfg.prompt,
-                                &critique,
-                                &trajectory.trajectory(),
-                            ),
-                            images: Vec::new(),
-                        }).context("send Loki continuation")?;
-                    }
-                }
-                Some(UiEvent::Info(String::new()))
-            }
-        };
-        let Some(event) = event else {
+        let Some(event) = event_rx.recv().await else {
             break;
         };
-        let boundary = (review_epoch > 0)
+        if let Some(boundary) = (review_epoch > 0)
             .then(|| trajectory.observe(&event))
-            .flatten();
-        let target_completed = crate::council_target_completed(&event);
-        if target_completed && let Some(reviewer) = loki_handle.as_ref() {
-            reviewer.target_completed(review_epoch, loki::Target::Thor, None);
-        }
-        let interrupting =
-            boundary.is_some() && !target_completed && intervention.interrupt_at_boundary();
-        if interrupting {
-            let _ = cmd_tx.send(UiCommand::CancelPrompt);
-        }
-        if let Some(boundary) = boundary
-            && !interrupting
-            && !(target_completed && intervention.is_pending())
-            && !loki_followup_started
+            .flatten()
             && let Some(reviewer) = loki_handle.as_ref()
         {
             reviewer.observe(review_epoch, loki::Target::Thor, None, boundary);
@@ -406,68 +348,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 stop_reason: reason,
                 usage: prompt_usage,
             } => {
-                let cancelled = matches!(reason, StopReason::Cancelled);
-                if cancelled && intervention.is_pending() {
-                    if intervention.cancellation_was_requested() {
-                        if let Some(reviewer) = loki_handle.as_ref() {
-                            reviewer.target_resumed(review_epoch, loki::Target::Thor, None);
-                        }
-                        trajectory.reset_attempt();
-                        state.final_text.clear();
-                        collecting_turn_output = false;
-                        let critique = intervention.take().expect("queued intervention");
-                        if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                            emit_json(&StreamRecord::Review {
-                                actor: "loki",
-                                target: "thor",
-                                kind: "intervention",
-                                text: &critique,
-                            })?;
-                        }
-                        cmd_tx
-                            .send(UiCommand::SendPrompt {
-                                text: crate::council_continuation_prompt(
-                                    &cfg.prompt,
-                                    &critique,
-                                    &trajectory.trajectory(),
-                                ),
-                                images: Vec::new(),
-                            })
-                            .context("send Loki continuation")?;
-                        continue;
-                    }
-                    intervention.clear();
-                }
                 held_completion = Some((reason, prompt_usage));
             }
             UiEvent::PromptFailed { message } => {
-                if let Some(critique) = intervention.take() {
-                    if let Some(reviewer) = loki_handle.as_ref() {
-                        reviewer.target_resumed(review_epoch, loki::Target::Thor, None);
-                    }
-                    trajectory.reset_attempt();
-                    state.final_text.clear();
-                    collecting_turn_output = false;
-                    if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                        emit_json(&StreamRecord::Review {
-                            actor: "loki",
-                            target: "thor",
-                            kind: "intervention",
-                            text: &critique,
-                        })?;
-                    }
-                    cmd_tx
-                        .send(UiCommand::SendPrompt {
-                            text: crate::council_continuation_prompt(
-                                &cfg.prompt,
-                                &critique,
-                                &trajectory.trajectory(),
-                            ),
-                            images: Vec::new(),
-                        })
-                        .context("send Loki continuation after failure")?;
-                    continue;
-                }
                 if matches!(cfg.output_format, OutputFormat::StreamJson) {
                     emit_json(&StreamRecord::Error { message: &message })?;
                 }
@@ -557,6 +440,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                         crate::event::InternalMessageKind::Exploration => "exploration",
                         crate::event::InternalMessageKind::DiscreteReview => "discrete_review",
                         crate::event::InternalMessageKind::Continuation => "continuation",
+                        crate::event::InternalMessageKind::Interjection => "interjection",
                     };
                     emit_json(&StreamRecord::Review {
                         actor: &message.source.to_ascii_lowercase(),
@@ -574,7 +458,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             }
         }
 
-        if held_completion.is_some() && !intervention.is_pending() {
+        if held_completion.is_some() {
             let handoffs = implementation_handoffs.load(Ordering::Acquire);
             let delta =
                 if app_config.thor.discrete_review && handoffs > 1 && !discrete_review_started {
@@ -597,8 +481,19 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 let initial_result = trajectory.final_message();
                 let context =
                     crate::discrete_review_context(delta.as_ref(), trajectory.trajectory());
-                let review_prompt =
-                    crate::thor_discrete_review_prompt(&cfg.prompt, &initial_result, &context);
+                // Fold queued Loki advice into the review brief.
+                let advice = loki_handle
+                    .as_ref()
+                    .map(|reviewer| reviewer.take_deferred())
+                    .unwrap_or_default();
+                let advice =
+                    (!advice.is_empty()).then(|| loki::format_deferred(&advice, review_epoch));
+                let review_prompt = crate::thor_discrete_review_prompt(
+                    &cfg.prompt,
+                    &initial_result,
+                    &context,
+                    advice.as_deref(),
+                );
                 if matches!(cfg.output_format, OutputFormat::StreamJson) {
                     emit_json(&StreamRecord::Review {
                         actor: "thor",
@@ -609,9 +504,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 }
                 held_completion = None;
                 discrete_review_started = true;
-                if let Some(reviewer) = loki_handle.as_ref() {
-                    reviewer.target_resumed(review_epoch, loki::Target::Thor, None);
-                }
                 trajectory.reset_attempt();
                 state.final_text.clear();
                 collecting_turn_output = false;
@@ -623,22 +515,26 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     .context("send Thor discrete review")?;
                 continue;
             }
-            if !loki_followup_started && let Some(reviewer) = loki_handle.as_ref() {
-                let deferred = reviewer.take_deferred(review_epoch);
+            if !advice_turn_started && let Some(reviewer) = loki_handle.as_ref() {
+                let deferred = reviewer.take_deferred();
                 if !deferred.is_empty() {
-                    let advice = loki::format_deferred(&deferred);
+                    let advice = loki::format_deferred(&deferred, review_epoch);
                     held_completion = None;
-                    loki_followup_started = true;
+                    advice_turn_started = true;
                     trajectory.reset_attempt();
                     state.final_text.clear();
                     collecting_turn_output = false;
+                    if matches!(cfg.output_format, OutputFormat::StreamJson) {
+                        emit_json(&StreamRecord::Review {
+                            actor: "loki",
+                            target: "thor",
+                            kind: "continuation",
+                            text: &advice,
+                        })?;
+                    }
                     cmd_tx
                         .send(UiCommand::SendPrompt {
-                            text: crate::council_continuation_prompt(
-                                &cfg.prompt,
-                                &advice,
-                                &trajectory.trajectory(),
-                            ),
+                            text: crate::loki_advice_prompt(&advice),
                             images: Vec::new(),
                         })
                         .context("send deferred Loki advice")?;
@@ -649,9 +545,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             stop_reason = Some(reason);
             usage = prompt_usage;
             saw_terminal_event = true;
-            if let Some(reviewer) = loki_handle.as_ref() {
-                reviewer.end_turn(review_epoch);
-            }
             let _ = cmd_tx.send(UiCommand::Shutdown);
             break;
         }

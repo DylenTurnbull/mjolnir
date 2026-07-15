@@ -3784,6 +3784,9 @@ fn transcript_export_markdown(state: &AppState) -> String {
                     crate::event::InternalMessageKind::Continuation => {
                         format!("{} → {} continuation", message.source, message.target)
                     }
+                    crate::event::InternalMessageKind::Interjection => {
+                        format!("{} → {} interjection", message.source, message.target)
+                    }
                 };
                 push_export_text(&mut out, &heading, &message.text);
             }
@@ -5441,6 +5444,13 @@ fn render_transcript_entry_range(
                     crate::event::InternalMessageKind::Continuation => {
                         format!(
                             "continuation for {} · {}",
+                            message.target,
+                            message_size_label(chars)
+                        )
+                    }
+                    crate::event::InternalMessageKind::Interjection => {
+                        format!(
+                            "post-turn thoughts for {} · {}",
                             message.target,
                             message_size_label(chars)
                         )

@@ -147,13 +147,20 @@ session streams directly through the normal Mjolnir UI. Ctrl-C cancels the
 currently active Eitri request, not the paused Thor request. Eitri's final
 message and invocation diff return to Thor through MCP, then Thor resumes.
 
-Loki runs in its own fresh, best-effort read-only ACP session. A streaming Loki
-intervention is intentionally expensive: it causes Mjolnir to cancel at the next
-safe step boundary and re-prompt the target with the critique. Loki's prompt
-therefore requires intervention only for material correctness, safety, scope,
-or strategy problems. Thor performs the optional discrete workspace review at
-the end of a turn; a turn containing only one implementation handoff skips that
-extra review.
+Loki runs in one long-lived, best-effort read-only ACP session and reviews
+asynchronously at his own pace: transcript checkpoints — including each turn's
+concluding message — stream into his queue, and his advice is pulled off at
+natural turn boundaries. Loki never interrupts running work and nothing ever
+waits on him. Advice ready when an Eitri invocation returns rides back inside
+the tool result; advice ready when Thor's turn completes either folds into the
+discrete review brief or starts one follow-up Thor turn; and advice that lands
+after the turn already finished interjects one council-initiated follow-up
+("thoughts on the work you just did") unless the user has started a new prompt,
+in which case it waits for that turn's boundary. Delivered advice is always
+labeled with the turn and span it reviewed, since later work may have
+superseded it. Thor performs the optional discrete workspace review at the end
+of a turn; a turn containing only one implementation handoff skips that extra
+review.
 
 ## Worktrees and resume
 

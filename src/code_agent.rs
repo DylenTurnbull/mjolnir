@@ -663,9 +663,7 @@ async fn run(
     } else {
         None
     };
-    let mut decisions = loki.as_ref().map(loki::Handle::subscribe);
     let mut tracker = loki::BoundaryTracker::default();
-    let mut intervention = loki::DeferredIntervention::default();
     let result = loop {
         tokio::select! {
             joined = &mut runtime => {
@@ -679,27 +677,7 @@ async fn run(
                 let Some(event) = event else {
                     break Err(anyhow!("Eitri event stream closed before completing"));
                 };
-                let boundary = (epoch > 0).then(|| tracker.observe(&event)).flatten();
-                let boundary_observed = boundary.is_some();
-                let target_completed = matches!(
-                    &event,
-                    UiEvent::PromptDone { .. }
-                        | UiEvent::PromptFailed { .. }
-                        | UiEvent::SessionForkFailed { .. }
-                        | UiEvent::Fatal(_)
-                );
-                if target_completed && let Some(reviewer) = loki.as_ref() {
-                    reviewer.target_completed(epoch, loki::Target::Eitri, eitri_invocation);
-                }
-                let interrupting = boundary_observed
-                    && !target_completed
-                    && intervention.interrupt_at_boundary();
-                if interrupting {
-                    let _ = nested_cmd_tx.send(UiCommand::CancelPrompt);
-                }
-                if let Some(boundary) = boundary
-                    && !interrupting
-                    && !(target_completed && intervention.is_pending())
+                if let Some(boundary) = (epoch > 0).then(|| tracker.observe(&event)).flatten()
                     && let Some(reviewer) = loki.as_ref()
                 {
                     reviewer.observe(epoch, loki::Target::Eitri, eitri_invocation, boundary);
@@ -740,60 +718,13 @@ async fn run(
                     }
                     UiEvent::PromptDone { stop_reason, .. } => {
                         if matches!(stop_reason, StopReason::Cancelled) {
-                            if intervention.is_pending()
-                                && !intervention.cancellation_was_requested()
-                            {
-                                // A user cancellation wins if Loki had not yet
-                                // reached the deferred interruption boundary.
-                                intervention.clear();
-                                break Err(anyhow!("Eitri cancelled"));
-                            }
-                            if let Some(critique) = intervention.take() {
-                                if let Some(reviewer) = loki.as_ref() {
-                                    reviewer.target_resumed(epoch, loki::Target::Eitri, eitri_invocation);
-                                }
-                                collector = AgentMessageCollector::new();
-                                tracker.reset_attempt();
-                                let continuation = continuation_prompt(purpose, &critique);
-                                emit_continuation(&ui_tx, &critique);
-                                if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
-                                    break Err(anyhow!("re-prompt Eitri after Loki intervention"));
-                                }
-                                continue;
-                            }
                             break Err(anyhow!("Eitri cancelled"));
-                        }
-                        if let Some(critique) = intervention.take() {
-                            if let Some(reviewer) = loki.as_ref() {
-                                reviewer.target_resumed(epoch, loki::Target::Eitri, eitri_invocation);
-                            }
-                            collector = AgentMessageCollector::new();
-                            tracker.reset_attempt();
-                            let continuation = continuation_prompt(purpose, &critique);
-                            emit_continuation(&ui_tx, &critique);
-                            if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
-                                break Err(anyhow!("re-prompt Eitri after Loki intervention"));
-                            }
-                            continue;
                         }
                         break collector.finish();
                     }
                     UiEvent::PromptFailed { message }
                     | UiEvent::SessionForkFailed { message }
                     | UiEvent::Fatal(message) => {
-                        if let Some(critique) = intervention.take() {
-                            if let Some(reviewer) = loki.as_ref() {
-                                reviewer.target_resumed(epoch, loki::Target::Eitri, eitri_invocation);
-                            }
-                            collector = AgentMessageCollector::new();
-                            tracker.reset_attempt();
-                            let continuation = continuation_prompt(purpose, &critique);
-                            emit_continuation(&ui_tx, &critique);
-                            if nested_cmd_tx.send(UiCommand::SendPrompt { text: continuation, images: Vec::new() }).is_err() {
-                                break Err(anyhow!("re-prompt Eitri after Loki intervention"));
-                            }
-                            continue;
-                        }
                         break Err(anyhow!(message));
                     }
                     UiEvent::ClaudeUsage(_)
@@ -806,51 +737,22 @@ async fn run(
                     }
                 }
             }
-            decision = async {
-                match decisions.as_mut() {
-                    Some(rx) => rx.recv().await.ok(),
-                    None => std::future::pending().await,
-                }
-            } => {
-                let Some(decision) = decision else { continue; };
-                if decision.epoch != epoch || decision.target != loki::Target::Eitri {
-                    continue;
-                }
-                {
-                    let critique = decision.critique;
-                        if let Some(role) = log_role.as_ref()
-                            && let Some(council_session) = role.council_session.as_deref()
-                        {
-                            tracing::info!(
-                                event = "advice_received",
-                                council_session,
-                                god = "Eitri",
-                                source = "Loki",
-                                model = %role.model_id,
-                                adapter = %role.adapter_source_id,
-                                advice = %critique,
-                                "Eitri received Loki advice"
-                            );
-                        }
-                        intervention.push(decision.id, critique);
-                }
-            }
         }
     };
 
-    if let (Some(reviewer), Some(invocation)) = (loki.as_ref(), eitri_invocation) {
-        reviewer.end_eitri(epoch, invocation);
-    }
+    // Eitri's completion is a natural turn boundary: hand whatever advice
+    // Loki has queued so far back to Thor inside the tool result. Reviews
+    // still in flight deliver at a later boundary; nothing waits on Loki.
     let mut result = result;
     if result.is_ok()
         && let Some(reviewer) = loki.as_ref()
     {
-        let deferred = reviewer.take_deferred(epoch);
+        let deferred = reviewer.take_deferred();
         if !deferred.is_empty()
             && let Ok(message) = result.as_mut()
         {
-            message.push_str("\n\n<loki_advice target=\"thor\">\n");
-            message.push_str(&loki::format_deferred(&deferred));
+            message.push_str("\n\n<loki_advice target=\"thor\" mode=\"asynchronous; may be superseded by later work\">\n");
+            message.push_str(&loki::format_deferred(&deferred, epoch));
             message.push_str("\n</loki_advice>");
         }
     }
@@ -908,25 +810,6 @@ fn with_workspace_diff(message: &str, delta: &WorkspaceDelta) -> String {
         result.push_str("\n\nYou should review Eitri's work now.");
     }
     result
-}
-
-fn continuation_prompt(purpose: EitriPurpose, critique: &str) -> String {
-    let activity = match purpose {
-        EitriPurpose::Code => "implementation",
-        EitriPurpose::Explore => "read-only exploration",
-    };
-    format!(
-        "<advisory guidance=\"weigh, don't blindly obey\">\n{critique}\n</advisory>\n\nContinue the interrupted {activity} turn. Address the material advice, then finish the existing task. Please continue from where you left off."
-    )
-}
-
-fn emit_continuation(ui_tx: &mpsc::UnboundedSender<UiEvent>, text: &str) {
-    let _ = ui_tx.send(UiEvent::InternalMessage(InternalMessage {
-        source: "Loki".to_string(),
-        target: LABEL.to_string(),
-        kind: InternalMessageKind::Continuation,
-        text: text.to_string(),
-    }));
 }
 
 #[cfg(test)]
@@ -1010,26 +893,5 @@ mod tests {
         );
         assert!(!EitriPurpose::Explore.marks_implementation_delegation());
         assert!(EitriPurpose::Code.marks_implementation_delegation());
-    }
-
-    #[test]
-    fn loki_continuation_prompt_keeps_extra_resume_instruction_hidden() {
-        let critique = "Would it be better to verify the fallback first?";
-        let prompt = continuation_prompt(EitriPurpose::Code, critique);
-        assert!(prompt.contains(critique));
-        assert!(prompt.contains("Please continue from where you left off."));
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        emit_continuation(&tx, critique);
-        let event = rx.try_recv().expect("continuation event");
-        let UiEvent::InternalMessage(message) = event else {
-            panic!("expected internal message");
-        };
-        assert_eq!(message.text, critique);
-        assert!(
-            !message
-                .text
-                .contains("Please continue from where you left off.")
-        );
     }
 }

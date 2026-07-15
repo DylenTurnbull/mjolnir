@@ -2114,6 +2114,17 @@ impl AppState {
             }
             UiEvent::LokiActivity(activity) => self.apply_loki_activity(activity),
             UiEvent::InternalMessage(message) => {
+                // A Loki interjection starts a fresh council-initiated Thor
+                // turn after the user's turn already completed. Re-enter the
+                // streaming state so submissions queue behind it instead of
+                // racing the in-flight prompt.
+                if message.kind == crate::event::InternalMessageKind::Interjection
+                    && self.connection_state == ConnectionState::Ready
+                {
+                    self.set_connection_state(ConnectionState::Streaming);
+                    self.turn_started_at = Some(Instant::now());
+                    self.last_turn_elapsed = None;
+                }
                 self.transcript.push(Entry::InternalMessage(message));
                 self.bump_transcript_revision();
             }
@@ -3562,6 +3573,39 @@ mod tests {
             state.transcript.as_slice(),
             [Entry::CodeAgentMessage(text)] if text == "done"
         ));
+    }
+
+    #[test]
+    fn loki_interjection_reenters_streaming_so_submissions_queue() {
+        let mut state = AppState::new();
+        state.set_connection_state(ConnectionState::Ready);
+
+        state.apply_event(UiEvent::InternalMessage(InternalMessage {
+            source: "Loki".to_string(),
+            target: "Thor".to_string(),
+            kind: crate::event::InternalMessageKind::Continuation,
+            text: "boundary advice".to_string(),
+        }));
+        assert_eq!(
+            state.connection_state,
+            ConnectionState::Ready,
+            "continuations ride held completions and must not change state"
+        );
+
+        state.apply_event(UiEvent::InternalMessage(InternalMessage {
+            source: "Loki".to_string(),
+            target: "Thor".to_string(),
+            kind: crate::event::InternalMessageKind::Interjection,
+            text: "post-turn thoughts".to_string(),
+        }));
+        assert_eq!(state.connection_state, ConnectionState::Streaming);
+        assert!(state.is_busy());
+
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        assert_eq!(state.connection_state, ConnectionState::Ready);
     }
 
     #[test]

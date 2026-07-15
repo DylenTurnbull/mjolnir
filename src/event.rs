@@ -58,6 +58,9 @@ pub enum InternalMessageKind {
     Exploration,
     DiscreteReview,
     Continuation,
+    /// Loki finished reviewing after the turn already completed; the council
+    /// starts a fresh Thor turn to surface the late advice to the user.
+    Interjection,
 }
 
 /// Events flowing from the ACP runtime into the UI task.
