@@ -90,6 +90,8 @@ pub struct RuntimeRoleConfig {
     pub model_value: String,
     pub adapter_source_id: String,
     pub force_high_reasoning: bool,
+    /// Correlates Thor, Eitri, and Loki records in one interactive session.
+    pub council_session: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -681,6 +683,19 @@ pub async fn run(
     ui_rx: mpsc::UnboundedReceiver<UiCommand>,
 ) -> Result<()> {
     let fatal_emitted = Arc::new(AtomicBool::new(false));
+    if let Some(role) = cfg.role_config.as_ref()
+        && let Some(council_session) = role.council_session.as_deref()
+    {
+        tracing::info!(
+            event = "agent_runtime_started",
+            council_session,
+            god = %role.label,
+            model = %role.model_id,
+            adapter = %role.adapter_source_id,
+            command = %cfg.command.display(),
+            "Council agent runtime started"
+        );
+    }
 
     let prepared = match prepare_agent_command_for_spawn(&cfg.command, &cfg.env, &ui_tx).await {
         Ok(prepared) => prepared,
@@ -784,6 +799,20 @@ pub async fn run(
             format!("acp: {e}")
         };
         emit_fatal(&ui_tx, &fatal_emitted, msg);
+    }
+    if let Some(role) = cfg.role_config.as_ref()
+        && let Some(council_session) = role.council_session.as_deref()
+    {
+        tracing::info!(
+            event = "agent_runtime_finished",
+            council_session,
+            god = %role.label,
+            model = %role.model_id,
+            adapter = %role.adapter_source_id,
+            outcome = if result.is_ok() { "completed" } else { "failed" },
+            error = result.as_ref().err().map(|error| format!("{error:#}")),
+            "Council agent runtime finished"
+        );
     }
     result
 }
@@ -1341,6 +1370,7 @@ where
     let notif_session_state = session_state.clone();
     let terminal_metadata_bridge = Arc::new(Mutex::new(TerminalMetadataBridge::default()));
     let notif_terminal_metadata_bridge = terminal_metadata_bridge.clone();
+    let notification_role = role_config.clone();
     let read_filesystem = filesystem.clone();
     let write_filesystem = filesystem.clone();
     let create_terminals = terminals.clone();
@@ -1365,6 +1395,20 @@ where
                         .observe(&notification.session_id, &notification.update);
                     for snapshot in terminal_snapshots {
                         let _ = notif_ui_tx.send(UiEvent::TerminalOutput(snapshot));
+                    }
+                    if let Some(role) = notification_role.as_ref()
+                        && let Some(council_session) = role.council_session.as_deref()
+                    {
+                        tracing::debug!(
+                            event = "agent_update",
+                            council_session,
+                            god = %role.label,
+                            model = %role.model_id,
+                            adapter = %role.adapter_source_id,
+                            acp_session = %notification.session_id,
+                            update = ?notification.update,
+                            "Council agent update"
+                        );
                     }
                     let _ = notif_ui_tx.send(UiEvent::SessionUpdate(notification.update));
                 }
@@ -1783,6 +1827,20 @@ async fn drive_session(
         session_id: session_id.to_string(),
         resumed,
     });
+    if let Some(role) = role_config.as_ref()
+        && let Some(council_session) = role.council_session.as_deref()
+    {
+        tracing::info!(
+            event = "agent_session_started",
+            council_session,
+            god = %role.label,
+            model = %role.model_id,
+            adapter = %role.adapter_source_id,
+            acp_session = %session_id,
+            resumed,
+            "Council ACP session started"
+        );
+    }
     if !session_config.options.is_empty() {
         let _ = ui_tx.send(UiEvent::SessionConfigOptions {
             options: session_config.options.clone(),
@@ -1798,6 +1856,21 @@ async fn drive_session(
     while let Some(cmd) = ui_rx.recv().await {
         match cmd {
             UiCommand::SendPrompt { text, images } => {
+                if let Some(role) = role_config.as_ref()
+                    && let Some(council_session) = role.council_session.as_deref()
+                {
+                    tracing::info!(
+                        event = "prompt_sent",
+                        council_session,
+                        god = %role.label,
+                        model = %role.model_id,
+                        adapter = %role.adapter_source_id,
+                        acp_session = %session_id,
+                        prompt = %text,
+                        image_count = images.len(),
+                        "Prompt sent to Council agent"
+                    );
+                }
                 session_state.clear_permissions_cancelled(&session_id).await;
                 let prompt = prompt_content_blocks(text, images, primary_policy.take_for_prompt());
                 let req = PromptRequest::new(session_id.clone(), prompt);
@@ -5570,6 +5643,7 @@ mod tests {
             model_value: "claude-sonnet-5".to_string(),
             adapter_source_id: "claude-acp".to_string(),
             force_high_reasoning: true,
+            council_session: None,
         };
         assert_eq!(
             select_role_model(&claude_model, &claude_role).map(|value| value.to_string()),
@@ -5592,6 +5666,7 @@ mod tests {
             model_value: "gpt-5-6-sol".to_string(),
             adapter_source_id: "codex-acp".to_string(),
             force_high_reasoning: true,
+            council_session: None,
         };
         assert_eq!(
             select_role_model(&codex_model, &codex_role).map(|value| value.to_string()),

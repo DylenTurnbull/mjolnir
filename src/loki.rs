@@ -62,6 +62,7 @@ struct ActiveAdvice {
     epoch: u64,
     target: Target,
     accepted: bool,
+    note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,6 +77,7 @@ impl AdviceSlot {
             epoch,
             target,
             accepted: false,
+            note: None,
         });
     }
 
@@ -88,6 +90,7 @@ impl AdviceSlot {
             return Err("only one advice note is allowed per advisor update");
         }
         active.accepted = true;
+        active.note = Some(note.clone());
         Ok(Decision {
             id: active.id,
             epoch: active.epoch,
@@ -96,12 +99,12 @@ impl AdviceSlot {
         })
     }
 
-    async fn finish(&self, id: u64) -> bool {
+    async fn finish(&self, id: u64) -> Option<String> {
         let mut active = self.active.lock().await;
         if active.as_ref().is_some_and(|active| active.id == id) {
-            return active.take().is_some_and(|active| active.accepted);
+            return active.take().and_then(|active| active.note);
         }
-        false
+        None
     }
 }
 
@@ -575,6 +578,7 @@ impl Handle {
         cwd: PathBuf,
         additional_directories: Vec<PathBuf>,
         ui_tx: mpsc::UnboundedSender<UiEvent>,
+        council_session: String,
     ) -> Self {
         let (requests, rx) = mpsc::unbounded_channel();
         let (decisions, _) = broadcast::channel(512);
@@ -597,6 +601,7 @@ impl Handle {
             decisions,
             abort_rx,
             finished_tx,
+            council_session,
         ));
         handle
     }
@@ -673,6 +678,7 @@ async fn worker(
     decisions: broadcast::Sender<Decision>,
     abort_rx: watch::Receiver<bool>,
     finished: watch::Sender<bool>,
+    council_session: String,
 ) {
     let mut epoch = 0;
     let mut pending_context: HashMap<Target, String> = HashMap::new();
@@ -730,6 +736,18 @@ async fn worker(
                 target,
                 mut delta,
             } if request_epoch == epoch => {
+                tracing::info!(
+                    event = "review_started",
+                    council_session = %council_session,
+                    god = "Loki",
+                    model = %role.model.model,
+                    adapter = %role.launch.source_id,
+                    target = target.label(),
+                    review_id = id,
+                    epoch,
+                    delta = %delta,
+                    "Loki review started"
+                );
                 let mut review_ids = vec![id];
                 while let Ok(next) = requests.try_recv() {
                     match next {
@@ -781,6 +799,7 @@ async fn worker(
                         &additional_directories,
                         abort_rx.clone(),
                         server.advertised.clone(),
+                        &council_session,
                     )
                     .await
                     {
@@ -858,8 +877,8 @@ async fn worker(
                         | TurnEvent::Note(_) => {}
                     })
                     .await;
-                let advised = advice.finish(id).await;
-                if !advised {
+                let advice_note = advice.finish(id).await;
+                if advice_note.is_none() {
                     let verdict = match result {
                         Ok(_) => Verdict::NoIntervention,
                         Err(_) if *abort_rx.borrow() => Verdict::NoIntervention,
@@ -882,12 +901,43 @@ async fn worker(
                             verdict: verdict.clone(),
                         });
                     }
+                    tracing::info!(
+                        event = "review_finished",
+                        council_session = %council_session,
+                        god = "Loki",
+                        model = %role.model.model,
+                        adapter = %role.launch.source_id,
+                        target = target.label(),
+                        review_id = id,
+                        verdict = match &verdict {
+                            Verdict::NoIntervention => "no_intervention",
+                            Verdict::Intervention(_) => "intervention",
+                            Verdict::Failed(_) => "failed",
+                        },
+                        error = ?match &verdict {
+                            Verdict::Failed(message) => Some(message.as_str()),
+                            _ => None,
+                        },
+                        "Loki review finished"
+                    );
                     if matches!(verdict, Verdict::Failed(_))
                         && let Some(old) = session.take()
                     {
                         old.dismiss().await;
                     }
                 } else {
+                    tracing::info!(
+                        event = "review_finished",
+                        council_session = %council_session,
+                        god = "Loki",
+                        model = %role.model.model,
+                        adapter = %role.launch.source_id,
+                        target = target.label(),
+                        review_id = id,
+                        verdict = "intervention",
+                        advice = %advice_note.as_deref().unwrap_or_default(),
+                        "Loki review finished"
+                    );
                     for id in review_ids.into_iter().skip(1) {
                         let _ = decisions.send(Decision {
                             id,
@@ -914,6 +964,7 @@ async fn connect(
     additional_directories: &[PathBuf],
     abort: watch::Receiver<bool>,
     advise_server: McpServer,
+    council_session: &str,
 ) -> Result<AgentHandle> {
     let launch = Launch {
         program: role.launch.command.clone(),
@@ -933,6 +984,7 @@ async fn connect(
             model_value: role.model_value.clone(),
             adapter_source_id: role.launch.source_id.clone(),
             force_high_reasoning: true,
+            council_session: Some(council_session.to_string()),
         }),
         vec![advise_server],
     )
@@ -1013,7 +1065,7 @@ mod tests {
             matches!(decision.verdict, Verdict::Intervention(ref note) if note == "fix the race")
         );
         assert!(slot.accept("second note".to_string()).await.is_err());
-        assert!(slot.finish(4).await);
+        assert_eq!(slot.finish(4).await.as_deref(), Some("fix the race"));
     }
 
     #[test]

@@ -160,6 +160,7 @@ impl Config {
                 model_value: role.model_value,
                 adapter_source_id: role.launch.source_id,
                 force_high_reasoning: true,
+                council_session: None,
             }),
             loki,
             implementation_handoff_counter: None,
@@ -593,12 +594,28 @@ async fn run(
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     controller: Controller,
 ) -> EitriRunResult {
+    let log_role = config.role_config.clone();
     if purpose.marks_implementation_delegation()
         && let Some(counter) = config.implementation_handoff_counter.as_ref()
     {
         counter.fetch_add(1, Ordering::AcqRel);
     }
     let standalone_prompt = purpose.standalone_prompt(&task);
+    if let Some(role) = log_role.as_ref()
+        && let Some(council_session) = role.council_session.as_deref()
+    {
+        tracing::info!(
+            event = "delegation_started",
+            council_session,
+            god = "Eitri",
+            source = "Thor",
+            model = %role.model_id,
+            adapter = %role.adapter_source_id,
+            purpose = ?purpose,
+            task = %task,
+            "Thor delegated work to Eitri"
+        );
+    }
     let display_label = config.display_label.clone();
     let _ = ui_tx.send(UiEvent::InternalMessage(InternalMessage {
         source: "Thor".to_string(),
@@ -812,6 +829,20 @@ async fn run(
                 }
                 match decision.verdict {
                     loki::Verdict::Intervention(critique) => {
+                        if let Some(role) = log_role.as_ref()
+                            && let Some(council_session) = role.council_session.as_deref()
+                        {
+                            tracing::info!(
+                                event = "advice_received",
+                                council_session,
+                                god = "Eitri",
+                                source = "Loki",
+                                model = %role.model_id,
+                                adapter = %role.adapter_source_id,
+                                advice = %critique,
+                                "Eitri received Loki advice"
+                            );
+                        }
                         intervention.push(decision.id, critique);
                         if completed.is_some() {
                             completed = None;
@@ -861,6 +892,23 @@ async fn run(
         Err(error) => CodeAgentOutcome::Failed(error.to_string()),
     };
     let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::Finished { outcome }));
+    if let Some(role) = log_role.as_ref()
+        && let Some(council_session) = role.council_session.as_deref()
+    {
+        tracing::info!(
+            event = "delegation_finished",
+            council_session,
+            god = "Eitri",
+            target = "Thor",
+            model = %role.model_id,
+            adapter = %role.adapter_source_id,
+            purpose = ?purpose,
+            outcome = if result.is_ok() { "completed" } else { "failed" },
+            workspace_changed = workspace_delta.as_ref().is_some_and(WorkspaceDelta::changed),
+            error = ?result.as_ref().err().map(|error| format!("{error:#}")),
+            "Eitri delegation finished"
+        );
+    }
     EitriRunResult {
         outcome: result,
         workspace_delta,

@@ -1532,6 +1532,14 @@ async fn run_session(
     thor_config: config::ThorConfig,
 ) -> Result<RunSessionResult> {
     let mut terminal = SessionTerminal::fresh(mode)?;
+    let council_session = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
     let (eitri_role, _eitri_codex_home) = match council.eitri.clone() {
         Some(role) => {
             let (role, guard) = isolated_council_role(role, "eitri")?;
@@ -1552,6 +1560,53 @@ async fn run_session(
     let (runtime_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel();
     let implementation_handoffs_this_turn = Arc::new(AtomicUsize::new(0));
+    tracing::info!(
+        event = "council_setup",
+        council_session = %council_session,
+        god = "Thor",
+        model = %council.thor.model.model,
+        model_value = %council.thor.model_value,
+        adapter = %council.thor.launch.source_id,
+        "Council role configured"
+    );
+    if let Some(role) = council.eitri.as_ref() {
+        tracing::info!(
+            event = "council_setup",
+            council_session = %council_session,
+            god = "Eitri",
+            model = %role.model.model,
+            model_value = %role.model_value,
+            adapter = %role.launch.source_id,
+            "Council role configured"
+        );
+    } else {
+        tracing::info!(
+            event = "council_setup",
+            council_session = %council_session,
+            god = "Eitri",
+            model = "disabled",
+            "Council role disabled"
+        );
+    }
+    if let Some(role) = council.loki.as_ref() {
+        tracing::info!(
+            event = "council_setup",
+            council_session = %council_session,
+            god = "Loki",
+            model = %role.model.model,
+            model_value = %role.model_value,
+            adapter = %role.launch.source_id,
+            "Council role configured"
+        );
+    } else {
+        tracing::info!(
+            event = "council_setup",
+            council_session = %council_session,
+            god = "Loki",
+            model = "disabled",
+            "Council role disabled"
+        );
+    }
     let _ = ui_event_tx.send(crate::event::UiEvent::Info(format!(
         "Council · Thor {} · Loki {} · Eitri {} · {} launchable models",
         council.thor.model.model,
@@ -1576,6 +1631,7 @@ async fn run_session(
             cwd.clone(),
             runtime_options.additional_directories.clone(),
             ui_event_tx.clone(),
+            council_session.clone(),
         )
     });
     let (usage_turn_tx, usage_shutdown_tx, usage_task) = if agent.source_id == "claude-acp" {
@@ -1655,14 +1711,18 @@ async fn run_session(
             model_value: council.thor.model_value.clone(),
             adapter_source_id: council.thor.launch.source_id.clone(),
             force_high_reasoning: true,
+            council_session: Some(council_session.clone()),
         }),
         code_agent: eitri_role.map(|eitri_role| {
-            code_agent::Config::council(
+            let mut config = code_agent::Config::council(
                 eitri_role,
                 runtime_options.agent_stderr.clone(),
                 loki_handle.clone(),
-            )
-            .with_implementation_handoff_counter(implementation_handoffs_this_turn.clone())
+            );
+            if let Some(role) = config.role_config.as_mut() {
+                role.council_session = Some(council_session.clone());
+            }
+            config.with_implementation_handoff_counter(implementation_handoffs_this_turn.clone())
         }),
     };
 
@@ -1715,6 +1775,7 @@ async fn run_session(
     let event_thor_review_enabled = thor_review_enabled.clone();
     let refresh_usage_on_failure = agent.source_id == "codex-acp";
     let event_usage_turn_tx = usage_turn_tx.clone();
+    let event_council_session = council_session.clone();
     let event_proxy = tokio::spawn(async move {
         let mut runtime_event_rx = runtime_event_rx;
         let mut decisions = event_loki.as_ref().map(loki::Handle::subscribe);
@@ -1865,6 +1926,16 @@ async fn run_session(
                         continue;
                     }
                     if let loki::Verdict::Intervention(critique) = decision.verdict {
+                        tracing::info!(
+                            event = "advice_received",
+                            council_session = %event_council_session,
+                            god = "Thor",
+                            source = "Loki",
+                            model = %event_thor.model.model,
+                            adapter = %event_thor.launch.source_id,
+                            advice = %critique,
+                            "Thor received Loki advice"
+                        );
                         intervention.push(decision.id, critique);
                         if held_completion.is_some() {
                             held_completion = None;
@@ -2476,6 +2547,10 @@ fn init_logging(path: Option<&std::path::Path>) -> Result<()> {
         .with_writer(file)
         .with_env_filter(filter)
         .with_ansi(false)
+        .json()
+        .flatten_event(true)
+        .with_current_span(false)
+        .with_span_list(false)
         .init();
     Ok(())
 }

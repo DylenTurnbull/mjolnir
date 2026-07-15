@@ -2091,6 +2091,7 @@ fn start_server_agent_session(
             cwd.clone(),
             additional_directories.clone(),
             runtime_event_tx.clone(),
+            format!("remote-{}", std::process::id()),
         )
     });
     let role_config = council.as_ref().map(|resolved| acp::RuntimeRoleConfig {
@@ -2099,6 +2100,7 @@ fn start_server_agent_session(
         model_value: resolved.thor.model_value.clone(),
         adapter_source_id: resolved.thor.launch.source_id.clone(),
         force_high_reasoning: true,
+        council_session: None,
     });
     let implementation_handoffs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let code_agent = isolated_eitri.as_ref().map(|eitri| {

@@ -185,6 +185,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             cfg.cwd.clone(),
             cfg.additional_directories.clone(),
             event_tx.clone(),
+            format!("headless-{}", std::process::id()),
         )
     });
     let (eitri, _eitri_codex_home) = match resolved.eitri.clone() {
@@ -215,6 +216,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             model_value: thor.model_value.clone(),
             adapter_source_id: thor.launch.source_id.clone(),
             force_high_reasoning: true,
+            council_session: None,
         }),
         code_agent: eitri.map(|eitri| {
             code_agent::Config::council(eitri, cfg.agent_stderr.clone(), loki_handle.clone())
