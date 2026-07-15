@@ -572,6 +572,7 @@ pub struct AppState {
     pub spinner_style: SpinnerStyle,
     /// Open `/mjconfig` overlay, if any.
     pub mjconfig_menu: Option<MjConfigMenu>,
+    pub council_inventory: crate::council::AcpInventory,
     /// Active `/ragnarok` battle (arena overlay), if any.
     pub ragnarok: Option<RagnarokUi>,
     /// One-shot launch request set by `/ragnarok <task>`. The UI loop takes
@@ -958,6 +959,7 @@ impl AppState {
             theme: theme_kind.palette(),
             spinner_style: SpinnerStyle::default(),
             mjconfig_menu: None,
+            council_inventory: crate::council::AcpInventory::default(),
             ragnarok: None,
             ragnarok_launch: None,
             session_cwd: PathBuf::from("."),
@@ -1124,7 +1126,8 @@ impl AppState {
         config.spinner = self.spinner_style;
         self.mjconfig_menu = Some(MjConfigMenu {
             editor: SettingsEditor::new(config, self.council_choices.clone(), None)
-                .with_active_models(self.active_council_models.clone()),
+                .with_active_models(self.active_council_models.clone())
+                .with_inventory(self.council_inventory.clone()),
             orig_theme: self.theme_kind,
             orig_spinner: self.spinner_style,
         });
@@ -1143,6 +1146,12 @@ impl AppState {
         action
     }
 
+    pub fn poll_mjconfig_background(&mut self) {
+        if let Some(menu) = self.mjconfig_menu.as_mut() {
+            menu.editor.poll_background();
+        }
+    }
+
     /// Close the menu, keeping its live appearance preview.
     pub fn mjconfig_menu_accept(&mut self) -> Option<crate::config::Config> {
         self.mjconfig_menu.take().map(|menu| menu.editor.config)
@@ -1151,7 +1160,8 @@ impl AppState {
     /// Close the menu and restore the theme and spinner that were active when
     /// it opened, discarding the live preview.
     pub fn mjconfig_menu_cancel(&mut self) {
-        if let Some(menu) = self.mjconfig_menu.take() {
+        if let Some(mut menu) = self.mjconfig_menu.take() {
+            menu.editor.cancel_background();
             self.set_theme(menu.orig_theme);
             self.set_spinner_style(menu.orig_spinner);
         }

@@ -3,7 +3,7 @@
 //! Stores role-owned Council preferences and custom ACP launches. Lives at
 //! `~/.config/mj/config.toml`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -14,6 +14,7 @@ use crate::spinner::SpinnerStyle;
 use crate::theme::TerminalThemeKind;
 
 pub const DISABLED_MODEL: &str = "disabled";
+pub const CONFIG_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoleModelOverrides {
@@ -22,19 +23,13 @@ pub struct RoleModelOverrides {
     pub eitri: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Config {
+    pub version: u32,
     #[serde(default, skip_serializing_if = "TerminalThemeKind::is_default")]
     pub theme: TerminalThemeKind,
     #[serde(default, skip_serializing_if = "SpinnerStyle::is_default")]
     pub spinner: SpinnerStyle,
-    /// Legacy custom-agent entries migrated into `acp.servers` on load.
-    #[serde(default, skip_serializing)]
-    pub custom_agents: Vec<CustomAgent>,
-    /// Legacy quick-start Council model table. Values migrate into the role
-    /// tables below and this field is never serialized.
-    #[serde(default, skip_serializing)]
-    pub models: ModelsConfig,
     /// Thor's coordination and review behavior.
     #[serde(default, skip_serializing_if = "ThorConfig::is_default")]
     pub thor: ThorConfig,
@@ -50,6 +45,21 @@ pub struct Config {
     /// `/ragnarok` battle knobs.
     #[serde(default, skip_serializing_if = "RagnarokConfig::is_default")]
     pub ragnarok: RagnarokConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: CONFIG_VERSION,
+            theme: TerminalThemeKind::default(),
+            spinner: SpinnerStyle::default(),
+            thor: ThorConfig::default(),
+            loki: LokiConfig::default(),
+            eitri: EitriConfig::default(),
+            acp: AcpConfig::default(),
+            ragnarok: RagnarokConfig::default(),
+        }
+    }
 }
 
 fn default_auto() -> String {
@@ -103,16 +113,12 @@ impl ThorConfig {
 pub struct LokiConfig {
     #[serde(default = "default_auto")]
     pub model: String,
-    /// Removed in favor of `model = "disabled"`; retained only while loading.
-    #[serde(default, rename = "streaming_review", skip_serializing)]
-    legacy_streaming_review: Option<bool>,
 }
 
 impl Default for LokiConfig {
     fn default() -> Self {
         Self {
             model: default_auto(),
-            legacy_streaming_review: None,
         }
     }
 }
@@ -137,37 +143,13 @@ impl EitriConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AcpConfig {
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub codex: bool,
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub claude: bool,
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub anvil: bool,
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub opencode: bool,
+    /// Policy overrides for built-in auto-detected servers. Missing means Auto.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub policies: BTreeMap<String, AcpServerPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub servers: Vec<CustomAcpServer>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AcpServerSelection {
-    pub id: String,
-    pub label: String,
-    pub enabled: bool,
-}
-
-impl Default for AcpConfig {
-    fn default() -> Self {
-        Self {
-            codex: true,
-            claude: true,
-            anvil: true,
-            opencode: true,
-            servers: Vec::new(),
-        }
-    }
+    pub servers: Vec<ConfiguredAcpServer>,
 }
 
 impl AcpConfig {
@@ -176,15 +158,53 @@ impl AcpConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpServerPolicy {
+    #[default]
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+impl std::fmt::Display for AcpServerPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Enabled => f.write_str("on"),
+            Self::Disabled => f.write_str("off"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpServerOrigin {
+    Registry,
+    Custom,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct CustomAcpServer {
-    pub name: String,
+pub struct ConfiguredAcpServer {
+    pub id: String,
+    pub label: String,
     pub command: PathBuf,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+    pub origin: AcpServerOrigin,
+    #[serde(default = "enabled_policy", skip_serializing_if = "is_enabled_policy")]
+    pub policy: AcpServerPolicy,
+}
+
+fn enabled_policy() -> AcpServerPolicy {
+    AcpServerPolicy::Enabled
+}
+
+fn is_enabled_policy(policy: &AcpServerPolicy) -> bool {
+    *policy == AcpServerPolicy::Enabled
 }
 
 impl LokiConfig {
@@ -224,10 +244,6 @@ fn default_true() -> bool {
     true
 }
 
-fn is_true(value: &bool) -> bool {
-    *value
-}
-
 /// Concrete ACP launch selected by the model catalog for a session.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SelectedAgent {
@@ -239,18 +255,17 @@ pub struct SelectedAgent {
     pub env: HashMap<String, String>,
 }
 
-/// Legacy custom-agent shape retained solely for config migration.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct CustomAgent {
-    pub name: String,
-    pub program: PathBuf,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub description: String,
-}
-
 impl Config {
+    pub fn path_has_current_version(path: &Path) -> bool {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        toml::from_str::<toml::Value>(&contents)
+            .ok()
+            .and_then(|document| document.get("version").and_then(toml::Value::as_integer))
+            == Some(i64::from(CONFIG_VERSION))
+    }
+
     pub fn apply_role_model_overrides(&mut self, overrides: &RoleModelOverrides) {
         if let Some(model) = &overrides.thor {
             self.thor.model.clone_from(model);
@@ -263,47 +278,19 @@ impl Config {
         }
     }
 
-    pub fn acp_server_selections(&self) -> Vec<AcpServerSelection> {
-        let mut selections = vec![
-            ("codex-acp", "Codex", self.acp.codex),
-            ("claude-acp", "Claude Code", self.acp.claude),
-            ("anvil", "Anvil", self.acp.anvil),
-            ("opencode-acp", "OpenCode", self.acp.opencode),
-        ]
-        .into_iter()
-        .map(|(id, label, enabled)| AcpServerSelection {
-            id: id.to_string(),
-            label: label.to_string(),
-            enabled,
-        })
-        .collect::<Vec<_>>();
-        selections.extend(self.acp.servers.iter().map(|server| AcpServerSelection {
-            id: format!("custom:{}", server.name),
-            label: server.name.clone(),
-            enabled: server.enabled,
-        }));
-        selections
-    }
-
-    pub fn set_acp_server_enabled(&mut self, id: &str, enabled: bool) -> bool {
-        match id {
-            "codex-acp" => self.acp.codex = enabled,
-            "claude-acp" => self.acp.claude = enabled,
-            "anvil" => self.acp.anvil = enabled,
-            "opencode-acp" => self.acp.opencode = enabled,
-            custom if custom.starts_with("custom:") => {
-                let Some(server) = self
-                    .acp
-                    .servers
-                    .iter_mut()
-                    .find(|server| server.name == custom[7..])
-                else {
-                    return false;
-                };
-                server.enabled = enabled;
+    pub fn set_acp_server_policy(&mut self, id: &str, policy: AcpServerPolicy) -> bool {
+        if matches!(id, "codex-acp" | "claude-acp" | "anvil" | "opencode-acp") {
+            if policy == AcpServerPolicy::Auto {
+                self.acp.policies.remove(id);
+            } else {
+                self.acp.policies.insert(id.to_string(), policy);
             }
-            _ => return false,
+            return true;
         }
+        let Some(server) = self.acp.servers.iter_mut().find(|server| server.id == id) else {
+            return false;
+        };
+        server.policy = policy;
         true
     }
 
@@ -323,6 +310,18 @@ impl Config {
         }
         let s =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let document: toml::Value =
+            toml::from_str(&s).with_context(|| format!("parse {}", path.display()))?;
+        let version = document.get("version").and_then(toml::Value::as_integer);
+        if version != Some(i64::from(CONFIG_VERSION)) {
+            tracing::warn!(
+                path = %path.display(),
+                found_version = ?version,
+                expected_version = CONFIG_VERSION,
+                "ignoring incompatible config and starting fresh"
+            );
+            return Ok(Self::default());
+        }
         let mut cfg: Self =
             toml::from_str(&s).with_context(|| format!("parse {}", path.display()))?;
         cfg.normalize()?;
@@ -345,10 +344,6 @@ impl Config {
     }
 
     fn normalize(&mut self) -> Result<()> {
-        if self.loki.legacy_streaming_review == Some(false) {
-            self.loki.model = DISABLED_MODEL.to_string();
-        }
-        self.loki.legacy_streaming_review = None;
         if self.loki.model.eq_ignore_ascii_case("none") {
             self.loki.model = DISABLED_MODEL.to_string();
         }
@@ -356,62 +351,27 @@ impl Config {
             self.eitri.model = DISABLED_MODEL.to_string();
         }
 
-        if self.thor.model == "auto" && self.models.thor != "auto" {
-            self.thor.model.clone_from(&self.models.thor);
-        }
-        if self.loki.model == "auto" && self.models.loki != "auto" {
-            self.loki.model.clone_from(&self.models.loki);
-        }
-        if self.eitri.model == "auto" && self.models.eitri != "auto" {
-            self.eitri.model.clone_from(&self.models.eitri);
-        }
-
-        for legacy in &self.custom_agents {
-            if !self
-                .acp
-                .servers
-                .iter()
-                .any(|server| server.name == legacy.name)
-            {
-                self.acp.servers.push(CustomAcpServer {
-                    name: legacy.name.clone(),
-                    command: legacy.program.clone(),
-                    args: legacy.args.clone(),
-                    enabled: true,
-                });
-            }
-        }
-
-        for custom in self.custom_agents.iter_mut() {
-            custom.program = expand_home_shortcut(&custom.program.to_string_lossy());
-            custom.program = normalize_spawn_program(custom.program.clone());
-            custom.args = custom
-                .args
-                .iter()
-                .map(|arg| expand_home_shortcut(arg).to_string_lossy().into_owned())
-                .collect();
-        }
         let mut names = std::collections::HashSet::new();
         for server in &mut self.acp.servers {
-            let valid_name = !server.name.is_empty()
+            let valid_name = !server.id.is_empty()
                 && server
-                    .name
+                    .id
                     .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'));
             anyhow::ensure!(
                 valid_name,
-                "custom ACP server name '{}' must contain only letters, digits, '-' or '_'",
-                server.name
+                "ACP server id '{}' contains unsupported characters",
+                server.id
             );
             anyhow::ensure!(
-                names.insert(server.name.clone()),
-                "duplicate custom ACP server name '{}'",
-                server.name
+                names.insert(server.id.clone()),
+                "duplicate configured ACP server id '{}'",
+                server.id
             );
             anyhow::ensure!(
                 !server.command.as_os_str().is_empty(),
-                "custom ACP server '{}' has an empty command",
-                server.name
+                "configured ACP server '{}' has an empty command",
+                server.id
             );
             server.command = expand_home_shortcut(&server.command.to_string_lossy());
             server.command = normalize_spawn_program(server.command.clone());
@@ -422,6 +382,12 @@ impl Config {
                 .collect();
         }
         Ok(())
+    }
+}
+
+impl AcpConfig {
+    pub fn policy(&self, id: &str) -> AcpServerPolicy {
+        self.policies.get(id).copied().unwrap_or_default()
     }
 }
 
@@ -570,7 +536,11 @@ mod tests {
         );
 
         // A custom cap survives the round trip.
-        std::fs::write(&path, "[ragnarok]\nmax_competitors = 3\n").expect("write");
+        std::fs::write(
+            &path,
+            format!("version = {CONFIG_VERSION}\n[ragnarok]\nmax_competitors = 3\n"),
+        )
+        .expect("write");
         let cfg = Config::load(&path).expect("load custom");
         assert_eq!(cfg.ragnarok.max_competitors, 3);
         cfg.save(&path).expect("save custom");
@@ -590,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_disabled_loki_review_migrates_to_disabled_model() {
+    fn incompatible_config_starts_fresh() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -600,16 +570,17 @@ mod tests {
         .expect("write config");
 
         let cfg = Config::load(&path).expect("load config");
-        assert!(!cfg.thor.discrete_review);
-        assert_eq!(cfg.loki.model, DISABLED_MODEL);
+        assert_eq!(cfg, Config::default());
+    }
 
-        cfg.save(&path).expect("save config");
-        let saved = std::fs::read_to_string(&path).expect("read saved config");
-        assert!(saved.contains("[thor]"), "saved: {saved}");
-        assert!(saved.contains("discrete_review = false"), "saved: {saved}");
-        assert!(saved.contains("[loki]"), "saved: {saved}");
-        assert!(saved.contains("model = \"disabled\""), "saved: {saved}");
-        assert!(!saved.contains("streaming_review"), "saved: {saved}");
+    #[test]
+    fn only_current_schema_counts_as_an_existing_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "version = 1\n").expect("old config");
+        assert!(!Config::path_has_current_version(&path));
+        Config::default().save(&path).expect("current config");
+        assert!(Config::path_has_current_version(&path));
     }
 
     #[test]
@@ -623,11 +594,14 @@ mod tests {
                 discrete_review: false,
             },
             acp: AcpConfig {
-                servers: vec![CustomAcpServer {
-                    name: "company".to_string(),
+                servers: vec![ConfiguredAcpServer {
+                    id: "custom:company".to_string(),
+                    label: "company".to_string(),
                     command: PathBuf::from("/usr/local/bin/company-acp"),
                     args: vec!["--stdio".to_string()],
-                    enabled: true,
+                    env: HashMap::new(),
+                    origin: AcpServerOrigin::Custom,
+                    policy: AcpServerPolicy::Enabled,
                 }],
                 ..AcpConfig::default()
             },
@@ -638,7 +612,7 @@ mod tests {
         assert_eq!(loaded.theme, TerminalThemeKind::Light);
         assert_eq!(loaded.thor.model, "gpt-5-6-sol");
         assert!(!loaded.thor.discrete_review);
-        assert_eq!(loaded.acp.servers[0].name, "company");
+        assert_eq!(loaded.acp.servers[0].id, "custom:company");
         assert_eq!(loaded.acp.servers[0].args, vec!["--stdio"]);
     }
 
@@ -671,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_models_migrate_into_role_owned_models() {
+    fn missing_version_discards_old_model_table() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -686,13 +660,7 @@ eitri = "gpt-5-6-luna"
         .expect("write");
 
         let cfg = Config::load(&path).expect("load");
-        assert_eq!(cfg.thor.model, "gpt-5-6-sol");
-        assert_eq!(cfg.loki.model, "claude-opus-4-8");
-        assert_eq!(cfg.eitri.model, "gpt-5-6-luna");
-        cfg.save(&path).expect("save migrated config");
-        let saved = std::fs::read_to_string(path).expect("read migrated config");
-        assert!(!saved.contains("[models]"), "saved: {saved}");
-        assert!(saved.contains("model = \"gpt-5-6-sol\""), "saved: {saved}");
+        assert_eq!(cfg, Config::default());
     }
 
     #[test]
@@ -706,42 +674,7 @@ eitri = "gpt-5-6-luna"
     }
 
     #[test]
-    fn legacy_custom_agents_migrate_to_acp_servers_without_serializing_legacy_data() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        let cfg = Config {
-            theme: TerminalThemeKind::AnsiDark,
-            custom_agents: vec![
-                CustomAgent {
-                    name: "local-claude".to_string(),
-                    program: PathBuf::from("/usr/local/bin/claude-acp"),
-                    args: vec!["--debug".to_string()],
-                    description: "claude with debug logging".to_string(),
-                },
-                CustomAgent {
-                    name: "staging-agent".to_string(),
-                    program: PathBuf::from("npx"),
-                    args: vec!["-y".to_string(), "@example/staging".to_string()],
-                    description: String::new(),
-                },
-            ],
-            ..Config::default()
-        };
-        let mut migrated = cfg;
-        migrated.normalize().expect("normalize");
-        migrated.save(&path).expect("save");
-        let loaded = Config::load(&path).expect("load");
-        assert_eq!(loaded.theme, TerminalThemeKind::AnsiDark);
-        assert!(loaded.custom_agents.is_empty());
-        assert_eq!(loaded.acp.servers.len(), 2);
-        assert_eq!(loaded.acp.servers[0].name, "local-claude");
-        assert_eq!(loaded.acp.servers[0].args, vec!["--debug"]);
-        let body = std::fs::read_to_string(path).expect("read");
-        assert!(!body.contains("custom_agents"), "saved: {body}");
-    }
-
-    #[test]
-    fn load_expands_home_shortcuts_in_custom_agents() {
+    fn load_expands_home_shortcuts_in_configured_servers() {
         let Some(home) = dirs::home_dir() else {
             return;
         };
@@ -750,11 +683,13 @@ eitri = "gpt-5-6-luna"
         std::fs::write(
             &path,
             r#"
-[[custom_agents]]
-name = "my-agent"
-program = "~/bin/agent"
+version = 2
+[[acp.servers]]
+id = "custom:my-agent"
+label = "my-agent"
+command = "~/bin/agent"
 args = ["--config", "$HOME/.config/agent.toml"]
-description = "test"
+origin = "custom"
 "#,
         )
         .expect("write");
@@ -773,45 +708,18 @@ description = "test"
     }
 
     #[test]
-    fn explicit_acp_server_wins_legacy_custom_agent_name_conflict() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
-[[acp.servers]]
-name = "company"
-command = "/new/acp"
-args = ["--new"]
-
-[[custom_agents]]
-name = "company"
-program = "/legacy/acp"
-args = ["--legacy"]
-description = "old entry"
-"#,
-        )
-        .expect("write");
-
-        let config = Config::load(&path).expect("load");
-        assert_eq!(config.acp.servers.len(), 1);
-        assert_eq!(config.acp.servers[0].command, PathBuf::from("/new/acp"));
-        assert_eq!(config.acp.servers[0].args, vec!["--new"]);
-    }
-
-    #[test]
-    fn custom_acp_servers_validate_names_commands_and_duplicates() {
+    fn configured_acp_servers_validate_ids_commands_and_duplicates() {
         for (body, expected) in [
             (
-                "[[acp.servers]]\nname = 'bad name'\ncommand = 'server'\n",
-                "must contain only",
+                "version = 2\n[[acp.servers]]\nid = 'bad name'\nlabel = 'bad'\ncommand = 'server'\norigin = 'custom'\n",
+                "unsupported characters",
             ),
             (
-                "[[acp.servers]]\nname = 'empty'\ncommand = ''\n",
+                "version = 2\n[[acp.servers]]\nid = 'empty'\nlabel = 'empty'\ncommand = ''\norigin = 'custom'\n",
                 "empty command",
             ),
             (
-                "[[acp.servers]]\nname = 'same'\ncommand = 'one'\n[[acp.servers]]\nname = 'same'\ncommand = 'two'\n",
+                "version = 2\n[[acp.servers]]\nid = 'same'\nlabel = 'one'\ncommand = 'one'\norigin = 'custom'\n[[acp.servers]]\nid = 'same'\nlabel = 'two'\ncommand = 'two'\norigin = 'custom'\n",
                 "duplicate",
             ),
         ] {
@@ -824,7 +732,7 @@ description = "old entry"
     }
 
     #[test]
-    fn saving_legacy_config_drops_obsolete_agent_fields() {
+    fn incompatible_version_is_discarded() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -841,71 +749,42 @@ mode = "ask"
 "#,
         )
         .expect("write");
-        let config = Config::load(&path).expect("load ignored legacy fields");
-        config.save(&path).expect("save clean schema");
-        let body = std::fs::read_to_string(path).expect("read");
-        assert_eq!(body, "");
+        let config = Config::load(&path).expect("load incompatible config");
+        assert_eq!(config, Config::default());
     }
 
     #[test]
-    fn agent_enablement_roundtrips_and_defaults_on() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[acp]\nclaude = false\n\n[[acp.servers]]\nname = 'company'\ncommand = 'company-acp'\nenabled = false\n",
-        )
-        .expect("write");
-
-        let config = Config::load(&path).expect("load");
-        assert!(config.acp.codex);
-        assert!(!config.acp.claude);
-        assert!(config.acp.anvil);
-        assert!(config.acp.opencode);
-        assert!(!config.acp.servers[0].enabled);
-
-        config.save(&path).expect("save");
-        let body = std::fs::read_to_string(path).expect("read");
-        assert!(body.contains("claude = false"), "saved: {body}");
-        assert!(body.contains("enabled = false"), "saved: {body}");
-        assert!(!body.contains("codex = true"), "saved: {body}");
-    }
-
-    #[test]
-    fn shared_acp_server_selections_update_builtins_and_custom_servers() {
+    fn server_policies_update_builtins_and_configured_servers() {
         let mut config = Config {
             acp: AcpConfig {
-                servers: vec![CustomAcpServer {
-                    name: "company".to_string(),
+                servers: vec![ConfiguredAcpServer {
+                    id: "custom:company".to_string(),
+                    label: "company".to_string(),
                     command: PathBuf::from("company-acp"),
                     args: Vec::new(),
-                    enabled: true,
+                    env: HashMap::new(),
+                    origin: AcpServerOrigin::Custom,
+                    policy: AcpServerPolicy::Enabled,
                 }],
                 ..AcpConfig::default()
             },
             ..Config::default()
         };
 
-        let selections = config.acp_server_selections();
-        assert_eq!(selections[0].id, "codex-acp");
-        assert_eq!(selections[4].id, "custom:company");
-        assert!(config.set_acp_server_enabled("codex-acp", false));
-        assert!(config.set_acp_server_enabled("custom:company", false));
-        assert!(!config.set_acp_server_enabled("custom:missing", false));
-        assert!(!config.acp.codex);
-        assert!(!config.acp.servers[0].enabled);
+        assert!(config.set_acp_server_policy("codex-acp", AcpServerPolicy::Disabled));
+        assert!(config.set_acp_server_policy("custom:company", AcpServerPolicy::Disabled));
+        assert!(!config.set_acp_server_policy("custom:missing", AcpServerPolicy::Disabled));
+        assert_eq!(config.acp.policy("codex-acp"), AcpServerPolicy::Disabled);
+        assert_eq!(config.acp.servers[0].policy, AcpServerPolicy::Disabled);
     }
 
     #[test]
-    fn empty_config_serializes_as_blank() {
+    fn default_config_serializes_only_its_version() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         Config::default().save(&path).expect("save");
         let body = std::fs::read_to_string(&path).expect("read");
-        assert!(
-            !body.contains("models") && !body.contains("custom_agents"),
-            "blank config should not write legacy fields: {body:?}"
-        );
+        assert!(body.contains("version = 2"), "config: {body:?}");
         assert!(
             !body.contains("theme"),
             "default theme should not be serialized: {body:?}"

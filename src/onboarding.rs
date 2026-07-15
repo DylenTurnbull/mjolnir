@@ -22,24 +22,31 @@ pub enum Outcome {
 pub async fn run(
     terminal: &mut Terminal<TrackedBackend<Stdout>>,
     config: Config,
-    council: ResolvedCouncil,
+    council: Option<ResolvedCouncil>,
     notice: Option<String>,
 ) -> Result<Outcome> {
-    let active_models = crate::config::ModelsConfig {
-        thor: council.thor.model.model.clone(),
-        eitri: council
-            .eitri
-            .as_ref()
-            .map(|role| role.model.model.clone())
-            .unwrap_or_else(|| "off".to_string()),
-        loki: council
-            .loki
-            .as_ref()
-            .map(|role| role.model.model.clone())
-            .unwrap_or_else(|| "off".to_string()),
-    };
-    let mut editor =
-        SettingsEditor::new(config, council.choices, notice).with_active_models(active_models);
+    let inventory = council
+        .as_ref()
+        .map(|council| council.inventory.clone())
+        .unwrap_or_else(|| crate::council::discover_inventory(&config));
+    let choices = council
+        .as_ref()
+        .map(|council| council.choices.clone())
+        .unwrap_or_default();
+    let mut editor = SettingsEditor::new(config, choices, notice).with_inventory(inventory);
+    if let Some(council) = council {
+        editor = editor.with_active_models(crate::config::ModelsConfig {
+            thor: council.thor.model.model,
+            eitri: council
+                .eitri
+                .map(|role| role.model.model)
+                .unwrap_or_else(|| "off".to_string()),
+            loki: council
+                .loki
+                .map(|role| role.model.model)
+                .unwrap_or_else(|| "off".to_string()),
+        });
+    }
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     terminal
@@ -55,7 +62,7 @@ pub async fn run(
                     return Ok(outcome);
                 }
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => editor.poll_background(),
         }
         terminal.draw(|frame| {
             draw_settings_panel(frame, frame.area(), &editor, "Welcome to Mjolnir")
@@ -71,11 +78,15 @@ fn handle_event(editor: &mut SettingsEditor, event: CtEvent) -> Option<Outcome> 
         return None;
     }
     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+        editor.cancel_background();
         return Some(Outcome::Cancel);
     }
     match editor.handle_key(key.code) {
         SettingsAction::Save => Some(Outcome::Accept(Box::new(editor.config.clone()))),
-        SettingsAction::Cancel => Some(Outcome::Cancel),
+        SettingsAction::Cancel => {
+            editor.cancel_background();
+            Some(Outcome::Cancel)
+        }
         SettingsAction::None | SettingsAction::Changed => None,
     }
 }
@@ -128,6 +139,7 @@ mod tests {
                 ranked: true,
             }],
             warnings: Vec::new(),
+            inventory: crate::council::AcpInventory::default(),
         }
     }
 

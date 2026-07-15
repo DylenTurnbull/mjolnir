@@ -484,6 +484,7 @@ pub struct UiRunOptions<'a> {
     /// The ACP session cwd; `/ragnarok` battles are rooted here.
     pub session_cwd: PathBuf,
     pub council_choices: Vec<crate::council::ModelChoice>,
+    pub council_inventory: crate::council::AcpInventory,
     pub council_models: crate::config::ModelsConfig,
     pub active_council_models: crate::config::ModelsConfig,
     pub thor_review_enabled: bool,
@@ -513,6 +514,7 @@ struct UiInitialState {
     session_boundary: Option<String>,
     session_cwd: PathBuf,
     council_choices: Vec<crate::council::ModelChoice>,
+    council_inventory: crate::council::AcpInventory,
     council_models: crate::config::ModelsConfig,
     active_council_models: crate::config::ModelsConfig,
     thor_review_enabled: bool,
@@ -574,6 +576,7 @@ pub async fn run(
             session_boundary: options.session_boundary,
             session_cwd: options.session_cwd,
             council_choices: options.council_choices,
+            council_inventory: options.council_inventory,
             council_models: options.council_models,
             active_council_models: options.active_council_models,
             thor_review_enabled: options.thor_review_enabled,
@@ -766,6 +769,7 @@ async fn ui_loop(
     state.active_agent_launch = initial.active_agent_launch;
     state.session_cwd = initial.session_cwd;
     state.council_choices = initial.council_choices;
+    state.council_inventory = initial.council_inventory;
     state.council_models = initial.council_models;
     state.active_council_models = initial.active_council_models;
     state.thor_review_enabled = initial.thor_review_enabled;
@@ -977,6 +981,7 @@ async fn ui_loop(
                 }
             }
             _ = redraw_tick.tick() => {
+                state.poll_mjconfig_background();
                 if flush_input_paste_burst_if_due(&mut state, Instant::now(), false) {
                     pending_redraw.mark_interactive();
                 }
@@ -985,6 +990,7 @@ async fn ui_loop(
                 }
             }
             _ = animation_tick.tick() => {
+                state.poll_mjconfig_background();
                 if timer_driven_live_redraw(mode, &state) {
                     pending_redraw.mark_animation();
                 }
@@ -3593,6 +3599,7 @@ fn persist_mjconfig_selection(
         match config.save(&path) {
             Ok(()) => {
                 state.council_models = config.role_models();
+                state.council_inventory = crate::council::discover_inventory(&config);
                 state.thor_review_enabled = config.thor.discrete_review;
                 if thor_changed {
                     let _ = cmd_tx.send(UiCommand::SetThorReviewPolicy {
@@ -12341,7 +12348,10 @@ mod tests {
         let saved = config::Config::load(&path).expect("load saved config");
         assert_eq!(saved.spinner, previewed);
         assert_eq!(saved.theme, previewed_theme);
-        assert!(!saved.acp.codex);
+        assert_eq!(
+            saved.acp.policy("codex-acp"),
+            crate::config::AcpServerPolicy::Disabled
+        );
         assert!(!saved.thor.discrete_review);
         assert!(matches!(
             cmd_rx.try_recv(),

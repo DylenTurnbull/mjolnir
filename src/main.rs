@@ -5,6 +5,7 @@
 //! a ratatui chat UI.
 
 mod acp;
+mod anvil;
 mod app;
 mod archive;
 mod claude_usage;
@@ -16,6 +17,7 @@ mod council;
 mod deepswe;
 mod event;
 mod headless;
+mod install;
 mod labels;
 mod loki;
 mod menu;
@@ -28,6 +30,7 @@ mod probe;
 mod qr;
 mod ragnarok;
 mod ragnarok_sprites;
+mod registry;
 mod remote;
 mod self_update;
 mod session;
@@ -160,6 +163,10 @@ struct Cli {
     /// Skip the startup check for a newer mj release.
     #[arg(long, global = true, env = "MJOLNIR_NO_UPDATE_CHECK")]
     no_update_check: bool,
+
+    /// Use this Anvil development binary instead of bundled or managed Anvil.
+    #[arg(long, global = true, value_name = "PATH")]
+    anvil_path: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -340,6 +347,7 @@ fn should_run_startup_update_check(cli: &Cli) -> bool {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    anvil::configure_cli_override(cli.anvil_path.clone());
     init_logging(cli.log_file.as_deref())?;
     let fullscreen_tui = cli.fullscreen_tui;
 
@@ -608,7 +616,7 @@ async fn run_resume(
     let mut resume_council = if args.list {
         council::resolve(&cfg, &cwd).await?
     } else {
-        resolve_council_for_tui(&cfg, &cwd).await?
+        resolve_council_for_tui(&cfg, &cwd, false).await?
     };
     let mut agent = selected_agent_for_role(&resume_council.thor);
     if let Some(session_id) = args.session_id.as_deref()
@@ -986,13 +994,24 @@ fn apply_session_result_to_config(cfg: &mut Config, result: &RunSessionResult) {
     cfg.spinner = result.spinner_style;
 }
 
-async fn resolve_council_for_tui(cfg: &Config, cwd: &Path) -> Result<council::ResolvedCouncil> {
+async fn resolve_council_for_tui(
+    cfg: &Config,
+    cwd: &Path,
+    wait_for_installs: bool,
+) -> Result<council::ResolvedCouncil> {
+    let resolve = || async {
+        if wait_for_installs {
+            council::resolve_waiting_for_installs(cfg, cwd).await
+        } else {
+            council::resolve(cfg, cwd).await
+        }
+    };
     let mut stdout = std::io::stdout();
     if !stdout.is_terminal() {
-        return council::resolve(cfg, cwd).await;
+        return resolve().await;
     }
 
-    let mut resolution = Box::pin(council::resolve(cfg, cwd));
+    let mut resolution = Box::pin(resolve());
     let mut tick = tokio::time::interval(Duration::from_millis(125));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let started = Instant::now();
@@ -1049,23 +1068,26 @@ async fn run_app(
     initial_agent: Option<SelectedAgent>,
     mode: UiMode,
 ) -> Result<Option<String>> {
+    anvil::start_background_install();
     let config_path = config::default_config_path();
     let first_startup = should_open_first_startup(
-        config_path.exists(),
+        config::Config::path_has_current_version(&config_path),
         resume_target.as_ref(),
         initial_agent.as_ref(),
     );
     let mut cfg = Config::load(&config_path)?;
-    let mut council = resolve_council_for_tui(&cfg, &cwd).await?;
-    if first_startup {
+    let initial_resolution = resolve_council_for_tui(&cfg, &cwd, false).await;
+    let mut council = if first_startup {
         let Some((accepted_config, accepted_council)) =
-            run_first_startup(cfg, council, &config_path, &cwd).await?
+            run_first_startup(cfg, initial_resolution.ok(), &config_path, &cwd).await?
         else {
             return Ok(None);
         };
         cfg = accepted_config;
-        council = accepted_council;
-    }
+        accepted_council
+    } else {
+        initial_resolution?
+    };
     if let Some(agent) = initial_agent.as_ref()
         && let Some(pinned) = council.available.iter().find(|role| {
             role.launch.command == agent.program
@@ -1120,7 +1142,7 @@ async fn run_app(
             UiExitReason::Quit => return Ok(session_result.session_id),
             UiExitReason::NewSession => {
                 cfg = Config::load(&config_path)?;
-                council = resolve_council_for_tui(&cfg, &cwd).await?;
+                council = resolve_council_for_tui(&cfg, &cwd, true).await?;
                 council_agent = selected_agent_for_role(&council.thor);
                 initial_agent = Some(council_agent.clone());
                 pending_new_session_boundary = true;
@@ -1200,7 +1222,7 @@ fn should_open_first_startup(
 
 async fn run_first_startup(
     mut candidate: Config,
-    preview: council::ResolvedCouncil,
+    mut preview: Option<council::ResolvedCouncil>,
     config_path: &Path,
     cwd: &Path,
 ) -> Result<Option<(Config, council::ResolvedCouncil)>> {
@@ -1212,7 +1234,7 @@ async fn run_first_startup(
             return Ok(None);
         };
         let next = *next;
-        match resolve_council_for_tui(&next, cwd).await {
+        match resolve_council_for_tui(&next, cwd, true).await {
             Ok(resolved) => {
                 next.save(config_path)
                     .with_context(|| format!("save {}", config_path.display()))?;
@@ -1220,6 +1242,7 @@ async fn run_first_startup(
             }
             Err(error) => {
                 candidate = next;
+                preview = None;
                 notice = Some(format!("Configuration is not launchable: {error:#}"));
             }
         }
@@ -1228,7 +1251,7 @@ async fn run_first_startup(
 
 async fn run_onboarding_once(
     config: Config,
-    council: council::ResolvedCouncil,
+    council: Option<council::ResolvedCouncil>,
     notice: Option<String>,
 ) -> Result<onboarding::Outcome> {
     let mut terminal = ui::setup_fullscreen_terminal().context("setup onboarding terminal")?;
@@ -2008,6 +2031,7 @@ async fn run_session(
                 session_boundary: session_boundary.take(),
                 session_cwd: cwd.clone(),
                 council_choices: council.choices.clone(),
+                council_inventory: council.inventory.clone(),
                 council_models: config::Config::load(&config_path)
                     .map(|config| config.role_models())
                     .unwrap_or_default(),
@@ -2566,6 +2590,7 @@ mod tests {
             available: vec![codex, claude],
             choices: Vec::new(),
             warnings: Vec::new(),
+            inventory: council::AcpInventory::default(),
         };
 
         assert!(select_primary_agent(&mut council, 1));

@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::{StreamExt, stream};
 
-use crate::config::Config;
+use crate::config::{AcpServerOrigin, AcpServerPolicy, Config};
 use crate::deepswe::{self, Row};
 use crate::{model_resolve, probe};
 
@@ -62,6 +62,27 @@ pub struct ResolvedCouncil {
     pub available: Vec<ResolvedRole>,
     pub choices: Vec<ModelChoice>,
     pub warnings: Vec<String>,
+    pub inventory: AcpInventory,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AcpInventory {
+    pub servers: Vec<AcpServerInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcpServerInfo {
+    pub id: String,
+    pub label: String,
+    pub policy: AcpServerPolicy,
+    pub detected: bool,
+    pub selected: bool,
+    pub evidence: String,
+    pub launch: AdapterLaunch,
+    pub model_count: usize,
+    pub error: Option<String>,
+    pub installing: bool,
+    pub origin: Option<AcpServerOrigin>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,7 +109,7 @@ impl Availability {
         Self {
             codex_credentials: codex_credentials_available(),
             claude_credentials: claude_credentials_available(),
-            anvil: find_on_path("anvil"),
+            anvil: crate::anvil::detect().path,
             opencode: find_on_path("opencode"),
         }
     }
@@ -97,9 +118,7 @@ impl Availability {
         match adapter_kind(model) {
             AdapterKind::Codex if !self.codex_credentials => Some("Codex credentials not found"),
             AdapterKind::Claude if !self.claude_credentials => Some("Claude credentials not found"),
-            AdapterKind::Anvil if self.anvil.is_none() => {
-                Some("anvil executable not found on PATH")
-            }
+            AdapterKind::Anvil if self.anvil.is_none() => Some("managed Anvil is not ready"),
             AdapterKind::OpenCode if self.opencode.is_none() => {
                 Some("opencode executable not found on PATH")
             }
@@ -127,6 +146,10 @@ fn credential_file_has_any(path: &Path, pointers: &[&str]) -> bool {
             .and_then(serde_json::Value::as_str)
             .is_some_and(|value| !value.trim().is_empty())
     })
+}
+
+fn credential_file_evidence(path: &Path, pointers: &[&str]) -> Option<String> {
+    credential_file_has_any(path, pointers).then(|| path.display().to_string())
 }
 
 fn codex_credentials_available() -> bool {
@@ -165,6 +188,44 @@ fn claude_credentials_available() -> bool {
             &["/claudeAiOauth/accessToken", "/claudeAiOauth/refreshToken"],
         )
     })
+}
+
+fn codex_detection() -> Option<String> {
+    for name in ["CODEX_API_KEY", "OPENAI_API_KEY"] {
+        if nonempty_env(&[name]) {
+            return Some(format!("{name} is set"));
+        }
+    }
+    let root = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?;
+    credential_file_evidence(
+        &root.join("auth.json"),
+        &[
+            "/OPENAI_API_KEY",
+            "/tokens/access_token",
+            "/tokens/refresh_token",
+        ],
+    )
+}
+
+fn claude_detection() -> Option<String> {
+    for name in [
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+    ] {
+        if nonempty_env(&[name]) {
+            return Some(format!("{name} is set"));
+        }
+    }
+    let root = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))?;
+    credential_file_evidence(
+        &root.join(".credentials.json"),
+        &["/claudeAiOauth/accessToken", "/claudeAiOauth/refreshToken"],
+    )
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -239,6 +300,99 @@ fn launch_for(kind: AdapterKind) -> AdapterLaunch {
         },
         AdapterKind::Custom => unreachable!("custom launches come from configuration"),
     }
+}
+
+pub fn discover_inventory(config: &Config) -> AcpInventory {
+    let availability = Availability::detect();
+    let anvil = crate::anvil::detect();
+    let detections = [
+        (
+            AdapterKind::Codex,
+            codex_detection(),
+            "Codex credentials not found".to_string(),
+        ),
+        (
+            AdapterKind::Claude,
+            claude_detection(),
+            "Claude credentials not found".to_string(),
+        ),
+        (
+            AdapterKind::Anvil,
+            availability.anvil.as_ref().map(|_| anvil.evidence.clone()),
+            anvil.evidence.clone(),
+        ),
+        (
+            AdapterKind::OpenCode,
+            availability
+                .opencode
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            "opencode executable not found on PATH".to_string(),
+        ),
+    ];
+    let mut servers = detections
+        .into_iter()
+        .map(|(kind, evidence, missing)| {
+            let launch = launch_for(kind);
+            let policy = config.acp.policy(&launch.source_id);
+            let detected = evidence.is_some();
+            AcpServerInfo {
+                id: launch.source_id.clone(),
+                label: kind.display_name().to_string(),
+                policy,
+                detected,
+                selected: policy == AcpServerPolicy::Enabled
+                    || (policy == AcpServerPolicy::Auto && detected),
+                evidence: evidence.unwrap_or(missing),
+                launch,
+                model_count: 0,
+                error: None,
+                installing: kind == AdapterKind::Anvil && anvil.installing,
+                origin: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let configured_ids = config
+        .acp
+        .servers
+        .iter()
+        .map(|server| server.id.as_str())
+        .collect::<HashSet<_>>();
+    servers.retain(|server| !configured_ids.contains(server.id.as_str()));
+    servers.extend(config.acp.servers.iter().map(|server| {
+        let selected = server.policy == AcpServerPolicy::Enabled;
+        AcpServerInfo {
+            id: server.id.clone(),
+            label: server.label.clone(),
+            policy: server.policy,
+            detected: true,
+            selected,
+            evidence: match server.origin {
+                AcpServerOrigin::Registry => "installed from ACP registry".to_string(),
+                AcpServerOrigin::Custom => "custom command".to_string(),
+            },
+            launch: AdapterLaunch {
+                kind: AdapterKind::Custom,
+                source_id: server.id.clone(),
+                command: server.command.clone(),
+                args: server.args.clone(),
+                env: server.env.clone(),
+            },
+            model_count: 0,
+            error: None,
+            installing: false,
+            origin: Some(server.origin),
+        }
+    }));
+    if let Some(server) = servers.iter_mut().find(|server| server.id == "anvil") {
+        server.error = anvil.error;
+        if let Some(path) = availability.anvil {
+            server.launch.command = path;
+        } else if let Some(path) = crate::anvil::managed_path() {
+            server.launch.command = path;
+        }
+    }
+    AcpInventory { servers }
 }
 
 type ProbeResult = std::result::Result<probe::AdapterCapabilities, String>;
@@ -396,71 +550,13 @@ fn resolve_probes(rows: &[Row], mut probes: Vec<(usize, AdapterLaunch, ProbeResu
     }
 }
 
-fn configured_launches(config: &Config, availability: &Availability) -> Vec<AdapterLaunch> {
-    let mut launches = config
-        .acp
+fn configured_launches(inventory: &AcpInventory) -> Vec<AdapterLaunch> {
+    inventory
         .servers
         .iter()
-        .filter(|server| server.enabled)
-        .map(|server| AdapterLaunch {
-            kind: AdapterKind::Custom,
-            source_id: format!("custom:{}", server.name),
-            command: server.command.clone(),
-            args: server.args.clone(),
-            env: HashMap::new(),
-        })
-        .collect::<Vec<_>>();
-    if config.acp.codex && availability.codex_credentials {
-        launches.push(launch_for(AdapterKind::Codex));
-    }
-    if config.acp.claude && availability.claude_credentials {
-        launches.push(launch_for(AdapterKind::Claude));
-    }
-    if config.acp.anvil && availability.anvil.is_some() {
-        launches.push(launch_for(AdapterKind::Anvil));
-    }
-    if config.acp.opencode && availability.opencode.is_some() {
-        launches.push(launch_for(AdapterKind::OpenCode));
-    }
-    launches
-}
-
-fn missing_enabled_adapter_errors(
-    config: &Config,
-    availability: &Availability,
-) -> HashMap<String, String> {
-    let mut errors = HashMap::new();
-    for (enabled, missing, kind, reason) in [
-        (
-            config.acp.codex,
-            !availability.codex_credentials,
-            AdapterKind::Codex,
-            "Codex credentials not found",
-        ),
-        (
-            config.acp.claude,
-            !availability.claude_credentials,
-            AdapterKind::Claude,
-            "Claude credentials not found",
-        ),
-        (
-            config.acp.anvil,
-            availability.anvil.is_none(),
-            AdapterKind::Anvil,
-            "anvil executable not found on PATH",
-        ),
-        (
-            config.acp.opencode,
-            availability.opencode.is_none(),
-            AdapterKind::OpenCode,
-            "opencode executable not found on PATH",
-        ),
-    ] {
-        if enabled && missing {
-            errors.insert(launch_for(kind).source_id, reason.to_string());
-        }
-    }
-    errors
+        .filter(|server| server.selected)
+        .map(|server| server.launch.clone())
+        .collect()
 }
 
 fn custom_model_id(source_id: &str, model_value: &str) -> String {
@@ -488,13 +584,8 @@ fn credentialed_provider_capabilities(
     })
 }
 
-async fn discover_available(
-    config: &Config,
-    rows: &[Row],
-    availability: &Availability,
-    cwd: &Path,
-) -> Discovery {
-    let launches = configured_launches(config, availability);
+async fn discover_available(rows: &[Row], inventory: &AcpInventory, cwd: &Path) -> Discovery {
+    let launches = configured_launches(inventory);
     let probes = stream::iter(launches.into_iter().enumerate().map(|(priority, launch)| {
         let cwd = cwd.to_path_buf();
         let credentialed = credentialed_provider_capabilities(&launch, rows);
@@ -513,11 +604,7 @@ async fn discover_available(
     .collect::<Vec<_>>()
     .await;
 
-    let mut discovery = resolve_probes(rows, probes);
-    discovery
-        .adapter_errors
-        .extend(missing_enabled_adapter_errors(config, availability));
-    discovery
+    resolve_probes(rows, probes)
 }
 
 fn explicit<'a>(
@@ -622,26 +709,43 @@ fn unavailable_reason(
     adapter_errors: &HashMap<String, String>,
 ) -> String {
     let mut reasons = Vec::new();
-    for server in config.acp.servers.iter().filter(|server| server.enabled) {
-        let source = format!("custom:{}", server.name);
+    for server in config
+        .acp
+        .servers
+        .iter()
+        .filter(|server| server.policy == AcpServerPolicy::Enabled)
+    {
+        let source = server.id.clone();
         reasons.push(match adapter_errors.get(&source) {
-            Some(reason) => format!("{}: {reason}", server.name),
-            None => format!("{} did not advertise this model", server.name),
+            Some(reason) => format!("{}: {reason}", server.label),
+            None => format!("{} did not advertise this model", server.label),
         });
     }
     let native = adapter_kind(&row.model);
     let native_source = launch_for(native).source_id;
     let native_detected = match native {
-        AdapterKind::Codex => availability.codex_credentials,
-        AdapterKind::Claude => availability.claude_credentials,
-        AdapterKind::Anvil => true,
-        _ => false,
+        AdapterKind::Codex => {
+            availability.codex_credentials
+                || config.acp.policy("codex-acp") == AcpServerPolicy::Enabled
+        }
+        AdapterKind::Claude => {
+            availability.claude_credentials
+                || config.acp.policy("claude-acp") == AcpServerPolicy::Enabled
+        }
+        AdapterKind::Anvil => {
+            availability.anvil.is_some() || config.acp.policy("anvil") == AcpServerPolicy::Enabled
+        }
+        AdapterKind::OpenCode => {
+            availability.opencode.is_some()
+                || config.acp.policy("opencode-acp") == AcpServerPolicy::Enabled
+        }
+        AdapterKind::Custom => false,
     };
     let native_enabled = match native {
-        AdapterKind::Codex => config.acp.codex,
-        AdapterKind::Claude => config.acp.claude,
-        AdapterKind::Anvil => config.acp.anvil,
-        AdapterKind::OpenCode => config.acp.opencode,
+        AdapterKind::Codex => config.acp.policy("codex-acp") != AcpServerPolicy::Disabled,
+        AdapterKind::Claude => config.acp.policy("claude-acp") != AcpServerPolicy::Disabled,
+        AdapterKind::Anvil => config.acp.policy("anvil") != AcpServerPolicy::Disabled,
+        AdapterKind::OpenCode => config.acp.policy("opencode-acp") != AcpServerPolicy::Disabled,
         AdapterKind::Custom => true,
     };
     if !native_enabled {
@@ -654,13 +758,13 @@ fn unavailable_reason(
     } else if let Some(reason) = availability.missing_reason(&row.model) {
         reasons.push(reason.to_string());
     }
-    if native != AdapterKind::Anvil && config.acp.anvil {
+    if native != AdapterKind::Anvil && config.acp.policy("anvil") != AcpServerPolicy::Disabled {
         reasons.push(adapter_errors.get("anvil").map_or_else(
             || "anvil did not advertise this model".to_string(),
             |reason| format!("anvil: {reason}"),
         ));
     }
-    if config.acp.opencode {
+    if config.acp.policy("opencode-acp") != AcpServerPolicy::Disabled {
         if availability.opencode.is_some() {
             reasons.push(adapter_errors.get("opencode-acp").map_or_else(
                 || "opencode-acp did not advertise this model".to_string(),
@@ -676,6 +780,21 @@ fn unavailable_reason(
 }
 
 pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
+    resolve_inner(config, cwd).await
+}
+
+pub async fn resolve_waiting_for_installs(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
+    if config.acp.policy("anvil") != AcpServerPolicy::Disabled
+        && crate::anvil::detect().path.is_none()
+    {
+        crate::anvil::wait_until_ready()
+            .await
+            .context("install managed Anvil")?;
+    }
+    resolve_inner(config, cwd).await
+}
+
+async fn resolve_inner(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
     let leaderboard = deepswe::load(
         &deepswe::default_cache_path(),
         deepswe::CACHE_TTL,
@@ -684,7 +803,16 @@ pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
     .await;
     let rows = deepswe::eligible_high(&leaderboard.rows);
     let availability = Availability::detect();
-    let discovery = discover_available(config, &rows, &availability, cwd).await;
+    let mut inventory = discover_inventory(config);
+    let discovery = discover_available(&rows, &inventory, cwd).await;
+    for server in &mut inventory.servers {
+        server.model_count = discovery
+            .available
+            .iter()
+            .filter(|role| role.launch.source_id == server.id)
+            .count();
+        server.error = discovery.adapter_errors.get(&server.id).cloned();
+    }
     let available = discovery.available;
     let mut choices = rows
         .iter()
@@ -781,6 +909,7 @@ pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
         available,
         choices,
         warnings,
+        inventory,
     })
 }
 
@@ -879,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn anvil_launch_requires_installed_binary() {
+    fn anvil_launch_uses_inventory_resolved_binary() {
         let launch = launch_for(AdapterKind::Anvil);
         assert_eq!(launch.command, PathBuf::from("anvil"));
         assert!(launch.args.is_empty());
@@ -911,67 +1040,69 @@ mod tests {
     #[test]
     fn configured_launches_exclude_disabled_adapters() {
         let mut config = Config::default();
-        config.acp.codex = false;
-        config.acp.opencode = false;
-        config.acp.servers.push(crate::config::CustomAcpServer {
-            name: "disabled".to_string(),
+        config.set_acp_server_policy("codex-acp", AcpServerPolicy::Disabled);
+        config.set_acp_server_policy("opencode-acp", AcpServerPolicy::Disabled);
+        config.acp.servers.push(crate::config::ConfiguredAcpServer {
+            id: "custom:disabled".to_string(),
+            label: "disabled".to_string(),
             command: PathBuf::from("disabled-acp"),
             args: Vec::new(),
-            enabled: false,
+            env: HashMap::new(),
+            origin: AcpServerOrigin::Custom,
+            policy: AcpServerPolicy::Disabled,
         });
-        config.acp.servers.push(crate::config::CustomAcpServer {
-            name: "enabled".to_string(),
+        config.acp.servers.push(crate::config::ConfiguredAcpServer {
+            id: "custom:enabled".to_string(),
+            label: "enabled".to_string(),
             command: PathBuf::from("enabled-acp"),
             args: Vec::new(),
-            enabled: true,
+            env: HashMap::new(),
+            origin: AcpServerOrigin::Custom,
+            policy: AcpServerPolicy::Enabled,
         });
-        let availability = Availability {
-            codex_credentials: true,
-            claude_credentials: true,
-            anvil: Some(PathBuf::from("anvil")),
-            opencode: Some(PathBuf::from("opencode")),
-        };
-
-        let ids = configured_launches(&config, &availability)
+        let mut inventory = discover_inventory(&config);
+        for server in &mut inventory.servers {
+            if matches!(server.id.as_str(), "claude-acp" | "anvil") {
+                server.detected = true;
+                server.selected = true;
+            }
+        }
+        let ids = configured_launches(&inventory)
             .into_iter()
             .map(|launch| launch.source_id)
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["custom:enabled", "claude-acp", "anvil"]);
+        assert!(ids.contains(&"custom:enabled".to_string()));
+        assert!(!ids.contains(&"custom:disabled".to_string()));
+        assert!(!ids.contains(&"codex-acp".to_string()));
     }
 
     #[test]
-    fn missing_enabled_adapters_report_errors_and_disabled_adapters_are_silent() {
+    fn explicit_policy_selects_a_builtin_without_detection() {
         let mut config = Config::default();
-        let availability = Availability {
-            codex_credentials: false,
-            claude_credentials: false,
-            anvil: None,
-            opencode: None,
-        };
+        config.set_acp_server_policy("anvil", AcpServerPolicy::Enabled);
+        let inventory = discover_inventory(&config);
+        let anvil = inventory
+            .servers
+            .iter()
+            .find(|server| server.id == "anvil")
+            .expect("anvil");
+        assert!(anvil.selected);
+        assert_eq!(anvil.policy, AcpServerPolicy::Enabled);
+    }
 
-        let errors = missing_enabled_adapter_errors(&config, &availability);
-        assert_eq!(
-            errors.get("codex-acp").map(String::as_str),
-            Some("Codex credentials not found")
+    #[test]
+    fn auto_misses_are_inventory_state_not_probe_errors() {
+        let mut config = Config::default();
+        for id in ["codex-acp", "claude-acp", "anvil", "opencode-acp"] {
+            config.set_acp_server_policy(id, AcpServerPolicy::Disabled);
+        }
+        let inventory = discover_inventory(&config);
+        assert!(
+            inventory
+                .servers
+                .iter()
+                .all(|server| server.error.is_none())
         );
-        assert_eq!(
-            errors.get("claude-acp").map(String::as_str),
-            Some("Claude credentials not found")
-        );
-        assert_eq!(
-            errors.get("anvil").map(String::as_str),
-            Some("anvil executable not found on PATH")
-        );
-        assert_eq!(
-            errors.get("opencode-acp").map(String::as_str),
-            Some("opencode executable not found on PATH")
-        );
-
-        config.acp.codex = false;
-        config.acp.claude = false;
-        config.acp.anvil = false;
-        config.acp.opencode = false;
-        assert!(missing_enabled_adapter_errors(&config, &availability).is_empty());
     }
 
     #[test]
@@ -1087,7 +1218,7 @@ mod tests {
         );
         assert_eq!(
             availability.missing_reason("glm-5-2"),
-            Some("anvil executable not found on PATH")
+            Some("managed Anvil is not ready")
         );
     }
 

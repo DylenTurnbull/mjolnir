@@ -47,7 +47,7 @@ Mjolnir discovers these built-in routes automatically:
 
 - Existing Codex credentials enable OpenAI models through `codex-acp`.
 - Existing Claude credentials enable Anthropic models through `claude-agent-acp`.
-- `anvil` on `PATH` enables models exposed by Anvil.
+- Pinned Anvil `0.22.0` is a managed pseudo-builtin and enables its exposed models.
 - `opencode` on `PATH` enables OpenCode through `opencode acp`.
 
 Council adapters must advertise ACP HTTP MCP support because Thor invokes
@@ -56,12 +56,19 @@ Codex and Claude discovery checks local credential files and supported token
 environment variables without launching either CLI or their npm ACP bridges.
 Explicit ACP routes are probed once per process; Mjolnir never logs API-key
 values and selects High reasoning when the adapter advertises that control.
+Interactive startup installs pinned Anvil in the background when no development
+override, bundled sibling, or managed copy is available. Resolution precedence
+is `--anvil-path`, `MJ_ANVIL_PATH`, an `anvil` sibling beside `mj`, then the
+managed copy under the platform data directory (`~/.local/share/mj/agents` on
+Linux). Development overrides are never updated or replaced.
 
 ## Council configuration
 
 The default is automatic model selection for every role:
 
 ```toml
+version = 2
+
 [thor]
 model = "auto"
 discrete_review = true
@@ -83,8 +90,14 @@ when no distinct qualifying choice exists. Set `model = "disabled"` under
 
 Use `/mjconfig` to configure Council models, ACP servers, review policy, and
 appearance. `/models` opens the same editor directly on the Council tab. Model
-and ACP server changes apply to the next session. Use `/reviews`, `/reviews thor
-on|off` to inspect or change Thor's discrete review policy.
+and ACP server changes apply to the next session. The ACP Servers tab explains
+why each built-in route was detected and shows its launch command. Its inline
+registry browser installs explicitly selected servers; binary distributions are
+owned under Mjolnir's platform data directory. Use `/reviews`, `/reviews thor on|off` to
+inspect or change Thor's discrete review policy.
+
+The config schema is versioned. A missing or incompatible `version` starts from
+fresh defaults instead of attempting field-by-field migration.
 
 For one non-interactive invocation, `--thor MODEL`, `--loki MODEL`, and
 `--eitri MODEL` override the saved Council selection when used with `--print`.
@@ -101,10 +114,14 @@ Custom servers are launched directly without a shell, inherit Mjolnir's
 environment, and run in the workspace directory:
 
 ```toml
+version = 2
+
 [[acp.servers]]
-name = "company"
+id = "custom:company"
+label = "company"
 command = "/opt/company/bin/acp-server"
 args = ["--stdio"]
+origin = "custom"
 ```
 
 Custom routes take precedence over built-ins in configuration order. Their
