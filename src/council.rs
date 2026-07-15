@@ -620,6 +620,12 @@ fn explicit<'a>(
         return Ok(candidate);
     }
     if selector.starts_with("custom/") {
+        if let Some(candidate) = available.iter().find(|candidate| {
+            candidate.launch.kind == AdapterKind::Custom
+                && custom_model_id(&candidate.launch.source_id, &candidate.model_value) == selector
+        }) {
+            return Ok(candidate);
+        }
         bail!("{role} model '{selector}' is unavailable from its configured custom ACP server");
     }
     if !rows.iter().any(|row| row.model == selector) {
@@ -1202,6 +1208,39 @@ mod tests {
         assert!(!role.ranked);
         assert_eq!(role.model.model, "custom/company/company/private-model");
         assert_eq!(role.model_value, "company/private-model");
+    }
+
+    #[test]
+    fn explicit_custom_selector_resolves_ranked_model_by_exact_advertised_value() {
+        let rows = vec![Row {
+            model: "kimi-k2-7-code".to_string(),
+            reasoning_effort: None,
+            pass_at_1: 0.3,
+            mean_cost_usd: 2.8,
+        }];
+        let discovery = resolve_probes(
+            &rows,
+            vec![(
+                0,
+                custom_launch("bpr-agent"),
+                capabilities(true, &["openrouter::moonshotai/kimi-k2.7-code"]),
+            )],
+        );
+
+        let resolved = explicit(
+            "Thor",
+            "custom/bpr-agent/openrouter::moonshotai/kimi-k2.7-code",
+            &rows,
+            &discovery.available,
+        )
+        .expect("exact custom selector");
+
+        assert_eq!(resolved.model.model, "kimi-k2-7-code");
+        assert_eq!(
+            resolved.model_value,
+            "openrouter::moonshotai/kimi-k2.7-code"
+        );
+        assert_eq!(resolved.launch.source_id, "custom:bpr-agent");
     }
 
     #[test]
