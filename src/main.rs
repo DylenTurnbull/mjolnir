@@ -84,7 +84,14 @@ struct Cli {
     /// the prompt as the optional value, or omit the value/read `-` to read
     /// stdin. Headless mode uses the configured agent from
     /// `~/.config/mj/config.toml`; it does not open the interactive picker.
-    #[arg(short = 'p', long = "print", value_name = "PROMPT", num_args = 0..=1, default_missing_value = "-")]
+    #[arg(
+        short = 'p',
+        long = "print",
+        value_name = "PROMPT",
+        num_args = 0..=1,
+        default_missing_value = "-",
+        allow_hyphen_values = true
+    )]
     print: Option<String>,
 
     /// Override Thor's model for this non-interactive invocation.
@@ -2594,6 +2601,17 @@ mod tests {
         assert_eq!(cli.thor.as_deref(), Some("gpt-test"));
         assert_eq!(cli.loki.as_deref(), Some(config::DISABLED_MODEL));
         assert_eq!(cli.eitri.as_deref(), Some(config::DISABLED_MODEL));
+    }
+
+    #[test]
+    fn parse_accepts_role_overrides_after_stdin_print_sentinel() {
+        let cli =
+            Cli::try_parse_from(["mj", "--print", "-", "--thor", "gpt-test", "--loki", "disabled"])
+                .expect("parse role overrides after stdin sentinel");
+
+        assert_eq!(cli.print.as_deref(), Some("-"));
+        assert_eq!(cli.thor.as_deref(), Some("gpt-test"));
+        assert_eq!(cli.loki.as_deref(), Some(config::DISABLED_MODEL));
     }
 
     #[test]
