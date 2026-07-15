@@ -323,22 +323,56 @@ impl RuntimeSessionState {
 
 #[derive(Debug)]
 struct PrimaryPolicyState {
+    enabled: bool,
     append_to_next_prompt: bool,
+    context_usage: Arc<ContextUsageTracker>,
 }
 
 impl PrimaryPolicyState {
-    fn new(code_agent_enabled: bool, resumed: bool) -> Self {
+    fn new(code_agent_enabled: bool, context_usage: Arc<ContextUsageTracker>) -> Self {
         Self {
-            append_to_next_prompt: code_agent_enabled && !resumed,
+            enabled: code_agent_enabled,
+            append_to_next_prompt: code_agent_enabled,
+            context_usage,
         }
     }
 
     fn take_for_prompt(&mut self) -> bool {
-        std::mem::take(&mut self.append_to_next_prompt)
+        let compacted = self.context_usage.take_reinjection_needed();
+        (std::mem::take(&mut self.append_to_next_prompt) || compacted) && self.enabled
     }
 
     fn loaded_existing_session(&mut self) {
-        self.append_to_next_prompt = false;
+        self.context_usage.reset_for_session();
+        self.append_to_next_prompt = self.enabled;
+    }
+}
+
+/// ACP does not expose a dedicated compaction notification. A decrease in the
+/// reported number of tokens currently in context is the portable signal that
+/// the agent replaced its history with a compacted one. A false positive only
+/// costs one redundant policy suffix on the next user prompt.
+#[derive(Debug, Default)]
+struct ContextUsageTracker {
+    last_used: AtomicU64,
+    reinjection_needed: AtomicBool,
+}
+
+impl ContextUsageTracker {
+    fn observe(&self, used: u64) {
+        let previous = self.last_used.swap(used, Ordering::AcqRel);
+        if previous > 0 && used < previous {
+            self.reinjection_needed.store(true, Ordering::Release);
+        }
+    }
+
+    fn reset_for_session(&self) {
+        self.last_used.store(0, Ordering::Release);
+        self.reinjection_needed.store(false, Ordering::Release);
+    }
+
+    fn take_reinjection_needed(&self) -> bool {
+        self.reinjection_needed.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -1439,6 +1473,8 @@ where
     let terminal_metadata_bridge = Arc::new(Mutex::new(TerminalMetadataBridge::default()));
     let notif_terminal_metadata_bridge = terminal_metadata_bridge.clone();
     let notification_role = role_config.clone();
+    let context_usage = Arc::new(ContextUsageTracker::default());
+    let notif_context_usage = context_usage.clone();
     let read_filesystem = filesystem.clone();
     let write_filesystem = filesystem.clone();
     let create_terminals = terminals.clone();
@@ -1463,6 +1499,9 @@ where
                         .observe(&notification.session_id, &notification.update);
                     for snapshot in terminal_snapshots {
                         let _ = notif_ui_tx.send(UiEvent::TerminalOutput(snapshot));
+                    }
+                    if let SessionUpdate::UsageUpdate(usage) = &notification.update {
+                        notif_context_usage.observe(usage.used);
                     }
                     if let Some(role) = notification_role.as_ref()
                         && let Some(council_session) = role.council_session.as_deref()
@@ -1632,6 +1671,7 @@ where
                 role_config,
                 code_agent,
                 drive_code_agent_controller,
+                context_usage,
             )
             .await
             {
@@ -1672,6 +1712,7 @@ async fn drive_session(
     role_config: Option<RuntimeRoleConfig>,
     code_agent: Option<code_agent::Config>,
     code_agent_controller: code_agent::Controller,
+    context_usage: Arc<ContextUsageTracker>,
 ) -> Result<()> {
     // Advertise the client capabilities backed by handlers registered in
     // `drive_client` above.
@@ -1881,9 +1922,11 @@ async fn drive_session(
         emit_fatal(ui_tx, &fatal_emitted, text.clone());
         return Err(anyhow::anyhow!(text));
     }
-    // A new Thor session receives its policy as a suffix on the first real
-    // user message. A resumed/loaded session is never modified implicitly.
-    let mut primary_policy = PrimaryPolicyState::new(code_agent_http.is_some(), resumed);
+    // Thor's policy rides as a suffix on the first real user message of any
+    // session (new, resumed, or loaded) and again after a detected context
+    // compaction, so the delegation contract survives history replacement.
+    context_usage.reset_for_session();
+    let mut primary_policy = PrimaryPolicyState::new(code_agent_http.is_some(), context_usage);
     if !resumed && !saved_session_config.is_empty() {
         apply_saved_session_config(
             &conn,
@@ -4609,24 +4652,57 @@ mod tests {
 
     #[test]
     fn primary_policy_is_appended_once_for_a_new_session() {
-        let mut policy = PrimaryPolicyState::new(true, false);
+        let mut policy = PrimaryPolicyState::new(true, Arc::default());
 
         assert!(policy.take_for_prompt());
         assert!(!policy.take_for_prompt());
     }
 
     #[test]
-    fn primary_policy_is_not_appended_when_resuming() {
-        let mut policy = PrimaryPolicyState::new(true, true);
+    fn loading_an_existing_session_rearms_the_policy() {
+        let mut policy = PrimaryPolicyState::new(true, Arc::default());
+        assert!(policy.take_for_prompt());
 
+        policy.loaded_existing_session();
+        assert!(policy.take_for_prompt());
         assert!(!policy.take_for_prompt());
     }
 
     #[test]
-    fn loading_an_existing_session_clears_a_pending_policy() {
-        let mut policy = PrimaryPolicyState::new(true, false);
+    fn context_usage_drop_requests_policy_reinjection() {
+        let usage = Arc::new(ContextUsageTracker::default());
+        let mut policy = PrimaryPolicyState::new(true, usage.clone());
+        assert!(policy.take_for_prompt());
 
-        policy.loaded_existing_session();
+        usage.observe(20_000);
+        usage.observe(24_000);
+        assert!(!policy.take_for_prompt());
+
+        usage.observe(7_000);
+        assert!(policy.take_for_prompt());
+        assert!(!policy.take_for_prompt());
+    }
+
+    #[test]
+    fn context_usage_reset_does_not_treat_new_session_as_compaction() {
+        let usage = ContextUsageTracker::default();
+        usage.observe(20_000);
+        usage.observe(7_000);
+        assert!(usage.take_reinjection_needed());
+
+        usage.reset_for_session();
+        usage.observe(2_000);
+        assert!(!usage.take_reinjection_needed());
+    }
+
+    #[test]
+    fn compaction_reinjection_is_suppressed_without_code_agent() {
+        let usage = Arc::new(ContextUsageTracker::default());
+        let mut policy = PrimaryPolicyState::new(false, usage.clone());
+        assert!(!policy.take_for_prompt());
+
+        usage.observe(20_000);
+        usage.observe(7_000);
         assert!(!policy.take_for_prompt());
     }
 
