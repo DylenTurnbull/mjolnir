@@ -698,6 +698,10 @@ pub struct AppState {
     pub code_agent_active: bool,
     /// Eitri identity currently holding the interactive UI/control lane.
     pub code_agent_label: Option<String>,
+    /// Number of read-only Eitri scouts currently running in the background.
+    pub active_explorations: usize,
+    exploration_entries: HashMap<u64, usize>,
+    pub council_usage: crate::council_usage::Snapshot,
     /// Transient status line with severity.
     pub status_line: Option<StatusMessage>,
     /// True while the local microphone dictation helper is running.
@@ -1019,6 +1023,9 @@ impl AppState {
             runtime_closed: false,
             code_agent_active: false,
             code_agent_label: None,
+            active_explorations: 0,
+            exploration_entries: HashMap::new(),
+            council_usage: crate::council_usage::Snapshot::default(),
             status_line: None,
             voice_input_active: false,
             voice_input_range: None,
@@ -2117,6 +2124,7 @@ impl AppState {
                 self.transcript.push(Entry::InternalMessage(message));
                 self.bump_transcript_revision();
             }
+            UiEvent::CouncilUsage(record) => self.council_usage.observe(record),
             UiEvent::PermissionRequest(prompt) => {
                 // Append to the queue rather than replacing the current
                 // pending prompt: overwriting would drop the prior
@@ -2233,6 +2241,37 @@ impl AppState {
                 self.code_agent_label = Some(label.clone());
                 self.code_agent_token_usage = TokenUsage::default();
                 self.set_status_line(StatusKind::Info, label);
+            }
+            CodeAgentEvent::ExplorationStarted { run_id, label } => {
+                let index = self.transcript.len();
+                self.transcript.push(Entry::System(format!(
+                    "{label} · explore #{run_id} · starting"
+                )));
+                self.exploration_entries.insert(run_id, index);
+                self.active_explorations = self.active_explorations.saturating_add(1);
+                self.bump_transcript_revision();
+            }
+            CodeAgentEvent::ExplorationProgress { run_id, activity } => {
+                if let Some(index) = self.exploration_entries.get(&run_id).copied()
+                    && let Some(Entry::System(text)) = self.transcript.get_mut(index)
+                {
+                    *text = format!("Eitri · explore #{run_id} · {activity}");
+                    self.bump_transcript_revision();
+                }
+            }
+            CodeAgentEvent::ExplorationFinished { run_id, outcome } => {
+                let status = match outcome {
+                    CodeAgentOutcome::Completed => "complete".to_string(),
+                    CodeAgentOutcome::Cancelled => "cancelled".to_string(),
+                    CodeAgentOutcome::Failed(message) => format!("failed · {message}"),
+                };
+                if let Some(index) = self.exploration_entries.remove(&run_id)
+                    && let Some(Entry::System(text)) = self.transcript.get_mut(index)
+                {
+                    *text = format!("Eitri · explore #{run_id} · {status}");
+                    self.bump_transcript_revision();
+                }
+                self.active_explorations = self.active_explorations.saturating_sub(1);
             }
             CodeAgentEvent::SessionUpdate(update) => self.apply_code_agent_update(update),
             CodeAgentEvent::TerminalOutput(mut snapshot) => {

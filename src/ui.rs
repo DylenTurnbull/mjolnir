@@ -712,6 +712,7 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::PromptDone { .. }
         | UiEvent::ClaudeUsage(_)
         | UiEvent::CodexUsage(_)
+        | UiEvent::CouncilUsage(_)
         | UiEvent::PromptFailed { .. }
         | UiEvent::SessionForkFailed { .. }
         | UiEvent::RemotePermissionDecision { .. }
@@ -3420,11 +3421,17 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         clear_attachments(state);
         state.input_cursor = 0;
         state.scroll_input_to_bottom();
+        let eitri = state.council_usage.eitri();
         state.push_system_message(format!(
-            "Council models\nThor   {}\nEitri  {}\nLoki   {}",
+            "Council models\nThor   {}\nEitri  {}\nLoki   {}\n\nUsage (tokens)\nThor   {}\nEitri  {} (code {}, explore {})\nLoki   {}",
             state.active_council_models.thor,
             state.active_council_models.eitri,
             state.active_council_models.loki,
+            council_role_usage_label(&state.council_usage.thor),
+            council_role_usage_label(&eitri),
+            council_role_usage_label(&state.council_usage.eitri_code),
+            council_role_usage_label(&state.council_usage.eitri_explore),
+            council_role_usage_label(&state.council_usage.loki),
         ));
         return;
     }
@@ -5084,6 +5091,13 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         ));
         spans.push(Span::raw("   "));
     }
+    if state.active_explorations > 0 {
+        spans.push(Span::styled(
+            format!("explore ×{}", state.active_explorations),
+            Style::default().fg(state.theme.tool),
+        ));
+        spans.push(Span::raw("   "));
+    }
     let project_label = state.project_label.trim();
     if !project_label.is_empty() {
         let max_width = match width {
@@ -5231,7 +5245,24 @@ fn token_usage_label(state: &AppState) -> String {
 }
 
 fn header_token_usage_label(state: &AppState, _width: usize) -> String {
+    let usage = &state.council_usage;
+    if usage.thor.prompts + usage.loki.prompts + usage.eitri().prompts > 0 {
+        return format!(
+            "T {} · L {} · E {}",
+            compact_count(usage.thor.total_tokens),
+            compact_count(usage.loki.total_tokens),
+            compact_count(usage.eitri().total_tokens),
+        );
+    }
     token_usage_label(state)
+}
+
+fn council_role_usage_label(usage: &crate::council_usage::RoleUsage) -> String {
+    let mut label = format!("{} tokens", usage.total_tokens);
+    for (currency, amount) in &usage.costs {
+        label.push_str(&format!(" · {amount:.4} {currency}"));
+    }
+    label
 }
 
 fn compact_count(value: u64) -> String {
@@ -12383,7 +12414,7 @@ mod tests {
         assert!(matches!(
             state.transcript.last(),
             Some(Entry::System(text))
-                if text == "Council models\nThor   claude-opus\nEitri  gpt-5.5\nLoki   off"
+                if text == "Council models\nThor   claude-opus\nEitri  gpt-5.5\nLoki   off\n\nUsage (tokens)\nThor   0 tokens\nEitri  0 tokens (code 0 tokens, explore 0 tokens)\nLoki   0 tokens"
         ));
     }
 

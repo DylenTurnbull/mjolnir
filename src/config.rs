@@ -127,14 +127,21 @@ impl Default for LokiConfig {
 pub struct EitriConfig {
     #[serde(default = "default_auto")]
     pub model: String,
+    #[serde(default = "default_max_parallel_explores")]
+    pub max_parallel_explores: usize,
 }
 
 impl Default for EitriConfig {
     fn default() -> Self {
         Self {
             model: default_auto(),
+            max_parallel_explores: default_max_parallel_explores(),
         }
     }
+}
+
+fn default_max_parallel_explores() -> usize {
+    6
 }
 
 impl EitriConfig {
@@ -350,6 +357,10 @@ impl Config {
         if self.eitri.model.eq_ignore_ascii_case("none") {
             self.eitri.model = DISABLED_MODEL.to_string();
         }
+        anyhow::ensure!(
+            self.eitri.max_parallel_explores <= 16,
+            "eitri.max_parallel_explores must be between 0 and 16"
+        );
 
         let mut names = std::collections::HashSet::new();
         for server in &mut self.acp.servers {

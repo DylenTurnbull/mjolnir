@@ -24,7 +24,7 @@ use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
-    SessionConfigOption, SessionUpdate, StopReason, ToolCallStatus, ToolKind,
+    SessionConfigOption, SessionUpdate, StopReason, ToolCallStatus, ToolKind, Usage, UsageUpdate,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -1160,6 +1160,8 @@ pub(crate) enum TurnEvent {
 pub(crate) struct TurnOutcome {
     pub text: String,
     pub stop: StopReason,
+    pub usage: Option<Usage>,
+    pub usage_update: Option<UsageUpdate>,
 }
 
 /// A live agent subprocess + session, driven over the same channel pair the
@@ -1462,6 +1464,7 @@ impl AgentHandle {
         let mut acc = String::new();
         let mut truncated = false;
         let mut known_tools: HashMap<String, (String, Option<ToolKind>)> = HashMap::new();
+        let mut latest_usage_update = None;
         loop {
             let ev = tokio::select! {
                 ev = self.events.recv() => ev,
@@ -1517,6 +1520,7 @@ impl AgentHandle {
                             started: false,
                         });
                     }
+                    SessionUpdate::UsageUpdate(update) => latest_usage_update = Some(update),
                     _ => {}
                 },
                 UiEvent::SessionConfigOptions { options, targets } => {
@@ -1531,13 +1535,15 @@ impl AgentHandle {
                 UiEvent::ElicitationRequest(e) => {
                     let _ = e.responder.send(ElicitationOutcome::Decline);
                 }
-                UiEvent::PromptDone { stop_reason, .. } => {
+                UiEvent::PromptDone { stop_reason, usage } => {
                     if truncated {
                         acc.push_str("\n…[output truncated]");
                     }
                     return Ok(TurnOutcome {
                         text: acc,
                         stop: stop_reason,
+                        usage,
+                        usage_update: latest_usage_update,
                     });
                 }
                 UiEvent::PromptFailed { message } => {

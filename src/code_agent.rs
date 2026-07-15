@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    HttpHeader, McpServer, McpServerHttp, SessionUpdate, StopReason,
+    HttpHeader, McpServer, McpServerHttp, SessionUpdate, StopReason, UsageUpdate,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::{Request, State};
@@ -38,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::acp::{self, AcpRuntimeConfig, RuntimeAccessMode};
 use crate::council::ResolvedRole;
+use crate::council_usage::{Purpose, Record, Role};
 use crate::event::{
     CodeAgentEvent, CodeAgentOutcome, InternalMessage, InternalMessageKind, UiCommand, UiEvent,
     content_block_text,
@@ -162,6 +163,7 @@ pub struct Config {
     pub role_config: Option<acp::RuntimeRoleConfig>,
     pub loki: Option<loki::Handle>,
     pub implementation_handoff_counter: Option<Arc<AtomicUsize>>,
+    pub max_parallel_explores: usize,
 }
 
 impl Config {
@@ -185,11 +187,17 @@ impl Config {
             }),
             loki,
             implementation_handoff_counter: None,
+            max_parallel_explores: 6,
         }
     }
 
     pub fn with_implementation_handoff_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
         self.implementation_handoff_counter = Some(counter);
+        self
+    }
+
+    pub fn with_max_parallel_explores(mut self, max: usize) -> Self {
+        self.max_parallel_explores = max.min(16);
         self
     }
 }
@@ -261,11 +269,11 @@ impl McpHandler {
                 None,
             ));
         }
-        if !self.controller.begin().await {
+        let Some(run_id) = self.controller.begin(RunKind::Code).await else {
             return Ok(CallToolResult::error(vec![Content::text(
-                "an Eitri run is already active",
+                "an Eitri implementation run is already active",
             )]));
-        }
+        };
 
         let result = run_boxed(
             self.config.clone(),
@@ -274,6 +282,7 @@ impl McpHandler {
             EitriPurpose::Code,
             self.ui_tx.clone(),
             self.controller.clone(),
+            run_id,
         )
         .await;
         let workspace_delta = result
@@ -304,11 +313,11 @@ impl McpHandler {
         if prompt.is_empty() {
             return Err(McpError::invalid_params("prompt must not be empty", None));
         }
-        if !self.controller.begin().await {
+        let Some(run_id) = self.controller.begin(RunKind::Explore).await else {
             return Ok(CallToolResult::error(vec![Content::text(
-                "an Eitri run is already active",
+                "the Eitri exploration pool is full or disabled",
             )]));
-        }
+        };
 
         let result = run_boxed(
             self.config.clone(),
@@ -317,6 +326,7 @@ impl McpHandler {
             EitriPurpose::Explore(args.thoroughness),
             self.ui_tx.clone(),
             self.controller.clone(),
+            run_id,
         )
         .await;
         Ok(match result.outcome {
@@ -376,6 +386,7 @@ impl HttpServer {
         ui_tx: mpsc::UnboundedSender<UiEvent>,
         controller: Controller,
     ) -> Result<Self> {
+        controller.configure(config.max_parallel_explores).await;
         let mut token_bytes = [0_u8; 32];
         getrandom::fill(&mut token_bytes)
             .map_err(|error| anyhow!("generate code-agent MCP bearer token: {error}"))?;
@@ -462,53 +473,103 @@ async fn require_bearer(
         Err((StatusCode::UNAUTHORIZED, "unauthorized"))
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunKind {
+    Code,
+    Explore,
+}
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 enum ActiveRun {
-    #[default]
-    Idle,
     Starting {
+        kind: RunKind,
         cancel_requested: bool,
         shutdown_requested: bool,
     },
     Running {
+        kind: RunKind,
         commands: mpsc::UnboundedSender<UiCommand>,
     },
 }
 
-/// Coordinates the one allowed Eitri foreground run. Thor remains suspended in
-/// its MCP request while UI cancellation is forwarded to this nested lane as
-/// well as to Thor's outer turn.
+#[derive(Debug)]
+struct ControllerState {
+    next_id: u64,
+    max_parallel_explores: usize,
+    runs: HashMap<u64, ActiveRun>,
+}
+
+impl Default for ControllerState {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            max_parallel_explores: 6,
+            runs: HashMap::new(),
+        }
+    }
+}
+
+/// Coordinates one implementation run and a bounded pool of read-only scouts.
 #[derive(Debug, Clone, Default)]
 pub struct Controller {
-    state: Arc<Mutex<ActiveRun>>,
+    state: Arc<Mutex<ControllerState>>,
 }
 
 impl Controller {
-    pub async fn begin(&self) -> bool {
-        let mut state = self.state.lock().await;
-        if !matches!(*state, ActiveRun::Idle) {
-            return false;
-        }
-        *state = ActiveRun::Starting {
-            cancel_requested: false,
-            shutdown_requested: false,
-        };
-        true
+    async fn configure(&self, max_parallel_explores: usize) {
+        self.state.lock().await.max_parallel_explores = max_parallel_explores.min(16);
     }
 
-    async fn attach(&self, commands: mpsc::UnboundedSender<UiCommand>) {
+    async fn begin(&self, kind: RunKind) -> Option<u64> {
         let mut state = self.state.lock().await;
-        let (cancel_requested, shutdown_requested) = match *state {
+        let allowed = match kind {
+            RunKind::Code => !state.runs.values().any(|run| run.kind() == RunKind::Code),
+            RunKind::Explore => {
+                let active = state
+                    .runs
+                    .values()
+                    .filter(|run| run.kind() == RunKind::Explore)
+                    .count();
+                active < state.max_parallel_explores
+            }
+        };
+        if !allowed {
+            return None;
+        }
+        let id = state.next_id;
+        state.next_id = state.next_id.saturating_add(1);
+        state.runs.insert(
+            id,
             ActiveRun::Starting {
-                cancel_requested,
-                shutdown_requested,
-            } => (cancel_requested, shutdown_requested),
-            _ => (false, false),
+                kind,
+                cancel_requested: false,
+                shutdown_requested: false,
+            },
+        );
+        Some(id)
+    }
+
+    async fn attach(&self, id: u64, commands: mpsc::UnboundedSender<UiCommand>) {
+        let mut state = self.state.lock().await;
+        let Some(run) = state.runs.remove(&id) else {
+            let _ = commands.send(UiCommand::Shutdown);
+            return;
         };
-        *state = ActiveRun::Running {
-            commands: commands.clone(),
+        let ActiveRun::Starting {
+            kind,
+            cancel_requested,
+            shutdown_requested,
+        } = run
+        else {
+            return;
         };
+        state.runs.insert(
+            id,
+            ActiveRun::Running {
+                kind,
+                commands: commands.clone(),
+            },
+        );
         if shutdown_requested {
             let _ = commands.send(UiCommand::Shutdown);
         } else if cancel_requested {
@@ -518,43 +579,50 @@ impl Controller {
 
     pub async fn cancel(&self) -> bool {
         let mut state = self.state.lock().await;
-        match &mut *state {
-            ActiveRun::Idle => false,
-            ActiveRun::Starting {
-                cancel_requested, ..
-            } => {
-                *cancel_requested = true;
-                true
-            }
-            ActiveRun::Running { commands } => {
-                let _ = commands.send(UiCommand::CancelPrompt);
-                true
+        let mut active = false;
+        for run in state.runs.values_mut() {
+            active = true;
+            match run {
+                ActiveRun::Starting {
+                    cancel_requested, ..
+                } => *cancel_requested = true,
+                ActiveRun::Running { commands, .. } => {
+                    let _ = commands.send(UiCommand::CancelPrompt);
+                }
             }
         }
+        active
     }
 
     pub async fn shutdown(&self) -> bool {
         let mut state = self.state.lock().await;
-        match &mut *state {
-            ActiveRun::Idle => false,
-            ActiveRun::Starting {
-                shutdown_requested, ..
-            } => {
-                *shutdown_requested = true;
-                true
-            }
-            ActiveRun::Running { commands } => {
-                let _ = commands.send(UiCommand::Shutdown);
-                true
+        let mut active = false;
+        for run in state.runs.values_mut() {
+            active = true;
+            match run {
+                ActiveRun::Starting {
+                    shutdown_requested, ..
+                } => *shutdown_requested = true,
+                ActiveRun::Running { commands, .. } => {
+                    let _ = commands.send(UiCommand::Shutdown);
+                }
             }
         }
+        active
     }
 
-    pub async fn finish(&self) {
-        *self.state.lock().await = ActiveRun::Idle;
+    async fn finish(&self, id: u64) {
+        self.state.lock().await.runs.remove(&id);
     }
 }
 
+impl ActiveRun {
+    fn kind(&self) -> RunKind {
+        match self {
+            Self::Starting { kind, .. } | Self::Running { kind, .. } => *kind,
+        }
+    }
+}
 struct AgentMessageCollector {
     last: String,
     message_open: bool,
@@ -593,6 +661,20 @@ impl AgentMessageCollector {
     }
 }
 
+fn exploration_activity(update: &SessionUpdate) -> Option<String> {
+    match update {
+        SessionUpdate::ToolCall(call) => Some(call.title.clone()),
+        SessionUpdate::ToolCallUpdate(update) => update.fields.title.clone().or_else(|| {
+            update
+                .fields
+                .status
+                .map(|status| format!("tool {status:?}"))
+        }),
+        SessionUpdate::Plan(_) => Some("planning exploration".to_string()),
+        _ => None,
+    }
+}
+
 struct EitriRunResult {
     outcome: Result<String>,
     workspace_delta: Option<WorkspaceDelta>,
@@ -605,8 +687,11 @@ fn run_boxed(
     purpose: EitriPurpose,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     controller: Controller,
+    run_id: u64,
 ) -> futures::future::BoxFuture<'static, EitriRunResult> {
-    Box::pin(run(config, context, task, purpose, ui_tx, controller))
+    Box::pin(run(
+        config, context, task, purpose, ui_tx, controller, run_id,
+    ))
 }
 
 async fn run(
@@ -616,6 +701,7 @@ async fn run(
     purpose: EitriPurpose,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     controller: Controller,
+    run_id: u64,
 ) -> EitriRunResult {
     let log_role = config.role_config.clone();
     if purpose.marks_implementation_delegation()
@@ -646,9 +732,16 @@ async fn run(
         kind: purpose.internal_message_kind(),
         text: task.clone(),
     }));
-    let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::Started {
-        label: display_label,
-    }));
+    let start_event = match purpose {
+        EitriPurpose::Code => CodeAgentEvent::Started {
+            label: display_label,
+        },
+        EitriPurpose::Explore(_) => CodeAgentEvent::ExplorationStarted {
+            run_id,
+            label: display_label,
+        },
+    };
+    let _ = ui_tx.send(UiEvent::CodeAgent(start_event));
 
     let invocation_snapshot = if purpose.marks_implementation_delegation() {
         let mut workspace_roots = Vec::with_capacity(1 + context.additional_directories.len());
@@ -661,9 +754,12 @@ async fn run(
 
     let (nested_event_tx, mut nested_event_rx) = mpsc::unbounded_channel();
     let (nested_cmd_tx, nested_cmd_rx) = mpsc::unbounded_channel();
-    controller.attach(nested_cmd_tx.clone()).await;
+    controller.attach(run_id, nested_cmd_tx.clone()).await;
 
-    let loki = config.loki.clone();
+    let loki = purpose
+        .marks_implementation_delegation()
+        .then(|| config.loki.clone())
+        .flatten();
     let runtime_config = AcpRuntimeConfig {
         command: config.command,
         args: config.args,
@@ -696,6 +792,7 @@ async fn run(
     let mut decisions = loki.as_ref().map(loki::Handle::subscribe);
     let mut tracker = loki::BoundaryTracker::default();
     let mut intervention = loki::DeferredIntervention::default();
+    let mut latest_usage_update: Option<UsageUpdate> = None;
     let result = loop {
         tokio::select! {
             joined = &mut runtime => {
@@ -750,25 +847,71 @@ async fn run(
                     }
                     UiEvent::SessionStarted { .. } | UiEvent::SessionConfigOptions { .. } => {}
                     UiEvent::SessionUpdate(update) => {
+                        if let SessionUpdate::UsageUpdate(value) = &update {
+                            latest_usage_update = Some(value.clone());
+                        }
                         collector.observe(&update);
-                        let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(update)));
+                        match purpose {
+                            EitriPurpose::Code => {
+                                let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(update)));
+                            }
+                            EitriPurpose::Explore(_) => {
+                                if let Some(activity) = exploration_activity(&update) {
+                                    let _ = ui_tx.send(UiEvent::CodeAgent(
+                                        CodeAgentEvent::ExplorationProgress { run_id, activity },
+                                    ));
+                                }
+                            }
+                        }
                     }
                     UiEvent::TerminalOutput(snapshot) => {
-                        let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::TerminalOutput(snapshot)));
+                        if matches!(purpose, EitriPurpose::Code) {
+                            let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::TerminalOutput(snapshot)));
+                        }
                     }
                     UiEvent::PermissionRequest(prompt) => {
-                        let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::PermissionRequest(prompt)));
+                        if matches!(purpose, EitriPurpose::Explore(_)) {
+                            let decision = crate::ragnarok::permission_decision_for_access(
+                                RuntimeAccessMode::ReadOnly,
+                                &prompt,
+                            );
+                            let _ = prompt.responder.send(decision);
+                        } else {
+                            let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::PermissionRequest(prompt)));
+                        }
                     }
                     UiEvent::ElicitationRequest(prompt) => {
-                        let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::ElicitationRequest(prompt)));
+                        if matches!(purpose, EitriPurpose::Explore(_)) {
+                            let _ = prompt.responder.send(crate::event::ElicitationOutcome::Decline);
+                        } else {
+                            let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::ElicitationRequest(prompt)));
+                        }
                     }
                     UiEvent::CancelPendingPermissions => {
-                        let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::CancelPendingPermissions));
+                        if matches!(purpose, EitriPurpose::Code) {
+                            let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::CancelPendingPermissions));
+                        }
                     }
                     UiEvent::Info(message) | UiEvent::Warning(message) => {
-                        let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::Status(message)));
+                        let event = match purpose {
+                            EitriPurpose::Code => CodeAgentEvent::Status(message),
+                            EitriPurpose::Explore(_) => CodeAgentEvent::ExplorationProgress {
+                                run_id,
+                                activity: message,
+                            },
+                        };
+                        let _ = ui_tx.send(UiEvent::CodeAgent(event));
                     }
-                    UiEvent::PromptDone { stop_reason, .. } => {
+                    UiEvent::PromptDone { stop_reason, usage } => {
+                        let _ = ui_tx.send(UiEvent::CouncilUsage(Record {
+                            role: Role::Eitri,
+                            purpose: Some(match purpose {
+                                EitriPurpose::Code => Purpose::Code,
+                                EitriPurpose::Explore(_) => Purpose::Explore,
+                            }),
+                            usage,
+                            update: latest_usage_update.take(),
+                        }));
                         if matches!(stop_reason, StopReason::Cancelled) {
                             if intervention.is_pending()
                                 && !intervention.cancellation_was_requested()
@@ -828,6 +971,7 @@ async fn run(
                     }
                     UiEvent::ClaudeUsage(_)
                     | UiEvent::CodexUsage(_)
+                    | UiEvent::CouncilUsage(_)
                     | UiEvent::RemotePermissionDecision { .. }
                     | UiEvent::LokiActivity(_)
                     | UiEvent::InternalMessage(_) => {}
@@ -894,7 +1038,7 @@ async fn run(
         runtime.abort();
         let _ = runtime.await;
     }
-    controller.finish().await;
+    controller.finish(run_id).await;
     let workspace_delta = match invocation_snapshot {
         Some(snapshot) => Some(snapshot.delta().await),
         None => None,
@@ -905,7 +1049,11 @@ async fn run(
         Err(error) if error.to_string().contains("cancelled") => CodeAgentOutcome::Cancelled,
         Err(error) => CodeAgentOutcome::Failed(error.to_string()),
     };
-    let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::Finished { outcome }));
+    let finish_event = match purpose {
+        EitriPurpose::Code => CodeAgentEvent::Finished { outcome },
+        EitriPurpose::Explore(_) => CodeAgentEvent::ExplorationFinished { run_id, outcome },
+    };
+    let _ = ui_tx.send(UiEvent::CodeAgent(finish_event));
     if let Some(role) = log_role.as_ref()
         && let Some(council_session) = role.council_session.as_deref()
     {
@@ -986,22 +1134,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controller_rejects_concurrent_runs_and_resets() {
+    async fn controller_allows_code_and_bounded_explores_concurrently() {
         let controller = Controller::default();
-        assert!(controller.begin().await);
-        assert!(!controller.begin().await);
+        controller.configure(2).await;
+        let code = controller.begin(RunKind::Code).await.expect("code");
+        assert!(controller.begin(RunKind::Code).await.is_none());
+        let first = controller.begin(RunKind::Explore).await.expect("explore 1");
+        let second = controller.begin(RunKind::Explore).await.expect("explore 2");
+        assert!(controller.begin(RunKind::Explore).await.is_none());
         assert!(controller.cancel().await);
-        controller.finish().await;
-        assert!(controller.begin().await);
+        controller.finish(first).await;
+        assert!(controller.begin(RunKind::Explore).await.is_some());
+        controller.finish(second).await;
+        controller.finish(code).await;
+        assert!(controller.begin(RunKind::Code).await.is_some());
     }
 
     #[tokio::test]
     async fn shutdown_requested_while_starting_reaches_nested_runtime() {
         let controller = Controller::default();
-        assert!(controller.begin().await);
+        let run_id = controller.begin(RunKind::Explore).await.expect("explore");
         assert!(controller.shutdown().await);
         let (commands, mut receiver) = mpsc::unbounded_channel();
-        controller.attach(commands).await;
+        controller.attach(run_id, commands).await;
         assert!(matches!(receiver.recv().await, Some(UiCommand::Shutdown)));
     }
 

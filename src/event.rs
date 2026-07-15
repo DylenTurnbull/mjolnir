@@ -92,6 +92,8 @@ pub enum UiEvent {
     LokiActivity(LokiActivity),
     /// Hidden council coordination made inspectable in the shared transcript.
     InternalMessage(InternalMessage),
+    /// Completed prompt usage attributed to one Council role.
+    CouncilUsage(crate::council_usage::Record),
     /// `session/request_permission` from the agent. The UI is expected to
     /// render a modal and answer through `responder` exactly once.
     PermissionRequest(PermissionPrompt),
@@ -144,14 +146,30 @@ pub enum UiEvent {
 
 #[derive(Debug)]
 pub enum CodeAgentEvent {
-    Started { label: String },
+    Started {
+        label: String,
+    },
+    ExplorationStarted {
+        run_id: u64,
+        label: String,
+    },
+    ExplorationProgress {
+        run_id: u64,
+        activity: String,
+    },
+    ExplorationFinished {
+        run_id: u64,
+        outcome: CodeAgentOutcome,
+    },
     SessionUpdate(SessionUpdate),
     TerminalOutput(TerminalOutputSnapshot),
     PermissionRequest(PermissionPrompt),
     ElicitationRequest(ElicitationPrompt),
     CancelPendingPermissions,
     Status(String),
-    Finished { outcome: CodeAgentOutcome },
+    Finished {
+        outcome: CodeAgentOutcome,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

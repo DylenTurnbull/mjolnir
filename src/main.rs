@@ -14,6 +14,8 @@ mod code_agent;
 mod codex_usage;
 mod config;
 mod council;
+mod council_orchestrator;
+mod council_usage;
 mod deepswe;
 mod event;
 mod headless;
@@ -54,14 +56,14 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::app::UiExitReason;
 use crate::config::{Config, SelectedAgent, history_path, transcript_export_dir};
-use crate::event::{InternalMessage, InternalMessageKind, LoadSessionResult, UiCommand, UiEvent};
+use crate::event::{LoadSessionResult, UiCommand, UiEvent};
 use crate::session::SessionEntryJson;
 use crate::ui::{HeaderLabels, UiMode};
 use crate::worktree::CreatedWorktree;
@@ -1135,6 +1137,7 @@ async fn run_app(
             session_boundary,
             council.clone(),
             cfg.thor.clone(),
+            cfg.eitri.clone(),
         )
         .await?;
         apply_session_result_to_config(&mut cfg, &session_result);
@@ -1530,6 +1533,7 @@ async fn run_session(
     mut session_boundary: Option<String>,
     council: council::ResolvedCouncil,
     thor_config: config::ThorConfig,
+    eitri_config: config::EitriConfig,
 ) -> Result<RunSessionResult> {
     let mut terminal = SessionTerminal::fresh(mode)?;
     let council_session = format!(
@@ -1625,6 +1629,22 @@ async fn run_session(
     for warning in &council.warnings {
         let _ = ui_event_tx.send(crate::event::UiEvent::Warning(warning.clone()));
     }
+    let usage_roles = std::iter::once(&council.thor)
+        .chain(eitri_role.as_ref())
+        .chain(loki_role.as_ref());
+    let mut claude_usage_env = None;
+    let mut codex_usage_env = None;
+    for role in usage_roles {
+        match role.launch.source_id.as_str() {
+            "claude-acp" if claude_usage_env.is_none() => {
+                claude_usage_env = Some(role.launch.env.clone());
+            }
+            "codex-acp" if codex_usage_env.is_none() => {
+                codex_usage_env = Some(role.launch.env.clone());
+            }
+            _ => {}
+        }
+    }
     let loki_handle = loki_role.map(|role| {
         loki::Handle::start(
             role,
@@ -1634,54 +1654,49 @@ async fn run_session(
             council_session.clone(),
         )
     });
-    let (usage_turn_tx, usage_shutdown_tx, usage_task) = if agent.source_id == "claude-acp" {
-        let (tx, mut rx) = mpsc::unbounded_channel::<()>();
-        let usage_ui_tx = ui_event_tx.clone();
-        let usage_cwd = cwd.clone();
-        let usage_env = agent.env.clone();
-        let handle = tokio::spawn(async move {
-            let mut completed_turns = 0_u64;
-            while rx.recv().await.is_some() {
-                completed_turns = completed_turns.saturating_add(1);
-                if !completed_turns.is_multiple_of(2) {
-                    continue;
-                }
-                match claude_usage::query(usage_cwd.clone(), usage_env.clone()).await {
-                    Ok(report) => {
-                        let _ = usage_ui_tx.send(crate::event::UiEvent::ClaudeUsage(report));
-                    }
-                    Err(error) => {
-                        tracing::warn!("claude /usage failed: {error}");
-                    }
-                }
-            }
-        });
-        (Some(tx), None, Some(handle))
-    } else if agent.source_id == "codex-acp" {
+    let (usage_turn_tx, usage_shutdown_tx, usage_task) = if claude_usage_env.is_some()
+        || codex_usage_env.is_some()
+    {
         let (tx, mut rx) = mpsc::unbounded_channel::<()>();
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
-        let _ = tx.send(());
         let usage_ui_tx = ui_event_tx.clone();
         let usage_cwd = cwd.clone();
-        let usage_env = agent.env.clone();
+        if codex_usage_env.is_some() {
+            let _ = tx.send(());
+        }
         let handle = tokio::spawn(async move {
-            let mut client = None;
-            while rx.recv().await.is_some() {
-                let refresh =
-                    codex_usage::refresh(&mut client, usage_cwd.clone(), usage_env.clone());
-                let status = tokio::select! {
+            let mut completed_turns = 0_u64;
+            let mut codex_client = None;
+            loop {
+                tokio::select! {
                     biased;
                     _ = shutdown_rx.recv() => break,
-                    status = refresh => status,
-                };
-                if usage_ui_tx
-                    .send(crate::event::UiEvent::CodexUsage(status))
-                    .is_err()
+                    trigger = rx.recv() => if trigger.is_none() { break; },
+                }
+                completed_turns = completed_turns.saturating_add(1);
+                if completed_turns.is_multiple_of(2)
+                    && let Some(env) = claude_usage_env.as_ref()
                 {
-                    break;
+                    match claude_usage::query(usage_cwd.clone(), env.clone()).await {
+                        Ok(report) => {
+                            let _ = usage_ui_tx.send(crate::event::UiEvent::ClaudeUsage(report));
+                        }
+                        Err(error) => tracing::warn!("claude /usage failed: {error}"),
+                    }
+                }
+                if let Some(env) = codex_usage_env.as_ref() {
+                    let status =
+                        codex_usage::refresh(&mut codex_client, usage_cwd.clone(), env.clone())
+                            .await;
+                    if usage_ui_tx
+                        .send(crate::event::UiEvent::CodexUsage(status))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
-            if let Some(client) = client {
+            if let Some(client) = codex_client {
                 client.shutdown().await;
             }
         });
@@ -1721,7 +1736,9 @@ async fn run_session(
             if let Some(role) = config.role_config.as_mut() {
                 role.council_session = Some(council_session.clone());
             }
-            config.with_implementation_handoff_counter(implementation_handoffs_this_turn.clone())
+            config
+                .with_implementation_handoff_counter(implementation_handoffs_this_turn.clone())
+                .with_max_parallel_explores(eitri_config.max_parallel_explores)
         }),
     };
 
@@ -1757,331 +1774,60 @@ async fn run_session(
         Some(cmd_tx.clone()),
         Some(ui_event_tx.clone()),
     );
-
+    let orchestrated = council_orchestrator::spawn(
+        runtime_event_rx,
+        council_orchestrator::Config {
+            reviewer: loki_handle.clone(),
+            runtime_commands: runtime_cmd_tx.clone(),
+            implementation_handoffs: implementation_handoffs_this_turn.clone(),
+            discrete_review: thor_config.discrete_review,
+            log_context: Some(council_orchestrator::LogContext {
+                council_session: council_session.clone(),
+                model: council.thor.model.model.clone(),
+                adapter: council.thor.launch.source_id.clone(),
+            }),
+        },
+    );
+    let thor_orchestrator = orchestrated.handle.clone();
+    let refresh_usage_on_failure = council.thor.launch.source_id == "codex-acp";
+    let event_usage_turn_tx = usage_turn_tx.clone();
     let event_tracker = remote_tracker.clone();
-    let review_commands = runtime_cmd_tx.clone();
-    let turn_state = std::sync::Arc::new(tokio::sync::Mutex::new((
-        0_u64,
-        String::new(),
-        None::<workspace_snapshot::WorkspaceSnapshot>,
-    )));
-    let event_turn_state = turn_state.clone();
-    let event_loki = loki_handle.clone();
-    let event_handoffs = implementation_handoffs_this_turn.clone();
     let event_thor = council.thor.clone();
     let event_cwd = cwd.clone();
-    let thor_review_enabled = Arc::new(AtomicBool::new(thor_config.discrete_review));
-    let event_thor_review_enabled = thor_review_enabled.clone();
-    let refresh_usage_on_failure = agent.source_id == "codex-acp";
-    let event_usage_turn_tx = usage_turn_tx.clone();
-    let event_council_session = council_session.clone();
     let event_proxy = tokio::spawn(async move {
-        let mut runtime_event_rx = runtime_event_rx;
-        let mut decisions = event_loki.as_ref().map(loki::Handle::subscribe);
-        let mut trajectory = loki::BoundaryTracker::default();
-        let mut held_completion = None;
-        let mut intervention = loki::DeferredIntervention::default();
-        let mut discrete_review_started = false;
-        let mut loki_followup_started = false;
-        loop {
-            tokio::select! {
-                event = runtime_event_rx.recv() => {
-                    let Some(event) = event else { break; };
-                    if let UiEvent::SessionStarted { session_id, .. } = &event {
-                        session_provenance::record(session_provenance::Record {
-                            session_id: session_id.clone(),
-                            cwd: event_cwd.clone(),
-                            adapter_source_id: event_thor.launch.source_id.clone(),
-                            model: event_thor.model.model.clone(),
-                            model_value: event_thor.model_value.clone(),
-                        });
-                    }
-                    // Intercept before rendering: permission prompts get their
-                    // responder wrapped so remote viewers can answer them.
-                    let event = event_tracker.intercept_event(event);
-                    let (epoch, task, _) = event_turn_state.lock().await.clone();
-                    let boundary = (epoch > 0).then(|| trajectory.observe(&event)).flatten();
-                    let boundary_observed = boundary.is_some();
-                    let target_completed = council_target_completed(&event);
-                    if target_completed && let Some(reviewer) = event_loki.as_ref() {
-                        reviewer.target_completed(epoch, loki::Target::Thor, None);
-                    }
-                    let interrupting = boundary_observed
-                        && !target_completed
-                        && intervention.interrupt_at_boundary();
-                    if interrupting {
-                        let _ = ui_event_tx.send(crate::event::UiEvent::Info(
-                            "Thor · interrupting at step boundary for Loki review".to_string(),
-                        ));
-                        let _ = review_commands.send(UiCommand::CancelPrompt);
-                    }
-                    if let Some(boundary) = boundary
-                        && !interrupting
-                        && !(target_completed && intervention.is_pending())
-                        && !loki_followup_started
-                        && let Some(reviewer) = event_loki.as_ref()
-                    {
-                        reviewer.observe(epoch, loki::Target::Thor, None, boundary);
-                    }
-
-                    if let crate::event::UiEvent::PromptDone { stop_reason, .. } = &event {
-                        let cancelled = matches!(
-                            stop_reason,
-                            agent_client_protocol::schema::v1::StopReason::Cancelled
-                        );
-                        if cancelled
-                            && intervention.is_pending()
-                            && !intervention.cancellation_was_requested()
-                        {
-                            // Do not turn a user's cancellation into a Loki
-                            // continuation before the deferred boundary arrives.
-                            intervention.clear();
-                        } else if let Some(critique) = intervention.take() {
-                            if let Some(reviewer) = event_loki.as_ref() {
-                                reviewer.target_resumed(epoch, loki::Target::Thor, None);
-                            }
-                            held_completion = None;
-                            trajectory.reset_attempt();
-                            let _ = ui_event_tx.send(crate::event::UiEvent::Info(
-                                "Thor · resumed after Loki intervention".to_string(),
-                            ));
-                            let continuation = council_continuation_prompt(
-                                &task,
-                                &critique,
-                                &trajectory.trajectory(),
-                            );
-                            emit_internal_message(
-                                &ui_event_tx,
-                                "Loki",
-                                "Thor",
-                                InternalMessageKind::Continuation,
-                                &critique,
-                            );
-                            let _ = review_commands.send(UiCommand::SendPrompt {
-                                text: continuation,
-                                images: Vec::new(),
-                            });
-                            continue;
-                        }
-                        if cancelled {
-                            event_tracker.observe_event(&event);
-                            if ui_event_tx.send(event).is_err() { break; }
-                            event_turn_state.lock().await.2 = None;
-                            discrete_review_started = false;
-                            trajectory = loki::BoundaryTracker::default();
-                            continue;
-                        }
-                        held_completion = Some(event);
-                    } else if let Some(critique) =
-                        take_failed_prompt_intervention(&event, &mut intervention)
-                    {
-                        if let Some(reviewer) = event_loki.as_ref() {
-                            reviewer.target_resumed(epoch, loki::Target::Thor, None);
-                        }
-                        held_completion = None;
-                        trajectory.reset_attempt();
-                        let _ = ui_event_tx.send(crate::event::UiEvent::Info(
-                            "Thor · resumed after Loki intervention".to_string(),
-                        ));
-                        let continuation = council_continuation_prompt(
-                            &task,
-                            &critique,
-                            &trajectory.trajectory(),
-                        );
-                        emit_internal_message(
-                            &ui_event_tx,
-                            "Loki",
-                            "Thor",
-                            InternalMessageKind::Continuation,
-                            &critique,
-                        );
-                        let _ = review_commands.send(UiCommand::SendPrompt {
-                            text: continuation,
-                            images: Vec::new(),
-                        });
-                        continue;
-                    } else {
-                        if refresh_usage_on_failure
-                            && matches!(event, crate::event::UiEvent::PromptFailed { .. })
-                            && let Some(tx) = event_usage_turn_tx.as_ref()
-                        {
-                            let _ = tx.send(());
-                        }
-                        event_tracker.observe_event(&event);
-                        if ui_event_tx.send(event).is_err() { break; }
-                        if target_completed {
-                            event_turn_state.lock().await.2 = None;
-                            discrete_review_started = false;
-                            intervention.clear();
-                            trajectory = loki::BoundaryTracker::default();
-                        }
-                    }
-                }
-                decision = async {
-                    match decisions.as_mut() {
-                        Some(rx) => rx.recv().await.ok(),
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    let Some(decision) = decision else { continue; };
-                    let (epoch, task, _) = event_turn_state.lock().await.clone();
-                    if decision.epoch != epoch || decision.target != loki::Target::Thor {
-                        continue;
-                    }
-                    {
-                        let critique = decision.critique;
-                        tracing::info!(
-                            event = "advice_received",
-                            council_session = %event_council_session,
-                            god = "Thor",
-                            source = "Loki",
-                            model = %event_thor.model.model,
-                            adapter = %event_thor.launch.source_id,
-                            advice = %critique,
-                            "Thor received Loki advice"
-                        );
-                        intervention.push(decision.id, critique);
-                        if held_completion.is_some() {
-                            if let Some(reviewer) = event_loki.as_ref() {
-                                reviewer.target_resumed(epoch, loki::Target::Thor, None);
-                            }
-                            held_completion = None;
-                            trajectory.reset_attempt();
-                            let critique = intervention.take().expect("intervention queued");
-                            let _ = ui_event_tx.send(crate::event::UiEvent::Info(
-                                "Thor · re-prompted after Loki intervention".to_string(),
-                            ));
-                            let continuation = council_continuation_prompt(
-                                &task,
-                                &critique,
-                                &trajectory.trajectory(),
-                            );
-                            emit_internal_message(
-                                &ui_event_tx,
-                                "Loki",
-                                "Thor",
-                                InternalMessageKind::Continuation,
-                                &critique,
-                            );
-                            let _ = review_commands.send(UiCommand::SendPrompt {
-                                text: continuation,
-                                images: Vec::new(),
-                            });
-                        } else {
-                            let _ = ui_event_tx.send(crate::event::UiEvent::Info(
-                                "Thor · Loki intervention queued for the next step boundary".to_string(),
-                            ));
-                        }
-                    }
-                }
+        let mut events = orchestrated.events;
+        while let Some(event) = events.recv().await {
+            if let UiEvent::SessionStarted { session_id, .. } = &event {
+                session_provenance::record(session_provenance::Record {
+                    session_id: session_id.clone(),
+                    cwd: event_cwd.clone(),
+                    adapter_source_id: event_thor.launch.source_id.clone(),
+                    model: event_thor.model.model.clone(),
+                    model_value: event_thor.model_value.clone(),
+                });
             }
-
-            if held_completion.is_some() && !intervention.is_pending() {
-                let implementation_handoffs = event_handoffs.load(Ordering::Acquire);
-                let discrete_review_enabled = event_thor_review_enabled.load(Ordering::Acquire);
-                let workspace_delta = if discrete_review_enabled
-                    && implementation_handoffs > 1
-                    && !discrete_review_started
-                {
-                    let (_, _, snapshot) = event_turn_state.lock().await.clone();
-                    match snapshot {
-                        Some(snapshot) => Some(snapshot.delta().await),
-                        None => None,
-                    }
-                } else {
-                    None
-                };
-                let workspace_changed = workspace_delta
-                    .as_ref()
-                    .is_some_and(workspace_snapshot::WorkspaceDelta::changed);
-                if should_start_discrete_review(
-                    discrete_review_enabled,
-                    discrete_review_started,
-                    implementation_handoffs,
-                    workspace_changed,
-                ) {
-                    let (epoch, task, _) = event_turn_state.lock().await.clone();
-                    if epoch == 0 {
-                        continue;
-                    }
-                    let initial_result = trajectory.final_message();
-                    let context =
-                        discrete_review_context(workspace_delta.as_ref(), trajectory.trajectory());
-                    held_completion = None;
-                    trajectory.reset_attempt();
-                    discrete_review_started = true;
-                    if let Some(reviewer) = event_loki.as_ref() {
-                        reviewer.target_resumed(epoch, loki::Target::Thor, None);
-                    }
-                    let _ = ui_event_tx.send(crate::event::UiEvent::Info(
-                        "reviewing the completed work…".to_string(),
-                    ));
-                    let review_prompt =
-                        thor_discrete_review_prompt(&task, &initial_result, &context);
-                    emit_internal_message(
-                        &ui_event_tx,
-                        "Thor",
-                        "Thor",
-                        InternalMessageKind::DiscreteReview,
-                        &review_prompt,
-                    );
-                    let _ = review_commands.send(UiCommand::SendPrompt {
-                        text: review_prompt,
-                        images: Vec::new(),
-                    });
-                    continue;
-                }
-                if !loki_followup_started && let Some(reviewer) = event_loki.as_ref() {
-                    let (epoch, task, _) = event_turn_state.lock().await.clone();
-                    let deferred = reviewer.take_deferred(epoch);
-                    if !deferred.is_empty() {
-                        let advice = loki::format_deferred(&deferred);
-                        held_completion = None;
-                        trajectory.reset_attempt();
-                        loki_followup_started = true;
-                        emit_internal_message(
-                            &ui_event_tx,
-                            "Loki",
-                            "Thor",
-                            InternalMessageKind::Continuation,
-                            &advice,
-                        );
-                        let _ = review_commands.send(UiCommand::SendPrompt {
-                            text: council_continuation_prompt(
-                                &task,
-                                &advice,
-                                &trajectory.trajectory(),
-                            ),
-                            images: Vec::new(),
-                        });
-                        continue;
-                    }
-                }
-                let (epoch, _, _) = event_turn_state.lock().await.clone();
-                let event = held_completion.take().expect("completion held");
-                event_tracker.observe_event(&event);
-                if let Some(tx) = event_usage_turn_tx.as_ref() {
-                    let _ = tx.send(());
-                }
-                if ui_event_tx.send(event).is_err() {
-                    break;
-                }
-                event_turn_state.lock().await.2 = None;
-                if let Some(reviewer) = event_loki.as_ref() {
-                    reviewer.end_turn(epoch);
-                }
-                discrete_review_started = false;
-                loki_followup_started = false;
-                intervention.clear();
-                trajectory = loki::BoundaryTracker::default();
+            let event = event_tracker.intercept_event(event);
+            if refresh_usage_on_failure
+                && matches!(event, UiEvent::PromptFailed { .. })
+                && let Some(tx) = event_usage_turn_tx.as_ref()
+            {
+                let _ = tx.send(());
+            }
+            let completed = matches!(event, UiEvent::PromptDone { .. });
+            event_tracker.observe_event(&event);
+            if ui_event_tx.send(event).is_err() {
+                break;
+            }
+            if completed && let Some(tx) = event_usage_turn_tx.as_ref() {
+                let _ = tx.send(());
             }
         }
+        let _ = orchestrated.task.await;
     });
 
     let cmd_tracker = remote_tracker.clone();
     let cmd_loki = loki_handle.clone();
-    let cmd_thor_review_enabled = thor_review_enabled.clone();
-    let cmd_turn_state = turn_state.clone();
+    let cmd_orchestrator = thor_orchestrator.clone();
     let mut cmd_workspace_roots =
         Vec::with_capacity(1 + runtime_options.additional_directories.len());
     cmd_workspace_roots.push(cwd.clone());
@@ -2091,7 +1837,7 @@ async fn run_session(
         while let Some(command) = ui_cmd_rx.recv().await {
             cmd_tracker.observe_command(&command);
             if let UiCommand::SetThorReviewPolicy { enabled } = &command {
-                cmd_thor_review_enabled.store(*enabled, Ordering::Release);
+                cmd_orchestrator.set_review_enabled(*enabled);
                 continue;
             }
             if let UiCommand::SendPrompt { text, .. } = &command {
@@ -2102,7 +1848,9 @@ async fn run_session(
                 let epoch = cmd_loki
                     .as_ref()
                     .map_or(local_epoch, |reviewer| reviewer.begin_turn(text.clone()));
-                *cmd_turn_state.lock().await = (epoch, text.clone(), Some(snapshot));
+                cmd_orchestrator
+                    .begin_turn(epoch, text.clone(), snapshot)
+                    .await;
             }
             if matches!(command, UiCommand::CancelPrompt)
                 && let Some(reviewer) = cmd_loki.as_ref()
@@ -2248,7 +1996,7 @@ async fn run_session(
         {
             LoadSessionResult::Switched => {
                 header_labels.session_title = target_title;
-                if agent.source_id == "codex-acp"
+                if council.thor.launch.source_id == "codex-acp"
                     && let Some(tx) = usage_turn_tx.as_ref()
                 {
                     let _ = tx.send(());
@@ -2393,78 +2141,6 @@ fn isolated_council_role(
         isolated.path().display().to_string(),
     );
     Ok((role, Some(isolated)))
-}
-
-fn council_continuation_prompt(_task: &str, critique: &str, _trajectory: &str) -> String {
-    format!(
-        "<advisory guidance=\"weigh, don't blindly obey\">\n{critique}\n</advisory>\n\nContinue the interrupted turn. Address the material advice, then finish the existing task. Please continue from where you left off."
-    )
-}
-
-fn should_start_discrete_review(
-    enabled: bool,
-    already_started: bool,
-    implementation_handoffs: usize,
-    workspace_changed: bool,
-) -> bool {
-    enabled && !already_started && implementation_handoffs > 1 && workspace_changed
-}
-
-fn emit_internal_message(
-    ui_tx: &mpsc::UnboundedSender<UiEvent>,
-    source: &str,
-    target: &str,
-    kind: InternalMessageKind,
-    text: &str,
-) {
-    let _ = ui_tx.send(UiEvent::InternalMessage(InternalMessage {
-        source: source.to_string(),
-        target: target.to_string(),
-        kind,
-        text: text.to_string(),
-    }));
-}
-
-fn council_target_completed(event: &crate::event::UiEvent) -> bool {
-    matches!(
-        event,
-        crate::event::UiEvent::PromptDone { .. } | crate::event::UiEvent::PromptFailed { .. }
-    )
-}
-
-fn take_failed_prompt_intervention(
-    event: &crate::event::UiEvent,
-    intervention: &mut loki::DeferredIntervention,
-) -> Option<String> {
-    matches!(event, crate::event::UiEvent::PromptFailed { .. })
-        .then(|| intervention.take())
-        .flatten()
-}
-
-fn thor_discrete_review_prompt(task: &str, initial_result: &str, context: &str) -> String {
-    format!(
-        "Perform Thor's discrete review for this same user turn. You own the research, planning, coordination, review, verification, and final response; do not act as a thin relay for Eitri. Re-read the original task, critically review the initial result and implementation evidence, investigate or verify anything necessary, and correct material issues. If code changes are still needed, delegate them to Eitri with code_agent and then review the new result. Return the final user-facing answer when the work is genuinely complete.\n\nOriginal task:\n{task}\n\nInitial result:\n{initial_result}\n\nBounded trajectory and workspace context:\n{context}"
-    )
-}
-
-fn discrete_review_context(
-    delta: Option<&workspace_snapshot::WorkspaceDelta>,
-    trajectory: String,
-) -> String {
-    let diff = match delta {
-        Some(delta) => delta
-            .review_patch()
-            .map(str::to_string)
-            .unwrap_or_else(|| "[no workspace changes attributable to this user turn]".to_string()),
-        None => "[workspace turn snapshot unavailable]".to_string(),
-    };
-    let mut context = format!("Trajectory:\n{trajectory}\n\nWorkspace diff:\n{diff}");
-    const LIMIT: usize = 128 * 1024;
-    if context.len() > LIMIT {
-        let split = context.ceil_char_boundary(context.len() - LIMIT);
-        context = format!("…[earlier review context omitted]\n{}", &context[split..]);
-    }
-    context
 }
 
 fn setup_session_terminal(
@@ -2615,63 +2291,6 @@ mod tests {
             "must not enter the alternate screen"
         );
         assert!(rendered.ends_with("\r\x1b[2K"));
-    }
-
-    #[test]
-    fn prompt_failure_resolves_deferred_intervention_for_current_turn() {
-        let event = crate::event::UiEvent::PromptFailed {
-            message: "prompt transport failed".to_string(),
-        };
-        let mut trajectory = loki::BoundaryTracker::default();
-        let mut intervention = loki::DeferredIntervention::default();
-        intervention.push(7, "retry with the corrected result".to_string());
-
-        let boundary_observed = trajectory.observe(&event).is_some();
-        let target_completed = council_target_completed(&event);
-        let interrupting =
-            boundary_observed && !target_completed && intervention.interrupt_at_boundary();
-
-        assert!(target_completed);
-        assert!(!interrupting);
-        assert!(!intervention.cancellation_was_requested());
-
-        let critique = take_failed_prompt_intervention(&event, &mut intervention)
-            .expect("queued intervention should resolve at prompt failure");
-        let continuation =
-            council_continuation_prompt("current user turn", &critique, &trajectory.trajectory());
-
-        assert!(!intervention.is_pending());
-        assert!(continuation.contains("<advisory"));
-        assert!(continuation.contains("retry with the corrected result"));
-        assert!(continuation.contains("Please continue from where you left off."));
-        assert!(!continuation.contains("current user turn"));
-        assert!(!continuation.contains("Bounded prior trajectory"));
-    }
-
-    #[test]
-    fn discrete_review_is_thors_review_and_preserves_eitri_delegation() {
-        let prompt = thor_discrete_review_prompt(
-            "implement the feature",
-            "Eitri says it is complete",
-            "Trajectory and diff",
-        );
-
-        assert!(prompt.contains("Perform Thor's discrete review"));
-        assert!(prompt.contains("do not act as a thin relay for Eitri"));
-        assert!(prompt.contains("research, planning, coordination, review, verification"));
-        assert!(prompt.contains("delegate them to Eitri with code_agent"));
-        assert!(prompt.contains("Initial result:\nEitri says it is complete"));
-        assert!(!prompt.contains("Loki verdict"));
-    }
-
-    #[test]
-    fn discrete_review_requires_multiple_eitri_handoffs_and_workspace_changes() {
-        assert!(should_start_discrete_review(true, false, 2, true));
-        assert!(!should_start_discrete_review(true, false, 0, true));
-        assert!(!should_start_discrete_review(true, false, 1, true));
-        assert!(!should_start_discrete_review(true, false, 2, false));
-        assert!(!should_start_discrete_review(false, false, 2, true));
-        assert!(!should_start_discrete_review(true, true, 2, true));
     }
 
     fn test_council_role(model: &str, agent: &str) -> council::ResolvedRole {

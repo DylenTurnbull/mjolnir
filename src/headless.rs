@@ -110,6 +110,7 @@ enum StreamRecord<'a> {
         resumed: bool,
         text: &'a str,
         usage: Option<&'a Usage>,
+        council_usage: &'a crate::council_usage::Snapshot,
         error: Option<&'a str>,
     },
 }
@@ -121,6 +122,7 @@ struct JsonResult<'a> {
     result: &'a str,
     stop_reason: String,
     usage: Option<&'a Usage>,
+    council_usage: &'a crate::council_usage::Snapshot,
     error: Option<&'a str>,
 }
 
@@ -167,7 +169,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let project_label = crate::paths::project_label_from_cwd(&cfg.cwd);
     let worktree_label = crate::paths::worktree_name_from_cwd(&cfg.cwd);
     let agent_label = format!("Thor · {}", thor.model.model);
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     for warning in &resolved.warnings {
         let _ = event_tx.send(UiEvent::Warning(warning.clone()));
@@ -220,6 +222,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         code_agent: eitri.map(|eitri| {
             code_agent::Config::council(eitri, cfg.agent_stderr.clone(), loki_handle.clone())
                 .with_implementation_handoff_counter(implementation_handoffs.clone())
+                .with_max_parallel_explores(app_config.eitri.max_parallel_explores)
         }),
     };
 
@@ -233,93 +236,41 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         Some(cmd_tx.clone()),
         None,
     );
+    let orchestrated = crate::council_orchestrator::spawn(
+        event_rx,
+        crate::council_orchestrator::Config {
+            reviewer: loki_handle.clone(),
+            runtime_commands: cmd_tx.clone(),
+            implementation_handoffs: implementation_handoffs.clone(),
+            discrete_review: app_config.thor.discrete_review,
+            log_context: Some(crate::council_orchestrator::LogContext {
+                council_session: format!("headless-{}", std::process::id()),
+                model: thor.model.model.clone(),
+                adapter: thor.launch.source_id.clone(),
+            }),
+        },
+    );
+    let thor_orchestrator = orchestrated.handle.clone();
+    let mut event_rx = orchestrated.events;
+    let orchestrator_task = orchestrated.task;
 
     let mut state = HeadlessState::default();
     let mut sent_prompt = false;
     let mut saw_terminal_event = false;
     let mut stop_reason = None;
     let mut usage = None;
+    let mut council_usage = crate::council_usage::Snapshot::default();
     let mut session_id = None;
     let mut resumed = false;
     let mut terminal_error = None;
     let mut prompt_sent = false;
     let mut collecting_turn_output = false;
-    let mut decisions = loki_handle.as_ref().map(loki::Handle::subscribe);
-    let mut trajectory = loki::BoundaryTracker::default();
-    let mut intervention = loki::DeferredIntervention::default();
-    let mut held_completion: Option<(StopReason, Option<Usage>)> = None;
-    let mut review_epoch = 0_u64;
-    let mut outer_snapshot = None;
-    let mut discrete_review_started = false;
-    let mut loki_followup_started = false;
 
     loop {
-        let event = tokio::select! {
-            event = event_rx.recv() => event,
-            decision = async {
-                match decisions.as_mut() {
-                    Some(rx) => rx.recv().await.ok(),
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(decision) = decision
-                    && decision.epoch == review_epoch
-                    && decision.target == loki::Target::Thor
-                {
-                    let critique = decision.critique;
-                    intervention.push(decision.id, critique);
-                    if held_completion.take().is_some() {
-                        if let Some(reviewer) = loki_handle.as_ref() {
-                            reviewer.target_resumed(review_epoch, loki::Target::Thor, None);
-                        }
-                        trajectory.reset_attempt();
-                        state.final_text.clear();
-                        collecting_turn_output = false;
-                        let critique = intervention.take().expect("queued intervention");
-                        if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                            emit_json(&StreamRecord::Review {
-                                actor: "loki",
-                                target: "thor",
-                                kind: "intervention",
-                                text: &critique,
-                            })?;
-                        }
-                        cmd_tx.send(UiCommand::SendPrompt {
-                            text: crate::council_continuation_prompt(
-                                &cfg.prompt,
-                                &critique,
-                                &trajectory.trajectory(),
-                            ),
-                            images: Vec::new(),
-                        }).context("send Loki continuation")?;
-                    }
-                }
-                Some(UiEvent::Info(String::new()))
-            }
-        };
+        let event = event_rx.recv().await;
         let Some(event) = event else {
             break;
         };
-        let boundary = (review_epoch > 0)
-            .then(|| trajectory.observe(&event))
-            .flatten();
-        let target_completed = crate::council_target_completed(&event);
-        if target_completed && let Some(reviewer) = loki_handle.as_ref() {
-            reviewer.target_completed(review_epoch, loki::Target::Thor, None);
-        }
-        let interrupting =
-            boundary.is_some() && !target_completed && intervention.interrupt_at_boundary();
-        if interrupting {
-            let _ = cmd_tx.send(UiCommand::CancelPrompt);
-        }
-        if let Some(boundary) = boundary
-            && !interrupting
-            && !(target_completed && intervention.is_pending())
-            && !loki_followup_started
-            && let Some(reviewer) = loki_handle.as_ref()
-        {
-            reviewer.observe(review_epoch, loki::Target::Thor, None, boundary);
-        }
         let event = remote_tracker.intercept_event(event);
         remote_tracker.observe_event(&event);
         if matches!(cfg.output_format, OutputFormat::StreamJson) {
@@ -365,11 +316,14 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     let mut roots = Vec::with_capacity(1 + cfg.additional_directories.len());
                     roots.push(cfg.cwd.clone());
                     roots.extend(cfg.additional_directories.iter().cloned());
-                    outer_snapshot =
-                        Some(crate::workspace_snapshot::WorkspaceSnapshot::capture(&roots).await);
-                    review_epoch = loki_handle
+                    let snapshot =
+                        crate::workspace_snapshot::WorkspaceSnapshot::capture(&roots).await;
+                    let review_epoch = loki_handle
                         .as_ref()
                         .map_or(1, |reviewer| reviewer.begin_turn(cfg.prompt.clone()));
+                    thor_orchestrator
+                        .begin_turn(review_epoch, cfg.prompt.clone(), snapshot)
+                        .await;
                     let command = UiCommand::SendPrompt {
                         text: cfg.prompt.clone(),
                         images: Vec::new(),
@@ -406,68 +360,13 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 stop_reason: reason,
                 usage: prompt_usage,
             } => {
-                let cancelled = matches!(reason, StopReason::Cancelled);
-                if cancelled && intervention.is_pending() {
-                    if intervention.cancellation_was_requested() {
-                        if let Some(reviewer) = loki_handle.as_ref() {
-                            reviewer.target_resumed(review_epoch, loki::Target::Thor, None);
-                        }
-                        trajectory.reset_attempt();
-                        state.final_text.clear();
-                        collecting_turn_output = false;
-                        let critique = intervention.take().expect("queued intervention");
-                        if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                            emit_json(&StreamRecord::Review {
-                                actor: "loki",
-                                target: "thor",
-                                kind: "intervention",
-                                text: &critique,
-                            })?;
-                        }
-                        cmd_tx
-                            .send(UiCommand::SendPrompt {
-                                text: crate::council_continuation_prompt(
-                                    &cfg.prompt,
-                                    &critique,
-                                    &trajectory.trajectory(),
-                                ),
-                                images: Vec::new(),
-                            })
-                            .context("send Loki continuation")?;
-                        continue;
-                    }
-                    intervention.clear();
-                }
-                held_completion = Some((reason, prompt_usage));
+                stop_reason = Some(reason);
+                usage = prompt_usage;
+                saw_terminal_event = true;
+                let _ = cmd_tx.send(UiCommand::Shutdown);
+                break;
             }
             UiEvent::PromptFailed { message } => {
-                if let Some(critique) = intervention.take() {
-                    if let Some(reviewer) = loki_handle.as_ref() {
-                        reviewer.target_resumed(review_epoch, loki::Target::Thor, None);
-                    }
-                    trajectory.reset_attempt();
-                    state.final_text.clear();
-                    collecting_turn_output = false;
-                    if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                        emit_json(&StreamRecord::Review {
-                            actor: "loki",
-                            target: "thor",
-                            kind: "intervention",
-                            text: &critique,
-                        })?;
-                    }
-                    cmd_tx
-                        .send(UiCommand::SendPrompt {
-                            text: crate::council_continuation_prompt(
-                                &cfg.prompt,
-                                &critique,
-                                &trajectory.trajectory(),
-                            ),
-                            images: Vec::new(),
-                        })
-                        .context("send Loki continuation after failure")?;
-                    continue;
-                }
                 if matches!(cfg.output_format, OutputFormat::StreamJson) {
                     emit_json(&StreamRecord::Error { message: &message })?;
                 }
@@ -498,10 +397,44 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             UiEvent::Info(_) => {}
             UiEvent::CancelPendingPermissions => {}
             UiEvent::ClaudeUsage(_) | UiEvent::CodexUsage(_) => {}
+            UiEvent::CouncilUsage(record) => council_usage.observe(record),
             // Headless runs never receive remote decisions (no UI event
             // channel is registered with the tracker).
             UiEvent::RemotePermissionDecision { .. } => {}
             UiEvent::CodeAgent(event) => match event {
+                CodeAgentEvent::ExplorationStarted { run_id, label } => {
+                    if matches!(cfg.output_format, OutputFormat::StreamJson) {
+                        let text = format!("explore #{run_id} started · {label}");
+                        emit_json(&StreamRecord::Review {
+                            actor: "eitri",
+                            target: "thor",
+                            kind: "exploration_status",
+                            text: &text,
+                        })?;
+                    }
+                }
+                CodeAgentEvent::ExplorationProgress { run_id, activity } => {
+                    if matches!(cfg.output_format, OutputFormat::StreamJson) {
+                        let text = format!("explore #{run_id} · {activity}");
+                        emit_json(&StreamRecord::Review {
+                            actor: "eitri",
+                            target: "thor",
+                            kind: "exploration_status",
+                            text: &text,
+                        })?;
+                    }
+                }
+                CodeAgentEvent::ExplorationFinished { run_id, outcome } => {
+                    if matches!(cfg.output_format, OutputFormat::StreamJson) {
+                        let text = format!("explore #{run_id} · {outcome:?}");
+                        emit_json(&StreamRecord::Review {
+                            actor: "eitri",
+                            target: "thor",
+                            kind: "exploration_status",
+                            text: &text,
+                        })?;
+                    }
+                }
                 CodeAgentEvent::SessionUpdate(update) => {
                     if matches!(cfg.output_format, OutputFormat::StreamJson) {
                         emit_stream_update(&update, &state, "eitri")?;
@@ -573,88 +506,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 let _ = prompt.responder.send(ElicitationOutcome::Decline);
             }
         }
-
-        if held_completion.is_some() && !intervention.is_pending() {
-            let handoffs = implementation_handoffs.load(Ordering::Acquire);
-            let delta =
-                if app_config.thor.discrete_review && handoffs > 1 && !discrete_review_started {
-                    match outer_snapshot.as_ref() {
-                        Some(snapshot) => Some(snapshot.delta().await),
-                        None => None,
-                    }
-                } else {
-                    None
-                };
-            let workspace_changed = delta
-                .as_ref()
-                .is_some_and(crate::workspace_snapshot::WorkspaceDelta::changed);
-            if crate::should_start_discrete_review(
-                app_config.thor.discrete_review,
-                discrete_review_started,
-                handoffs,
-                workspace_changed,
-            ) {
-                let initial_result = trajectory.final_message();
-                let context =
-                    crate::discrete_review_context(delta.as_ref(), trajectory.trajectory());
-                let review_prompt =
-                    crate::thor_discrete_review_prompt(&cfg.prompt, &initial_result, &context);
-                if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                    emit_json(&StreamRecord::Review {
-                        actor: "thor",
-                        target: "thor",
-                        kind: "discrete_review",
-                        text: &review_prompt,
-                    })?;
-                }
-                held_completion = None;
-                discrete_review_started = true;
-                if let Some(reviewer) = loki_handle.as_ref() {
-                    reviewer.target_resumed(review_epoch, loki::Target::Thor, None);
-                }
-                trajectory.reset_attempt();
-                state.final_text.clear();
-                collecting_turn_output = false;
-                cmd_tx
-                    .send(UiCommand::SendPrompt {
-                        text: review_prompt,
-                        images: Vec::new(),
-                    })
-                    .context("send Thor discrete review")?;
-                continue;
-            }
-            if !loki_followup_started && let Some(reviewer) = loki_handle.as_ref() {
-                let deferred = reviewer.take_deferred(review_epoch);
-                if !deferred.is_empty() {
-                    let advice = loki::format_deferred(&deferred);
-                    held_completion = None;
-                    loki_followup_started = true;
-                    trajectory.reset_attempt();
-                    state.final_text.clear();
-                    collecting_turn_output = false;
-                    cmd_tx
-                        .send(UiCommand::SendPrompt {
-                            text: crate::council_continuation_prompt(
-                                &cfg.prompt,
-                                &advice,
-                                &trajectory.trajectory(),
-                            ),
-                            images: Vec::new(),
-                        })
-                        .context("send deferred Loki advice")?;
-                    continue;
-                }
-            }
-            let (reason, prompt_usage) = held_completion.take().expect("held completion");
-            stop_reason = Some(reason);
-            usage = prompt_usage;
-            saw_terminal_event = true;
-            if let Some(reviewer) = loki_handle.as_ref() {
-                reviewer.end_turn(review_epoch);
-            }
-            let _ = cmd_tx.send(UiCommand::Shutdown);
-            break;
-        }
     }
 
     if !saw_terminal_event {
@@ -672,6 +523,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     if let Some(reviewer) = loki_handle.as_ref() {
         reviewer.shutdown_and_wait().await;
     }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), orchestrator_task).await;
     remote_tracker.shutdown().await;
 
     let stop_reason_label = stop_reason.map(stop_reason_label).unwrap_or_else(|| {
@@ -695,6 +547,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 result: &state.final_text,
                 stop_reason: stop_reason_label.to_string(),
                 usage: usage.as_ref(),
+                council_usage: &council_usage,
                 error: terminal_error.as_deref(),
             })?;
         }
@@ -705,6 +558,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 resumed,
                 text: &state.final_text,
                 usage: usage.as_ref(),
+                council_usage: &council_usage,
                 error: terminal_error.as_deref(),
             })?;
         }

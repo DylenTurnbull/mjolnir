@@ -201,7 +201,7 @@ impl SettingsEditor {
 
     fn row_count(&self) -> usize {
         match self.tab {
-            SettingsTab::Council => 4,
+            SettingsTab::Council => 5,
             SettingsTab::AcpServers => self.inventory.servers.len() + 1,
             SettingsTab::Appearance => 2,
         }
@@ -217,6 +217,11 @@ impl SettingsEditor {
     fn change_selected(&mut self, delta: i32) -> SettingsAction {
         match self.tab {
             SettingsTab::Council if self.selected < 3 => self.cycle_model(self.selected, delta),
+            SettingsTab::Council if self.selected == 4 => {
+                self.config.eitri.max_parallel_explores =
+                    (self.config.eitri.max_parallel_explores as i32 + delta).rem_euclid(17)
+                        as usize;
+            }
             SettingsTab::AcpServers => {
                 let Some(server) = self.inventory.servers.get(self.selected) else {
                     return SettingsAction::None;
@@ -856,6 +861,14 @@ fn draw_council(
         format!(
             "Thor review     [{}]",
             on_off(editor.config.thor.discrete_review)
+        ),
+        theme,
+    ));
+    lines.push(selected_line(
+        editor.selected == 4,
+        format!(
+            "Parallel explores < {} >",
+            editor.config.eitri.max_parallel_explores
         ),
         theme,
     ));

@@ -40,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::acp::{RuntimeAccessMode, RuntimeRoleConfig};
 use crate::council::ResolvedRole;
+use crate::council_usage::{Record, Role};
 use crate::event::{LokiActivity, LokiIdentity, UiEvent};
 use crate::ragnarok::{AgentHandle, Launch, TurnEvent};
 
@@ -185,6 +186,8 @@ impl AdviceSlot {
         if advice.urgent && active_target {
             tracing::info!(
                 event = "advice_routed",
+                advice_id = advice.id,
+                epoch = advice.epoch,
                 review_target = advice.target.label(),
                 urgency = "urgent",
                 reviewed_span = %advice.span.marker(),
@@ -202,6 +205,8 @@ impl AdviceSlot {
         } else {
             tracing::info!(
                 event = "advice_routed",
+                advice_id = advice.id,
+                epoch = advice.epoch,
                 review_target = advice.target.label(),
                 urgency = if advice.urgent { "urgent_late" } else { "nonurgent" },
                 reviewed_span = %advice.span.marker(),
@@ -1214,6 +1219,14 @@ async fn worker(
                 | TurnEvent::Note(_) => {}
             })
             .await;
+        if let Ok(outcome) = &result {
+            let _ = ui_tx.send(UiEvent::CouncilUsage(Record {
+                role: Role::Loki,
+                purpose: None,
+                usage: outcome.usage.clone(),
+                update: outcome.usage_update.clone(),
+            }));
+        }
         let accepted = advice.finish(id).await;
         for item in &batch {
             recent_trajectory.push_str(&format!(
@@ -1238,7 +1251,7 @@ async fn worker(
                 old.dismiss().await;
             }
         }
-        tracing::info!(event = "review_finished", council_session = %council_session, god = "Loki", model = %role.model.model, adapter = %role.launch.source_id, review_id = id, epoch, batch_size = batch.len(), advice_target = accepted.as_ref().map(|a| a.target.label()), urgency = accepted.as_ref().map(|a| a.urgent), advice = accepted.as_ref().map(|a| a.note.as_str()), "Loki review finished");
+        tracing::info!(event = "review_finished", council_session = %council_session, god = "Loki", model = %role.model.model, adapter = %role.launch.source_id, review_id = id, epoch, batch_size = batch.len(), advice_accepted = accepted.is_some(), advice_id = accepted.as_ref().map(|a| a.id), advice_target = accepted.as_ref().map(|a| a.target.label()), urgency = accepted.as_ref().map(|a| a.urgent), advice = accepted.as_ref().map(|a| a.note.as_str()), "Loki review finished");
     }
     if let Some(agent) = session {
         agent.dismiss().await;
