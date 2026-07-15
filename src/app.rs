@@ -145,6 +145,12 @@ pub enum UiExitReason {
 }
 
 /// One entry in the scrolling transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThoughtEntry {
+    pub text: String,
+    pub completed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum Entry {
     /// Plain user prompt (echoed locally as soon as it is sent).
@@ -152,10 +158,10 @@ pub enum Entry {
     /// Streaming agent reply. Mutated in place as chunks arrive.
     AgentMessage(String),
     /// Streaming agent reasoning ("thoughts").
-    AgentThought(String),
+    AgentThought(ThoughtEntry),
     /// Nested agent response and reasoning, kept visually distinct from the primary.
     CodeAgentMessage(String),
-    CodeAgentThought(String),
+    CodeAgentThought(ThoughtEntry),
     /// A tool call slot identified by id. The body is rendered from
     /// `tool_calls[id]`; we keep an entry pointer so it shows up in order.
     ToolCall(String),
@@ -2077,17 +2083,6 @@ impl AppState {
     }
 
     pub fn apply_event(&mut self, event: UiEvent) {
-        let is_thinking_update = matches!(
-            &event,
-            UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(_))
-                | UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-                    SessionUpdate::AgentThoughtChunk(_)
-                ))
-        );
-        if !is_thinking_update && remove_trailing_thinking(&mut self.transcript) {
-            self.bump_transcript_revision();
-        }
-
         match event {
             UiEvent::Connected {
                 prompt_images_supported,
@@ -2119,6 +2114,7 @@ impl AppState {
                 self.apply_known_terminal_outputs();
             }
             UiEvent::TerminalOutput(snapshot) => {
+                self.finalize_thinking(EntryKind::Thought);
                 self.terminal_outputs
                     .insert(snapshot.terminal_id.clone(), snapshot);
                 self.apply_known_terminal_outputs();
@@ -2149,6 +2145,7 @@ impl AppState {
             UiEvent::CouncilUsage(record) => self.council_usage.observe(record),
             UiEvent::WorkspaceDiff(diff) => self.workspace_diffs.push(diff),
             UiEvent::PermissionRequest(prompt) => {
+                self.finalize_thinking(EntryKind::Thought);
                 // Append to the queue rather than replacing the current
                 // pending prompt: overwriting would drop the prior
                 // oneshot responder, which the agent reads as a silent
@@ -2165,11 +2162,13 @@ impl AppState {
                 self.update_autocomplete();
             }
             UiEvent::CancelPendingPermissions => {
+                self.finalize_thinking(EntryKind::Thought);
                 self.cancel_all_pending_permissions();
                 self.mark_unfinished_tool_calls_failed("tool call cancelled");
                 self.update_autocomplete();
             }
             UiEvent::ElicitationRequest(prompt) => {
+                self.finalize_thinking(EntryKind::Thought);
                 // Append to the queue rather than replacing the front prompt:
                 // overwriting would drop the prior oneshot responder, which the
                 // agent reads as a silent cancel. Render unconditionally (no
@@ -2192,9 +2191,7 @@ impl AppState {
                 self.resolve_permission_remotely(&request_id, &option_id);
             }
             UiEvent::PromptDone { stop_reason, usage } => {
-                if remove_trailing_thinking(&mut self.transcript) {
-                    self.bump_transcript_revision();
-                }
+                self.finalize_thinking(EntryKind::Thought);
                 self.finish_prompt_turn(matches!(stop_reason, StopReason::Cancelled));
                 if let Some(usage) = usage {
                     self.token_usage.apply_prompt_usage(usage);
@@ -2215,9 +2212,7 @@ impl AppState {
                 self.codex_usage = Some(status);
             }
             UiEvent::PromptFailed { message } => {
-                if remove_trailing_thinking(&mut self.transcript) {
-                    self.bump_transcript_revision();
-                }
+                self.finalize_thinking(EntryKind::Thought);
                 self.finish_prompt_turn(true);
                 // Drop queued prompts: finish_prompt_turn flips back to
                 // Ready, which the next drain pass would otherwise read as
@@ -2249,6 +2244,7 @@ impl AppState {
                 self.record_status_message(StatusKind::Info, msg);
             }
             UiEvent::Fatal(msg) => {
+                self.finalize_thinking(EntryKind::Thought);
                 self.set_connection_state(ConnectionState::Fatal);
                 self.record_status_message(StatusKind::Fatal, msg);
                 self.mark_runtime_closed();
@@ -2298,18 +2294,14 @@ impl AppState {
             }
             CodeAgentEvent::SessionUpdate(update) => self.apply_code_agent_update(update),
             CodeAgentEvent::TerminalOutput(mut snapshot) => {
-                if remove_trailing_thinking(&mut self.transcript) {
-                    self.bump_transcript_revision();
-                }
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 snapshot.terminal_id = format!("{PREFIX}{}", snapshot.terminal_id);
                 self.terminal_outputs
                     .insert(snapshot.terminal_id.clone(), snapshot);
                 self.apply_known_terminal_outputs();
             }
             CodeAgentEvent::PermissionRequest(prompt) => {
-                if remove_trailing_thinking(&mut self.transcript) {
-                    self.bump_transcript_revision();
-                }
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 self.help_overlay = false;
                 self.permission_queue.push_back(PendingPermission {
                     prompt,
@@ -2322,9 +2314,7 @@ impl AppState {
                 self.update_autocomplete();
             }
             CodeAgentEvent::ElicitationRequest(prompt) => {
-                if remove_trailing_thinking(&mut self.transcript) {
-                    self.bump_transcript_revision();
-                }
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 self.help_overlay = false;
                 self.elicitation_queue.push_back(PendingElicitation {
                     prompt,
@@ -2336,17 +2326,16 @@ impl AppState {
                 self.update_autocomplete();
             }
             CodeAgentEvent::CancelPendingPermissions => {
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 self.cancel_code_agent_prompts();
                 self.mark_code_agent_tools_failed("tool call cancelled");
             }
             CodeAgentEvent::Status(message) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 self.push_system_message(format!("Eitri · {message}"));
             }
             CodeAgentEvent::Finished { outcome } => {
-                if remove_trailing_thinking(&mut self.transcript) {
-                    self.bump_transcript_revision();
-                }
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 self.code_agent_active = false;
                 self.code_agent_label = None;
                 self.cancel_code_agent_prompts();
@@ -2370,12 +2359,18 @@ impl AppState {
         }
     }
 
+    fn finalize_thinking(&mut self, kind: EntryKind) {
+        if finalize_active_thinking(&mut self.transcript, kind) {
+            self.bump_transcript_revision();
+        }
+    }
+
     fn apply_code_agent_update(&mut self, update: SessionUpdate) {
         const PREFIX: &str = "codeagent:";
         match update {
             SessionUpdate::UserMessageChunk(_) => {}
             SessionUpdate::AgentMessageChunk(chunk) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 append_or_start(
                     &mut self.transcript,
                     EntryKind::CodeAgent,
@@ -2392,7 +2387,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCall(tool_call) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 let key = format!("{PREFIX}{}", tool_call.tool_call_id);
                 let mut view = ToolCallView::from_tool_call(&tool_call);
                 view.namespace_terminal_ids(PREFIX);
@@ -2401,7 +2396,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCallUpdate(update) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 let key = format!("{PREFIX}{}", update.tool_call_id);
                 if let Some(view) = self.tool_calls.get_mut(&key) {
                     view.apply_update(&update);
@@ -2427,7 +2422,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::Plan(Plan { entries, .. }) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 if let Some(Entry::CodeAgentPlan(existing)) = self
                     .transcript
                     .iter_mut()
@@ -2449,7 +2444,6 @@ impl AppState {
     }
 
     fn apply_loki_activity(&mut self, activity: LokiActivity) {
-        remove_trailing_thinking(&mut self.transcript);
         self.transcript
             .push(Entry::LokiActivity(Box::new(activity)));
         self.bump_transcript_revision();
@@ -2576,7 +2570,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::AgentMessageChunk(c) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::Thought);
                 let text = content_block_text(&c.content);
                 append_or_start(&mut self.transcript, EntryKind::Agent, text);
                 self.bump_transcript_revision();
@@ -2587,7 +2581,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCall(tc) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::Thought);
                 let id = tc.tool_call_id.to_string();
                 let suppressed = is_code_agent_transport_call(&tc);
                 self.tool_calls
@@ -2600,7 +2594,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCallUpdate(u) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::Thought);
                 let id = u.tool_call_id.to_string();
                 let suppressed =
                     self.suppressed_tool_calls.contains(&id) || is_code_agent_transport_update(&u);
@@ -2632,7 +2626,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::Plan(Plan { entries, .. }) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::Thought);
                 // Replace the most recent Plan entry if present, else push.
                 if let Some(Entry::Plan(existing)) = self
                     .transcript
@@ -2813,7 +2807,7 @@ fn config_option_targets(options: &[SessionConfigOption]) -> Vec<SessionConfigTa
         .collect()
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
     User,
     Agent,
@@ -2839,37 +2833,61 @@ fn append_or_start(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) {
     transcript.push(match kind {
         EntryKind::User => Entry::UserPrompt(text),
         EntryKind::Agent => Entry::AgentMessage(text),
-        EntryKind::Thought => Entry::AgentThought(text),
+        EntryKind::Thought => Entry::AgentThought(ThoughtEntry {
+            text,
+            completed: false,
+        }),
         EntryKind::CodeAgent => Entry::CodeAgentMessage(text),
-        EntryKind::CodeAgentThought => Entry::CodeAgentThought(text),
+        EntryKind::CodeAgentThought => Entry::CodeAgentThought(ThoughtEntry {
+            text,
+            completed: false,
+        }),
     });
 }
 
 fn append_thinking_chunk(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) {
-    match (kind, transcript.last_mut()) {
-        (EntryKind::Thought, Some(Entry::AgentThought(existing)))
-        | (EntryKind::CodeAgentThought, Some(Entry::CodeAgentThought(existing))) => {
-            existing.push_str(&text);
-        }
-        (EntryKind::Thought, _) => {
-            remove_trailing_thinking(transcript);
-            transcript.push(Entry::AgentThought(text));
-        }
-        (EntryKind::CodeAgentThought, _) => {
-            remove_trailing_thinking(transcript);
-            transcript.push(Entry::CodeAgentThought(text));
-        }
+    let existing = match kind {
+        EntryKind::Thought => transcript.iter_mut().rev().find_map(|entry| match entry {
+            Entry::AgentThought(thought) if !thought.completed => Some(thought),
+            _ => None,
+        }),
+        EntryKind::CodeAgentThought => transcript.iter_mut().rev().find_map(|entry| match entry {
+            Entry::CodeAgentThought(thought) if !thought.completed => Some(thought),
+            _ => None,
+        }),
+        _ => unreachable!("append_thinking_chunk requires a thought entry kind"),
+    };
+    if let Some(thought) = existing {
+        thought.text.push_str(&text);
+        return;
+    }
+    match kind {
+        EntryKind::Thought => transcript.push(Entry::AgentThought(ThoughtEntry {
+            text,
+            completed: false,
+        })),
+        EntryKind::CodeAgentThought => transcript.push(Entry::CodeAgentThought(ThoughtEntry {
+            text,
+            completed: false,
+        })),
         _ => unreachable!("append_thinking_chunk requires a thought entry kind"),
     }
 }
 
-fn remove_trailing_thinking(transcript: &mut Vec<Entry>) -> bool {
-    let thinking = matches!(
-        transcript.last(),
-        Some(Entry::AgentThought(_) | Entry::CodeAgentThought(_))
-    );
-    if thinking {
-        transcript.pop();
+fn finalize_active_thinking(transcript: &mut [Entry], kind: EntryKind) -> bool {
+    let thought = match kind {
+        EntryKind::Thought => transcript.iter_mut().rev().find_map(|entry| match entry {
+            Entry::AgentThought(thought) if !thought.completed => Some(thought),
+            _ => None,
+        }),
+        EntryKind::CodeAgentThought => transcript.iter_mut().rev().find_map(|entry| match entry {
+            Entry::CodeAgentThought(thought) if !thought.completed => Some(thought),
+            _ => None,
+        }),
+        _ => unreachable!("finalize_active_thinking requires a thought entry kind"),
+    };
+    if let Some(thought) = thought {
+        thought.completed = true;
         true
     } else {
         false
@@ -3631,7 +3649,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_chunks_accumulate_and_non_thinking_activity_removes_them() {
+    fn thinking_chunks_accumulate_and_same_actor_activity_finalizes_them() {
         let mut state = AppState::new();
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
             text_chunk("first"),
@@ -3642,7 +3660,7 @@ mod tests {
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::AgentThought(text)] if text == "first thought"
+            [Entry::AgentThought(text)] if text.text == "first thought" && !text.completed
         ));
 
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(
@@ -3650,7 +3668,8 @@ mod tests {
         )));
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::ToolCall(id)] if id == "call-1"
+            [Entry::AgentThought(thought), Entry::ToolCall(id)]
+                if thought.text == "first thought" && thought.completed && id == "call-1"
         ));
     }
 
@@ -3669,7 +3688,93 @@ mod tests {
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::CodeAgentThought(text)] if text == "forging now"
+            [Entry::CodeAgentThought(text)] if text.text == "forging now" && !text.completed
+        ));
+    }
+
+    #[test]
+    fn turn_completion_and_failure_finalize_primary_thoughts() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk("first turn"),
+        )));
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        assert!(matches!(
+            &state.transcript[0],
+            Entry::AgentThought(thought) if thought.text == "first turn" && thought.completed
+        ));
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk("failed turn"),
+        )));
+        state.apply_event(UiEvent::PromptFailed {
+            message: "boom".to_string(),
+        });
+        assert!(state.transcript.iter().any(|entry| matches!(
+            entry,
+            Entry::AgentThought(thought) if thought.text == "failed turn" && thought.completed
+        )));
+    }
+
+    #[test]
+    fn code_agent_finish_finalizes_thought_without_reply() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "Eitri · builder".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentThoughtChunk(text_chunk("forging")),
+        )));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
+            outcome: CodeAgentOutcome::Completed,
+        }));
+
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::CodeAgentThought(thought)]
+                if thought.text == "forging" && thought.completed
+        ));
+    }
+
+    #[test]
+    fn thor_and_eitri_thoughts_finalize_without_reordering_each_other() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk("planning"),
+        )));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "Eitri · builder".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentThoughtChunk(text_chunk("forging")),
+        )));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentMessageChunk(text_chunk("built")),
+        )));
+
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::AgentThought(thor), Entry::CodeAgentThought(eitri), Entry::CodeAgentMessage(message)]
+                if thor.text == "planning" && !thor.completed
+                    && eitri.text == "forging" && eitri.completed
+                    && message == "built"
+        ));
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk(" more"),
+        )));
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk("answer"),
+        )));
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::AgentThought(thor), Entry::CodeAgentThought(eitri), Entry::CodeAgentMessage(eitri_message), Entry::AgentMessage(thor_message)]
+                if thor.text == "planning more" && thor.completed
+                    && eitri.text == "forging" && eitri.completed
+                    && eitri_message == "built" && thor_message == "answer"
         ));
     }
 
@@ -3693,7 +3798,8 @@ mod tests {
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::CodeAgentMessage(text)] if text == "done"
+            [Entry::CodeAgentThought(thought), Entry::CodeAgentMessage(text)]
+                if thought.text == "forging" && thought.completed && text == "done"
         ));
     }
 

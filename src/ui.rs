@@ -412,12 +412,10 @@ fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bo
         | Entry::LokiActivity(_)
         | Entry::InternalMessage(_) => true,
         Entry::EphemeralSystem(_) => false,
-        Entry::AgentMessage(_) | Entry::AgentThought(_) => {
-            !(state.is_streaming() && idx + 1 == state.transcript.len())
-        }
-        Entry::CodeAgentMessage(_) | Entry::CodeAgentThought(_) => {
-            !state.code_agent_active || idx + 1 != state.transcript.len()
-        }
+        Entry::AgentThought(thought) => thought.completed,
+        Entry::CodeAgentThought(thought) => thought.completed,
+        Entry::AgentMessage(_) => !(state.is_streaming() && idx + 1 == state.transcript.len()),
+        Entry::CodeAgentMessage(_) => !state.code_agent_active || idx + 1 != state.transcript.len(),
         Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
             state.tool_calls.get(id).is_some_and(|view| {
                 matches!(
@@ -3771,9 +3769,11 @@ fn transcript_export_markdown(state: &AppState) -> String {
         match entry {
             Entry::UserPrompt(text) => push_export_text(&mut out, "You", text),
             Entry::AgentMessage(text) => push_export_text(&mut out, "Agent", text),
-            Entry::AgentThought(text) => push_export_text(&mut out, "Thought", text),
+            Entry::AgentThought(thought) => push_export_text(&mut out, "Thought", &thought.text),
             Entry::CodeAgentMessage(text) => push_export_text(&mut out, "Eitri", text),
-            Entry::CodeAgentThought(text) => push_export_text(&mut out, "Eitri Thought", text),
+            Entry::CodeAgentThought(thought) => {
+                push_export_text(&mut out, "Eitri Thought", &thought.text)
+            }
             Entry::LokiActivity(activity) => push_export_text(
                 &mut out,
                 &loki_activity_label(activity),
@@ -5500,8 +5500,8 @@ fn render_transcript_entry_range(
             Entry::AgentMessage(text) | Entry::CodeAgentMessage(text) => {
                 push_markdown_message(&mut out, text, collapse_message, width, theme)
             }
-            Entry::AgentThought(text) | Entry::CodeAgentThought(text) => {
-                push_thinking(&mut out, text, theme)
+            Entry::AgentThought(thought) | Entry::CodeAgentThought(thought) => {
+                push_thinking(&mut out, thought, collapse_limit.is_some(), theme)
             }
             Entry::LokiActivity(activity) => {
                 let text = loki_activity_text(activity);
@@ -5770,25 +5770,63 @@ fn god_name_color(role: &str, theme: TerminalTheme) -> Color {
     }
 }
 
-fn push_thinking(out: &mut Vec<Line<'static>>, text: &str, theme: TerminalTheme) {
+const ACTIVE_THOUGHT_TAIL_LINES: usize = 3;
+const ACTIVE_THOUGHT_TAIL_CHARS: usize = 360;
+
+fn push_thinking(
+    out: &mut Vec<Line<'static>>,
+    thought: &crate::app::ThoughtEntry,
+    compact: bool,
+    theme: TerminalTheme,
+) {
     let mut in_html_comment = false;
-    let text = text
+    let text = thought
+        .text
         .split('\n')
         .map(|line| strip_html_comments(line, &mut in_html_comment))
         .collect::<Vec<_>>()
-        .join("\n")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+        .join("\n");
     if text.is_empty() {
         return;
     }
     let thought_style = Style::default().fg(theme.thought);
-    out.push(Line::from(inline_markdown_spans_with_style(
-        &text,
-        theme,
-        thought_style,
-    )));
+    if compact && thought.completed {
+        let lines = text.lines().count();
+        let unit = if lines == 1 { "line" } else { "lines" };
+        out.push(Line::from(Span::styled(
+            format!("thought · {lines} {unit}"),
+            thought_style,
+        )));
+    } else {
+        let text = if compact {
+            active_thought_tail(&text)
+        } else {
+            text
+        };
+        for line in text.lines() {
+            out.push(Line::from(inline_markdown_spans_with_style(
+                line,
+                theme,
+                thought_style,
+            )));
+        }
+    }
+}
+
+fn active_thought_tail(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let tail = lines
+        .iter()
+        .rev()
+        .take(ACTIVE_THOUGHT_TAIL_LINES)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+    if tail.chars().count() > ACTIVE_THOUGHT_TAIL_CHARS {
+        let keep = tail.chars().count() - ACTIVE_THOUGHT_TAIL_CHARS;
+        tail = format!("…{}", tail.chars().skip(keep).collect::<String>());
+    }
+    tail
 }
 
 fn push_plain_message(
@@ -13426,7 +13464,7 @@ mod tests {
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::UserPrompt(_), Entry::AgentThought(text)] if text == "I need to inspect this"
+            [Entry::UserPrompt(_), Entry::AgentThought(text)] if text.text == "I need to inspect this"
         ));
         assert_eq!(stable_transcript_entry_count(&state), 1);
         assert!(sink.pending_lines(&state, 80).is_empty());
@@ -13436,6 +13474,50 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>();
         assert_eq!(tail, vec!["Thor", "I need to inspect this"]);
+
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentThoughtChunk(text_chunk("implementing")),
+        )));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentMessageChunk(text_chunk("done")),
+        )));
+        assert_eq!(stable_transcript_entry_count(&state), 1);
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk(" and report"),
+        )));
+        assert!(matches!(
+            &state.transcript[1],
+            Entry::AgentThought(thought)
+                if thought.text == "I need to inspect this and report" && !thought.completed
+        ));
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk("Here is the result"),
+        )));
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        let flushed = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flushed,
+            vec![
+                "Thor",
+                "thought · 1 line",
+                "Eitri",
+                "thought · 1 line",
+                "done",
+                "",
+                "Thor",
+                "Here is the result",
+                "",
+            ]
+        );
     }
 
     #[test]
@@ -13731,10 +13813,16 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(interjection.contains("Loki"), "{interjection}");
+        assert!(interjection.is_empty(), "{interjection}");
+        let live_after_loki = inline_transcript_tail_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(live_after_loki.contains("Loki"), "{live_after_loki}");
         assert!(
-            interjection.contains("trace the fallback path too"),
-            "{interjection}"
+            live_after_loki.contains("trace the fallback path too"),
+            "{live_after_loki}"
         );
         assert!(transcript_export_markdown(&state).contains("Thor → Eitri · explore"));
     }
@@ -13764,7 +13852,10 @@ mod tests {
             .iter()
             .map(line_text)
             .collect::<Vec<_>>();
-        assert_eq!(live, vec!["Eitri", "working now"]);
+        assert_eq!(
+            live,
+            vec!["Thor", "planning the handoff", "Eitri", "working now"]
+        );
         assert!(inline_transcript_tail_row_count(&state, 80) > 0);
         assert!(
             desired_inline_height(
@@ -13788,7 +13879,13 @@ mod tests {
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
             outcome: CodeAgentOutcome::Completed,
         }));
-        assert!(inline_transcript_tail_lines(&state, 80).is_empty());
+        assert_eq!(
+            inline_transcript_tail_lines(&state, 80)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            vec!["Thor", "planning the handoff", "Eitri", "thought · 1 line"]
+        );
         terminal
             .draw(|frame| draw_header(frame, frame.area(), &state))
             .expect("draw restored header");
@@ -15296,28 +15393,92 @@ mod tests {
     fn thinking_is_compact_and_primary_agent_names_have_distinct_colors() {
         let mut state = AppState::new();
         let theme = state.theme;
-        state.transcript.push(Entry::AgentThought(
-            "Planning initial\n\n<!-- -->\n\ncode_agent   invocation".to_string(),
-        ));
-        state.transcript.push(Entry::CodeAgentThought(
-            "Checking the implementation".to_string(),
-        ));
+        state
+            .transcript
+            .push(Entry::AgentThought(crate::app::ThoughtEntry {
+                text: "Planning initial\n\n<!-- -->\n\ncode_agent   invocation".to_string(),
+                completed: true,
+            }));
+        state
+            .transcript
+            .push(Entry::CodeAgentThought(crate::app::ThoughtEntry {
+                text: "Checking the implementation".to_string(),
+                completed: true,
+            }));
         let rendered = render_transcript_lines(&state, 80);
         let text = rendered.iter().map(line_text).collect::<Vec<_>>();
         assert_eq!(
             text,
-            vec![
-                "Thor",
-                "Planning initial code_agent invocation",
-                "Eitri",
-                "Checking the implementation",
-            ]
+            vec!["Thor", "thought · 5 lines", "Eitri", "thought · 1 line",]
         );
         assert_eq!(rendered[0].spans[0].style.fg, Some(theme.primary));
         assert_eq!(rendered[2].spans[0].style.fg, Some(theme.code));
         for line in [&rendered[1], &rendered[3]] {
             assert_eq!(line.spans[0].style.fg, Some(theme.thought));
         }
+    }
+
+    #[test]
+    fn active_thought_uses_bounded_tail_and_completed_thought_expands() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state
+            .transcript
+            .push(Entry::AgentThought(crate::app::ThoughtEntry {
+                text: "old one\nold two\nnew one\nnew two\nnew three".to_string(),
+                completed: false,
+            }));
+
+        let active = render_transcript_lines(&state, 80);
+        let active_text = active.iter().map(line_text).collect::<Vec<_>>();
+        assert!(!active_text.iter().any(|line| line.contains("old one")));
+        assert!(!active_text.iter().any(|line| line.contains("old two")));
+        assert!(active_text.iter().any(|line| line == "new one"));
+        assert!(active_text.iter().any(|line| line == "new two"));
+        assert!(active_text.iter().any(|line| line == "new three"));
+
+        let tail = active_thought_tail(&format!(
+            "{}TAIL",
+            "x".repeat(ACTIVE_THOUGHT_TAIL_CHARS + 40)
+        ));
+        assert!(tail.starts_with('…'));
+        assert!(tail.ends_with("TAIL"));
+        assert!(tail.chars().count() <= ACTIVE_THOUGHT_TAIL_CHARS + 1);
+
+        let Entry::AgentThought(thought) = &mut state.transcript[0] else {
+            panic!("thought entry");
+        };
+        thought.text = "first line\nsecond line".to_string();
+        thought.completed = true;
+
+        let compact = render_transcript_lines(&state, 80);
+        assert_eq!(
+            compact.iter().map(line_text).collect::<Vec<_>>(),
+            vec!["Thor", "thought · 2 lines"]
+        );
+
+        state.expand_transcript_details = true;
+        let expanded = render_transcript_lines(&state, 80);
+        assert_eq!(
+            expanded.iter().map(line_text).collect::<Vec<_>>(),
+            vec!["Thor", "first line", "second line"]
+        );
+        for line in expanded.iter().skip(1) {
+            assert!(
+                line.spans
+                    .iter()
+                    .all(|span| span.style.fg == Some(theme.thought))
+            );
+        }
+
+        state.expand_transcript_details = false;
+        assert_eq!(
+            render_full_transcript_lines(&state, 80)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            vec!["Thor", "first line", "second line"]
+        );
     }
 
     #[test]
@@ -15913,10 +16074,14 @@ mod tests {
     #[test]
     fn thought_blocks_render_dimmed_under_speaker_name() {
         let mut state = AppState::new();
+        state.expand_transcript_details = true;
         let theme = state.theme;
         state
             .transcript
-            .push(Entry::AgentThought("weighing the options".to_string()));
+            .push(Entry::AgentThought(crate::app::ThoughtEntry {
+                text: "weighing the options".to_string(),
+                completed: true,
+            }));
 
         let lines = render_transcript_lines(&state, 80);
         let row = lines
@@ -15939,10 +16104,14 @@ mod tests {
         // thought it must still read as dimmed reasoning, not like a real
         // reply heading.
         let mut state = AppState::new();
+        state.expand_transcript_details = true;
         let theme = state.theme;
         state
             .transcript
-            .push(Entry::AgentThought("# Plan\nthen do it".to_string()));
+            .push(Entry::AgentThought(crate::app::ThoughtEntry {
+                text: "# Plan\nthen do it".to_string(),
+                completed: true,
+            }));
 
         let lines = render_transcript_lines(&state, 80);
         let heading = lines
