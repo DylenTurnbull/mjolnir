@@ -526,6 +526,10 @@ impl BoundaryTracker {
                 None
             }
             UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)) => {
+                let terminal_backed = call
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, ToolCallContent::Terminal(_)));
                 for content in &call.content {
                     if let ToolCallContent::Terminal(terminal) = content {
                         self.terminals
@@ -538,7 +542,7 @@ impl BoundaryTracker {
                 );
                 self.tools
                     .insert(call.tool_call_id.to_string(), call.clone());
-                complete.then(|| {
+                (complete && !terminal_backed).then(|| {
                     self.final_message.clear();
                     let activity = tool_activity(call);
                     (
@@ -559,7 +563,7 @@ impl BoundaryTracker {
                         .entry(id.clone())
                         .or_insert_with(|| ToolCall::new(id.clone(), "tool"));
                     tool.update(update.fields.clone());
-                    completed.then(|| render_tool_delta(tool))
+                    (completed && !tool_has_terminal(tool)).then(|| render_tool_delta(tool))
                 };
                 rendered.map(|rendered| {
                     self.final_message.clear();
@@ -626,6 +630,13 @@ impl BoundaryTracker {
         self.tools.clear();
         self.terminals.clear();
     }
+}
+
+fn tool_has_terminal(tool: &agent_client_protocol::schema::v1::ToolCall) -> bool {
+    use agent_client_protocol::schema::v1::ToolCallContent;
+    tool.content
+        .iter()
+        .any(|content| matches!(content, ToolCallContent::Terminal(_)))
 }
 
 fn render_tool_delta(tool: &agent_client_protocol::schema::v1::ToolCall) -> String {
@@ -1595,6 +1606,36 @@ mod tests {
         assert!(projected.contains("tool: explore_agent (find config) [Completed]"));
         assert!(projected.contains("2 result lines"));
         assert!(!projected.contains("large successful body"));
+    }
+
+    #[test]
+    fn terminal_backed_tool_emits_only_the_terminal_exit_checkpoint() {
+        use crate::event::TerminalOutputSnapshot;
+        use agent_client_protocol::schema::v1::{Terminal, TerminalExitStatus, ToolCallContent};
+
+        let mut tracker = BoundaryTracker::default();
+        let pending = UiEvent::SessionUpdate(SessionUpdate::ToolCall(
+            ToolCall::new("tool", "printf")
+                .content(vec![ToolCallContent::Terminal(Terminal::new("term"))])
+                .status(ToolCallStatus::InProgress),
+        ));
+        assert!(tracker.observe(&pending).is_none());
+        let terminal = UiEvent::TerminalOutput(TerminalOutputSnapshot {
+            terminal_id: "term".into(),
+            output: "alpha\nbeta\n".into(),
+            truncated: false,
+            exit_status: Some(TerminalExitStatus::new().exit_code(0)),
+        });
+        let checkpoint = tracker.observe(&terminal).expect("terminal checkpoint");
+        assert_eq!(checkpoint.step, 1);
+        assert!(checkpoint.text.contains("2 output lines"));
+
+        let completed = UiEvent::SessionUpdate(SessionUpdate::ToolCall(
+            ToolCall::new("tool", "printf")
+                .content(vec![ToolCallContent::Terminal(Terminal::new("term"))])
+                .status(ToolCallStatus::Completed),
+        ));
+        assert!(tracker.observe(&completed).is_none());
     }
 
     #[tokio::test]
