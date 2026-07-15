@@ -3533,10 +3533,10 @@ mod tests {
         ContentBlock, ContentChunk, Cost, CreateElicitationRequest, CreateElicitationResponse,
         Diff, ElicitationAcceptAction, ElicitationAction, ElicitationFormMode, ElicitationId,
         ElicitationSchema, ElicitationSessionScope, ElicitationUrlMode, EmbeddedResource,
-        EmbeddedResourceResource, ImageContent, PermissionOption, PermissionOptionKind,
-        ResourceLink, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-        StopReason, StringPropertySchema, Terminal, TextContent, TextResourceContents, Usage,
-        UsageUpdate,
+        EmbeddedResourceResource, ImageContent, PermissionOption, PermissionOptionKind, Plan,
+        PlanEntry, PlanEntryPriority, PlanEntryStatus, ResourceLink, SessionConfigOption,
+        SessionConfigOptionCategory, SessionConfigSelectOption, StopReason, StringPropertySchema,
+        Terminal, TextContent, TextResourceContents, Usage, UsageUpdate,
     };
 
     fn text_chunk(s: &str) -> ContentChunk {
@@ -3557,6 +3557,43 @@ mod tests {
             Entry::AgentMessage(s) => assert_eq!(s, "hello world"),
             other => panic!("unexpected entry: {other:?}"),
         }
+    }
+
+    #[test]
+    fn plan_updates_replace_entries_without_changing_priority_or_status() {
+        let mut state = AppState::new();
+        let initial = vec![PlanEntry::new(
+            "inspect renderer",
+            PlanEntryPriority::High,
+            PlanEntryStatus::InProgress,
+        )];
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::Plan(Plan::new(
+            initial.clone(),
+        ))));
+        assert!(
+            matches!(state.transcript.last(), Some(Entry::Plan(entries)) if entries == &initial)
+        );
+
+        let replacement = vec![
+            PlanEntry::new(
+                "inspect renderer",
+                PlanEntryPriority::High,
+                PlanEntryStatus::Completed,
+            ),
+            PlanEntry::new(
+                "verify narrow layout",
+                PlanEntryPriority::Low,
+                PlanEntryStatus::Pending,
+            ),
+        ];
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::Plan(Plan::new(
+            replacement.clone(),
+        ))));
+
+        assert_eq!(state.transcript.len(), 1);
+        assert!(
+            matches!(state.transcript.last(), Some(Entry::Plan(entries)) if entries == &replacement)
+        );
     }
 
     #[test]

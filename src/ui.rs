@@ -3970,6 +3970,59 @@ fn plan_status_label(status: &agent_client_protocol::schema::v1::PlanEntryStatus
     }
 }
 
+fn plan_status_style(
+    status: &agent_client_protocol::schema::v1::PlanEntryStatus,
+    theme: TerminalTheme,
+) -> Style {
+    let color = match status {
+        agent_client_protocol::schema::v1::PlanEntryStatus::Pending => theme.muted,
+        agent_client_protocol::schema::v1::PlanEntryStatus::InProgress => theme.primary,
+        agent_client_protocol::schema::v1::PlanEntryStatus::Completed => theme.success,
+        _ => theme.error,
+    };
+    Style::default().fg(color)
+}
+
+fn plan_row(
+    entry: &agent_client_protocol::schema::v1::PlanEntry,
+    theme: TerminalTheme,
+) -> Line<'static> {
+    use agent_client_protocol::schema::v1::{PlanEntryPriority, PlanEntryStatus};
+
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("[{}]", plan_status_label(&entry.status)),
+            plan_status_style(&entry.status, theme),
+        ),
+    ];
+    match entry.priority {
+        PlanEntryPriority::Medium => {}
+        PlanEntryPriority::High => spans.push(Span::styled(
+            format!(" [{}]", plan_priority_label(&entry.priority)),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        )),
+        PlanEntryPriority::Low => spans.push(Span::styled(
+            format!(" [{}]", plan_priority_label(&entry.priority)),
+            Style::default().fg(theme.muted),
+        )),
+        _ => spans.push(Span::styled(
+            format!(" [{}]", plan_priority_label(&entry.priority)),
+            Style::default().fg(theme.error),
+        )),
+    }
+    let content_style = if matches!(entry.status, PlanEntryStatus::Completed) {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    };
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(entry.content.clone(), content_style));
+    Line::from(spans)
+}
+
 /// Re-issue a previously queued prompt now that the in-flight turn has
 /// finished. This fires after either a natural `PromptDone` or a
 /// `PromptDone(Cancelled)` from Ctrl-C.
@@ -5503,19 +5556,7 @@ fn render_transcript_entry_range(
                     Style::default().fg(theme.tool).add_modifier(Modifier::BOLD),
                 )));
                 for e in entries {
-                    let bullet = match e.priority {
-                        agent_client_protocol::schema::v1::PlanEntryPriority::High => "[!]",
-                        agent_client_protocol::schema::v1::PlanEntryPriority::Medium => "[*]",
-                        agent_client_protocol::schema::v1::PlanEntryPriority::Low => "[ ]",
-                        _ => "[?]",
-                    };
-                    let status = match e.status {
-                        agent_client_protocol::schema::v1::PlanEntryStatus::Pending => " ",
-                        agent_client_protocol::schema::v1::PlanEntryStatus::InProgress => "~",
-                        agent_client_protocol::schema::v1::PlanEntryStatus::Completed => "x",
-                        _ => "?",
-                    };
-                    out.push(Line::from(format!("  {bullet}{status} {}", e.content)));
+                    out.push(plan_row(e, theme));
                 }
                 out.push(Line::from(""));
             }
@@ -10558,10 +10599,11 @@ mod tests {
     use agent_client_protocol::schema::v1::{
         AvailableCommand, ContentBlock, ContentChunk, ElicitationFormMode, ElicitationId,
         ElicitationMode, ElicitationSchema, ElicitationSessionScope, ElicitationUrlMode,
-        EnumOption, PermissionOption, PermissionOptionKind, SessionConfigOption,
-        SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-        SessionUpdate, StopReason, StringPropertySchema, TerminalExitStatus, TextContent, ToolCall,
-        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+        EnumOption, PermissionOption, PermissionOptionKind, PlanEntry, PlanEntryPriority,
+        PlanEntryStatus, SessionConfigOption, SessionConfigOptionCategory,
+        SessionConfigSelectOption, SessionConfigValueId, SessionUpdate, StopReason,
+        StringPropertySchema, TerminalExitStatus, TextContent, ToolCall, ToolCallStatus,
+        ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::backend::{Backend, TestBackend};
@@ -10655,6 +10697,88 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn plan_rows_use_readable_status_and_priority_labels_in_every_transcript_view() {
+        let mut state = AppState::new();
+        state.transcript.push(Entry::Plan(vec![
+            PlanEntry::new(
+                "write tests",
+                PlanEntryPriority::Medium,
+                PlanEntryStatus::Pending,
+            ),
+            PlanEntry::new(
+                "render output",
+                PlanEntryPriority::High,
+                PlanEntryStatus::InProgress,
+            ),
+            PlanEntry::new(
+                "document behavior",
+                PlanEntryPriority::Low,
+                PlanEntryStatus::Completed,
+            ),
+        ]));
+
+        let expected = vec![
+            "Thor",
+            "plan",
+            "  [pending] write tests",
+            "  [running] [high] render output",
+            "  [done] [low] document behavior",
+            "",
+        ];
+        let normal = render_transcript_lines(&state, 80);
+        let full = render_full_transcript_lines(&state, 80);
+        assert_eq!(normal.iter().map(line_text).collect::<Vec<_>>(), expected);
+        assert_eq!(full.iter().map(line_text).collect::<Vec<_>>(), expected);
+        assert!(!normal.iter().any(|line| line_text(line).contains("[!]")));
+        assert!(!normal.iter().any(|line| line_text(line).contains("[*]")));
+
+        assert_eq!(normal[2].spans[1].style.fg, Some(state.theme.muted));
+        assert_eq!(normal[3].spans[1].style.fg, Some(state.theme.primary));
+        assert_eq!(normal[4].spans[1].style.fg, Some(state.theme.success));
+        assert_eq!(normal[3].spans[2].style.fg, Some(state.theme.warning));
+        assert!(
+            normal[3].spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(normal[4].spans[2].style.fg, Some(state.theme.muted));
+        assert!(
+            normal[4]
+                .spans
+                .last()
+                .expect("completed content")
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+    }
+
+    #[test]
+    fn plan_rows_wrap_without_truncating_content_at_narrow_widths() {
+        let mut state = AppState::new();
+        state.transcript.push(Entry::Plan(vec![PlanEntry::new(
+            "narrow content stays readable",
+            PlanEntryPriority::High,
+            PlanEntryStatus::InProgress,
+        )]));
+
+        let width = 18;
+        let lines = render_full_transcript_lines(&state, width);
+        let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+        let line_count = paragraph.line_count(width);
+        assert!(line_count > lines.len());
+
+        let area = Rect::new(0, 0, width, line_count as u16);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        paragraph.render(area, &mut buffer);
+        let rendered = buffer_lines(&buffer).join("\n");
+        for word in ["running", "high", "narrow", "content", "stays", "readable"] {
+            assert!(rendered.contains(word), "missing {word:?} in {rendered:?}");
+        }
     }
 
     fn buffer_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
