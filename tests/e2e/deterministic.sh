@@ -147,11 +147,15 @@ run_case() {
     grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 1
-    test -s "$root/primary-result.json"
     grep -a 'search fixture architecture' "$root/transcript.log" >/dev/null
     grep -a 'cancel-received' "$root/nested.log" >/dev/null
+    grep -a 'cancel-received' "$root/primary.log" >/dev/null
     grep -a 'explore-runtime:read-only=true:mcp-servers=0' "$root/nested.log" >/dev/null
-    node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || !r.response.isError || !text.includes("Eitri cancelled") || text.includes("workspace_diff") || text.includes("review Eitri")) process.exit(1)' "$root/primary-result.json"
+    test "$(grep -ac '^prompt-started$' "$root/nested.log")" -eq 1
+    if grep -a 'PRIMARY.*\(CANCELLED\|RECEIVED\)' "$root/transcript.log" >/dev/null; then
+      echo "cancelled exploration incorrectly resumed Thor" >&2
+      exit 1
+    fi
     test ! -e "$workspace/eitri-change.txt"
     test ! -e "$workspace/eitri-partial.txt"
   elif [ "$mode" = complete ] || [ "$mode" = loki-eitri ] || [ "$mode" = loki-thor ] || [ "$mode" = thor-review ] || [ "$mode" = details ]; then
@@ -211,10 +215,14 @@ run_case() {
     grep -ai 'waiting for Codex' "$root/transcript.log" >/dev/null
     grep -a 'Connected to Codex' "$root/transcript.log" >/dev/null
     test "$(grep -ac '^session-directive:' "$root/primary.log")" -eq 1
-    test -s "$root/primary-result.json"
     grep -a "Eitri" "$root/transcript.log" >/dev/null
     grep -a "cancel-received" "$root/nested.log" >/dev/null
-    node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])); const text=r.response.content?.map(x=>x.text||"").join(""); if(r.error || r.unauthorizedStatus!==401 || !r.response.isError || !text.includes("<workspace_diff scope=\"eitri-invocation\" authored_by=\"Eitri\">") || !text.includes("diff --git a/eitri-partial.txt b/eitri-partial.txt") || !text.includes("eitri-partial.txt") || !text.includes("You should review Eitri\u0027s work now.") || text.includes("seed.txt")) process.exit(1)' "$root/primary-result.json"
+    grep -a "cancel-received" "$root/primary.log" >/dev/null
+    test "$(grep -ac '^prompt-started$' "$root/nested.log")" -eq 1
+    if grep -a 'PRIMARY.*\(CANCELLED\|RECEIVED\)' "$root/transcript.log" >/dev/null; then
+      echo "cancelled Eitri handoff incorrectly resumed Thor" >&2
+      exit 1
+    fi
     if grep -a 'discrete-review:' "$root/primary.log" >/dev/null; then
       echo "single cancelled Eitri handoff incorrectly triggered Thor's discrete review" >&2
       exit 1

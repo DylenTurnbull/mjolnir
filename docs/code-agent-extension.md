@@ -35,7 +35,8 @@ its turn.
 
 Only one nested run is allowed. Invalid parameters are rejected, while busy,
 nested-runtime, cancellation, and message-less failures return MCP tool errors.
-While the nested turn is active, Ctrl-C cancels it rather than the primary turn.
+While the nested turn is active, Ctrl-C cancels both it and the primary turn so
+the primary agent cannot retry cancelled work without new user input.
 The nested runtime is not given this MCP server, so it cannot recursively
 delegate.
 

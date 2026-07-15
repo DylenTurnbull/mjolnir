@@ -4112,9 +4112,10 @@ async fn drive_prompt_turn(
             maybe_cmd = ui_rx.recv() => {
                 match maybe_cmd {
                     Some(UiCommand::CancelPrompt) => {
-                        if code_agent_controller.cancel().await {
-                            continue;
-                        }
+                        // Cancel both lanes. Stopping only Eitri returns a tool
+                        // error to the still-running Thor turn, which can then
+                        // immediately delegate the same work again.
+                        code_agent_controller.cancel().await;
                         if !cancel_sent {
                             session_state.mark_permissions_cancelled(session_id).await;
                             let _ = ui_tx.send(UiEvent::CancelPendingPermissions);

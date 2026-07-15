@@ -1640,16 +1640,12 @@ fn sync_inline_terminal_height(
         }
         Err(e) => return Err(e).context("query terminal size for inline viewport resize"),
     };
-    let desired = desired_inline_height(state, size);
-    if desired == *current_height {
-        return Ok(());
-    }
-
     let area = terminal.get_frame().area();
-    if let Err(e) = terminal
-        .backend_mut()
-        .set_cursor_position(area.as_position())
-    {
+    let Some(plan) = inline_viewport_resize_plan(state, area, size, *current_height) else {
+        return Ok(());
+    };
+
+    if let Err(e) = terminal.backend_mut().set_cursor_position(plan.origin) {
         if is_cursor_position_timeout_io(&e) {
             trace_inline_cursor_position_timeout("viewport resize cursor move", &e);
             return Ok(());
@@ -1657,7 +1653,12 @@ fn sync_inline_terminal_height(
         tracing::warn!("skip inline viewport resize: set cursor position failed: {e}");
         return Ok(());
     }
-    if let Err(e) = terminal.backend_mut().clear_region(ClearType::AfterCursor) {
+    let clear_type = if plan.clear_visible_screen {
+        ClearType::All
+    } else {
+        ClearType::AfterCursor
+    };
+    if let Err(e) = terminal.backend_mut().clear_region(clear_type) {
         tracing::warn!("skip inline viewport resize: clear region failed: {e}");
         return Ok(());
     }
@@ -1670,11 +1671,11 @@ fn sync_inline_terminal_height(
     // creating the inline viewport never issues a CPR query. A real query
     // here deadlocks against the crossterm EventStream lock and times out,
     // leaving the freshly cleared region blank until the next input event.
-    let backend = TrackedBackend::with_cursor_position(io::stdout(), area.as_position());
+    let backend = TrackedBackend::with_cursor_position(io::stdout(), plan.origin);
     let next = match Terminal::with_options(
         backend,
         TerminalOptions {
-            viewport: Viewport::Inline(desired),
+            viewport: Viewport::Inline(plan.height),
         },
     )
     .context("resize inline terminal")
@@ -1686,8 +1687,43 @@ fn sync_inline_terminal_height(
         }
     };
     *terminal = next;
-    *current_height = desired;
+    *current_height = plan.height;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InlineViewportResizePlan {
+    height: u16,
+    origin: Position,
+    clear_visible_screen: bool,
+}
+
+fn inline_viewport_resize_plan(
+    state: &AppState,
+    current_area: Rect,
+    size: Size,
+    current_height: u16,
+) -> Option<InlineViewportResizePlan> {
+    let height = clamped_inline_height(desired_inline_height(state, size), size);
+    let reader_active = inline_transcript_viewer_accepts_input(state);
+    let reader_geometry_changed = reader_active
+        && (current_area.width != size.width
+            || current_area.height != height
+            || current_area.y != size.height.saturating_sub(height));
+    if height == current_height && !reader_geometry_changed {
+        return None;
+    }
+
+    let origin = if reader_active {
+        Position::new(0, size.height.saturating_sub(height))
+    } else {
+        current_area.as_position()
+    };
+    Some(InlineViewportResizePlan {
+        height,
+        origin,
+        clear_visible_screen: reader_active,
+    })
 }
 
 fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
@@ -2197,10 +2233,6 @@ fn cancel_current_turn(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCo
         return;
     }
     let _ = cmd_tx.send(UiCommand::CancelPrompt);
-    if state.code_agent_active {
-        state.status_line = Some(StatusMessage::info("cancelling Eitri..."));
-        return;
-    }
     state.mark_cancelling();
     let queued = state.queued_prompt_count();
     let msg = if queued > 0 {
@@ -12857,6 +12889,46 @@ mod tests {
     }
 
     #[test]
+    fn transcript_reader_width_resize_clears_reserved_margin() {
+        let mut state = AppState::new();
+        state.open_transcript_viewer();
+
+        let plan = inline_viewport_resize_plan(
+            &state,
+            Rect::new(0, 1, 80, 22),
+            Size {
+                width: 60,
+                height: 23,
+            },
+            22,
+        )
+        .expect("reader width change needs a viewport repair");
+
+        assert_eq!(plan.height, 22);
+        assert_eq!(plan.origin, Position::new(0, 1));
+        assert!(plan.clear_visible_screen);
+    }
+
+    #[test]
+    fn compact_inline_height_change_keeps_clear_scoped_to_viewport() {
+        let state = AppState::new();
+        let plan = inline_viewport_resize_plan(
+            &state,
+            Rect::new(0, 17, 80, 7),
+            Size {
+                width: 80,
+                height: 24,
+            },
+            7,
+        )
+        .expect("height change needs a viewport repair");
+
+        assert_eq!(plan.height, INLINE_CHAT_HEIGHT);
+        assert_eq!(plan.origin, Position::new(0, 17));
+        assert!(!plan.clear_visible_screen);
+    }
+
+    #[test]
     fn inline_resize_reflow_snapshot_replays_streamed_prefix_at_new_width() {
         let mut state = AppState::new();
         state.record_user_prompt("hello from the resize test".to_string());
@@ -18008,6 +18080,35 @@ mod tests {
         assert!(
             cmd_rx.try_recv().is_err(),
             "second Ctrl-C while cancelling must not enqueue another cancel"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_cancels_whole_turn_while_code_agent_is_active() {
+        let mut state = ready_state_with_session();
+        state.record_user_prompt("delegate".to_string());
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "Eitri".to_string(),
+        }));
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(state.connection_state(), ConnectionState::Cancelling);
+        assert!(matches!(cmd_rx.try_recv(), Ok(UiCommand::CancelPrompt)));
+
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "second Ctrl-C must not dispatch another whole-turn cancellation"
         );
     }
 

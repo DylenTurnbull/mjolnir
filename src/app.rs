@@ -1562,9 +1562,6 @@ impl AppState {
     /// Note that the user has requested cancellation of the in-flight
     /// prompt. Idempotent and only meaningful while `Streaming`.
     pub fn mark_cancelling(&mut self) {
-        if self.code_agent_active {
-            return;
-        }
         if self.connection_state == ConnectionState::Streaming {
             self.set_connection_state(ConnectionState::Cancelling);
         }
@@ -3690,14 +3687,14 @@ mod tests {
     }
 
     #[test]
-    fn primary_turn_does_not_enter_cancelling_while_code_agent_is_active() {
+    fn whole_turn_enters_cancelling_while_code_agent_is_active() {
         let mut state = AppState::new();
         state.record_user_prompt("delegate".to_string());
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
             label: "codex".to_string(),
         }));
         state.mark_cancelling();
-        assert_eq!(state.connection_state, ConnectionState::Streaming);
+        assert_eq!(state.connection_state, ConnectionState::Cancelling);
     }
 
     #[test]

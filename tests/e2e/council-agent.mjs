@@ -90,8 +90,11 @@ async function prepareMcp() {
 }
 
 function finishPrimary(text) {
+  if (promptRequestId === null) return;
   update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
-  send({ id: promptRequestId, result: { stopReason: "end_turn" } });
+  const requestId = promptRequestId;
+  promptRequestId = null;
+  send({ id: requestId, result: { stopReason: "end_turn" } });
 }
 
 function eitriResult() {
@@ -267,6 +270,10 @@ input.on("line", (line) => {
     }, 250);
   } else if (message.method === "session/cancel") {
     log("cancel-received");
-    if (promptRequestId !== null) send({ id: promptRequestId, result: { stopReason: "cancelled" } });
+    if (promptRequestId !== null) {
+      const requestId = promptRequestId;
+      promptRequestId = null;
+      send({ id: requestId, result: { stopReason: "cancelled" } });
+    }
   }
 });

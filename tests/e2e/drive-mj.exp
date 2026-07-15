@@ -68,7 +68,7 @@ if {$mode eq "explore"} {
         timeout { exit 41 }
     }
     expect {
-        -re {PRIMARY.*CANCELLED} { after 500; send_ctrl_c }
+        -re {Enter send} { after 500; send_ctrl_c }
         timeout { exit 42 }
     }
 } elseif {$mode eq "inline-stream"} {
@@ -80,7 +80,7 @@ if {$mode eq "explore"} {
         timeout { exit 26 }
     }
     expect {
-        -re {PRIMARY.*CANCELLED} { after 500; send_ctrl_c }
+        -re {Enter send} { after 500; send_ctrl_c }
         timeout { exit 27 }
     }
 } elseif {$mode eq "cancel"} {
@@ -89,7 +89,7 @@ if {$mode eq "explore"} {
         timeout { exit 20 }
     }
     expect {
-        -re {PRIMARY.*CANCELLED} { after 500; send_ctrl_c }
+        -re {Enter send} { after 500; send_ctrl_c }
         timeout { exit 21 }
     }
 } elseif {$mode eq "failed"} {

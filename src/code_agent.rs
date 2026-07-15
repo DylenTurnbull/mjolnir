@@ -453,7 +453,8 @@ enum ActiveRun {
 }
 
 /// Coordinates the one allowed Eitri foreground run. Thor remains suspended in
-/// its MCP request while UI cancellation is routed exclusively to this lane.
+/// its MCP request while UI cancellation is forwarded to this nested lane as
+/// well as to Thor's outer turn.
 #[derive(Debug, Clone, Default)]
 pub struct Controller {
     state: Arc<Mutex<ActiveRun>>,
