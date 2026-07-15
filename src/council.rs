@@ -58,7 +58,7 @@ pub struct ResolvedRole {
 pub struct ResolvedCouncil {
     pub thor: ResolvedRole,
     pub loki: Option<ResolvedRole>,
-    pub eitri: ResolvedRole,
+    pub eitri: Option<ResolvedRole>,
     pub available: Vec<ResolvedRole>,
     pub choices: Vec<ModelChoice>,
     pub warnings: Vec<String>,
@@ -365,6 +365,38 @@ fn configured_launches(config: &Config, availability: &Availability) -> Vec<Adap
     launches
 }
 
+fn missing_enabled_adapter_errors(
+    config: &Config,
+    availability: &Availability,
+) -> HashMap<String, String> {
+    let mut errors = HashMap::new();
+    for (enabled, missing, kind, reason) in [
+        (
+            config.acp.codex,
+            availability.codex.is_none(),
+            AdapterKind::Codex,
+            "codex executable not found on PATH",
+        ),
+        (
+            config.acp.claude,
+            availability.claude.is_none(),
+            AdapterKind::Claude,
+            "claude executable not found on PATH",
+        ),
+        (
+            config.acp.opencode,
+            availability.opencode.is_none(),
+            AdapterKind::OpenCode,
+            "opencode executable not found on PATH",
+        ),
+    ] {
+        if enabled && missing {
+            errors.insert(launch_for(kind).source_id, reason.to_string());
+        }
+    }
+    errors
+}
+
 fn custom_model_id(source_id: &str, model_value: &str) -> String {
     let name = source_id.strip_prefix("custom:").unwrap_or(source_id);
     format!("custom/{name}/{model_value}")
@@ -388,7 +420,11 @@ async fn discover_available(
     .collect::<Vec<_>>()
     .await;
 
-    resolve_probes(rows, probes)
+    let mut discovery = resolve_probes(rows, probes);
+    discovery
+        .adapter_errors
+        .extend(missing_enabled_adapter_errors(config, availability));
+    discovery
 }
 
 fn explicit<'a>(
@@ -424,6 +460,18 @@ fn choose_eitri<'a>(rows: &[Row], available: &'a [ResolvedRole]) -> Option<&'a R
             .iter()
             .find(|candidate| candidate.model.model == row.model)
     })
+}
+
+fn resolve_eitri(
+    selector: &str,
+    rows: &[Row],
+    available: &[ResolvedRole],
+) -> Result<Option<ResolvedRole>> {
+    if selector == "auto" {
+        Ok(choose_eitri(rows, available).cloned())
+    } else {
+        explicit("Eitri", selector, rows, available).map(|role| Some(role.clone()))
+    }
 }
 
 fn provider_key(model: &str) -> &str {
@@ -576,12 +624,7 @@ pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
     if loki.is_some_and(|candidate| candidate.model.model == thor.model.model) {
         bail!("Loki must use a model distinct from Thor");
     }
-    let eitri = if config.eitri.model == "auto" {
-        choose_eitri(&rows, &available)
-            .ok_or_else(|| anyhow!("no launchable Eitri model lies on the DeepSWE frontier"))?
-    } else {
-        explicit("Eitri", &config.eitri.model, &rows, &available)?
-    };
+    let eitri = resolve_eitri(&config.eitri.model, &rows, &available)?;
 
     let mut warned = WARNED_ADAPTERS.lock().await;
     let mut warnings = discovery
@@ -590,11 +633,19 @@ pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
         .filter(|(adapter, _)| warned.insert((*adapter).clone()))
         .map(|(adapter, reason)| format!("{adapter} unavailable: {reason}"))
         .collect::<Vec<_>>();
+    if eitri.is_none() {
+        warnings.push(
+            "Eitri/code-agent delegation is disabled: no launchable Eitri model is available. \
+             Install and authenticate a supported ACP adapter (for Codex: install `@openai/codex` \
+             and run `codex login`), then restart or retry with /models."
+                .to_string(),
+        );
+    }
     warnings.sort();
     Ok(ResolvedCouncil {
         thor: thor.clone(),
         loki: loki.cloned(),
-        eitri: eitri.clone(),
+        eitri,
         available,
         choices,
         warnings,
@@ -707,6 +758,35 @@ mod tests {
             .map(|launch| launch.source_id)
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["custom:enabled", "claude-acp", "anvil"]);
+    }
+
+    #[test]
+    fn missing_enabled_adapters_report_errors_and_disabled_adapters_are_silent() {
+        let mut config = Config::default();
+        let availability = Availability {
+            codex: None,
+            claude: None,
+            opencode: None,
+        };
+
+        let errors = missing_enabled_adapter_errors(&config, &availability);
+        assert_eq!(
+            errors.get("codex-acp").map(String::as_str),
+            Some("codex executable not found on PATH")
+        );
+        assert_eq!(
+            errors.get("claude-acp").map(String::as_str),
+            Some("claude executable not found on PATH")
+        );
+        assert_eq!(
+            errors.get("opencode-acp").map(String::as_str),
+            Some("opencode executable not found on PATH")
+        );
+
+        config.acp.codex = false;
+        config.acp.claude = false;
+        config.acp.opencode = false;
+        assert!(missing_enabled_adapter_errors(&config, &availability).is_empty());
     }
 
     #[test]
@@ -890,6 +970,21 @@ mod tests {
                 .model
                 .model,
             "gpt-5-6-terra"
+        );
+    }
+
+    #[test]
+    fn unavailable_explicit_eitri_fails_resolution() {
+        let rows = vec![role_at("gpt-5-6-sol", 0.694, 3.47).model];
+        let available = vec![role_at("claude-fable-5", 0.64, 4.0)];
+
+        let error = resolve_eitri("gpt-5-6-sol", &rows, &available)
+            .expect_err("explicit unavailable Eitri must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("Eitri model 'gpt-5-6-sol' is unavailable"),
+            "{error:#}"
         );
     }
 }

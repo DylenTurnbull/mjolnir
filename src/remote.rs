@@ -909,8 +909,10 @@ impl TrackerState {
             | UiEvent::ElicitationRequest(_)
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::CodeAgent(_)
-            | UiEvent::Info(_)
-            | UiEvent::Warning(_) => {}
+            | UiEvent::Info(_) => {}
+            UiEvent::Warning(message) => {
+                self.push_system_notice(message.clone());
+            }
             UiEvent::LokiActivity(activity) => {
                 let (kind, text) = match activity {
                     crate::event::LokiActivity::Warning { message, .. } => {
@@ -2051,6 +2053,11 @@ fn start_server_agent_session(
         Some(server_cmd_tx.clone()),
         Some(remote_event_tx),
     );
+    if let Some(resolved) = council.as_ref() {
+        for warning in &resolved.warnings {
+            tracker.observe_event(&UiEvent::Warning(warning.clone()));
+        }
+    }
     let mut council_setup_error = None;
     let (isolated_loki, loki_codex_home) = match app_config
         .loki
@@ -2068,7 +2075,7 @@ fn start_server_agent_session(
         None => (None, None),
     };
     let (isolated_eitri, eitri_codex_home) =
-        match council.as_ref().map(|resolved| resolved.eitri.clone()) {
+        match council.as_ref().and_then(|resolved| resolved.eitri.clone()) {
             Some(role) => match crate::isolated_council_role(role, "eitri") {
                 Ok(pair) => (Some(pair.0), pair.1),
                 Err(error) => {
@@ -5149,6 +5156,23 @@ mod tests {
         assert_eq!(snapshot.transcript[1].kind, "agent");
         assert_eq!(snapshot.transcript[1].text, "hi there");
         assert!(!snapshot.transcript[1].timestamp.is_empty());
+    }
+
+    #[test]
+    fn tracker_records_warnings_as_system_transcript_entries() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+
+        state.observe_event(&UiEvent::Warning("Loki is unavailable".to_string()));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.transcript.len(), 1);
+        assert_eq!(snapshot.transcript[0].kind, "system");
+        assert_eq!(snapshot.transcript[0].text, "Loki is unavailable");
+        assert_eq!(snapshot.transcript[0].actor, None);
     }
 
     #[test]

@@ -1354,7 +1354,13 @@ async fn run_session(
     loki_config: config::LokiConfig,
 ) -> Result<RunSessionResult> {
     let mut terminal = SessionTerminal::fresh(mode)?;
-    let (eitri_role, _eitri_codex_home) = isolated_council_role(council.eitri.clone(), "eitri")?;
+    let (eitri_role, _eitri_codex_home) = match council.eitri.clone() {
+        Some(role) => {
+            let (role, guard) = isolated_council_role(role, "eitri")?;
+            (Some(role), guard)
+        }
+        None => (None, None),
+    };
     let (loki_role, _loki_codex_home) = match council.loki.clone() {
         Some(role) => {
             let (role, guard) = isolated_council_role(role, "loki")?;
@@ -1376,7 +1382,11 @@ async fn run_session(
             .as_ref()
             .map(|role| role.model.model.as_str())
             .unwrap_or("off"),
-        council.eitri.model.model,
+        council
+            .eitri
+            .as_ref()
+            .map(|role| role.model.model.as_str())
+            .unwrap_or("off"),
         council.available.len(),
     )));
     for warning in &council.warnings {
@@ -1473,7 +1483,7 @@ async fn run_session(
             model_value: council.thor.model_value.clone(),
             force_high_reasoning: true,
         }),
-        code_agent: Some(
+        code_agent: eitri_role.map(|eitri_role| {
             code_agent::Config::council(
                 eitri_role.launch.command.clone(),
                 eitri_role.launch.args.clone(),
@@ -1483,8 +1493,8 @@ async fn run_session(
                 eitri_role.model_value.clone(),
                 loki_handle.clone(),
             )
-            .with_implementation_handoff_counter(implementation_handoffs_this_turn.clone()),
-        ),
+            .with_implementation_handoff_counter(implementation_handoffs_this_turn.clone())
+        }),
     };
 
     // Drive the ACP runtime on its own task so the UI can own the
@@ -1874,7 +1884,11 @@ async fn run_session(
                         .as_ref()
                         .map(|role| role.model.model.clone())
                         .unwrap_or_else(|| "off".to_string()),
-                    eitri: council.eitri.model.model.clone(),
+                    eitri: council
+                        .eitri
+                        .as_ref()
+                        .map(|role| role.model.model.clone())
+                        .unwrap_or_else(|| "off".to_string()),
                 },
                 thor_review_enabled: thor_config.discrete_review,
                 loki_review_enabled: loki_config.streaming_review,
@@ -2399,7 +2413,7 @@ mod tests {
         let mut council = council::ResolvedCouncil {
             thor: codex.clone(),
             loki: None,
-            eitri: codex.clone(),
+            eitri: Some(codex.clone()),
             available: vec![codex, claude],
             choices: Vec::new(),
             warnings: Vec::new(),
