@@ -1802,7 +1802,7 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
         // the input box keeps its full height while the queue is visible.
         usize::from(INLINE_CHAT_HEIGHT)
             + usize::from(queued_prompt_row_count(state))
-            + usize::from(usage_quota_label(state).is_some())
+            + usage_quota_row_count(state, width)
             + inline_transcript_tail_row_count(state, width)
     };
 
@@ -4619,7 +4619,7 @@ fn draw(
     }
 
     let has_config_options = !state.selectable_config_options().is_empty();
-    let has_usage_quota = usage_quota_label(state).is_some();
+    let usage_quota_rows = usage_quota_row_count(state, f.area().width) as u16;
 
     // Dynamic input height: borders (2) + chip rows + text lines, clamped.
     let chip_rows = attachment_count(state);
@@ -4636,7 +4636,7 @@ fn draw(
             Constraint::Length(1),
             Constraint::Length(queued_row),
             Constraint::Length(input_height),
-            Constraint::Length(if has_usage_quota { 1 } else { 0 }),
+            Constraint::Length(usage_quota_rows),
             Constraint::Length(if has_config_options { 1 } else { 0 }),
         ])
         .split(f.area());
@@ -4790,7 +4790,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
     }
 
     let has_config_options = !state.selectable_config_options().is_empty();
-    let has_usage_quota = usage_quota_label(state).is_some();
+    let usage_quota_rows = usage_quota_row_count(state, f.area().width) as u16;
     let queued_row = queued_prompt_row_count(state);
     let live_rows = inline_transcript_tail_row_count(state, f.area().width)
         .min(usize::from(f.area().height)) as u16;
@@ -4801,7 +4801,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
             Constraint::Length(1),
             Constraint::Length(queued_row),
             Constraint::Min(MIN_INPUT_HEIGHT),
-            Constraint::Length(if has_usage_quota { 1 } else { 0 }),
+            Constraint::Length(usage_quota_rows),
             Constraint::Length(if has_config_options { 1 } else { 0 }),
         ])
         .split(f.area());
@@ -8029,9 +8029,23 @@ fn draw_usage_quota_row(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let label = truncate_text_to_width(label, area.width);
-    let paragraph = Paragraph::new(label).style(Style::default().fg(state.theme.warning));
+    let paragraph = Paragraph::new(label)
+        .style(Style::default().fg(state.theme.warning))
+        .wrap(Wrap { trim: false });
     f.render_widget(paragraph, area);
+}
+
+fn usage_quota_row_count(state: &AppState, width: u16) -> usize {
+    let Some(label) = usage_quota_label(state) else {
+        return 0;
+    };
+    if width == 0 {
+        return 0;
+    }
+    Paragraph::new(label)
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
 }
 
 fn usage_quota_label(state: &AppState) -> Option<String> {
@@ -8044,6 +8058,10 @@ fn usage_quota_label(state: &AppState) -> Option<String> {
             .openrouter_balance
             .as_ref()
             .map(crate::openrouter_balance::OpenRouterBalanceStatus::compact_label),
+        Some(crate::app::AnvilQuotaSource::DeepSeek) => state
+            .deepseek_balance
+            .as_ref()
+            .map(crate::deepseek_balance::DeepSeekBalanceStatus::compact_label),
         None => None,
     };
 
@@ -16757,6 +16775,74 @@ mod tests {
         assert!(
             buffer_lines(terminal.backend().buffer())[0]
                 .contains("OpenRouter balance unavailable: billing credentials are unavailable")
+        );
+    }
+
+    #[test]
+    fn usage_quota_row_renders_all_deepseek_balance_records() {
+        let mut state = AppState::new();
+        state.set_deepseek_balance(crate::deepseek_balance::DeepSeekBalanceStatus::Available(
+            crate::deepseek_balance::DeepSeekBalanceReport {
+                balances: vec![
+                    crate::deepseek_balance::DeepSeekBalance {
+                        currency: "CNY".to_string(),
+                        total_balance: "123.4500".to_string(),
+                        granted_balance: "23.0000".to_string(),
+                        topped_up_balance: "100.4500".to_string(),
+                    },
+                    crate::deepseek_balance::DeepSeekBalance {
+                        currency: "USD".to_string(),
+                        total_balance: "0.010".to_string(),
+                        granted_balance: "0.000".to_string(),
+                        topped_up_balance: "0.010".to_string(),
+                    },
+                ],
+                as_of: "2026-07-15T18:42:00Z".to_string(),
+            },
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some(
+                "DeepSeek balance: CNY total 123.4500 · granted 23.0000 · topped up 100.4500 · USD total 0.010 · granted 0.000 · topped up 0.010 · as of 2026-07-15T18:42:00Z"
+            )
+        );
+
+        let backend = TestBackend::new(50, 5);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_usage_quota_row(frame, frame.area(), &state))
+            .expect("draw");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        for expected in [
+            "CNY total",
+            "123.4500",
+            "granted",
+            "23.0000",
+            "topped up",
+            "100.4500",
+            "USD total",
+            "0.010",
+            "0.000",
+            "2026-07-15T18:42:00Z",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
+        assert!(usage_quota_row_count(&state, 50) > 1);
+
+        state.set_deepseek_balance(crate::deepseek_balance::DeepSeekBalanceStatus::Unavailable(
+            crate::deepseek_balance::DeepSeekBalanceUnavailable {
+                reason: "billing credentials are unavailable".to_string(),
+                as_of: "2026-07-15T18:43:00Z".to_string(),
+            },
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some(
+                "DeepSeek balance unavailable: billing credentials are unavailable · as of 2026-07-15T18:43:00Z"
+            )
         );
     }
 

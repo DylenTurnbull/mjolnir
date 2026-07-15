@@ -17,6 +17,7 @@ mod config;
 mod council;
 mod council_orchestrator;
 mod council_usage;
+mod deepseek_balance;
 mod deepswe;
 mod event;
 mod headless;

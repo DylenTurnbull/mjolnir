@@ -13,6 +13,7 @@ use crate::bedrock_credits::BedrockCreditsStatus;
 use crate::claude_usage::ClaudeUsageStatus;
 use crate::clipboard::ClipboardLease;
 use crate::codex_usage::CodexUsageStatus;
+use crate::deepseek_balance::DeepSeekBalanceStatus;
 use crate::openrouter_balance::OpenRouterBalanceStatus;
 use agent_client_protocol::schema::v1::{
     AvailableCommand, Diff, ElicitationContentValue, ElicitationMode, ElicitationPropertySchema,
@@ -41,6 +42,7 @@ pub const QUEUED_PROMPT_PREVIEW_WIDTH: usize = 40;
 pub enum AnvilQuotaSource {
     Bedrock,
     OpenRouter,
+    DeepSeek,
 }
 
 const BUILTIN_NEW_COMMAND: &str = "new";
@@ -747,6 +749,8 @@ pub struct AppState {
     pub bedrock_credits: Option<BedrockCreditsStatus>,
     /// OpenRouter balance supplied by Anvil for the active OpenRouter route.
     pub openrouter_balance: Option<OpenRouterBalanceStatus>,
+    /// DeepSeek balances supplied by Anvil for the active DeepSeek route.
+    pub deepseek_balance: Option<DeepSeekBalanceStatus>,
     /// The active provider reported in Anvil metadata.
     pub anvil_quota_source: Option<AnvilQuotaSource>,
     /// Slash-command autocomplete state, recomputed on every input edit.
@@ -1065,6 +1069,7 @@ impl AppState {
             codex_usage: None,
             bedrock_credits: None,
             openrouter_balance: None,
+            deepseek_balance: None,
             anvil_quota_source: None,
             autocomplete: Autocomplete::default(),
             help_overlay: false,
@@ -1088,8 +1093,18 @@ impl AppState {
     /// Select the Anvil provider reported by valid metadata and clear its stale peer.
     fn select_anvil_quota_source(&mut self, source: AnvilQuotaSource) {
         match source {
-            AnvilQuotaSource::Bedrock => self.openrouter_balance = None,
-            AnvilQuotaSource::OpenRouter => self.bedrock_credits = None,
+            AnvilQuotaSource::Bedrock => {
+                self.openrouter_balance = None;
+                self.deepseek_balance = None;
+            }
+            AnvilQuotaSource::OpenRouter => {
+                self.bedrock_credits = None;
+                self.deepseek_balance = None;
+            }
+            AnvilQuotaSource::DeepSeek => {
+                self.bedrock_credits = None;
+                self.openrouter_balance = None;
+            }
         }
         self.anvil_quota_source = Some(source);
     }
@@ -1102,6 +1117,11 @@ impl AppState {
     pub(crate) fn set_openrouter_balance(&mut self, status: OpenRouterBalanceStatus) {
         self.select_anvil_quota_source(AnvilQuotaSource::OpenRouter);
         self.openrouter_balance = Some(status);
+    }
+
+    pub(crate) fn set_deepseek_balance(&mut self, status: DeepSeekBalanceStatus) {
+        self.select_anvil_quota_source(AnvilQuotaSource::DeepSeek);
+        self.deepseek_balance = Some(status);
     }
 
     pub(crate) fn set_codex_usage(&mut self, status: CodexUsageStatus) {
@@ -2718,6 +2738,9 @@ impl AppState {
                 }
                 if let Some(status) = crate::openrouter_balance::from_usage_meta(u.meta.as_ref()) {
                     self.set_openrouter_balance(status);
+                }
+                if let Some(status) = crate::deepseek_balance::from_usage_meta(u.meta.as_ref()) {
+                    self.set_deepseek_balance(status);
                 }
                 if let Some(rate_limit) = self.token_usage.apply_usage_update(u) {
                     // The line is self-describing ("Current session: …"), so
@@ -5102,6 +5125,57 @@ mod tests {
                 "billing credentials are unavailable".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn usage_update_deepseek_balance_extracts_metadata_and_preserves_malformed_status() {
+        let mut state = AppState::new();
+        let available = serde_json::json!({"anvil":{"deepseekBalance":{"status":"available","balances":[{"currency":"CNY","totalBalance":"123.4500","grantedBalance":"23.0000","toppedUpBalance":"100.4500"},{"currency":"USD","totalBalance":"0.010","grantedBalance":"0.000","toppedUpBalance":"0.010"}],"asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(available.as_object().unwrap().clone()),
+        )));
+
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::DeepSeek));
+        assert!(matches!(
+            state.deepseek_balance,
+            Some(DeepSeekBalanceStatus::Available(_))
+        ));
+
+        let invalid = serde_json::json!({"anvil":{"deepseekBalance":{"status":"available","balances":[{"currency":"CNY","totalBalance":123.45,"grantedBalance":"23.0000","toppedUpBalance":"100.4500"}],"asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(invalid.as_object().unwrap().clone()),
+        )));
+
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::DeepSeek));
+        assert_eq!(
+            state.deepseek_balance,
+            crate::deepseek_balance::from_usage_meta(available.as_object())
+        );
+    }
+
+    #[test]
+    fn valid_deepseek_and_peer_updates_clear_each_other() {
+        let mut state = AppState::new();
+        state.set_bedrock_credits(BedrockCreditsStatus::Unavailable(
+            "bedrock unavailable".into(),
+        ));
+
+        state.set_deepseek_balance(DeepSeekBalanceStatus::Unavailable(
+            crate::deepseek_balance::DeepSeekBalanceUnavailable {
+                reason: "deepseek unavailable".into(),
+                as_of: "2026-07-15T18:42:00Z".into(),
+            },
+        ));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::DeepSeek));
+        assert!(state.bedrock_credits.is_none());
+        assert!(state.openrouter_balance.is_none());
+
+        state.set_openrouter_balance(OpenRouterBalanceStatus::Unavailable(
+            "openrouter unavailable".into(),
+        ));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::OpenRouter));
+        assert!(state.deepseek_balance.is_none());
+        assert!(state.bedrock_credits.is_none());
     }
 
     #[test]
