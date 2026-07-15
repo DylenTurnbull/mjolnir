@@ -2155,9 +2155,11 @@ fn start_server_agent_session(
         council_session: None,
     });
     let implementation_handoffs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let active_implementation_workers = code_agent::ActiveCodeWorkers::default();
     let code_agent = isolated_eitri.as_ref().map(|eitri| {
         code_agent::Config::council(eitri.clone(), None, loki_handle.clone())
             .with_implementation_handoff_counter(implementation_handoffs.clone())
+            .with_active_implementation_workers(active_implementation_workers.clone())
             .with_max_parallel_explores(app_config.eitri.max_parallel_explores)
     });
     let provenance_thor = council.as_ref().map(|resolved| resolved.thor.clone());
@@ -2181,6 +2183,7 @@ fn start_server_agent_session(
         saved_session_config: HashMap::new(),
         role_config,
         code_agent,
+        termination: None,
     };
     let command_tx = server_cmd_tx.clone();
     let shutdown_tx = runtime_cmd_tx.clone();
@@ -2197,6 +2200,7 @@ fn start_server_agent_session(
             reviewer: loki_handle.clone(),
             runtime_commands: runtime_cmd_tx.clone(),
             implementation_handoffs: implementation_handoffs.clone(),
+            active_implementation_workers: active_implementation_workers.clone(),
             discrete_review: app_config.thor.discrete_review,
             log_context,
         },

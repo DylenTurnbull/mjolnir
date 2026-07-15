@@ -178,7 +178,9 @@ impl CodexUsageClient {
         // Closing stdin asks app-server to stop; always follow with process-tree
         // cleanup so a wrapper cannot exit successfully while leaving a helper
         // behind. `kill_agent_tree` sends SIGTERM before escalating on Unix.
-        crate::acp::kill_agent_tree(&mut self.child, self.pid).await;
+        if let Err(error) = crate::acp::kill_agent_tree(&mut self.child, self.pid).await {
+            tracing::warn!("reap Codex usage client: {error:#}");
+        }
     }
 }
 

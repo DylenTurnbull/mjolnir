@@ -198,6 +198,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         None => (None, None),
     };
     let implementation_handoffs = Arc::new(AtomicUsize::new(0));
+    let active_implementation_workers = code_agent::ActiveCodeWorkers::default();
     let runtime_cfg = AcpRuntimeConfig {
         command: thor.launch.command.clone(),
         args: thor.launch.args.clone(),
@@ -222,8 +223,10 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         code_agent: eitri.map(|eitri| {
             code_agent::Config::council(eitri, cfg.agent_stderr.clone(), loki_handle.clone())
                 .with_implementation_handoff_counter(implementation_handoffs.clone())
+                .with_active_implementation_workers(active_implementation_workers.clone())
                 .with_max_parallel_explores(app_config.eitri.max_parallel_explores)
         }),
+        termination: None,
     };
 
     let runtime = tokio::spawn(async move { acp::run(runtime_cfg, event_tx, cmd_rx).await });
@@ -242,6 +245,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             reviewer: loki_handle.clone(),
             runtime_commands: cmd_tx.clone(),
             implementation_handoffs: implementation_handoffs.clone(),
+            active_implementation_workers: active_implementation_workers.clone(),
             discrete_review: app_config.thor.discrete_review,
             log_context: Some(crate::council_orchestrator::LogContext {
                 council_session: format!("headless-{}", std::process::id()),

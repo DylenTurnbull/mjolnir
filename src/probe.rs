@@ -82,7 +82,9 @@ where
         Err(_) => timed_out(),
     };
 
-    acp::kill_agent_tree(&mut child, agent_pid).await;
+    if let Err(error) = acp::kill_agent_tree(&mut child, agent_pid).await {
+        tracing::warn!("reap detached ACP probe: {error:#}");
+    }
     result
 }
 
