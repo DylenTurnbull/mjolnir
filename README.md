@@ -4,7 +4,7 @@ Mjolnir (`mj`) is a native Rust ACP client with a model-first coding Council:
 
 - **Thor** coordinates the user turn.
 - **Eitri** implements delegated, forgeable coding tasks or explores a codebase.
-- **Loki** optionally reviews Thor and Eitri at streaming step boundaries.
+- **Loki** optionally reviews Thor and Eitri's implementation runs at streaming step boundaries.
 
 Models are ranked with the public DeepSWE Pass@1 and average-cost data. Mjolnir
 selects models first, then routes them through locally available ACP adapters.
@@ -139,13 +139,17 @@ resumed or compacted sessions. Thor should use direct tools for small, tightly
 coupled edits and delegate self-contained implementation tasks with clear inputs
 and acceptance criteria to `code_agent`. It uses `explore_agent` for open-ended,
 multi-file research where locations or execution flow are not yet known.
+Read-only exploration runs in a bounded background pool and may overlap other
+explorations or an implementation run. Loki never observes or interrupts these
+scouts; its Eitri review path is reserved for `code_agent` implementation work.
 
 During a handoff, Thor's foreground ACP lane is detached and Eitri's fresh ACP
 session streams directly through the normal Mjolnir UI. Ctrl-C cancels the
 currently active Eitri request, not the paused Thor request. Eitri's final
 message and invocation diff return to Thor through MCP, then Thor resumes.
 
-Loki runs in its own fresh, best-effort read-only ACP session. A streaming Loki
+Loki runs in its own fresh, best-effort read-only ACP session. Per-role token
+and cost telemetry is shown in the header and `/council` status. A streaming Loki
 intervention is intentionally expensive: it causes Mjolnir to cancel at the next
 safe step boundary and re-prompt the target with the critique. Loki's prompt
 therefore requires intervention only for material correctness, safety, scope,

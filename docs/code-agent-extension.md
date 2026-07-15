@@ -2,7 +2,8 @@
 
 Interactive Mjolnir sessions automatically start an authenticated Streamable
 HTTP MCP server on a random loopback port and include it in the primary ACP
-session's `mcpServers`. The server exposes one model-visible tool:
+session's `mcpServers`. The server exposes `code_agent` for implementation and
+`explore_agent` for read-only scouting. The implementation schema is:
 
 ```json
 {
@@ -33,10 +34,13 @@ in the TUI, and keeps the MCP tool call pending. The successful MCP result
 contains only Codex's final text message, after which the primary agent resumes
 its turn.
 
-Only one nested run is allowed. Invalid parameters are rejected, while busy,
+One implementation run and a configurable bounded pool of exploration runs may
+execute concurrently. Invalid parameters are rejected, while busy,
 nested-runtime, cancellation, and message-less failures return MCP tool errors.
-While the nested turn is active, Ctrl-C cancels both it and the primary turn so
-the primary agent cannot retry cancelled work without new user input.
+Explorations are forced read-only and render as collapsed background status
+rows. Loki is connected only to implementation runs, never explorations.
+While nested work is active, Ctrl-C cancels the active nested runs and the
+primary turn so the primary agent cannot retry cancelled work without new user input.
 The nested runtime is not given this MCP server, so it cannot recursively
 delegate.
 
