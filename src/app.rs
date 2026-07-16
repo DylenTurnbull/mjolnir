@@ -2184,7 +2184,9 @@ impl AppState {
                 self.prompt_images_supported = prompt_images_supported;
                 self.session_fork_supported = session_fork_supported;
                 install_builtin_commands(&mut self.available_commands, session_fork_supported);
-                self.set_connection_state(ConnectionState::Initializing);
+                if !self.is_streaming() {
+                    self.set_connection_state(ConnectionState::Initializing);
+                }
                 self.announce_connected_to_primary();
             }
             UiEvent::SessionStarted { session_id, .. } => {
@@ -2195,7 +2197,9 @@ impl AppState {
                     self.workspace_diffs.clear();
                 }
                 self.session_id = Some(session_id);
-                self.set_connection_state(ConnectionState::Ready);
+                if !self.is_streaming() {
+                    self.set_connection_state(ConnectionState::Ready);
+                }
             }
             UiEvent::SessionUpdate(u) => {
                 self.apply_session_update(u);
@@ -4770,6 +4774,33 @@ mod tests {
         });
         assert_eq!(s.connection_state, ConnectionState::Ready);
         assert!(!s.is_streaming());
+    }
+
+    #[test]
+    fn prompt_submitted_during_startup_stays_busy_through_the_handshake() {
+        let mut state = AppState::new();
+        state.record_user_prompt("queued while starting".to_string());
+        assert_eq!(state.connection_state, ConnectionState::Streaming);
+
+        state.apply_event(UiEvent::Connected {
+            agent_name: Some("slow adapter".into()),
+            agent_version: None,
+            prompt_images_supported: false,
+            session_fork_supported: false,
+        });
+        assert_eq!(state.connection_state, ConnectionState::Streaming);
+        state.apply_event(UiEvent::SessionStarted {
+            session_id: "slow-session".into(),
+            resumed: false,
+        });
+        assert_eq!(state.connection_state, ConnectionState::Streaming);
+        assert!(state.is_busy());
+
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        assert_eq!(state.connection_state, ConnectionState::Ready);
     }
 
     #[test]
