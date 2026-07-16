@@ -296,16 +296,14 @@ fn push_bounded(queue: &mut VecDeque<Advice>, dropped: &mut u64, advice: Advice)
 #[derive(Clone)]
 struct McpHandler {
     advice: AdviceSlot,
-    tools_listed: watch::Sender<bool>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router(router = tool_router)]
 impl McpHandler {
-    fn new(advice: AdviceSlot, tools_listed: watch::Sender<bool>) -> Self {
+    fn new(advice: AdviceSlot) -> Self {
         Self {
             advice,
-            tools_listed,
             tool_router: Self::tool_router(),
         }
     }
@@ -345,7 +343,6 @@ impl ServerHandler for McpHandler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = std::result::Result<ListToolsResult, McpError>> + Send + '_ {
-        let _ = self.tools_listed.send(true);
         std::future::ready(Ok(ListToolsResult::with_all_items(
             self.tool_router.list_all(),
         )))
@@ -367,7 +364,6 @@ impl ServerHandler for McpHandler {
 
 struct HttpServer {
     advertised: McpServer,
-    tools_listed: watch::Receiver<bool>,
     cancellation: CancellationToken,
     task: JoinHandle<()>,
 }
@@ -379,8 +375,7 @@ impl HttpServer {
             .map_err(|error| anyhow!("generate Loki advisor MCP bearer token: {error}"))?;
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
         let authorization = format!("Bearer {token}");
-        let (tools_listed_tx, tools_listed) = watch::channel(false);
-        let handler = McpHandler::new(advice, tools_listed_tx);
+        let handler = McpHandler::new(advice);
         let cancellation = CancellationToken::new();
         let mut config = StreamableHttpServerConfig::default();
         config.cancellation_token = cancellation.clone();
@@ -413,22 +408,9 @@ impl HttpServer {
         );
         Ok(Self {
             advertised,
-            tools_listed,
             cancellation,
             task,
         })
-    }
-
-    async fn wait_until_tools_listed(&self) -> Result<()> {
-        let mut listed = self.tools_listed.clone();
-        if *listed.borrow() {
-            return Ok(());
-        }
-        tokio::time::timeout(Duration::from_secs(30), listed.changed())
-            .await
-            .map_err(|_| anyhow!("Loki timed out loading the advise MCP tool"))?
-            .map_err(|_| anyhow!("Loki advisor MCP server closed before tools/list"))?;
-        Ok(())
     }
 }
 
@@ -1454,16 +1436,6 @@ async fn worker(
                 Ok(agent) => match review_state.accept_session(agent.session_started()) {
                     Ok(()) => {
                         session = Some(agent);
-                        if let Err(error) = server.wait_until_tools_listed().await {
-                            emit_warning(
-                                &ui_tx,
-                                &role,
-                                format!("Loki could not load advise: {error:#}"),
-                            );
-                            if let Some(old) = session.take() {
-                                old.dismiss().await;
-                            }
-                        }
                     }
                     Err(error) => {
                         if !*abort_rx.borrow() {

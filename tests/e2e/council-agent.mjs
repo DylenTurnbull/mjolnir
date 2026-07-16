@@ -213,13 +213,13 @@ input.on("line", (line) => {
     mcpServer = sessionMcpServers.find((server) => server.name === "mj-code-agent" || server.name === "mj-loki-advisor");
     mcpToolName = mcpServer?.name === "mj-loki-advisor" ? "advise" : (exploreMode ? "explore_agent" : "code_agent");
     send({ id: message.id, result: { sessionId: "fixture-session", configOptions: configOptions() } });
-    if (mcpServer) mcpReady = prepareMcp();
   } else if (message.method === "session/set_config_option") {
     if (message.params.configId === "model") selectedModel = message.params.value;
     if (message.params.configId === "reasoning") reasoning = message.params.value;
     log(`config:${message.params.configId}=${message.params.value}`);
     send({ id: message.id, result: { configOptions: configOptions() } });
   } else if (message.method === "session/prompt") {
+    if (mcpServer && !mcpReady) mcpReady = prepareMcp();
     promptRequestId = message.id;
     const text = message.params?.prompt?.[0]?.text ?? "";
     if (reasoning !== "high") { send({ id: message.id, error: { code: -32602, message: "High was not selected before prompt" } }); return; }

@@ -1932,15 +1932,16 @@ async fn drive_session(
         emit_fatal(ui_tx, &fatal_emitted, text.clone());
         return Err(anyhow::anyhow!(text));
     }
-    if let Some(server) = &code_agent_http
-        && let Err(error) = server
-            .wait_until_tools_listed(Duration::from_secs(30))
-            .await
-    {
-        let text = format!("primary agent did not load the injected code-agent MCP tool: {error}");
-        emit_fatal(ui_tx, &fatal_emitted, text.clone());
-        return Err(anyhow::anyhow!(text));
-    }
+    // Do not require the primary agent to eagerly list Eitri's injected MCP
+    // tools before the first prompt. Some ACP agents, including Anvil, accept
+    // lifecycle `mcpServers` during `session/new` but intentionally construct
+    // their tool registry lazily when handling `session/prompt`. Waiting here
+    // deadlocks those agents: Mjolnir waits for `tools/list` while the agent
+    // waits for the first prompt before it lists tools.
+    //
+    // The code-agent MCP server stays advertised for the session, and the
+    // first substantive prompt below still carries Thor's policy requiring use
+    // of `code_agent`/`explore_agent` when delegation is needed.
     // Thor's policy rides as a suffix on the first real user message of any
     // session (new, resumed, or loaded) and again after a detected context
     // compaction, so the delegation contract survives history replacement.

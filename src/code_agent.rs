@@ -338,7 +338,6 @@ struct McpHandler {
     controller: Controller,
     code_runs: CodeRunRegistry,
     handoff_retry: Arc<Mutex<Option<HandoffRetry>>>,
-    tools_listed: watch::Sender<bool>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -356,7 +355,6 @@ impl McpHandler {
         context: RunContext,
         ui_tx: mpsc::UnboundedSender<UiEvent>,
         controller: Controller,
-        tools_listed: watch::Sender<bool>,
     ) -> Self {
         Self {
             config,
@@ -365,7 +363,6 @@ impl McpHandler {
             controller,
             code_runs: CodeRunRegistry::default(),
             handoff_retry: Arc::new(Mutex::new(None)),
-            tools_listed,
             tool_router: Self::tool_router(),
         }
     }
@@ -728,7 +725,6 @@ impl ServerHandler for McpHandler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = std::result::Result<ListToolsResult, McpError>> + Send + '_ {
-        let _ = self.tools_listed.send(true);
         std::future::ready(Ok(ListToolsResult::with_all_items(
             self.tool_router.list_all(),
         )))
@@ -752,7 +748,6 @@ impl ServerHandler for McpHandler {
 /// Dropping it cancels the listener and every open MCP session.
 pub struct HttpServer {
     advertised: McpServer,
-    tools_listed: watch::Receiver<bool>,
     cancellation: CancellationToken,
     task: JoinHandle<()>,
 }
@@ -776,8 +771,7 @@ impl HttpServer {
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
         let authorization = format!("Bearer {token}");
 
-        let (tools_listed_tx, tools_listed) = watch::channel(false);
-        let handler = McpHandler::new(config, context, ui_tx, controller, tools_listed_tx);
+        let handler = McpHandler::new(config, context, ui_tx, controller);
         let cancellation = CancellationToken::new();
         let mut server_config = StreamableHttpServerConfig::default();
         server_config.cancellation_token = cancellation.clone();
@@ -810,7 +804,6 @@ impl HttpServer {
         );
         Ok(Self {
             advertised,
-            tools_listed,
             cancellation,
             task,
         })
@@ -818,18 +811,6 @@ impl HttpServer {
 
     pub fn advertised(&self) -> &McpServer {
         &self.advertised
-    }
-
-    pub async fn wait_until_tools_listed(&self, timeout: Duration) -> Result<()> {
-        let mut tools_listed = self.tools_listed.clone();
-        if *tools_listed.borrow() {
-            return Ok(());
-        }
-        tokio::time::timeout(timeout, tools_listed.changed())
-            .await
-            .map_err(|_| anyhow!("primary agent timed out loading the Eitri MCP tools"))?
-            .map_err(|_| anyhow!("code-agent MCP server closed before tools/list"))?;
-        Ok(())
     }
 }
 

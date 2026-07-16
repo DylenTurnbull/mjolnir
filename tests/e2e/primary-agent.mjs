@@ -231,10 +231,10 @@ input.on("line", (line) => {
       return;
     }
     send({ id: message.id, result: { sessionId: "primary-session" } });
-    mcpReady = prepareMcp();
     return;
   }
   if (message.method === "session/prompt") {
+    if (mcpServer && !mcpReady) mcpReady = prepareMcp();
     promptRequestId = message.id;
     const prompt = message.params?.prompt ?? [];
     if (prompt.length === 1 && prompt[0]?.text?.includes("<mj-code-agent-policy>")) {
