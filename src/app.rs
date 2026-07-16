@@ -680,6 +680,10 @@ pub struct AppState {
     /// Workspace diffs observed locally after prompt turns. These deliberately
     /// remain outside ACP tool-call and transcript state.
     pub workspace_diffs: Vec<crate::event::WorkspaceDiffEvent>,
+    /// Accurate changed-file count reported for the current prompt turn.
+    /// Consumed when that turn completes so an older diff cannot affect a
+    /// later no-diff turn's status.
+    pending_workspace_diff_total: Option<usize>,
     /// Primary-agent MCP calls that transport an Eitri turn. Their protocol
     /// state remains available, but the redundant parent row is omitted from
     /// the transcript so it cannot pin nested activity behind a pending tool.
@@ -1123,6 +1127,7 @@ impl AppState {
             ragnarok_models: Vec::new(),
             clipboard_lease: None,
             queued_prompts: VecDeque::new(),
+            pending_workspace_diff_total: None,
         }
     }
 
@@ -1912,6 +1917,7 @@ impl AppState {
     /// Push a user prompt into the transcript immediately, before the
     /// command reaches the runtime. Keeps the UI responsive.
     pub fn record_user_prompt(&mut self, text: String) {
+        self.pending_workspace_diff_total = None;
         let prompt_index = self.transcript.len();
         self.transcript.push(Entry::UserPrompt(text.clone()));
         self.prompt_turns.push(PromptTurn {
@@ -2205,6 +2211,7 @@ impl AppState {
                 }
                 if self.session_id.as_deref() != Some(&session_id) {
                     self.workspace_diffs.clear();
+                    self.pending_workspace_diff_total = None;
                 }
                 self.session_id = Some(session_id);
                 if !self.is_streaming() {
@@ -2246,7 +2253,10 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             UiEvent::CouncilUsage(record) => self.council_usage.observe(record),
-            UiEvent::WorkspaceDiff(diff) => self.workspace_diffs.push(diff),
+            UiEvent::WorkspaceDiff(diff) => {
+                self.pending_workspace_diff_total = Some(diff.total_files);
+                self.workspace_diffs.push(diff);
+            }
             UiEvent::PermissionRequest(prompt) => {
                 self.finalize_thinking(EntryKind::Thought);
                 // Append to the queue rather than replacing the current
@@ -2304,8 +2314,22 @@ impl AppState {
                 // would only flash and then hang around stale through the
                 // new turn.
                 if !self.has_queued_prompts() {
-                    self.set_status_line(StatusKind::Info, format!("turn done: {stop_reason:?}"));
+                    if let Some(total_files) = self.pending_workspace_diff_total.take()
+                        && !matches!(stop_reason, StopReason::Cancelled)
+                    {
+                        let noun = if total_files == 1 { "file" } else { "files" };
+                        self.set_status_line(
+                            StatusKind::Info,
+                            format!("workspace changes: {total_files} {noun} · Ctrl-G diff"),
+                        );
+                    } else {
+                        self.set_status_line(
+                            StatusKind::Info,
+                            format!("turn done: {stop_reason:?}"),
+                        );
+                    }
                 }
+                self.pending_workspace_diff_total = None;
                 self.update_autocomplete();
             }
             UiEvent::ClaudeUsage(report) => {
@@ -2317,6 +2341,7 @@ impl AppState {
             UiEvent::PromptFailed { message } => {
                 self.finalize_thinking(EntryKind::Thought);
                 self.finish_prompt_turn(true);
+                self.pending_workspace_diff_total = None;
                 // Drop queued prompts: finish_prompt_turn flips back to
                 // Ready, which the next drain pass would otherwise read as
                 // "fire the stash" and auto-resubmit into a
@@ -3761,6 +3786,107 @@ mod tests {
     }
 
     #[test]
+    fn completed_turn_surfaces_workspace_diff_hint_with_singular_and_plural_counts() {
+        for (total_files, expected) in [
+            (1, "workspace changes: 1 file · Ctrl-G diff"),
+            (3, "workspace changes: 3 files · Ctrl-G diff"),
+        ] {
+            let mut state = AppState::new();
+            state.record_user_prompt("make a change".to_string());
+            let transcript_len = state.transcript.len();
+
+            state.apply_event(UiEvent::WorkspaceDiff(crate::event::WorkspaceDiffEvent {
+                turn_id: 1,
+                diffs: vec![crate::event::WorkspaceDiff {
+                    path: PathBuf::from("src/lib.rs"),
+                    old_text: Some("before\n".to_string()),
+                    new_text: "after\n".to_string(),
+                }],
+                total_files,
+                max_files: 20,
+                truncated: false,
+            }));
+            state.apply_event(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            });
+
+            assert_eq!(
+                state
+                    .status_line
+                    .as_ref()
+                    .map(|status| status.text.as_str()),
+                Some(expected)
+            );
+            assert_eq!(state.transcript.len(), transcript_len);
+            assert!(state.tool_calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn completed_no_diff_turn_keeps_normal_done_status_and_clears_prior_diff_hint() {
+        let mut state = AppState::new();
+        state.record_user_prompt("first".to_string());
+        state.apply_event(UiEvent::WorkspaceDiff(crate::event::WorkspaceDiffEvent {
+            turn_id: 1,
+            diffs: vec![crate::event::WorkspaceDiff {
+                path: PathBuf::from("src/lib.rs"),
+                old_text: None,
+                new_text: "after\n".to_string(),
+            }],
+            total_files: 1,
+            max_files: 20,
+            truncated: false,
+        }));
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        state.record_user_prompt("second".to_string());
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+
+        assert_eq!(
+            state
+                .status_line
+                .as_ref()
+                .map(|status| status.text.as_str()),
+            Some("turn done: EndTurn")
+        );
+    }
+
+    #[test]
+    fn completed_turn_uses_uncapped_workspace_diff_total_in_hint() {
+        let mut state = AppState::new();
+        state.record_user_prompt("make many changes".to_string());
+        state.apply_event(UiEvent::WorkspaceDiff(crate::event::WorkspaceDiffEvent {
+            turn_id: 1,
+            diffs: vec![crate::event::WorkspaceDiff {
+                path: PathBuf::from("src/lib.rs"),
+                old_text: None,
+                new_text: "after\n".to_string(),
+            }],
+            total_files: 21,
+            max_files: 20,
+            truncated: true,
+        }));
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+
+        assert_eq!(
+            state
+                .status_line
+                .as_ref()
+                .map(|status| status.text.as_str()),
+            Some("workspace changes: 21 files · Ctrl-G diff")
+        );
+    }
+
+    #[test]
     fn thinking_chunks_accumulate_and_same_actor_activity_finalizes_them() {
         let mut state = AppState::new();
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
@@ -4995,6 +5121,17 @@ mod tests {
                 display_text: "queued".to_string(),
             });
             s.status_line = Some(StatusMessage::info("queued 1: queued"));
+            s.apply_event(UiEvent::WorkspaceDiff(crate::event::WorkspaceDiffEvent {
+                turn_id: 1,
+                diffs: vec![crate::event::WorkspaceDiff {
+                    path: PathBuf::from("src/lib.rs"),
+                    old_text: None,
+                    new_text: "after\n".to_string(),
+                }],
+                total_files: 1,
+                max_files: 20,
+                truncated: false,
+            }));
 
             s.apply_event(UiEvent::PromptDone {
                 stop_reason: reason,
