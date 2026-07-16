@@ -1281,11 +1281,9 @@ async fn run_onboarding_once(
     council: Option<council::ResolvedCouncil>,
     notice: Option<String>,
 ) -> Result<onboarding::Outcome> {
-    let mut terminal = ui::setup_fullscreen_terminal().context("setup onboarding terminal")?;
-    let outcome = onboarding::run(&mut terminal, config, council, notice).await;
-    if let Err(error) = ui::restore_fullscreen_terminal(&mut terminal) {
-        tracing::warn!("restore terminal (onboarding) failed: {error}");
-    }
+    let mut terminal = FullscreenTerminal::fresh().context("setup onboarding terminal")?;
+    let outcome = onboarding::run(terminal.terminal_mut(), config, council, notice).await;
+    terminal.restore_once();
     settle_after_fullscreen_picker_restore().await;
     outcome
 }
@@ -1513,12 +1511,16 @@ async fn run_session_picker_once(
     notice: Option<String>,
     theme: palette::TerminalTheme,
 ) -> Result<session::ResumeOutcome> {
-    let mut terminal = ui::setup_fullscreen_terminal().context("setup terminal")?;
-    let outcome =
-        session::run_session_picker(&mut terminal, sessions, delete_supported, notice, theme).await;
-    if let Err(e) = ui::restore_fullscreen_terminal(&mut terminal) {
-        tracing::warn!("restore terminal (session picker) failed: {e}");
-    }
+    let mut terminal = FullscreenTerminal::fresh().context("setup terminal")?;
+    let outcome = session::run_session_picker(
+        terminal.terminal_mut(),
+        sessions,
+        delete_supported,
+        notice,
+        theme,
+    )
+    .await;
+    terminal.restore_once();
     settle_after_fullscreen_picker_restore().await;
     outcome
 }
@@ -1959,7 +1961,7 @@ async fn run_session(
     let mut header_labels = header_labels;
     let ui_result = loop {
         let ui_result = ui::run(
-            &mut terminal.term,
+            terminal.terminal_mut(),
             &cmd_tx,
             &mut ui_event_rx,
             header_labels.clone(),
@@ -2026,7 +2028,7 @@ async fn run_session(
 
         // LoadSession: restore now so the fullscreen session picker can take
         // over the screen.
-        terminal.restore_once(mode);
+        terminal.restore_once();
 
         let current_session_id = result.session_id;
         let current_session_title = result.session_title;
@@ -2182,11 +2184,11 @@ async fn run_session(
     // down moments before the process exits (or the next session draws) instead
     // of leaving a blank gap during teardown. No-op if the LoadSession path
     // already restored before showing the session picker.
-    terminal.restore_once(mode);
+    terminal.restore_once();
     if matches!(
         ui_result.as_ref().map(|result| result.reason),
         Ok(UiExitReason::ClearSession)
-    ) && let Err(e) = ui::clear_terminal_screen(&mut terminal.term)
+    ) && let Err(e) = ui::clear_terminal_screen(terminal.terminal_mut())
     {
         tracing::warn!("clear terminal for /clear failed: {e}");
     }
@@ -2256,36 +2258,120 @@ fn restore_session_terminal(
     }
 }
 
-/// The session terminal paired with whether it has already been restored.
+type Terminal = ratatui::Terminal<crate::term::TrackedBackend<std::io::Stdout>>;
+
+/// A restoration operation owned alongside the terminal it cleans up.
 ///
-/// `run_session` must restore the terminal exactly once, but the moment varies
-/// by exit path (the LoadSession picker needs it restored eagerly; every other
-/// path defers until after runtime teardown). Binding the flag to the terminal
-/// value keeps the two in sync by construction: `fresh` always starts
-/// unrestored, and `restore_once` is idempotent, so every exit path can call it
-/// without tracking who restored first.
-struct SessionTerminal {
-    term: ratatui::Terminal<crate::term::TrackedBackend<std::io::Stdout>>,
+/// The operation is deliberately invoked at most once, even when it fails:
+/// retrying terminal escape sequences from `Drop` can corrupt the terminal
+/// state just as easily as omitting them.  `Drop` is the safety net for early
+/// returns and panic unwinding; callers may still restore eagerly when another
+/// UI needs the terminal first.
+trait TerminalRestorer<T> {
+    fn restore(&mut self, terminal: &mut T) -> Result<()>;
+}
+
+impl<T, F> TerminalRestorer<T> for F
+where
+    F: for<'a> FnMut(&'a mut T) -> Result<()>,
+{
+    fn restore(&mut self, terminal: &mut T) -> Result<()> {
+        self(terminal)
+    }
+}
+
+struct TerminalOwner<T, R: TerminalRestorer<T>> {
+    terminal: T,
+    restorer: R,
     restored: bool,
+}
+
+impl<T, R: TerminalRestorer<T>> TerminalOwner<T, R> {
+    fn new(terminal: T, restorer: R) -> Self {
+        Self {
+            terminal,
+            restorer,
+            restored: false,
+        }
+    }
+
+    fn terminal_mut(&mut self) -> &mut T {
+        &mut self.terminal
+    }
+
+    /// Restore the terminal once.  Mark it first so a failed best-effort
+    /// restoration is never repeated by `Drop`.
+    fn restore_once(&mut self) {
+        if std::mem::replace(&mut self.restored, true) {
+            return;
+        }
+        if let Err(error) = self.restorer.restore(&mut self.terminal) {
+            tracing::warn!("restore terminal failed: {error}");
+        }
+    }
+}
+
+impl<T, R: TerminalRestorer<T>> Drop for TerminalOwner<T, R> {
+    fn drop(&mut self) {
+        self.restore_once();
+    }
+}
+
+struct SessionRestore {
+    mode: UiMode,
+}
+
+impl TerminalRestorer<Terminal> for SessionRestore {
+    fn restore(&mut self, terminal: &mut Terminal) -> Result<()> {
+        restore_session_terminal(terminal, self.mode)
+    }
+}
+
+struct FullscreenRestore;
+
+impl TerminalRestorer<Terminal> for FullscreenRestore {
+    fn restore(&mut self, terminal: &mut Terminal) -> Result<()> {
+        ui::restore_fullscreen_terminal(terminal)
+    }
+}
+
+/// The session terminal owns its UI mode and therefore its entire restoration
+/// context.  This makes restoration an invariant of terminal ownership rather
+/// than a responsibility of every `run_session` exit path.
+struct SessionTerminal {
+    owner: TerminalOwner<Terminal, SessionRestore>,
 }
 
 impl SessionTerminal {
     fn fresh(mode: UiMode) -> Result<Self> {
         Ok(Self {
-            term: setup_session_terminal(mode)?,
-            restored: false,
+            owner: TerminalOwner::new(setup_session_terminal(mode)?, SessionRestore { mode }),
         })
     }
 
-    /// Restore the terminal if it hasn't been already; later calls are no-ops.
-    fn restore_once(&mut self, mode: UiMode) {
-        if self.restored {
-            return;
-        }
-        if let Err(e) = restore_session_terminal(&mut self.term, mode) {
-            tracing::warn!("restore terminal failed: {e}");
-        }
-        self.restored = true;
+    fn terminal_mut(&mut self) -> &mut Terminal {
+        self.owner.terminal_mut()
+    }
+
+    fn restore_once(&mut self) {
+        self.owner.restore_once();
+    }
+}
+
+impl Drop for SessionTerminal {
+    fn drop(&mut self) {
+        self.restore_once();
+    }
+}
+
+type FullscreenTerminal = TerminalOwner<Terminal, FullscreenRestore>;
+
+impl TerminalOwner<Terminal, FullscreenRestore> {
+    fn fresh() -> Result<Self> {
+        Ok(Self::new(
+            ui::setup_fullscreen_terminal()?,
+            FullscreenRestore,
+        ))
     }
 }
 
@@ -2415,8 +2501,55 @@ mod tests {
     use std::{
         collections::HashSet,
         io::Write,
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::atomic::AtomicUsize,
         sync::{Arc, Barrier},
     };
+
+    struct CountRestore(Arc<AtomicUsize>);
+
+    impl TerminalRestorer<()> for CountRestore {
+        fn restore(&mut self, _: &mut ()) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn terminal_owner_explicit_restore_then_drop_runs_once() {
+        let restores = Arc::new(AtomicUsize::new(0));
+        let mut terminal = TerminalOwner::new((), CountRestore(Arc::clone(&restores)));
+
+        terminal.restore_once();
+        drop(terminal);
+
+        assert_eq!(restores.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn terminal_owner_restores_during_panic_unwind() {
+        let restores = Arc::new(AtomicUsize::new(0));
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _terminal = TerminalOwner::new((), CountRestore(Arc::clone(&restores)));
+            panic!("test unwind");
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(restores.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn replacing_an_eagerly_restored_terminal_keeps_owners_independent() {
+        let restores = Arc::new(AtomicUsize::new(0));
+        let mut terminal = TerminalOwner::new((), CountRestore(Arc::clone(&restores)));
+        terminal.restore_once();
+
+        terminal = TerminalOwner::new((), CountRestore(Arc::clone(&restores)));
+        drop(terminal);
+
+        assert_eq!(restores.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn synchronized_file_writer_keeps_concurrent_json_events_intact() {

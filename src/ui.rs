@@ -4460,27 +4460,52 @@ pub fn setup_fullscreen_terminal() -> Result<Terminal<TrackedBackend<Stdout>>> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
 
-    execute!(
+    if let Err(error) = execute!(
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste
-    )
-    .context("enter alt screen")?;
+    ) {
+        rollback_fullscreen_terminal_setup(&mut stdout);
+        return Err(error).context("enter alt screen");
+    }
     let backend = TrackedBackend::new(stdout);
-    let terminal = Terminal::new(backend).context("ratatui terminal")?;
-    Ok(terminal)
+    match Terminal::new(backend) {
+        Ok(terminal) => Ok(terminal),
+        Err(error) => {
+            // `Terminal::new` returns its backend only on success, so use a
+            // fresh stdout handle to undo the raw/alternate-screen setup.
+            let mut stdout = io::stdout();
+            rollback_fullscreen_terminal_setup(&mut stdout);
+            Err(error).context("ratatui terminal")
+        }
+    }
+}
+
+fn rollback_fullscreen_terminal_setup(stdout: &mut Stdout) {
+    let _ = execute!(
+        stdout,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        DisableBracketedPaste
+    );
+    let _ = disable_raw_mode();
 }
 
 pub fn restore_fullscreen_terminal(terminal: &mut Terminal<TrackedBackend<Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(
+    // Attempt every cleanup operation before returning the first error.  A
+    // partial failure must not strand the alternate screen or hidden cursor.
+    let raw_mode = disable_raw_mode();
+    let screen = execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
         LeaveAlternateScreen,
         DisableBracketedPaste
-    )?;
-    terminal.show_cursor()?;
+    );
+    let cursor = terminal.show_cursor();
+    raw_mode?;
+    screen?;
+    cursor?;
     Ok(())
 }
 
@@ -4554,13 +4579,18 @@ pub fn restore_inline_chat_terminal(terminal: &mut Terminal<TrackedBackend<Stdou
     } else if let Err(e) = Write::flush(terminal.backend_mut()) {
         tracing::warn!("skip inline exit cleanup flush: {e}");
     }
-    execute!(
+    // As with fullscreen restoration, attempt all terminal cleanup before
+    // reporting a failure so Drop's one restoration attempt is comprehensive.
+    let terminal_modes = execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
         DisableBracketedPaste
-    )?;
-    disable_raw_mode()?;
-    terminal.show_cursor()?;
+    );
+    let raw_mode = disable_raw_mode();
+    let cursor = terminal.show_cursor();
+    terminal_modes?;
+    raw_mode?;
+    cursor?;
     Ok(())
 }
 
