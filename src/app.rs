@@ -47,6 +47,7 @@ pub enum AnvilQuotaSource {
 
 const BUILTIN_NEW_COMMAND: &str = "new";
 const BUILTIN_CLEAR_COMMAND: &str = "clear";
+const BUILTIN_COMPACT_COMMAND: &str = "compact";
 const BUILTIN_LOAD_COMMAND: &str = "load";
 const BUILTIN_FORK_COMMAND: &str = "fork";
 const BUILTIN_EXPORT_COMMAND: &str = "export";
@@ -65,6 +66,13 @@ fn builtin_clear_command() -> AvailableCommand {
     AvailableCommand::new(
         BUILTIN_CLEAR_COMMAND,
         "start a fresh session with the current agent",
+    )
+}
+
+fn builtin_compact_command() -> AvailableCommand {
+    AvailableCommand::new(
+        BUILTIN_COMPACT_COMMAND,
+        "compact Thor and Loki where supported",
     )
 }
 
@@ -119,6 +127,7 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
     commands.retain(|command| {
         command.name != BUILTIN_NEW_COMMAND
             && command.name != BUILTIN_CLEAR_COMMAND
+            && command.name != BUILTIN_COMPACT_COMMAND
             && command.name != BUILTIN_LOAD_COMMAND
             && command.name != BUILTIN_FORK_COMMAND
             && command.name != BUILTIN_EXPORT_COMMAND
@@ -138,6 +147,7 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
     commands.insert(0, builtin_models_command());
     commands.insert(0, builtin_export_command());
     commands.insert(0, builtin_load_command());
+    commands.insert(0, builtin_compact_command());
     commands.insert(0, builtin_clear_command());
     commands.insert(0, builtin_new_command());
 }
@@ -2205,6 +2215,7 @@ impl AppState {
                 self.apply_session_update(u);
                 self.apply_known_terminal_outputs();
             }
+            UiEvent::ContextCompacted => {}
             UiEvent::TerminalOutput(snapshot) => {
                 self.finalize_thinking(EntryKind::Thought);
                 self.terminal_outputs
@@ -6133,8 +6144,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "load", "export", "models", "council", "reviews", "mjconfig",
-                "ragnarok"
+                "new", "clear", "compact", "load", "export", "models", "council", "reviews",
+                "mjconfig", "ragnarok"
             ]
         );
     }
@@ -6161,8 +6172,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "load", "export", "models", "council", "reviews", "mjconfig",
-                "ragnarok", "fork"
+                "new", "clear", "compact", "load", "export", "models", "council", "reviews",
+                "mjconfig", "ragnarok", "fork"
             ]
         );
     }
@@ -6197,6 +6208,7 @@ mod tests {
             vec![
                 "new",
                 "clear",
+                "compact",
                 "load",
                 "export",
                 "models",
@@ -6215,22 +6227,26 @@ mod tests {
         );
         assert_eq!(
             s.available_commands[2].description,
-            "load a previous session"
+            "compact Thor and Loki where supported"
         );
         assert_eq!(
             s.available_commands[3].description,
-            "export transcript to markdown"
+            "load a previous session"
         );
         assert_eq!(
             s.available_commands[4].description,
-            "open Council model settings"
+            "export transcript to markdown"
         );
         assert_eq!(
             s.available_commands[5].description,
+            "open Council model settings"
+        );
+        assert_eq!(
+            s.available_commands[6].description,
             "show active Council model selections"
         );
         assert_eq!(
-            s.available_commands[9].description,
+            s.available_commands[10].description,
             "fork the current session (unstable ACP extension)"
         );
     }
@@ -6255,6 +6271,7 @@ mod tests {
             vec![
                 "new",
                 "clear",
+                "compact",
                 "load",
                 "export",
                 "models",

@@ -11,7 +11,10 @@ use tokio::sync::{Mutex, mpsc};
 use crate::{
     code_agent::ActiveCodeWorkers,
     council_usage::{Record, Role},
-    event::{InternalMessage, InternalMessageKind, UiCommand, UiEvent},
+    event::{
+        AgentCommandOutcome, CompactTrigger, InternalMessage, InternalMessageKind, UiCommand,
+        UiEvent,
+    },
     loki,
     workspace_snapshot::{WorkspaceDelta, WorkspaceSnapshot},
 };
@@ -27,6 +30,10 @@ struct ActiveTurn {
 pub struct Handle {
     turn: Arc<Mutex<ActiveTurn>>,
     review_enabled: Arc<AtomicBool>,
+    manual_compact_active: Arc<AtomicBool>,
+    runtime_commands: mpsc::UnboundedSender<UiCommand>,
+    reviewer: Option<loki::Handle>,
+    events: mpsc::UnboundedSender<UiEvent>,
 }
 
 impl Handle {
@@ -40,6 +47,55 @@ impl Handle {
 
     pub fn set_review_enabled(&self, enabled: bool) {
         self.review_enabled.store(enabled, Ordering::Release);
+    }
+
+    pub async fn compact_manual(&self) -> String {
+        self.manual_compact_active.store(true, Ordering::Release);
+        let thor = async {
+            let (responder, response) = tokio::sync::oneshot::channel();
+            if self
+                .runtime_commands
+                .send(UiCommand::RunAdvertisedCommand {
+                    name: "compact".to_string(),
+                    trigger: CompactTrigger::Manual,
+                    responder,
+                })
+                .is_err()
+            {
+                return AgentCommandOutcome::Failed("Thor runtime closed".to_string());
+            }
+            response.await.unwrap_or_else(|_| {
+                AgentCommandOutcome::Failed("Thor compact response was dropped".to_string())
+            })
+        };
+        let loki = async {
+            match self.reviewer.as_ref() {
+                Some(reviewer) => reviewer.compact(CompactTrigger::Manual).await,
+                None => AgentCommandOutcome::Skipped,
+            }
+        };
+        let (thor, loki) = tokio::join!(thor, loki);
+        self.manual_compact_active.store(false, Ordering::Release);
+        let summary = format!(
+            "Council compact: Thor {}; Loki {}",
+            outcome_label(&thor),
+            outcome_label(&loki)
+        );
+        let _ = self.events.send(match (&thor, &loki) {
+            (AgentCommandOutcome::Failed(_), _) | (_, AgentCommandOutcome::Failed(_)) => {
+                UiEvent::Warning(summary.clone())
+            }
+            _ => UiEvent::Info(summary.clone()),
+        });
+        summary
+    }
+}
+
+fn outcome_label(outcome: &AgentCommandOutcome) -> String {
+    match outcome {
+        AgentCommandOutcome::Completed => "compacted".to_string(),
+        AgentCommandOutcome::Skipped => "skipped (unsupported)".to_string(),
+        AgentCommandOutcome::Failed(error) => format!("failed ({error})"),
     }
 }
 
@@ -69,9 +125,14 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
     let (events_tx, events) = mpsc::unbounded_channel();
     let turn = Arc::new(Mutex::new(ActiveTurn::default()));
     let review_enabled = Arc::new(AtomicBool::new(config.discrete_review));
+    let manual_compact_active = Arc::new(AtomicBool::new(false));
     let handle = Handle {
         turn: turn.clone(),
         review_enabled: review_enabled.clone(),
+        manual_compact_active: manual_compact_active.clone(),
+        runtime_commands: config.runtime_commands.clone(),
+        reviewer: config.reviewer.clone(),
+        events: events_tx.clone(),
     };
     let task = tokio::spawn(async move {
         let mut active_worker_updates = config.active_implementation_workers.subscribe();
@@ -89,6 +150,14 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                 event = runtime_events.recv() => {
                     let Some(event) = event else { break; };
                     let active = turn.lock().await.clone();
+                    if matches!(event, UiEvent::ContextCompacted) {
+                        if !manual_compact_active.load(Ordering::Acquire)
+                            && let Some(reviewer) = config.reviewer.as_ref()
+                        {
+                            reviewer.request_compact(CompactTrigger::ThorCompacted);
+                        }
+                        continue;
+                    }
                     if active.epoch != observed_epoch {
                         observed_epoch = active.epoch;
                         idle_epoch = None;
@@ -402,6 +471,19 @@ mod tests {
         let advice = "turn 3, Thor step 2: verify the fallback";
         assert!(loki_advice_prompt(advice).contains("may be superseded"));
         assert!(loki_interjection_prompt(advice).contains("previous answer"));
+    }
+
+    #[test]
+    fn compact_summary_preserves_partial_failure_and_skip_details() {
+        assert_eq!(outcome_label(&AgentCommandOutcome::Completed), "compacted");
+        assert_eq!(
+            outcome_label(&AgentCommandOutcome::Skipped),
+            "skipped (unsupported)"
+        );
+        assert_eq!(
+            outcome_label(&AgentCommandOutcome::Failed("timeout".to_string())),
+            "failed (timeout)"
+        );
     }
 
     #[tokio::test]

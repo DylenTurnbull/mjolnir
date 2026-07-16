@@ -699,6 +699,7 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         }
         UiEvent::Connected { .. }
         | UiEvent::SessionStarted { .. }
+        | UiEvent::ContextCompacted
         | UiEvent::SessionConfigOptions { .. }
         | UiEvent::WorkspaceDiff(_)
         | UiEvent::PermissionRequest(_)
@@ -3372,6 +3373,16 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         state.input_cursor = 0;
         state.scroll_input_to_bottom();
         state.exit_reason = Some(UiExitReason::ClearSession);
+        return;
+    }
+
+    if images.is_empty() && text == "/compact" {
+        state.input.clear();
+        clear_attachments(state);
+        state.input_cursor = 0;
+        state.scroll_input_to_bottom();
+        let _ = cmd_tx.send(UiCommand::CompactCouncil);
+        state.record_status_message(StatusKind::Info, "compacting Council context…");
         return;
     }
 
@@ -12748,6 +12759,18 @@ mod tests {
         assert_eq!(state.exit_reason, Some(UiExitReason::ClearSession));
         // Must not forward the command to the agent.
         assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn slash_compact_routes_to_the_council_coordinator() {
+        let mut state = AppState::new();
+        state.input = "/compact".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert!(state.input.is_empty());
+        assert!(matches!(cmd_rx.try_recv(), Ok(UiCommand::CompactCouncil)));
     }
 
     #[test]

@@ -1928,6 +1928,10 @@ async fn run_session(
                 cmd_orchestrator.set_review_enabled(*enabled);
                 continue;
             }
+            if matches!(command, UiCommand::CompactCouncil) {
+                cmd_orchestrator.compact_manual().await;
+                continue;
+            }
             if let UiCommand::SendPrompt { text, .. } = &command {
                 local_epoch = local_epoch.saturating_add(1);
                 implementation_handoffs_this_turn.store(0, Ordering::Release);

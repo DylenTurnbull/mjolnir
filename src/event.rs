@@ -101,6 +101,9 @@ pub enum UiEvent {
     /// `SessionUpdate` enum and let the UI state machine decide how to
     /// fold each variant into the transcript.
     SessionUpdate(SessionUpdate),
+    /// The current role's reported context usage decreased, indicating that
+    /// its ACP server compacted or replaced conversation history.
+    ContextCompacted,
     /// Snapshot for a managed ACP terminal. The runtime sends this whenever
     /// captured output or exit status changes so embedded terminal tool-call
     /// content can render live output.
@@ -274,6 +277,30 @@ pub enum SessionConfigTarget {
     LegacyMode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactTrigger {
+    Manual,
+    ThorCompacted,
+    Loki128k,
+}
+
+impl CompactTrigger {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::ThorCompacted => "thor_compacted",
+            Self::Loki128k => "loki_128k",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentCommandOutcome {
+    Completed,
+    Skipped,
+    Failed(String),
+}
+
 /// Commands flowing from the UI task into the ACP runtime.
 #[derive(Debug)]
 pub enum UiCommand {
@@ -289,6 +316,15 @@ pub enum UiCommand {
     },
     /// Change Thor's discrete review policy without replacing its ACP session.
     SetThorReviewPolicy { enabled: bool },
+    /// Compact Thor and the persistent Loki session where each role advertises
+    /// the exact portable command.
+    CompactCouncil,
+    /// Execute one exact advertised command in the foreground ACP session.
+    RunAdvertisedCommand {
+        name: String,
+        trigger: CompactTrigger,
+        responder: oneshot::Sender<AgentCommandOutcome>,
+    },
     /// Fork the current ACP session and continue in the forked session.
     ForkSession,
     /// Load another session on the existing ACP connection when supported.

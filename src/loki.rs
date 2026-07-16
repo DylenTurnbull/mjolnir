@@ -36,14 +36,14 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::acp::{RuntimeAccessMode, RuntimeRoleConfig};
 use crate::council::ResolvedRole;
 use crate::council_usage::{Record, Role};
-use crate::event::{LokiActivity, LokiIdentity, UiEvent};
+use crate::event::{AgentCommandOutcome, CompactTrigger, LokiActivity, LokiIdentity, UiEvent};
 use crate::ragnarok::{AgentHandle, Launch, TurnEvent};
 
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -54,6 +54,41 @@ const MCP_SERVER_NAME: &str = "mj-loki-advisor";
 const PULL_MCP_SERVER_NAME: &str = "mj-loki-pull";
 const ADVICE_QUEUE_CAPACITY: usize = 10;
 const PULL_WAIT: Duration = Duration::from_secs(10);
+const LOKI_COMPACT_THRESHOLD: u64 = 128_000;
+
+#[derive(Debug)]
+struct CompactThreshold {
+    armed: bool,
+}
+
+impl Default for CompactThreshold {
+    fn default() -> Self {
+        Self { armed: true }
+    }
+}
+
+impl CompactThreshold {
+    fn observe(&mut self, used: u64) -> bool {
+        if used < LOKI_COMPACT_THRESHOLD {
+            self.armed = true;
+            return false;
+        }
+        std::mem::replace(&mut self.armed, false)
+    }
+}
+
+fn preferred_compact_trigger(
+    requests: &[(CompactTrigger, Option<oneshot::Sender<AgentCommandOutcome>>)],
+) -> Option<CompactTrigger> {
+    requests
+        .iter()
+        .map(|(trigger, _)| *trigger)
+        .min_by_key(|trigger| match trigger {
+            CompactTrigger::Manual => 0,
+            CompactTrigger::ThorCompacted => 1,
+            CompactTrigger::Loki128k => 2,
+        })
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1016,6 +1051,10 @@ enum Request {
         invocation: Option<u64>,
         checkpoint: Checkpoint,
     },
+    Compact {
+        trigger: CompactTrigger,
+        responder: Option<oneshot::Sender<AgentCommandOutcome>>,
+    },
     Shutdown,
 }
 
@@ -1159,6 +1198,30 @@ impl Handle {
             );
         }
         self.pull_inner(consumer).await
+    }
+
+    pub async fn compact(&self, trigger: CompactTrigger) -> AgentCommandOutcome {
+        let (responder, response) = oneshot::channel();
+        if self
+            .requests
+            .send(Request::Compact {
+                trigger,
+                responder: Some(responder),
+            })
+            .is_err()
+        {
+            return AgentCommandOutcome::Failed("Loki worker closed".to_string());
+        }
+        response.await.unwrap_or_else(|_| {
+            AgentCommandOutcome::Failed("Loki compact response was dropped".to_string())
+        })
+    }
+
+    pub fn request_compact(&self, trigger: CompactTrigger) {
+        let _ = self.requests.send(Request::Compact {
+            trigger,
+            responder: None,
+        });
     }
 
     async fn pull_inner(&self, consumer: Consumer) -> PullOutcome {
@@ -1339,6 +1402,8 @@ async fn worker(
     let mut pending_context: HashMap<(Target, Option<u64>), String> = HashMap::new();
     let mut session: Option<AgentHandle> = None;
     let mut review_state = LokiReviewState::default();
+    let mut compact_threshold = CompactThreshold::default();
+    let mut automatic_compact = None;
     let advice = AdviceSlot {
         active: active_advice,
         state: advice_state,
@@ -1357,11 +1422,24 @@ async fn worker(
         }
     };
     'worker: loop {
-        let Some(request) = requests.recv().await else {
-            break;
+        let request = match automatic_compact.take() {
+            Some(trigger) => Request::Compact {
+                trigger,
+                responder: None,
+            },
+            None => {
+                let Some(request) = requests.recv().await else {
+                    break;
+                };
+                request
+            }
         };
         let mut batch = Vec::new();
+        let mut compact_requests = Vec::new();
         let mut incoming = VecDeque::from([request]);
+        while let Ok(next) = requests.try_recv() {
+            incoming.push_back(next);
+        }
         while let Some(request) = incoming.pop_front() {
             match request {
                 Request::Warmup => {}
@@ -1399,15 +1477,15 @@ async fn worker(
                         invocation,
                         checkpoint,
                     });
-                    while let Ok(next) = requests.try_recv() {
-                        incoming.push_back(next);
-                    }
                 }
                 Request::Review { target, .. } => match target {
                     Target::Thor => decrement_pending(&pending_thor),
                     Target::Eitri => decrement_pending(&pending_eitri),
                 },
                 Request::TargetContext { .. } => {}
+                Request::Compact { trigger, responder } => {
+                    compact_requests.push((trigger, responder));
+                }
                 Request::Shutdown => break 'worker,
             }
         }
@@ -1416,6 +1494,13 @@ async fn worker(
                 match item.target {
                     Target::Thor => decrement_pending(&pending_thor),
                     Target::Eitri => decrement_pending(&pending_eitri),
+                }
+            }
+            for (_, responder) in compact_requests {
+                if let Some(responder) = responder {
+                    let _ = responder.send(AgentCommandOutcome::Failed(
+                        "Loki advisor server is unavailable".to_string(),
+                    ));
                 }
             }
             continue;
@@ -1452,6 +1537,42 @@ async fn worker(
                     if !*abort_rx.borrow() {
                         emit_warning(&ui_tx, &role, format!("Loki could not start: {error:#}"));
                     }
+                }
+            }
+        }
+        if !compact_requests.is_empty() {
+            let trigger = preferred_compact_trigger(&compact_requests)
+                .expect("non-empty Loki compact request set");
+            tracing::info!(
+                event = "council_control",
+                god = "Loki",
+                command = "compact",
+                trigger = trigger.label(),
+                action = "request",
+                coalesced = compact_requests.len().saturating_sub(1),
+                "Council role control command"
+            );
+            let outcome = match session.as_mut() {
+                Some(agent) => agent.run_advertised_command("compact", trigger).await,
+                None => AgentCommandOutcome::Failed("Loki session is unavailable".to_string()),
+            };
+            let (action, error) = match &outcome {
+                AgentCommandOutcome::Completed => ("completion", None),
+                AgentCommandOutcome::Skipped => ("skip", None),
+                AgentCommandOutcome::Failed(error) => ("failure", Some(error.as_str())),
+            };
+            tracing::info!(
+                event = "council_control",
+                god = "Loki",
+                command = "compact",
+                trigger = trigger.label(),
+                action,
+                error,
+                "Council role control command"
+            );
+            for (_, responder) in compact_requests {
+                if let Some(responder) = responder {
+                    let _ = responder.send(outcome.clone());
                 }
             }
         }
@@ -1511,6 +1632,11 @@ async fn worker(
                 usage: outcome.usage.clone(),
                 update: outcome.usage_update.clone(),
             }));
+            if let Some(used) = outcome.usage_update.as_ref().map(|usage| usage.used)
+                && compact_threshold.observe(used)
+            {
+                automatic_compact = Some(CompactTrigger::Loki128k);
+            }
         }
         let accepted = advice.finish(id).await;
         if let Err(error) = result {
@@ -2311,6 +2437,13 @@ mod tests {
     }
 
     #[test]
+    fn compaction_signal_is_not_a_semantic_step() {
+        let mut tracker = BoundaryTracker::default();
+
+        assert!(tracker.observe(&UiEvent::ContextCompacted).is_none());
+    }
+
+    #[test]
     fn pull_server_registers_only_the_role_scoped_pull_tool() {
         let router = PullMcpHandler::tool_router();
         assert!(router.get("pull_advice").is_some());
@@ -2533,5 +2666,45 @@ mod tests {
             !review_prompt(&[], &[], &[], false).contains("persistent read-only advisor"),
             "a primed session does not repeat Loki's contract"
         );
+    }
+
+    #[test]
+    fn compact_threshold_coalesces_and_rearms_below_128k() {
+        let mut threshold = CompactThreshold::default();
+
+        assert!(!threshold.observe(127_999));
+        assert!(threshold.observe(128_000));
+        assert!(!threshold.observe(160_000));
+        assert!(!threshold.observe(64_000));
+        assert!(threshold.observe(128_001));
+    }
+
+    #[test]
+    fn manual_compaction_has_priority_when_triggers_coalesce() {
+        let requests = vec![
+            (CompactTrigger::Loki128k, None),
+            (CompactTrigger::ThorCompacted, None),
+            (CompactTrigger::Manual, None),
+        ];
+
+        assert_eq!(
+            preferred_compact_trigger(&requests),
+            Some(CompactTrigger::Manual)
+        );
+    }
+
+    #[test]
+    fn automatic_compaction_is_enqueued_on_lokis_single_worker_lane() {
+        let (handle, mut requests) = test_handle(1);
+
+        handle.request_compact(CompactTrigger::ThorCompacted);
+
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Request::Compact {
+                trigger: CompactTrigger::ThorCompacted,
+                responder: None,
+            })
+        ));
     }
 }

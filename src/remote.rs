@@ -78,6 +78,7 @@ const PROMPT_CANCEL_TTL: Duration = Duration::from_secs(5 * 60);
 const SESSION_COOKIE_NAME: &str = "mj_remote_session";
 const REMOTE_BUILTIN_NEW_COMMAND: &str = "new";
 const REMOTE_BUILTIN_CLEAR_COMMAND: &str = "clear";
+const REMOTE_BUILTIN_COMPACT_COMMAND: &str = "compact";
 const REMOTE_BUILTIN_LOAD_COMMAND: &str = "load";
 const REMOTE_BUILTIN_FORK_COMMAND: &str = "fork";
 const REMOTE_BUILTIN_EXPORT_COMMAND: &str = "export";
@@ -195,6 +196,12 @@ fn remote_builtin_command_records(include_fork: bool) -> Vec<CommandRecord> {
             "mjolnir",
         ),
         command_record(
+            REMOTE_BUILTIN_COMPACT_COMMAND,
+            "compact Thor and Loki where supported",
+            None,
+            "mjolnir",
+        ),
+        command_record(
             REMOTE_BUILTIN_EXPORT_COMMAND,
             "download this transcript as markdown",
             None,
@@ -224,6 +231,7 @@ fn is_remote_reserved_command(name: &str) -> bool {
         normalized.as_str(),
         REMOTE_BUILTIN_NEW_COMMAND
             | REMOTE_BUILTIN_CLEAR_COMMAND
+            | REMOTE_BUILTIN_COMPACT_COMMAND
             | REMOTE_BUILTIN_LOAD_COMMAND
             | REMOTE_BUILTIN_FORK_COMMAND
             | REMOTE_BUILTIN_EXPORT_COMMAND
@@ -884,6 +892,7 @@ impl TrackerState {
             UiEvent::SessionUpdate(update) => {
                 self.observe_session_update(update);
             }
+            UiEvent::ContextCompacted => {}
             UiEvent::WorkspaceDiff(_) => {}
             UiEvent::TerminalOutput(snapshot) => {
                 self.observe_terminal_output(snapshot);
@@ -938,8 +947,12 @@ impl TrackerState {
             | UiEvent::ElicitationRequest(_)
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::CodeAgent(_)
-            | UiEvent::CouncilUpdate { .. }
-            | UiEvent::Info(_) => {}
+            | UiEvent::CouncilUpdate { .. } => {}
+            UiEvent::Info(message) => {
+                if message.starts_with("Council compact:") {
+                    self.record_system_notice(message.clone());
+                }
+            }
             UiEvent::Warning(message) => {
                 self.record_system_notice(message.clone());
             }
@@ -2249,6 +2262,12 @@ fn start_server_agent_session(
             tokio::spawn(async move {
                 let mut local_epoch = 0_u64;
                 while let Some(command) = server_cmd_rx.recv().await {
+                    if matches!(command, UiCommand::CompactCouncil)
+                        || matches!(&command, UiCommand::SendPrompt { text, images } if text == "/compact" && images.is_empty())
+                    {
+                        thor_orchestrator.compact_manual().await;
+                        continue;
+                    }
                     tracker.observe_command(&command);
                     if let UiCommand::SendPrompt { text, .. } = &command {
                         local_epoch = local_epoch.saturating_add(1);
@@ -6606,11 +6625,14 @@ mod tests {
             .iter()
             .map(|command| command.name.as_str())
             .collect();
-        assert_eq!(names, vec!["new", "export", "mjconfig", "fork", "review"]);
-        assert_eq!(snapshot.available_commands[0].source, "mjolnir");
-        assert_eq!(snapshot.available_commands[4].source, "agent");
         assert_eq!(
-            snapshot.available_commands[4].input_hint.as_deref(),
+            names,
+            vec!["new", "compact", "export", "mjconfig", "fork", "review"]
+        );
+        assert_eq!(snapshot.available_commands[0].source, "mjolnir");
+        assert_eq!(snapshot.available_commands[5].source, "agent");
+        assert_eq!(
+            snapshot.available_commands[5].input_hint.as_deref(),
             Some("scope")
         );
     }
@@ -6655,7 +6677,7 @@ mod tests {
             .collect();
         assert_eq!(
             same_session_names,
-            vec!["new", "export", "mjconfig", "fork"]
+            vec!["new", "compact", "export", "mjconfig", "fork"]
         );
 
         state.observe_event(&UiEvent::SessionUpdate(
@@ -6674,7 +6696,10 @@ mod tests {
             .iter()
             .map(|command| command.name.clone())
             .collect();
-        assert_eq!(new_session_names, vec!["new", "export", "mjconfig", "fork"]);
+        assert_eq!(
+            new_session_names,
+            vec!["new", "compact", "export", "mjconfig", "fork"]
+        );
     }
 
     #[test]

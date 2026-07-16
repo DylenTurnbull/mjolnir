@@ -41,9 +41,9 @@ use tokio_util::sync::CancellationToken;
 use crate::archive;
 use crate::code_agent;
 use crate::event::{
-    ElicitationOutcome, ElicitationPrompt, LoadSessionResult, PermissionDecision, PermissionPrompt,
-    PromptImage, SessionConfigTarget, TerminalOutputSnapshot, UiCommand, UiEvent, WorkspaceDiff,
-    WorkspaceDiffEvent, content_block_text,
+    AgentCommandOutcome, CompactTrigger, ElicitationOutcome, ElicitationPrompt, LoadSessionResult,
+    PermissionDecision, PermissionPrompt, PromptImage, SessionConfigTarget, TerminalOutputSnapshot,
+    UiCommand, UiEvent, WorkspaceDiff, WorkspaceDiffEvent, content_block_text,
 };
 use crate::paths::{WorkspaceRoots, normalize_spawn_program, path_is_under_any_root};
 use crate::{deepswe, model_resolve};
@@ -364,11 +364,13 @@ struct ContextUsageTracker {
 }
 
 impl ContextUsageTracker {
-    fn observe(&self, used: u64) {
+    fn observe(&self, used: u64) -> bool {
         let previous = self.last_used.swap(used, Ordering::AcqRel);
-        if previous > 0 && used < previous {
+        let compacted = previous > 0 && used < previous;
+        if compacted {
             self.reinjection_needed.store(true, Ordering::Release);
         }
+        compacted
     }
 
     fn reset_for_session(&self) {
@@ -379,6 +381,10 @@ impl ContextUsageTracker {
     fn take_reinjection_needed(&self) -> bool {
         self.reinjection_needed.swap(false, Ordering::AcqRel)
     }
+}
+
+fn exact_command_advertised(commands: Option<&HashSet<String>>, name: &str) -> bool {
+    commands.is_some_and(|commands| commands.contains(name))
 }
 
 /// User-facing classification of launch-phase failures. Each variant
@@ -1494,6 +1500,14 @@ where
     let notification_role = role_config.clone();
     let context_usage = Arc::new(ContextUsageTracker::default());
     let notif_context_usage = context_usage.clone();
+    let advertised_commands = Arc::new(std::sync::Mutex::new(
+        HashMap::<String, HashSet<String>>::new(),
+    ));
+    let notif_advertised_commands = advertised_commands.clone();
+    let control_in_flight = Arc::new(AtomicBool::new(false));
+    let notif_control_in_flight = control_in_flight.clone();
+    let manual_compact_suppression = Arc::new(AtomicBool::new(false));
+    let notif_manual_compact_suppression = manual_compact_suppression.clone();
     let read_filesystem = filesystem.clone();
     let write_filesystem = filesystem.clone();
     let create_terminals = terminals.clone();
@@ -1519,8 +1533,24 @@ where
                     for snapshot in terminal_snapshots {
                         let _ = notif_ui_tx.send(UiEvent::TerminalOutput(snapshot));
                     }
-                    if let SessionUpdate::UsageUpdate(usage) = &notification.update {
-                        notif_context_usage.observe(usage.used);
+                    if let SessionUpdate::AvailableCommandsUpdate(update) = &notification.update {
+                        notif_advertised_commands
+                            .lock()
+                            .expect("advertised command set poisoned")
+                            .insert(
+                                notification.session_id.to_string(),
+                                update
+                                    .available_commands
+                                    .iter()
+                                    .map(|command| command.name.clone())
+                                    .collect(),
+                            );
+                    }
+                    if let SessionUpdate::UsageUpdate(usage) = &notification.update
+                        && notif_context_usage.observe(usage.used)
+                        && !notif_manual_compact_suppression.swap(false, Ordering::AcqRel)
+                    {
+                        let _ = notif_ui_tx.send(UiEvent::ContextCompacted);
                     }
                     if let Some(role) = notification_role.as_ref()
                         && let Some(council_session) = role.council_session.as_deref()
@@ -1539,7 +1569,15 @@ where
                             "Council agent update"
                         );
                     }
-                    let _ = notif_ui_tx.send(UiEvent::SessionUpdate(notification.update));
+                    let forward = !notif_control_in_flight.load(Ordering::Acquire)
+                        || matches!(
+                            &notification.update,
+                            SessionUpdate::UsageUpdate(_)
+                                | SessionUpdate::AvailableCommandsUpdate(_)
+                        );
+                    if forward {
+                        let _ = notif_ui_tx.send(UiEvent::SessionUpdate(notification.update));
+                    }
                 }
                 Ok(())
             },
@@ -1691,6 +1729,9 @@ where
                 code_agent,
                 drive_code_agent_controller,
                 context_usage,
+                advertised_commands,
+                control_in_flight,
+                manual_compact_suppression,
             )
             .await
             {
@@ -1732,6 +1773,9 @@ async fn drive_session(
     code_agent: Option<code_agent::Config>,
     code_agent_controller: code_agent::Controller,
     context_usage: Arc<ContextUsageTracker>,
+    advertised_commands: Arc<std::sync::Mutex<HashMap<String, HashSet<String>>>>,
+    control_in_flight: Arc<AtomicBool>,
+    manual_compact_suppression: Arc<AtomicBool>,
 ) -> Result<()> {
     // Advertise the client capabilities backed by handlers registered in
     // `drive_client` above.
@@ -1990,6 +2034,11 @@ async fn drive_session(
     while let Some(cmd) = ui_rx.recv().await {
         match cmd {
             UiCommand::SendPrompt { text, images } => {
+                // A manual compact that did not reduce reported usage must not
+                // suppress a later, agent-initiated compaction. Any delayed
+                // usage update from the control command has already preceded
+                // the next ordinary prompt on the ACP session.
+                manual_compact_suppression.store(false, Ordering::Release);
                 if let Some(role) = role_config.as_ref()
                     && let Some(council_session) = role.council_session.as_deref()
                 {
@@ -2150,11 +2199,75 @@ async fn drive_session(
                 }
             }
             UiCommand::SetThorReviewPolicy { .. } => {}
+            UiCommand::CompactCouncil => {
+                let _ = ui_tx.send(UiEvent::Warning(
+                    "Council compact command bypassed its coordinator".to_string(),
+                ));
+            }
+            UiCommand::RunAdvertisedCommand {
+                name,
+                trigger,
+                responder,
+            } => {
+                let advertised = {
+                    let command_sets = advertised_commands
+                        .lock()
+                        .expect("advertised command set poisoned");
+                    exact_command_advertised(command_sets.get(&session_id.to_string()), &name)
+                };
+                if !advertised {
+                    log_control_event(role_config.as_ref(), &name, trigger, "skip", None);
+                    let _ = responder.send(AgentCommandOutcome::Skipped);
+                    continue;
+                }
+                log_control_event(role_config.as_ref(), &name, trigger, "request", None);
+                if trigger == CompactTrigger::Manual && name == "compact" {
+                    manual_compact_suppression.store(true, Ordering::Release);
+                }
+                control_in_flight.store(true, Ordering::Release);
+                let request = PromptRequest::new(
+                    session_id.clone(),
+                    vec![ContentBlock::Text(TextContent::new(format!("/{name}")))],
+                );
+                let outcome = match conn.send_request(request).block_task().await {
+                    Ok(response) => match anvil_turn_failure_message(response.meta.as_ref()) {
+                        Some(message) => AgentCommandOutcome::Failed(message),
+                        None => AgentCommandOutcome::Completed,
+                    },
+                    Err(error) => AgentCommandOutcome::Failed(error.to_string()),
+                };
+                control_in_flight.store(false, Ordering::Release);
+                let (action, error) = match &outcome {
+                    AgentCommandOutcome::Completed => ("completion", None),
+                    AgentCommandOutcome::Skipped => ("skip", None),
+                    AgentCommandOutcome::Failed(error) => ("failure", Some(error.as_str())),
+                };
+                log_control_event(role_config.as_ref(), &name, trigger, action, error);
+                let _ = responder.send(outcome);
+            }
             UiCommand::CancelPrompt => {}
             UiCommand::Shutdown => break,
         }
     }
     Ok(())
+}
+
+fn log_control_event(
+    role: Option<&RuntimeRoleConfig>,
+    command: &str,
+    trigger: CompactTrigger,
+    action: &str,
+    error: Option<&str>,
+) {
+    tracing::info!(
+        event = "council_control",
+        god = role.map_or("Thor", |role| role.label.as_str()),
+        command,
+        trigger = trigger.label(),
+        action,
+        error,
+        "Council role control command"
+    );
 }
 
 fn emit_connected(ui_tx: &mpsc::UnboundedSender<UiEvent>, fields: &ConnectedEventFields) {
@@ -2390,6 +2503,12 @@ async fn drive_fork_session(
                     }
                     Some(UiCommand::CancelPrompt) => {}
                     Some(UiCommand::SetThorReviewPolicy { .. }) => {}
+                    Some(UiCommand::CompactCouncil) => {}
+                    Some(UiCommand::RunAdvertisedCommand { responder, .. }) => {
+                        let _ = responder.send(AgentCommandOutcome::Failed(
+                            "session fork already in flight".to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -4228,6 +4347,12 @@ async fn drive_config_update(
                     }
                     Some(UiCommand::CancelPrompt) => {}
                     Some(UiCommand::SetThorReviewPolicy { .. }) => {}
+                    Some(UiCommand::CompactCouncil) => {}
+                    Some(UiCommand::RunAdvertisedCommand { responder, .. }) => {
+                        let _ = responder.send(AgentCommandOutcome::Failed(
+                            "session config update already in flight".to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -4371,6 +4496,12 @@ async fn drive_prompt_turn(
                         });
                     }
                     Some(UiCommand::SetThorReviewPolicy { .. }) => {}
+                    Some(UiCommand::CompactCouncil) => {}
+                    Some(UiCommand::RunAdvertisedCommand { responder, .. }) => {
+                        let _ = responder.send(AgentCommandOutcome::Failed(
+                            "prompt already in flight".to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -4723,6 +4854,28 @@ mod tests {
         usage.observe(7_000);
         assert!(policy.take_for_prompt());
         assert!(!policy.take_for_prompt());
+    }
+
+    #[test]
+    fn exact_command_discovery_does_not_guess_aliases_or_case() {
+        let commands = HashSet::from(["compact".to_string(), "clear".to_string()]);
+
+        assert!(exact_command_advertised(Some(&commands), "compact"));
+        assert!(!exact_command_advertised(Some(&commands), "compress"));
+        assert!(!exact_command_advertised(Some(&commands), "Compact"));
+        assert!(!exact_command_advertised(None, "compact"));
+    }
+
+    #[test]
+    fn context_usage_reports_each_drop_once() {
+        let usage = ContextUsageTracker::default();
+
+        assert!(!usage.observe(100));
+        assert!(!usage.observe(120));
+        assert!(usage.observe(80));
+        assert!(!usage.observe(80));
+        assert!(!usage.observe(90));
+        assert!(usage.observe(70));
     }
 
     #[test]

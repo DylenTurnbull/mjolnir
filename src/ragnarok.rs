@@ -35,8 +35,8 @@ use tokio_util::sync::CancellationToken;
 use crate::acp;
 use crate::council;
 use crate::event::{
-    ElicitationOutcome, PermissionDecision, SessionConfigTarget, UiCommand, UiEvent,
-    content_block_text,
+    AgentCommandOutcome, CompactTrigger, ElicitationOutcome, PermissionDecision,
+    SessionConfigTarget, UiCommand, UiEvent, content_block_text,
 };
 use crate::headless::choose_allow_option;
 use crate::labels::stop_reason_label;
@@ -1180,6 +1180,33 @@ pub(crate) struct AgentHandle {
 }
 
 impl AgentHandle {
+    pub(crate) async fn run_advertised_command(
+        &mut self,
+        name: &str,
+        trigger: CompactTrigger,
+    ) -> AgentCommandOutcome {
+        let (responder, response) = tokio::sync::oneshot::channel();
+        if self
+            .cmd_tx
+            .send(UiCommand::RunAdvertisedCommand {
+                name: name.to_string(),
+                trigger,
+                responder,
+            })
+            .is_err()
+        {
+            return AgentCommandOutcome::Failed("agent runtime closed".to_string());
+        }
+        tokio::select! {
+            result = response => result.unwrap_or_else(|_| {
+                AgentCommandOutcome::Failed("agent command response was dropped".to_string())
+            }),
+            _ = wait_abort(self.abort.clone()) => {
+                AgentCommandOutcome::Failed("agent command aborted".to_string())
+            }
+        }
+    }
+
     pub(crate) async fn connect(
         launch: &Launch,
         cwd: &Path,

@@ -331,6 +331,13 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 }
                 if !sent_prompt {
                     sent_prompt = true;
+                    if cfg.prompt == "/compact" {
+                        state.final_text = thor_orchestrator.compact_manual().await;
+                        stop_reason = Some(StopReason::EndTurn);
+                        saw_terminal_event = true;
+                        let _ = cmd_tx.send(UiCommand::Shutdown);
+                        break;
+                    }
                     prompt_sent = true;
                     implementation_handoffs.store(0, Ordering::Release);
                     let mut roots = Vec::with_capacity(1 + cfg.additional_directories.len());
@@ -355,6 +362,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             UiEvent::SessionUpdate(update) => {
                 apply_session_update(&mut state, update, prompt_sent, &mut collecting_turn_output);
             }
+            UiEvent::ContextCompacted => {}
             UiEvent::WorkspaceDiff(_) => {}
             UiEvent::TerminalOutput(_) => {}
             UiEvent::SessionConfigOptions { .. } => {}

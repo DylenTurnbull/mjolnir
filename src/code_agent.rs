@@ -1803,6 +1803,7 @@ async fn run(
                 }
                 match event {
                     UiEvent::Connected { .. } => {}
+                    UiEvent::ContextCompacted => {}
                     UiEvent::SessionStarted { .. } if !prompt_sent => {
                         prompt_sent = true;
                         if nested_cmd_tx
