@@ -2605,9 +2605,10 @@ mod tests {
 
     #[test]
     fn parse_accepts_role_overrides_after_stdin_print_sentinel() {
-        let cli =
-            Cli::try_parse_from(["mj", "--print", "-", "--thor", "gpt-test", "--loki", "disabled"])
-                .expect("parse role overrides after stdin sentinel");
+        let cli = Cli::try_parse_from([
+            "mj", "--print", "-", "--thor", "gpt-test", "--loki", "disabled",
+        ])
+        .expect("parse role overrides after stdin sentinel");
 
         assert_eq!(cli.print.as_deref(), Some("-"));
         assert_eq!(cli.thor.as_deref(), Some("gpt-test"));
