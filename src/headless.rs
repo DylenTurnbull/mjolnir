@@ -17,6 +17,7 @@ use agent_client_protocol::schema::v1::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::acp::{self, AcpRuntimeConfig};
 use crate::event::{
@@ -50,6 +51,9 @@ pub struct RunConfig {
     pub output_format: OutputFormat,
     pub permission_mode: PermissionMode,
     pub role_overrides: config::RoleModelOverrides,
+    /// Process-wide graceful termination.  Headless owns its shutdown so it
+    /// can stop the ACP runtime and council workers before returning.
+    pub termination: CancellationToken,
 }
 
 #[derive(Debug, Serialize)]
@@ -251,7 +255,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     access_mode: acp::RuntimeAccessMode::Full,
                 })
         }),
-        termination: None,
+        termination: Some(cfg.termination.clone()),
     };
 
     let runtime = tokio::spawn(async move { acp::run(runtime_cfg, event_tx, cmd_rx).await });
@@ -294,9 +298,17 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let mut terminal_error = None;
     let mut prompt_sent = false;
     let mut collecting_turn_output = false;
+    let mut terminated = false;
 
     loop {
-        let event = event_rx.recv().await;
+        let event = tokio::select! {
+            _ = cfg.termination.cancelled() => {
+                terminated = true;
+                let _ = cmd_tx.send(UiCommand::Shutdown);
+                break;
+            }
+            event = event_rx.recv() => event,
+        };
         let Some(event) = event else {
             break;
         };
@@ -552,13 +564,13 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     if !saw_terminal_event {
         let _ = cmd_tx.send(UiCommand::Shutdown);
     }
+    let abort_handle = runtime.abort_handle();
     match tokio::time::timeout(std::time::Duration::from_secs(2), runtime).await {
         Ok(joined) => {
             joined.context("join ACP runtime")??;
         }
         Err(_) => {
-            // The TUI path handles this same case by aborting; in headless mode
-            // we keep that behavior local to the spawned task.
+            abort_handle.abort();
         }
     }
     if let Some(reviewer) = loki_handle.as_ref() {
@@ -605,7 +617,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         }
     }
 
-    if let Some(message) = terminal_error {
+    if terminated {
+        Ok(())
+    } else if let Some(message) = terminal_error {
         Err(anyhow!(message))
     } else if matches!(
         stop_reason.unwrap_or(StopReason::Cancelled),

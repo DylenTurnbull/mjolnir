@@ -47,6 +47,7 @@ mod speech;
 mod spinner;
 mod tailscale;
 mod term;
+mod termination;
 mod text;
 mod theme;
 mod ui;
@@ -65,6 +66,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::app::UiExitReason;
 use crate::config::{Config, SelectedAgent, history_path, transcript_export_dir};
@@ -363,6 +365,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     anvil::configure_cli_override(cli.anvil_path.clone());
     init_logging(cli.log_file.as_deref())?;
+    let termination = termination::Coordinator::install();
+    #[cfg(unix)]
+    if std::env::var_os("MJ_TERMINATION_PTY_INTEGRATION").is_some() {
+        return termination_pty_integration_helper(termination).await;
+    }
     let fullscreen_tui = cli.fullscreen_tui;
 
     if should_run_startup_update_check(&cli)
@@ -384,7 +391,13 @@ async fn main() -> Result<()> {
         return match command {
             Commands::Resume(mut args) => {
                 args.fullscreen_tui |= fullscreen_tui;
-                run_resume(args, fs_max_text_bytes, top_level_additional_directories).await
+                run_resume(
+                    args,
+                    fs_max_text_bytes,
+                    top_level_additional_directories,
+                    termination.token(),
+                )
+                .await
             }
             Commands::Server(args) => {
                 let workspace_roots =
@@ -398,6 +411,7 @@ async fn main() -> Result<()> {
                     cwd,
                     additional_directories: workspace_roots.additional_directories().to_vec(),
                     fs_max_text_bytes,
+                    termination: termination.token(),
                 })
                 .await
             }
@@ -421,6 +435,7 @@ async fn main() -> Result<()> {
                 loki: cli.loki,
                 eitri: cli.eitri,
             },
+            termination: termination.token(),
         })
         .await;
     }
@@ -435,6 +450,7 @@ async fn main() -> Result<()> {
             agent_stderr: cli.agent_stderr,
             additional_directories: workspace_roots.additional_directories().to_vec(),
             fs_max_text_bytes,
+            termination: termination.token(),
         },
         project_label,
         worktree_label.clone(),
@@ -463,6 +479,34 @@ async fn main() -> Result<()> {
     }
 
     result.map(|_| ())
+}
+
+/// Minimal real-binary path used only by the Unix PTY termination integration
+/// test. It deliberately waits on the installed coordinator so the test covers
+/// the operating system signal listener rather than a test-only cancellation
+/// path. The `force` mode keeps terminal ownership after acknowledging the
+/// first signal, allowing the integration test to deliver a real second signal.
+#[cfg(unix)]
+async fn termination_pty_integration_helper(termination: termination::Coordinator) -> Result<()> {
+    let _terminal = FullscreenTerminal::fresh().context("setup termination PTY terminal")?;
+    let mut stdout = std::io::stdout();
+    stdout
+        .write_all(format!("MJ_TERMINATION_PTY_READY:{}\n", std::process::id()).as_bytes())
+        .context("write termination PTY readiness marker")?;
+    stdout
+        .flush()
+        .context("flush termination PTY readiness marker")?;
+    termination.token().cancelled().await;
+    if std::env::var_os("MJ_TERMINATION_PTY_INTEGRATION").is_some_and(|mode| mode == "force") {
+        stdout
+            .write_all(b"MJ_TERMINATION_PTY_FIRST_SIGNAL_ACK\n")
+            .context("write termination PTY first-signal acknowledgement")?;
+        stdout
+            .flush()
+            .context("flush termination PTY first-signal acknowledgement")?;
+        std::future::pending::<()>().await;
+    }
+    Ok(())
 }
 
 /// Print a hint showing how to resume the session.
@@ -618,6 +662,7 @@ async fn run_resume(
     args: ResumeArgs,
     fs_max_text_bytes: u64,
     top_level_additional_directories: Vec<PathBuf>,
+    termination: CancellationToken,
 ) -> Result<()> {
     let mode = ui_mode(args.fullscreen_tui);
     let cwd = match args.cwd.clone() {
@@ -738,6 +783,7 @@ async fn run_resume(
                 agent_stderr: args.agent_stderr.clone(),
                 additional_directories: additional_directories.clone(),
                 fs_max_text_bytes,
+                termination: termination.clone(),
             },
             project_label,
             worktree_label.clone(),
@@ -785,6 +831,7 @@ async fn run_resume(
             Config::load(&config::default_config_path())
                 .map(|cfg| cfg.theme.palette())
                 .unwrap_or_else(|_| theme::TerminalThemeKind::default().palette()),
+            termination.clone(),
         )
         .await?;
         match outcome {
@@ -823,6 +870,7 @@ async fn run_resume(
                         agent_stderr: args.agent_stderr,
                         additional_directories: additional_directories.clone(),
                         fs_max_text_bytes,
+                        termination: termination.clone(),
                     },
                     project_label,
                     worktree_label.clone(),
@@ -984,6 +1032,7 @@ struct RuntimeOptions {
     agent_stderr: Option<PathBuf>,
     additional_directories: Vec<PathBuf>,
     fs_max_text_bytes: u64,
+    termination: CancellationToken,
 }
 
 struct RunSessionResult {
@@ -1099,6 +1148,7 @@ async fn run_app(
     initial_agent: Option<SelectedAgent>,
     mode: UiMode,
 ) -> Result<Option<String>> {
+    let termination = runtime_options.termination.clone();
     anvil::start_background_install();
     let config_path = config::default_config_path();
     let first_startup = should_open_first_startup(
@@ -1113,8 +1163,14 @@ async fn run_app(
         // Onboarding wants a fully settled catalog to preview, so first
         // startup keeps the blocking resolution.
         let initial_resolution = resolve_council_for_tui(&cfg, &cwd, false).await;
-        let Some((accepted_config, accepted_council)) =
-            run_first_startup(cfg, initial_resolution.ok(), &config_path, &cwd).await?
+        let Some((accepted_config, accepted_council)) = run_first_startup(
+            cfg,
+            initial_resolution.ok(),
+            &config_path,
+            &cwd,
+            termination.clone(),
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -1177,6 +1233,7 @@ async fn run_app(
             cfg.council.clone(),
             council_updates.take(),
             std::mem::take(&mut pending_probe_servers),
+            termination.clone(),
         )
         .await?;
         apply_session_result_to_config(&mut cfg, &session_result);
@@ -1226,6 +1283,7 @@ async fn run_app(
                     session_result.session_id,
                     session_result.session_title,
                     cfg.theme.palette(),
+                    termination.clone(),
                 )
                 .await?
                 {
@@ -1254,11 +1312,17 @@ async fn run_first_startup(
     mut preview: Option<council::ResolvedCouncil>,
     config_path: &Path,
     cwd: &Path,
+    termination: CancellationToken,
 ) -> Result<Option<(Config, council::ResolvedCouncil)>> {
     let mut notice = None;
     loop {
-        let outcome =
-            run_onboarding_once(candidate.clone(), preview.clone(), notice.take()).await?;
+        let outcome = run_onboarding_once(
+            candidate.clone(),
+            preview.clone(),
+            notice.take(),
+            termination.clone(),
+        )
+        .await?;
         let onboarding::Outcome::Accept(next) = outcome else {
             return Ok(None);
         };
@@ -1282,9 +1346,17 @@ async fn run_onboarding_once(
     config: Config,
     council: Option<council::ResolvedCouncil>,
     notice: Option<String>,
+    termination: CancellationToken,
 ) -> Result<onboarding::Outcome> {
     let mut terminal = FullscreenTerminal::fresh().context("setup onboarding terminal")?;
-    let outcome = onboarding::run(terminal.terminal_mut(), config, council, notice).await;
+    let outcome = onboarding::run(
+        terminal.terminal_mut(),
+        config,
+        council,
+        notice,
+        termination,
+    )
+    .await;
     terminal.restore_once();
     settle_after_fullscreen_picker_restore().await;
     outcome
@@ -1297,6 +1369,7 @@ async fn run_session_picker_action_for_agent(
     current_session_id: Option<String>,
     current_session_title: Option<String>,
     theme: palette::TerminalTheme,
+    termination: CancellationToken,
 ) -> Result<SessionPickerAction> {
     let mut notice = None;
     loop {
@@ -1313,9 +1386,14 @@ async fn run_session_picker_action_for_agent(
             listing.delete_supported,
             current_session_id.as_deref(),
         );
-        let outcome =
-            run_session_picker_once(listing.sessions, delete_supported, notice.take(), theme)
-                .await?;
+        let outcome = run_session_picker_once(
+            listing.sessions,
+            delete_supported,
+            notice.take(),
+            theme,
+            termination.clone(),
+        )
+        .await?;
         if let session::ResumeOutcome::DeleteRequested(entry) = outcome {
             if current_session_id.as_deref() == Some(entry.session_id.as_str()) {
                 notice = Some(
@@ -1339,6 +1417,7 @@ async fn run_session_picker_action_for_council(
     current_session_id: Option<String>,
     current_session_title: Option<String>,
     theme: palette::TerminalTheme,
+    termination: CancellationToken,
 ) -> Result<(SessionPickerAction, Option<council::ResolvedRole>)> {
     let mut notice = None;
     loop {
@@ -1349,7 +1428,9 @@ async fn run_session_picker_action_for_council(
                 None,
             ));
         }
-        let outcome = run_session_picker_once(sessions, true, notice.take(), theme).await?;
+        let outcome =
+            run_session_picker_once(sessions, true, notice.take(), theme, termination.clone())
+                .await?;
         match outcome {
             session::ResumeOutcome::Cancelled => {
                 return Ok((
@@ -1512,6 +1593,7 @@ async fn run_session_picker_once(
     delete_supported: bool,
     notice: Option<String>,
     theme: palette::TerminalTheme,
+    termination: CancellationToken,
 ) -> Result<session::ResumeOutcome> {
     let mut terminal = FullscreenTerminal::fresh().context("setup terminal")?;
     let outcome = session::run_session_picker(
@@ -1520,6 +1602,7 @@ async fn run_session_picker_once(
         delete_supported,
         notice,
         theme,
+        termination,
     )
     .await;
     terminal.restore_once();
@@ -1565,6 +1648,7 @@ async fn run_session(
     council_config: config::CouncilConfig,
     council_updates: Option<tokio::sync::watch::Receiver<council::ResolvedCouncil>>,
     pending_probe_servers: Vec<String>,
+    termination: CancellationToken,
 ) -> Result<RunSessionResult> {
     let mut terminal = SessionTerminal::fresh(mode)?;
     let council_session = format!(
@@ -2016,6 +2100,7 @@ async fn run_session(
                 thor_review_enabled: thor_config.discrete_review,
                 ragnarok_models: council.available.clone(),
                 primary_acp_name: council.thor.launch.kind.display_name().to_string(),
+                termination: termination.clone(),
             },
         )
         .await;
@@ -2052,6 +2137,7 @@ async fn run_session(
             current_session_id.clone(),
             current_session_title.clone(),
             theme_kind.palette(),
+            termination.clone(),
         )
         .await
         {
@@ -2540,7 +2626,6 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use std::{
         collections::HashSet,
-        io::Write,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::atomic::AtomicUsize,
         sync::{Arc, Barrier},

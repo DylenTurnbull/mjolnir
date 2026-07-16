@@ -42,6 +42,7 @@ hmac = "0.12"
 iana-time-zone = "0.1"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 libc = "0.2"
+signal-hook = "0.3"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 rcgen = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }

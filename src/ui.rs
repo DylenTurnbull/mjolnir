@@ -38,6 +38,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Widget,
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
@@ -502,6 +503,7 @@ pub struct UiRunOptions<'a> {
     pub thor_review_enabled: bool,
     pub ragnarok_models: Vec<crate::council::ResolvedRole>,
     pub primary_acp_name: String,
+    pub termination: CancellationToken,
 }
 
 pub struct UiRunResult {
@@ -593,6 +595,7 @@ pub async fn run(
             primary_acp_name: options.primary_acp_name,
         },
         options.mode,
+        options.termination,
     )
     .await?;
     if let Some(path) = options.persistence.history_path
@@ -764,6 +767,7 @@ async fn ui_loop(
     event_rx: &mut mpsc::UnboundedReceiver<UiEvent>,
     initial: UiInitialState,
     mode: UiMode,
+    termination: CancellationToken,
 ) -> Result<UiLoopOutcome> {
     let mut state = AppState::new();
     state.set_prompt_history(initial.history);
@@ -828,6 +832,9 @@ async fn ui_loop(
     loop {
         tokio::select! {
             biased;
+            _ = termination.cancelled() => {
+                state.exit_reason = Some(UiExitReason::Quit);
+            }
             maybe_ct = crossterm_events.next() => {
                 match maybe_ct {
                     Some(Ok(ev)) => {

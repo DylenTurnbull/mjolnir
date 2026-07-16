@@ -1,0 +1,141 @@
+//! Process-wide graceful termination coordination.
+//!
+//! The first termination signal cancels all subscribers so callers can unwind
+//! through their normal cleanup paths. A second signal exits immediately. On
+//! Unix the immediate exit status follows the conventional `128 + signal`
+//! convention (SIGINT 130, SIGHUP 129, SIGTERM 143); Windows uses 1.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use tokio_util::sync::CancellationToken;
+
+#[cfg(windows)]
+use tokio::signal::windows::{CtrlBreak, CtrlC};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalAction {
+    Graceful,
+    Force,
+}
+
+/// Pure, testable signal transition. The side effect for `Force` belongs to
+/// the listener task, never to this state machine.
+fn next_signal_action(signals_seen: &AtomicU8) -> SignalAction {
+    match signals_seen.fetch_add(1, Ordering::AcqRel) {
+        0 => SignalAction::Graceful,
+        _ => SignalAction::Force,
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Coordinator {
+    token: CancellationToken,
+    signals_seen: Arc<AtomicU8>,
+}
+
+impl Coordinator {
+    pub fn install() -> Self {
+        let coordinator = Self {
+            token: CancellationToken::new(),
+            signals_seen: Arc::new(AtomicU8::new(0)),
+        };
+        #[cfg(unix)]
+        {
+            let mut signals =
+                signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGTERM, libc::SIGHUP])
+                    .expect("install termination signal listeners");
+            let listener = coordinator.clone();
+            std::thread::Builder::new()
+                .name("mj-termination".to_string())
+                .spawn(move || {
+                    for signal in signals.forever() {
+                        listener.received_signal(signal);
+                    }
+                })
+                .expect("spawn termination signal listener");
+        }
+        #[cfg(windows)]
+        {
+            // Register both handlers before returning from `install`. Signals
+            // arriving before the spawned task is first polled are then held
+            // by the initialized streams instead of bypassing coordination.
+            let (ctrl_c, ctrl_break) = install_windows_signals();
+            let listener = coordinator.clone();
+            tokio::spawn(async move { listener.listen(ctrl_c, ctrl_break).await });
+        }
+        coordinator
+    }
+
+    pub fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    fn received_signal(&self, signal: i32) {
+        match next_signal_action(&self.signals_seen) {
+            SignalAction::Graceful => self.token.cancel(),
+            SignalAction::Force => std::process::exit(exit_code(signal)),
+        }
+    }
+
+    #[cfg(windows)]
+    async fn listen(self, mut ctrl_c: CtrlC, mut ctrl_break: CtrlBreak) {
+        loop {
+            tokio::select! {
+                _ = ctrl_c.recv() => self.received_signal(0),
+                _ = ctrl_break.recv() => self.received_signal(0),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn install_windows_signals() -> (CtrlC, CtrlBreak) {
+    use tokio::signal::windows::{ctrl_break, ctrl_c};
+
+    (
+        ctrl_c().expect("install Ctrl-C listener"),
+        ctrl_break().expect("install Ctrl-Break listener"),
+    )
+}
+
+#[cfg(unix)]
+const fn exit_code(signal: i32) -> i32 {
+    128 + signal
+}
+
+#[cfg(not(unix))]
+const fn exit_code(_signal: i32) -> i32 {
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_then_repeated_signal_transitions_to_force() {
+        let signals_seen = AtomicU8::new(0);
+        assert_eq!(next_signal_action(&signals_seen), SignalAction::Graceful);
+        assert_eq!(next_signal_action(&signals_seen), SignalAction::Force);
+    }
+
+    #[tokio::test]
+    async fn coordinator_cancellation_fans_out_to_late_subscribers() {
+        let coordinator = Coordinator {
+            token: CancellationToken::new(),
+            signals_seen: Arc::new(AtomicU8::new(0)),
+        };
+        let early = coordinator.token().child_token();
+        coordinator.received_signal(0);
+        let late = coordinator.token().child_token();
+        early.cancelled().await;
+        late.cancelled().await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_signal_streams_register_synchronously() {
+        let (_ctrl_c, _ctrl_break) = install_windows_signals();
+    }
+}

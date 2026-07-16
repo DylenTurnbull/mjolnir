@@ -8,6 +8,7 @@
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::term::TrackedBackend;
 use agent_client_protocol::schema::ProtocolVersion;
@@ -450,6 +451,7 @@ pub async fn run_session_picker(
     delete_supported: bool,
     notice: Option<String>,
     theme: TerminalTheme,
+    termination: CancellationToken,
 ) -> Result<ResumeOutcome> {
     let mut state = SessionPickerState::new(sessions, delete_supported, notice);
 
@@ -461,6 +463,7 @@ pub async fn run_session_picker(
     loop {
         tokio::select! {
             biased;
+            _ = termination.cancelled() => return Ok(ResumeOutcome::Cancelled),
             maybe_ev = events.next() => {
                 let Some(ev) = maybe_ev else {
                     return Ok(ResumeOutcome::Cancelled);

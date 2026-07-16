@@ -43,6 +43,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::acp::{self, AcpRuntimeConfig};
@@ -1964,6 +1965,7 @@ pub struct ServerOptions {
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
     pub fs_max_text_bytes: u64,
+    pub termination: CancellationToken,
 }
 
 pub async fn run_server(options: ServerOptions) -> Result<()> {
@@ -1976,6 +1978,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
         cwd,
         additional_directories,
         fs_max_text_bytes,
+        termination,
     } = options;
     clear_terminal_screen()?;
     install_crypto_provider();
@@ -2101,23 +2104,39 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
                 .expect("at least one remote-control listener task")
                 .context("remote-control server task join")?
         }
-        signal = tokio::signal::ctrl_c() => {
-            if let Err(error) = signal {
-                warn!("remote-control shutdown signal failed: {error}");
-            }
-            session_manager.shutdown_all().await;
+        _ = termination.cancelled() => {
+            // The process-wide coordinator does no terminal I/O; normal server
+            // teardown remains bounded here.
             server_handle.graceful_shutdown(Some(Duration::from_secs(2)));
             let mut shutdown_result = Ok(());
-            while let Some(joined) = server_tasks.join_next().await {
-                let joined = joined.context("remote-control server task join after shutdown")?;
-                if joined.is_err() {
-                    shutdown_result = joined;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while !server_tasks.is_empty() {
+                match tokio::time::timeout_at(deadline, server_tasks.join_next()).await {
+                    Ok(Some(joined)) => {
+                        let joined = joined.context("remote-control server task join after shutdown")?;
+                        if joined.is_err() {
+                            shutdown_result = joined;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        warn!("remote-control server shutdown timed out; aborting listeners");
+                        server_tasks.abort_all();
+                        break;
+                    }
                 }
             }
             shutdown_result
         }
     };
-    session_manager.shutdown_all().await;
+    // Session workers may be waiting on a peer; terminal/process shutdown must
+    // not be held hostage by that teardown.
+    if tokio::time::timeout(Duration::from_secs(3), session_manager.shutdown_all())
+        .await
+        .is_err()
+    {
+        warn!("remote-control session shutdown timed out");
+    }
     result.with_context(|| {
         format!(
             "serve remote-control API on {}",

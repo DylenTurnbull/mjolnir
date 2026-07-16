@@ -505,6 +505,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shell-words",
+ "signal-hook",
  "similar",
  "tar",
  "tempfile",

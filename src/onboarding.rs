@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::Terminal;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::council::ResolvedCouncil;
@@ -24,6 +25,7 @@ pub async fn run(
     config: Config,
     council: Option<ResolvedCouncil>,
     notice: Option<String>,
+    termination: CancellationToken,
 ) -> Result<Outcome> {
     let inventory = council
         .as_ref()
@@ -54,6 +56,7 @@ pub async fn run(
     loop {
         tokio::select! {
             biased;
+            _ = termination.cancelled() => return Ok(Outcome::Cancel),
             event = events.next() => {
                 let Some(event) = event else {
                     return Ok(Outcome::Cancel);
