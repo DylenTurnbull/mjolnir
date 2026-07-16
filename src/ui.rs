@@ -5904,11 +5904,27 @@ fn push_markdown_message(
     theme: TerminalTheme,
 ) {
     let (preview, collapsed) = message_preview(text, collapse);
-    push_markdown_lines(out, preview, 0, width, theme);
+    // Pre-wrap role prose here instead of leaving it to Paragraph. Markdown
+    // prefixes need a different continuation indentation from ordinary prose,
+    // and Paragraph only sees the already-flattened logical line.
+    push_wrapped_role_markdown_lines(out, preview, width, theme);
     if collapsed {
         push_message_collapse_hint(out, theme);
     }
     out.push(Line::from(""));
+}
+
+fn push_wrapped_role_markdown_lines(
+    out: &mut Vec<Line<'static>>,
+    text: String,
+    width: u16,
+    theme: TerminalTheme,
+) {
+    let mut markdown = Vec::new();
+    push_markdown_lines(&mut markdown, text, 0, width, theme);
+    for line in markdown {
+        out.extend(wrap_markdown_line(line, width as usize));
+    }
 }
 
 fn message_preview(text: &str, collapse: bool) -> (String, bool) {
@@ -6552,6 +6568,14 @@ fn with_tool_gutter(line: Line<'static>, color: Color) -> Line<'static> {
 /// indentation on the first row is preserved — it is meaningful for tool
 /// output — so only whitespace pushed past the edge is dropped.
 fn wrap_tool_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    wrap_markdown_line(line, width)
+}
+
+/// Wrap a rendered Markdown line while retaining its leading block indentation
+/// and, for recognized list and quote prefixes, hanging subsequent rows under
+/// the item text. Styles stay attached to individual characters as wrapping
+/// crosses inline spans.
+fn wrap_markdown_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
 
     // Flatten to (char, style) so wrapping can cross span boundaries while
@@ -6578,6 +6602,16 @@ fn wrap_tool_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 
     let cell_width =
         |t: &[(char, Style)]| t.iter().map(|(c, _)| c.width().unwrap_or(0)).sum::<usize>();
+    let continuation_width = markdown_continuation_width(&line);
+    let continuation_style = line
+        .spans
+        .first()
+        .map(|span| span.style)
+        .unwrap_or_default();
+    // Leave at least one cell for content on narrow terminals. This keeps the
+    // result bounded even when a source indentation is wider than the viewport.
+    let continuation_width = continuation_width.min(width.saturating_sub(1));
+    let continuation = vec![(' ', continuation_style); continuation_width];
 
     let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
     let mut cur: Vec<(char, Style)> = Vec::new();
@@ -6593,21 +6627,30 @@ fn wrap_tool_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
         if is_ws {
             // Break here; the run of whitespace at the break is dropped.
             rows.push(std::mem::take(&mut cur));
-            cur_w = 0;
-        } else if tok_w <= width {
+            cur = continuation.clone();
+            cur_w = continuation_width;
+        } else if tok_w + continuation_width <= width {
             // Word fits on a fresh row.
-            if !cur.is_empty() {
+            if cur.len() > continuation.len() {
+                while cur.last().is_some_and(|(ch, _)| ch.is_whitespace()) {
+                    cur.pop();
+                }
                 rows.push(std::mem::take(&mut cur));
             }
-            cur = tok;
-            cur_w = tok_w;
+            cur = continuation.clone();
+            cur.extend(tok);
+            cur_w = continuation_width + tok_w;
         } else {
             // Word longer than a full row: fill the current row, then hard-split.
             for (ch, style) in tok {
                 let ch_w = ch.width().unwrap_or(0);
                 if cur_w + ch_w > width && !cur.is_empty() {
+                    while cur.last().is_some_and(|(ch, _)| ch.is_whitespace()) {
+                        cur.pop();
+                    }
                     rows.push(std::mem::take(&mut cur));
-                    cur_w = 0;
+                    cur = continuation.clone();
+                    cur_w = continuation_width;
                 }
                 cur.push((ch, style));
                 cur_w += ch_w;
@@ -6640,6 +6683,35 @@ fn wrap_tool_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             Line::from(spans)
         })
         .collect()
+}
+
+/// The Markdown parser above recognizes only `- ` / `* `, ASCII-numbered
+/// items, and `> ` quotes. Compute the matching rendered prefix in display
+/// cells so continuation rows align beneath the text rather than the marker.
+/// For ordinary tool output, retaining its initial indentation is still useful
+/// block indentation and prevents continuation rows from jumping left.
+fn markdown_continuation_width(line: &Line<'_>) -> usize {
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let leading_end = text
+        .char_indices()
+        .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))
+        .unwrap_or(text.len());
+    let rest = &text[leading_end..];
+    let prefix_len = if rest.starts_with("> ") || rest.starts_with("- ") {
+        leading_end + 2
+    } else {
+        let digits = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        if digits > 0 && rest[digits..].starts_with(". ") {
+            leading_end + digits + 2
+        } else {
+            leading_end
+        }
+    };
+    text[..prefix_len].width()
 }
 
 fn push_tool_outputs(
@@ -14920,12 +14992,24 @@ mod tests {
         );
 
         state.expand_transcript_details = true;
-        let expanded = render_transcript_lines(&state, 80)
+        let expanded_lines = render_transcript_lines(&state, 80);
+        let expanded = expanded_lines.iter().collect::<Vec<_>>();
+        let expanded_tool_content = expanded
             .iter()
-            .map(line_text)
-            .collect::<Vec<_>>();
-        assert!(expanded.iter().any(|line| line.contains("ONE_LINE_SUFFIX")));
-        assert!(!expanded.iter().any(|line| line.contains("details hidden")));
+            .filter(|line| line_text(line).starts_with(TOOL_GUTTER))
+            .flat_map(|line| line.spans.iter().skip(1))
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            expanded_tool_content.contains("ONE") && expanded_tool_content.contains("_LINE_SUFFIX"),
+            "expanded tool content: {expanded_tool_content:?}"
+        );
+        assert!(
+            !expanded
+                .iter()
+                .map(|line| line_text(line))
+                .any(|line| line.contains("details hidden"))
+        );
     }
 
     #[test]
@@ -15790,6 +15874,107 @@ mod tests {
     }
 
     #[test]
+    fn markdown_wrapping_hangs_prefixes_and_preserves_inline_styles() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state.transcript.push(Entry::AgentMessage(
+            "- **bold** *italic* `code` tail\n  123. **wide界** tail words\n> quoted words here"
+                .to_string(),
+        ));
+
+        let width = 16;
+        let lines = render_transcript_lines(&state, width);
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            rendered,
+            [
+                "Thor",
+                "- bold italic",
+                "  code tail",
+                "  123. wide界",
+                "       tail",
+                "       words",
+                "> quoted words",
+                "  here",
+                "",
+            ],
+            "rendered role rows"
+        );
+        for row in &lines[1..8] {
+            assert!(
+                line_text(row).width() <= width as usize,
+                "row exceeds {width} cells: {:?}",
+                line_text(row)
+            );
+        }
+
+        let span = |content: &str| {
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.as_ref() == content)
+                .unwrap_or_else(|| panic!("missing span {content:?}: {rendered:?}"))
+        };
+        assert!(span("bold").style.add_modifier.contains(Modifier::BOLD));
+        assert!(span("italic").style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(span("code").style.fg, Some(theme.code));
+        assert!(span("wide界").style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn tool_markdown_wrapping_keeps_gutter_and_hanging_indent() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state.tool_calls.insert(
+            "call-344".to_string(),
+            crate::app::ToolCallView {
+                title: "log".to_string(),
+                kind: ToolKind::Execute,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Text(
+                    "- **bold** *italic* `code` tail".to_string(),
+                )],
+            },
+        );
+        state
+            .transcript
+            .push(Entry::ToolCall("call-344".to_string()));
+
+        let width = 16;
+        let lines = render_transcript_lines(&state, width);
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        let body: Vec<&Line<'static>> = lines
+            .iter()
+            .filter(|line| {
+                matches!(
+                    line_text(line).as_str(),
+                    "│   - bold" | "│     italic" | "│     code tail"
+                )
+            })
+            .collect();
+        assert_eq!(
+            body.iter().map(|line| line_text(line)).collect::<Vec<_>>(),
+            ["│   - bold", "│     italic", "│     code tail"],
+            "rendered tool rows: {rendered:?}"
+        );
+        for row in &body {
+            assert!(
+                line_text(row).width() <= width as usize,
+                "too wide: {row:?}"
+            );
+        }
+        let span = |content: &str| {
+            body.iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.as_ref() == content)
+                .unwrap_or_else(|| panic!("missing span {content:?}: {rendered:?}"))
+        };
+        assert!(span("bold").style.add_modifier.contains(Modifier::BOLD));
+        assert!(span("italic").style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(span("code").style.fg, Some(theme.code));
+    }
+
+    #[test]
     fn transcript_markdown_links_tables_lists_headings_and_rules_share_reader_rendering() {
         let mut state = AppState::new();
         let theme = state.theme;
@@ -15820,8 +16005,12 @@ mod tests {
 
         let rendered: Vec<String> = normal.iter().map(line_text).collect();
         assert!(
-            rendered.iter().any(|line| line
-                == "docs (https://example.test/docs) and more (https://example.test/more)")
+            rendered
+                .join("")
+                .contains("docs (https://example.test/docs)")
+                && rendered
+                    .join("")
+                    .contains("more (https://example.test/more)")
         );
         assert!(rendered.iter().any(|line| line == "name | value"));
         assert!(rendered.iter().any(|line| line == "alpha | beta"));
@@ -15895,11 +16084,12 @@ mod tests {
         let tool_content = lines
             .iter()
             .filter(|line| line_text(line).starts_with(TOOL_GUTTER))
-            .flat_map(|line| line.spans.iter().skip(1))
-            .map(|span| span.content.as_ref())
+            .map(line_text)
             .collect::<String>();
         assert!(
-            tool_content.contains("label (https://example.test/a-very-long-path)"),
+            tool_content.contains("label (https://examp")
+                && tool_content.contains("le.test/a-very-long-")
+                && tool_content.contains("path)"),
             "wrapped tool rows lost link content: {rendered:?}"
         );
         assert!(rendered.iter().any(|line| line == "│   key | value"));
