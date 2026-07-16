@@ -360,13 +360,32 @@ fn code_agent_identity_from_raw_input(raw_input: Option<&serde_json::Value>) -> 
         && object
             .get("tool")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|tool| matches!(tool, "code_agent" | "explore_agent"))
+            .is_some_and(|tool| matches!(tool, "code_agent" | "explore_agent" | "explore_agents"))
 }
 
 fn code_agent_identity_from_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name.contains("mj-code-agent")
-        && (name.contains("code_agent") || name.contains("explore_agent"))
+        && ["code_agent", "explore_agent", "explore_agents"]
+            .into_iter()
+            .any(|tool| contains_tool_identifier(&name, tool))
+}
+
+/// Tool titles arrive in a few transport-specific forms (for example
+/// `mcp.mj-code-agent.explore_agents` and
+/// `mcp__mj-code-agent__explore_agents`).  Match complete identifiers so a
+/// similarly named third-party tool is not hidden from the transcript.
+fn contains_tool_identifier(name: &str, tool: &str) -> bool {
+    name.match_indices(tool).any(|(start, _)| {
+        let before = name[..start].chars().next_back();
+        let suffix = &name[start + tool.len()..];
+        let after = suffix.chars().next();
+        (!before.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+            || name[..start].ends_with("__"))
+            && (!after
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+                || suffix.starts_with("__"))
+    })
 }
 
 fn code_agent_identity_from_meta(
@@ -4024,6 +4043,30 @@ mod tests {
 
         assert!(state.tool_calls.contains_key("explore-bridge"));
         assert!(state.transcript.is_empty());
+    }
+
+    #[test]
+    fn primary_explore_agents_transport_call_is_tracked_but_not_transcribed() {
+        let mut state = AppState::new();
+        let call = ToolCall::new("fanout-bridge", "mcp.mj-code-agent.explore_agents")
+            .status(ToolCallStatus::InProgress)
+            .raw_input(serde_json::json!({
+                "server": "mj-code-agent",
+                "tool": "explore_agents",
+                "arguments": { "prompts": ["trace startup", "trace shutdown"] }
+            }));
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)));
+
+        assert!(state.tool_calls.contains_key("fanout-bridge"));
+        assert!(state.transcript.is_empty());
+    }
+
+    #[test]
+    fn similarly_named_mcp_tools_are_not_filtered_as_eitri_transport() {
+        let call = ToolCall::new("other-tool", "mcp.mj-code-agent.explore_agents_extra");
+
+        assert!(!is_code_agent_transport_call(&call));
     }
 
     #[test]

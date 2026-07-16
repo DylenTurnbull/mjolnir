@@ -51,7 +51,7 @@ pub const MCP_SERVER_NAME: &str = "mj-code-agent";
 pub const PRIMARY_SESSION_DIRECTIVE: &str = r#"<mj-code-agent-policy>
 You are Thor, the primary coordinator and owner of the user's outcome. You are responsible for understanding the request, doing necessary research and context gathering, forming the plan, coordinating implementation, reviewing and verifying the result, and delivering the final answer. You are not a thin handoff between the user and Eitri. This policy applies to every subsequent user request in this ACP session.
 
-Eitri is available through two optional MCP tools. explore_agent is a read-only scout that can offload bounded, multi-step codebase research at any point in ongoing work, especially when affected locations are unknown, the question crosses multiple areas, or tracing architecture or execution flow requires several search rounds. It is not a required phase or gate before implementation. Direct tools are usually faster for a known path, known symbol, exact definition, work confined to roughly two or three known files, or a trivial single-step lookup; use your judgment. Because every Eitri call starts with fresh context, an explore_agent prompt must be a complete standalone brief that states the current task state and work already completed, the specific question, known context, scope, stopping condition, and expected report.
+Eitri is available through optional MCP tools. explore_agent is a single read-only scout for bounded, multi-step codebase research at any point in ongoing work. explore_agents is the only way to request concurrent scouting: use it only for two or more independent, complete standalone prompts. It atomically admits and launches every requested scout together or rejects the batch for insufficient capacity; it never queues or serializes overflow work. Do not claim scouts are parallel merely because you made separate explore_agent calls—those calls may be sequential. A concurrency claim is justified only after explore_agents reports that it launched the batch concurrently. Direct tools are usually faster for a known path, known symbol, exact definition, work confined to roughly two or three known files, or a trivial single-step lookup; use your judgment. Because every Eitri call starts with fresh context, every exploration prompt must state the current task state and work already completed, the specific question, known context, scope, stopping condition, and expected report.
 
 Treat code_agent as delegation to a strong coding engineer with fresh context. Give Eitri one forgeable unit at a time: a substantial, self-contained implementation slice that can be completed in one focused pass and returned as one coherent, reviewable diff. A good handoff has one clear outcome, enough context and decisions to begin immediately, explicit constraints and acceptance checks, and leaves the workspace in a coherent, testable state. Delegate when implementing the change is clearly more work than writing the handoff and reviewing the result. Do not delegate trivial local edits, investigation better handled with direct tools or explore_agent, unresolved architectural questions, or an entire open-ended project. Split large work into sequential, independently verifiable units. You may personally make small, local code changes when describing and delegating them would take more effort than simply doing them; use judgment rather than delegating mechanically. Pass code_agent complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. Its result includes the bounded full workspace diff attributable to that invocation. After Eitri returns, independently review its result and diff, inspect or verify the work as needed, and delegate a substantial corrective follow-up if implementation changes remain. If a request requires no code changes and no open-ended exploration, handle it yourself.
 
@@ -230,6 +230,13 @@ pub struct ExploreAgentArgs {
     pub prompt: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExploreAgentsArgs {
+    /// Ordered, complete standalone read-only research requests to launch concurrently.
+    pub prompts: Vec<String>,
+}
+
 #[derive(Clone)]
 struct McpHandler {
     config: Config,
@@ -335,6 +342,78 @@ impl McpHandler {
             Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
         })
     }
+
+    #[tool(
+        name = "explore_agents",
+        description = "CONCURRENT READ-ONLY EXPLORATION FAN-OUT (EITRI). Use only for two or more independent research questions, each supplied as a complete standalone prompt with current task state, specific question, known context, scope, stopping condition, and expected report. This tool atomically admits the entire ordered batch and launches all scouts concurrently, or rejects it when capacity is unavailable; it never queues or runs overflow prompts sequentially. Its ordered result identifies each scout as completed or failed and retains successful reports when siblings fail. For one scout, use explore_agent."
+    )]
+    async fn explore_agents(
+        &self,
+        Parameters(args): Parameters<ExploreAgentsArgs>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        validate_explore_batch(&args.prompts)?;
+        let run_ids = match self.controller.begin_explores(args.prompts.len()).await {
+            Ok(ids) => ids,
+            Err(rejection) => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    rejection.message(),
+                )]));
+            }
+        };
+        tracing::info!(
+            event = "eitri_explore_fanout_admitted",
+            requested = args.prompts.len(),
+            reserved = run_ids.len(),
+            "Eitri exploration fan-out atomically admitted; preparing supervisor futures"
+        );
+        let results = await_explore_fanout(
+            args.prompts
+                .into_iter()
+                .zip(run_ids)
+                .map(|(prompt, run_id)| {
+                    await_supervisor(
+                        self.config.clone(),
+                        self.context.clone(),
+                        prompt,
+                        EitriPurpose::Explore,
+                        self.ui_tx.clone(),
+                        self.controller.clone(),
+                        run_id,
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        let completed = results
+            .iter()
+            .filter(|result| result.outcome.is_ok())
+            .count();
+        let failed = results.len() - completed;
+        tracing::info!(
+            event = "eitri_explore_fanout_completed",
+            launched = results.len(),
+            completed,
+            failed,
+            "Eitri exploration fan-out completed"
+        );
+        Ok(explore_fanout_tool_result(&results))
+    }
+}
+
+fn validate_explore_batch(prompts: &[String]) -> std::result::Result<(), McpError> {
+    if prompts.len() < 2 {
+        return Err(McpError::invalid_params(
+            "prompts must contain at least two items; use explore_agent for one prompt",
+            None,
+        ));
+    }
+    if prompts.iter().any(|prompt| prompt.trim().is_empty()) {
+        return Err(McpError::invalid_params(
+            "every exploration prompt must not be empty",
+            None,
+        ));
+    }
+    Ok(())
 }
 
 /// Narrows an explicit implementation delegation to its requested worktree.
@@ -430,7 +509,7 @@ impl ServerHandler for McpHandler {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("mj-code-agent", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "EITRI DELEGATION POLICY: explore_agent is an optional read-only scout for bounded, multi-step research at any point in ongoing work, especially when locations are unknown or the question needs multiple search rounds; it is not a required phase before implementation. Direct tools are usually faster for known paths, known symbols, roughly 2-3 known files, and trivial lookups. Give code_agent one forgeable implementation unit at a time. Thor chooses and sequences tools, retains planning, coordination, review, verification, and the final answer, and must give each fresh Eitri call complete standalone context including the current task state and work already completed.",
+                "EITRI DELEGATION POLICY: explore_agent is one optional read-only scout. For two or more independent scouts that must actually overlap, use explore_agents with complete standalone prompts: it atomically launches the whole batch concurrently or rejects it without queueing. Do not claim separate explore_agent calls ran in parallel. Give code_agent one forgeable implementation unit at a time. Thor chooses and sequences tools, retains planning, coordination, review, verification, and the final answer, and must give each fresh Eitri call complete standalone context including the current task state and work already completed.",
             )
     }
 
@@ -643,23 +722,40 @@ impl Controller {
         if !allowed {
             return None;
         }
-        let id = state.next_id;
-        state.next_id = state.next_id.saturating_add(1);
-        state.runs.insert(
-            id,
-            ActiveRun::Starting {
-                kind,
-                cancel_requested: false,
-                shutdown_requested: false,
-                termination: RunTermination::default(),
-            },
-        );
+        let id = state.insert_starting(kind);
         if matches!(kind, RunKind::Code) {
             state.active_implementation_workers.set(1);
         }
         let active = state.runs.len();
         state.active_runs.send_replace(active);
         Some(id)
+    }
+
+    /// Atomically reserves all requested read-only slots. Unlike repeated
+    /// `begin(Explore)` calls, this never leaves a partially admitted batch.
+    async fn begin_explores(
+        &self,
+        requested: usize,
+    ) -> std::result::Result<Vec<u64>, ExploreAdmission> {
+        let mut state = self.state.lock().await;
+        let active = state
+            .runs
+            .values()
+            .filter(|run| run.kind() == RunKind::Explore)
+            .count();
+        let available = state.max_parallel_explores.saturating_sub(active);
+        if requested > state.max_parallel_explores || requested > available {
+            return Err(ExploreAdmission {
+                requested,
+                available,
+                maximum: state.max_parallel_explores,
+            });
+        }
+        let ids = (0..requested)
+            .map(|_| state.insert_starting(RunKind::Explore))
+            .collect();
+        state.active_runs.send_replace(state.runs.len());
+        Ok(ids)
     }
 
     async fn attach(&self, id: u64, commands: mpsc::UnboundedSender<UiCommand>) {
@@ -773,6 +869,39 @@ impl Controller {
         }
         let active = state.runs.len();
         state.active_runs.send_replace(active);
+    }
+}
+
+impl ControllerState {
+    fn insert_starting(&mut self, kind: RunKind) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        self.runs.insert(
+            id,
+            ActiveRun::Starting {
+                kind,
+                cancel_requested: false,
+                shutdown_requested: false,
+                termination: RunTermination::default(),
+            },
+        );
+        id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExploreAdmission {
+    requested: usize,
+    available: usize,
+    maximum: usize,
+}
+
+impl ExploreAdmission {
+    fn message(self) -> String {
+        format!(
+            "Eitri exploration fan-out was not launched: requested {} concurrent scouts, but only {} of {} exploration slots are available; no scouts were queued or started",
+            self.requested, self.available, self.maximum
+        )
     }
 }
 
@@ -981,6 +1110,56 @@ async fn await_supervisor(
     };
     request_guard.disarm();
     result
+}
+
+/// Poll every supervisor before awaiting the aggregate, so a batch cannot
+/// accidentally turn into one launch followed by the next.
+async fn await_explore_fanout<F>(supervisors: Vec<F>) -> Vec<EitriRunResult>
+where
+    F: Future<Output = EitriRunResult>,
+{
+    futures::future::join_all(supervisors).await
+}
+
+fn format_explore_fanout(results: &[EitriRunResult]) -> String {
+    let completed = results
+        .iter()
+        .filter(|result| result.outcome.is_ok())
+        .count();
+    let failed = results.len() - completed;
+    let summary = match (completed, failed) {
+        (_, 0) => format!(
+            "launched {} Eitri explorations concurrently; all completed",
+            results.len()
+        ),
+        (0, _) => format!(
+            "launched {} Eitri explorations concurrently; all failed",
+            results.len()
+        ),
+        _ => format!(
+            "launched {} Eitri explorations concurrently; {} completed and {} failed",
+            results.len(),
+            completed,
+            failed
+        ),
+    };
+    let mut report = summary;
+    for (index, result) in results.iter().enumerate() {
+        match &result.outcome {
+            Ok(content) => report.push_str(&format!("\n\n[{index}] completed\n{content}")),
+            Err(error) => report.push_str(&format!("\n\n[{index}] failed\n{error}")),
+        }
+    }
+    report
+}
+
+fn explore_fanout_tool_result(results: &[EitriRunResult]) -> CallToolResult {
+    let report = format_explore_fanout(results);
+    if results.iter().any(|result| result.outcome.is_ok()) {
+        CallToolResult::success(vec![Content::text(report)])
+    } else {
+        CallToolResult::error(vec![Content::text(report)])
+    }
 }
 
 async fn self_termination(controller: &Controller, run_id: u64) -> RunTermination {
@@ -1580,6 +1759,160 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_str::<ExploreAgentArgs>("{}").is_err());
+
+        let batch: ExploreAgentsArgs =
+            serde_json::from_str(r#"{"prompts":["first","second"]}"#).expect("batch args");
+        assert_eq!(batch.prompts, ["first", "second"]);
+        assert!(
+            serde_json::from_str::<ExploreAgentsArgs>(
+                r#"{"prompts":["first","second"],"unexpected":true}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fanout_tool_is_registered_on_the_mcp_router() {
+        assert!(McpHandler::tool_router().get("explore_agents").is_some());
+    }
+
+    #[tokio::test]
+    async fn fanout_reserves_all_explore_slots_atomically_and_respects_capacity() {
+        let controller = Controller::default();
+        controller.configure(2, ActiveCodeWorkers::default()).await;
+
+        let ids = controller
+            .begin_explores(2)
+            .await
+            .expect("two slots admitted");
+        assert_eq!(ids.len(), 2);
+        assert!(controller.begin(RunKind::Explore).await.is_none());
+        assert_eq!(
+            controller
+                .begin_explores(2)
+                .await
+                .expect_err("pool is full"),
+            ExploreAdmission {
+                requested: 2,
+                available: 0,
+                maximum: 2,
+            }
+        );
+        controller.finish(ids[0]).await;
+        assert!(controller.begin_explores(2).await.is_err());
+        controller.finish(ids[1]).await;
+        assert!(controller.begin_explores(3).await.is_err());
+
+        let capped = Controller::default();
+        capped.configure(99, ActiveCodeWorkers::default()).await;
+        assert_eq!(
+            capped
+                .begin_explores(17)
+                .await
+                .expect_err("hard cap rejects oversized fan-out")
+                .maximum,
+            16
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_polls_all_siblings_before_awaiting_completion() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let supervisors = (0..2)
+            .map(|index| {
+                let barrier = barrier.clone();
+                let active = active.clone();
+                async move {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    barrier.wait().await;
+                    EitriRunResult {
+                        outcome: Ok(format!("report {index}")),
+                        workspace_delta: None,
+                    }
+                }
+            })
+            .collect();
+        let results = tokio::time::timeout(
+            Duration::from_millis(100),
+            await_explore_fanout(supervisors),
+        )
+        .await
+        .expect("both sibling futures were polled");
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fanout_aggregation_is_input_ordered_and_retains_partial_failures() {
+        let supervisors: Vec<futures::future::BoxFuture<'static, EitriRunResult>> = vec![
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                EitriRunResult {
+                    outcome: Ok("first report".to_string()),
+                    workspace_delta: None,
+                }
+            }),
+            Box::pin(async {
+                EitriRunResult {
+                    outcome: Err(anyhow!("second failed")),
+                    workspace_delta: None,
+                }
+            }),
+        ];
+        let report = format_explore_fanout(&await_explore_fanout(supervisors).await);
+        assert!(
+            report.starts_with(
+                "launched 2 Eitri explorations concurrently; 1 completed and 1 failed"
+            )
+        );
+        assert!(report.find("[0] completed").unwrap() < report.find("[1] failed").unwrap());
+        assert!(report.contains("first report"));
+        assert!(report.contains("second failed"));
+
+        let all_failed = [
+            EitriRunResult {
+                outcome: Err(anyhow!("one")),
+                workspace_delta: None,
+            },
+            EitriRunResult {
+                outcome: Err(anyhow!("two")),
+                workspace_delta: None,
+            },
+        ];
+        assert!(format_explore_fanout(&all_failed).contains("all failed"));
+        assert_eq!(explore_fanout_tool_result(&all_failed).is_error, Some(true));
+        assert_eq!(
+            explore_fanout_tool_result(&[
+                EitriRunResult {
+                    outcome: Ok("report".to_string()),
+                    workspace_delta: None,
+                },
+                EitriRunResult {
+                    outcome: Err(anyhow!("sibling failed")),
+                    workspace_delta: None,
+                },
+            ])
+            .is_error,
+            Some(false)
+        );
+        assert!(
+            ExploreAdmission {
+                requested: 2,
+                available: 1,
+                maximum: 2
+            }
+            .message()
+            .contains("was not launched")
+        );
+    }
+
+    #[test]
+    fn fanout_rejects_empty_and_single_prompts() {
+        assert!(validate_explore_batch(&[]).is_err());
+        assert!(validate_explore_batch(&["one".to_string()]).is_err());
+        assert!(validate_explore_batch(&["one".to_string(), " ".to_string()]).is_err());
+        assert!(validate_explore_batch(&["one".to_string(), "two".to_string()]).is_ok());
     }
 
     #[tokio::test]
