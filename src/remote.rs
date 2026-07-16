@@ -856,6 +856,7 @@ impl TrackerState {
 
     fn observe_event(&mut self, event: &UiEvent) {
         match event {
+            UiEvent::Side(_) | UiEvent::SideStartFailed { .. } => {}
             UiEvent::Connected {
                 session_fork_supported,
                 ..
@@ -2301,6 +2302,7 @@ fn start_server_agent_session(
         saved_session_config: HashMap::new(),
         role_config,
         code_agent,
+        side_prompt_policy: false,
         termination: None,
     };
     let command_tx = server_cmd_tx.clone();
@@ -6804,6 +6806,8 @@ mod tests {
             agent_version: None,
             prompt_images_supported: false,
             session_fork_supported: true,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         state.observe_event(&UiEvent::SessionStarted {
             session_id: "sess-1".to_string(),
@@ -6848,6 +6852,8 @@ mod tests {
             agent_version: None,
             prompt_images_supported: false,
             session_fork_supported: true,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         state.observe_event(&UiEvent::SessionStarted {
             session_id: "sess-1".to_string(),

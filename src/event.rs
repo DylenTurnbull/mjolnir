@@ -94,7 +94,13 @@ pub enum UiEvent {
         agent_version: Option<String>,
         prompt_images_supported: bool,
         session_fork_supported: bool,
+        side_session_supported: bool,
+        side_session_unsupported_reason: Option<String>,
     },
+    /// Event emitted by the isolated side runtime.
+    Side(Box<UiEvent>),
+    /// Side startup failed after the UI switched views.
+    SideStartFailed { message: String },
     /// A session has been opened or loaded; future updates carry this session id.
     SessionStarted { session_id: String, resumed: bool },
     /// A streaming or status update from the agent. We forward the raw
@@ -335,6 +341,16 @@ pub enum UiCommand {
     },
     /// Fork the current ACP session and continue in the forked session.
     ForkSession,
+    /// Fork without replacing the runtime's active main session.
+    ForkSideSession {
+        responder: oneshot::Sender<Result<String, String>>,
+    },
+    /// Enter an isolated side conversation, optionally sending an initial prompt.
+    StartSide,
+    /// Leave and delete the active ephemeral side conversation.
+    ExitSide,
+    /// Force a command to the hidden main runtime while side mode is visible.
+    Main(Box<UiCommand>),
     /// Load another session on the existing ACP connection when supported.
     LoadSession {
         session_id: String,

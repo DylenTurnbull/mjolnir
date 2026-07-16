@@ -1048,6 +1048,76 @@ struct RunSessionResult {
     spinner_style: spinner::SpinnerStyle,
 }
 
+struct ActiveSideRuntime {
+    session_id: String,
+    commands: mpsc::UnboundedSender<UiCommand>,
+    runtime_task: tokio::task::JoinHandle<()>,
+    event_task: tokio::task::JoinHandle<()>,
+}
+
+fn isolated_side_runtime_config(
+    agent: &SelectedAgent,
+    session_id: String,
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
+    agent_stderr: Option<PathBuf>,
+    fs_max_text_bytes: u64,
+) -> acp::AcpRuntimeConfig {
+    acp::AcpRuntimeConfig {
+        command: agent.program.clone(),
+        args: agent.args.clone(),
+        cwd,
+        additional_directories,
+        mcp_servers: Vec::new(),
+        resume_session: Some(session_id),
+        env: agent.env.clone(),
+        agent_stderr,
+        fs_max_text_bytes,
+        access_mode: acp::RuntimeAccessMode::Full,
+        agent_source_id: None,
+        config_path: None,
+        saved_session_config: std::collections::HashMap::new(),
+        role_config: None,
+        code_agent: None,
+        side_prompt_policy: true,
+        termination: None,
+    }
+}
+
+async fn discard_side_runtime(
+    side: ActiveSideRuntime,
+    agent: &SelectedAgent,
+    agent_stderr: Option<&Path>,
+) -> Option<String> {
+    let _ = side.commands.send(UiCommand::CancelPrompt);
+    let _ = side.commands.send(UiCommand::Shutdown);
+    let mut runtime_task = side.runtime_task;
+    if tokio::time::timeout(Duration::from_secs(2), &mut runtime_task)
+        .await
+        .is_err()
+    {
+        runtime_task.abort();
+        let _ = runtime_task.await;
+    }
+    side.event_task.abort();
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        session::delete_session(agent, side.session_id.clone(), agent_stderr),
+    )
+    .await
+    {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!(
+            "could not delete side session {}: {error:#}",
+            side.session_id
+        )),
+        Err(_) => Some(format!(
+            "timed out deleting side session {}",
+            side.session_id
+        )),
+    }
+}
+
 impl From<ui::UiRunResult> for RunSessionResult {
     fn from(result: ui::UiRunResult) -> Self {
         Self {
@@ -1937,6 +2007,7 @@ async fn run_session(
                     access_mode: acp::RuntimeAccessMode::Full,
                 })
         }),
+        side_prompt_policy: false,
         termination: None,
     };
 
@@ -1993,6 +2064,7 @@ async fn run_session(
     let event_tracker = remote_tracker.clone();
     let event_thor = council.thor.clone();
     let event_cwd = cwd.clone();
+    let side_ui_event_tx = ui_event_tx.clone();
     let event_proxy = tokio::spawn(async move {
         let mut events = orchestrated.events;
         while let Some(event) = events.recv().await {
@@ -2031,9 +2103,119 @@ async fn run_session(
         Vec::with_capacity(1 + runtime_options.additional_directories.len());
     cmd_workspace_roots.push(cwd.clone());
     cmd_workspace_roots.extend(runtime_options.additional_directories.iter().cloned());
+    let side_agent = agent.clone();
+    let side_cwd = cwd.clone();
+    let side_additional_directories = runtime_options.additional_directories.clone();
+    let side_agent_stderr = runtime_options.agent_stderr.clone();
+    let side_fs_max_text_bytes = runtime_options.fs_max_text_bytes;
     let cmd_proxy = tokio::spawn(async move {
+        let mut side_runtime: Option<ActiveSideRuntime> = None;
         let mut local_epoch = 0_u64;
         while let Some(command) = ui_cmd_rx.recv().await {
+            if matches!(&command, UiCommand::StartSide) {
+                if side_runtime.is_some() {
+                    let _ = side_ui_event_tx.send(UiEvent::SideStartFailed {
+                        message: "a side conversation is already active".to_string(),
+                    });
+                    continue;
+                }
+                let (responder, response) = tokio::sync::oneshot::channel();
+                if runtime_cmd_tx
+                    .send(UiCommand::ForkSideSession { responder })
+                    .is_err()
+                {
+                    let _ = side_ui_event_tx.send(UiEvent::SideStartFailed {
+                        message: "the main ACP runtime closed before side startup".to_string(),
+                    });
+                    continue;
+                }
+                let child_session_id = match response.await {
+                    Ok(Ok(session_id)) => session_id,
+                    Ok(Err(message)) => {
+                        let _ = side_ui_event_tx.send(UiEvent::SideStartFailed { message });
+                        continue;
+                    }
+                    Err(_) => {
+                        let _ = side_ui_event_tx.send(UiEvent::SideStartFailed {
+                            message: "the main ACP runtime dropped the side fork response"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                };
+
+                let (side_event_tx, mut side_event_rx) = mpsc::unbounded_channel();
+                let (side_cmd_tx, side_cmd_rx) = mpsc::unbounded_channel();
+                let side_cfg = isolated_side_runtime_config(
+                    &side_agent,
+                    child_session_id.clone(),
+                    side_cwd.clone(),
+                    side_additional_directories.clone(),
+                    side_agent_stderr.clone(),
+                    side_fs_max_text_bytes,
+                );
+                let runtime_task = tokio::spawn(async move {
+                    let _ = acp::run(side_cfg, side_event_tx, side_cmd_rx).await;
+                });
+                let forwarded_events = side_ui_event_tx.clone();
+                let event_task = tokio::spawn(async move {
+                    let mut started = false;
+                    while let Some(event) = side_event_rx.recv().await {
+                        if matches!(event, UiEvent::SessionStarted { .. }) {
+                            started = true;
+                        }
+                        if !started
+                            && matches!(
+                                event,
+                                UiEvent::SessionUpdate(_)
+                                    | UiEvent::SessionConfigOptions { .. }
+                                    | UiEvent::TerminalOutput(_)
+                            )
+                        {
+                            continue;
+                        }
+                        if forwarded_events
+                            .send(UiEvent::Side(Box::new(event)))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                side_runtime = Some(ActiveSideRuntime {
+                    session_id: child_session_id,
+                    commands: side_cmd_tx,
+                    runtime_task,
+                    event_task,
+                });
+                continue;
+            }
+            if matches!(command, UiCommand::ExitSide) {
+                if let Some(side) = side_runtime.take()
+                    && let Some(message) =
+                        discard_side_runtime(side, &side_agent, side_agent_stderr.as_deref()).await
+                {
+                    let _ = side_ui_event_tx.send(UiEvent::Warning(message));
+                }
+                continue;
+            }
+            let (command, force_main) = match command {
+                UiCommand::Main(command) => (*command, true),
+                command => (command, false),
+            };
+            if !force_main && side_runtime.is_some() {
+                if matches!(command, UiCommand::Shutdown) {
+                    if let Some(side) = side_runtime.take() {
+                        let _ =
+                            discard_side_runtime(side, &side_agent, side_agent_stderr.as_deref())
+                                .await;
+                    }
+                } else {
+                    let side = side_runtime.as_ref().expect("checked side runtime");
+                    let _ = side.commands.send(command);
+                    continue;
+                }
+            }
             cmd_tracker.observe_command(&command);
             if let UiCommand::SetThorReviewPolicy { enabled } = &command {
                 cmd_orchestrator.set_review_enabled(*enabled);
@@ -2064,6 +2246,12 @@ async fn run_session(
             if runtime_cmd_tx.send(command).is_err() || shutdown {
                 break;
             }
+        }
+        if let Some(side) = side_runtime.take()
+            && let Some(message) =
+                discard_side_runtime(side, &side_agent, side_agent_stderr.as_deref()).await
+        {
+            let _ = side_ui_event_tx.send(UiEvent::Warning(message));
         }
     });
 
@@ -2651,6 +2839,33 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[test]
+    fn side_runtime_config_has_no_council_services_or_persistence() {
+        let agent = SelectedAgent {
+            source_id: "test-agent".to_string(),
+            program: PathBuf::from("agent"),
+            args: vec!["acp".to_string()],
+            env: std::collections::HashMap::new(),
+        };
+        let cfg = isolated_side_runtime_config(
+            &agent,
+            "child-session".to_string(),
+            PathBuf::from("/workspace"),
+            vec![PathBuf::from("/extra")],
+            None,
+            acp::DEFAULT_FS_TEXT_BYTES,
+        );
+
+        assert!(cfg.mcp_servers.is_empty());
+        assert!(cfg.code_agent.is_none());
+        assert!(cfg.role_config.is_none());
+        assert!(cfg.agent_source_id.is_none());
+        assert!(cfg.config_path.is_none());
+        assert!(cfg.saved_session_config.is_empty());
+        assert!(cfg.side_prompt_policy);
+        assert_eq!(cfg.resume_session.as_deref(), Some("child-session"));
     }
 
     #[test]

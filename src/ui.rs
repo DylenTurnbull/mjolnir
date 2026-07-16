@@ -706,6 +706,8 @@ fn streaming_redraw_budget(mode: UiMode) -> Duration {
 
 fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
     match event {
+        UiEvent::Side(event) => ui_event_redraw_cause(event),
+        UiEvent::SideStartFailed { .. } => RedrawCause::Interactive,
         UiEvent::SessionUpdate(_) | UiEvent::TerminalOutput(_) | UiEvent::LokiActivity(_) => {
             RedrawCause::Stream
         }
@@ -735,6 +737,23 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::Fatal(_)
         | UiEvent::CouncilUpdate { .. }
         | UiEvent::CodeAgent(_) => RedrawCause::Interactive,
+    }
+}
+
+fn side_main_notice(event: &UiEvent) -> Option<&'static str> {
+    match event {
+        UiEvent::PermissionRequest(_) | UiEvent::ElicitationRequest(_) => Some("Main needs input"),
+        UiEvent::PromptDone { .. } => Some("Main complete"),
+        UiEvent::PromptFailed { .. } | UiEvent::Fatal(_) => Some("Main failed"),
+        _ => None,
+    }
+}
+
+fn drain_hidden_main_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>) {
+    let (main_tx, mut main_rx) = mpsc::unbounded_channel();
+    drain_queued_prompt(state, &main_tx);
+    while let Ok(command) = main_rx.try_recv() {
+        let _ = cmd_tx.send(UiCommand::Main(Box::new(command)));
     }
 }
 
@@ -798,8 +817,11 @@ async fn ui_loop(
     if let Some(boundary) = initial.session_boundary {
         state.push_session_boundary(boundary);
     }
+    let mut main_state: Option<AppState> = None;
     let mut transcript_scroll = TranscriptScrollState::default();
     let mut transcript_sink = TranscriptSink::default();
+    let mut main_transcript_scroll: Option<TranscriptScrollState> = None;
+    let mut main_transcript_sink: Option<TranscriptSink> = None;
     let mut inline_resize_reflow = InlineResizeReflow::default();
     let mut notification_backend = TerminalNotificationBackend::detect();
     let mut crossterm_events = EventStream::new();
@@ -931,16 +953,62 @@ async fn ui_loop(
             // arm and exits the loop. The conditional pattern disables
             // the branch when the channel closes, which would leave the
             // TUI spinning on tick + crossterm forever.
-            maybe_ev = event_rx.recv(), if !state.runtime_closed => {
+            maybe_ev = event_rx.recv(), if !state.runtime_closed || main_state.is_some() => {
                 match maybe_ev {
                     Some(ev) => {
+                        let ev = match ev {
+                            UiEvent::Side(event) if main_state.is_some() => *event,
+                            UiEvent::Side(_) => continue,
+                            UiEvent::SideStartFailed { message } => {
+                                if let Some(mut main) = main_state.take() {
+                                    main.record_status_message(StatusKind::Warning, message);
+                                    state = main;
+                                    transcript_scroll = main_transcript_scroll
+                                        .take()
+                                        .unwrap_or_default();
+                                    transcript_sink =
+                                        main_transcript_sink.take().unwrap_or_default();
+                                } else {
+                                    state.record_status_message(StatusKind::Warning, message);
+                                }
+                                pending_redraw.mark_interactive();
+                                continue;
+                            }
+                            main_event if main_state.is_some() => {
+                                if let Some(notice) = side_main_notice(&main_event) {
+                                    state.side_main_notice = Some(notice.to_string());
+                                }
+                                let main = main_state.as_mut().expect("checked main state");
+                                main.apply_event(main_event);
+                                drain_hidden_main_prompt(main, cmd_tx);
+                                pending_redraw.mark_interactive();
+                                continue;
+                            }
+                            event => event,
+                        };
                         let inline_reader_was_active =
                             mode == UiMode::InlineChat && inline_reader_accepts_input(&state);
                         let redraw_cause = ui_event_redraw_cause(&ev);
                         let force_repair_for_event =
                             should_force_inline_repair_for_ui_event(mode, &ev);
                         let notification = notification_message_for_event(mode, &state, &ev);
+                        let failed_side_start = state.is_side
+                            && state.session_id.is_none()
+                            && matches!(&ev, UiEvent::Fatal(_));
                         state.apply_event(ev);
+                        if failed_side_start {
+                            state.side_exit_requested = true;
+                        }
+                        if state.is_side
+                            && state.session_id.is_some()
+                            && let Some(question) = state.side_initial_question.take()
+                        {
+                            state.record_user_prompt(question.clone());
+                            let _ = cmd_tx.send(UiCommand::SendPrompt {
+                                text: question,
+                                images: Vec::new(),
+                            });
+                        }
                         if state.runtime_closed
                             && std::env::var_os("MJ_E2E_EXIT_ON_RUNTIME_CLOSE").is_some()
                         {
@@ -1015,6 +1083,40 @@ async fn ui_loop(
             }
         }
 
+        if state.side_start_requested && main_state.is_none() {
+            state.side_start_requested = false;
+            let question = state.side_initial_question.take();
+            let side_state = state.side_conversation(question.clone());
+            let main = std::mem::replace(&mut state, side_state);
+            main_state = Some(main);
+            let _ = question;
+            let _ = cmd_tx.send(UiCommand::StartSide);
+            main_transcript_scroll = Some(std::mem::take(&mut transcript_scroll));
+            main_transcript_sink = Some(std::mem::take(&mut transcript_sink));
+            pending_redraw.mark_interactive();
+        }
+
+        if state.side_exit_requested {
+            state.side_exit_requested = false;
+            let side_failure = (state.is_side && state.runtime_closed)
+                .then(|| state.status_line.as_ref().map(|status| status.text.clone()))
+                .flatten();
+            let _ = cmd_tx.send(UiCommand::ExitSide);
+            if let Some(mut main) = main_state.take() {
+                main.side_main_notice = None;
+                if let Some(message) = side_failure {
+                    main.record_status_message(
+                        StatusKind::Warning,
+                        format!("side conversation failed: {message}"),
+                    );
+                }
+                state = main;
+                transcript_scroll = main_transcript_scroll.take().unwrap_or_default();
+                transcript_sink = main_transcript_sink.take().unwrap_or_default();
+                pending_redraw.mark_interactive();
+            }
+        }
+
         if !inline_resize_reflow.is_pending()
             && should_attempt_inline_repair_before_flush(force_inline_repair, mode, &state)
         {
@@ -1073,13 +1175,14 @@ async fn ui_loop(
                     set_mouse_capture(terminal, enabled)
                 })?;
             }
+            let outcome_state = main_state.as_ref().unwrap_or(&state);
             return Ok(UiLoopOutcome {
                 reason,
-                session_id: state.session_id.clone(),
-                session_title: state.session_title.clone(),
+                session_id: outcome_state.session_id.clone(),
+                session_title: outcome_state.session_title.clone(),
                 theme_kind: state.theme_kind,
                 spinner_style: state.spinner_style,
-                history: state.prompt_history(),
+                history: outcome_state.prompt_history(),
             });
         }
 
@@ -1890,6 +1993,16 @@ fn handle_crossterm(
         && can_toggle_text_selection_mode(state)
     {
         return TerminalRequest::ToggleTextSelectionMode;
+    }
+
+    if key.modifiers == KeyModifiers::CONTROL
+        && matches!(key.code, KeyCode::Char('c'))
+        && state.is_side
+        && state.input.is_empty()
+        && attachment_count(state) == 0
+    {
+        state.side_exit_requested = true;
+        return TerminalRequest::None;
     }
 
     if key.modifiers == KeyModifiers::CONTROL
@@ -3618,6 +3731,43 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
                 StatusKind::Warning,
                 format!("transcript export failed: {e:#}"),
             ),
+        }
+        return;
+    }
+
+    if images.is_empty()
+        && let Some(rest) = text.strip_prefix("/side")
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        state.input.clear();
+        clear_attachments(state);
+        state.input_cursor = 0;
+        state.scroll_input_to_bottom();
+        if state.is_side {
+            state.record_status_message(
+                StatusKind::Warning,
+                "nested side conversations are not supported",
+            );
+        } else if state.runtime_closed {
+            state.record_status_message(StatusKind::Warning, "the ACP runtime is closed");
+        } else if state.session_id.is_none() {
+            state.announce_waiting_for_primary();
+        } else if !state.side_session_supported {
+            state.record_status_message(
+                StatusKind::Warning,
+                state
+                    .side_session_unsupported_reason
+                    .clone()
+                    .unwrap_or_else(|| {
+                        "side conversations are not supported by this agent".to_string()
+                    }),
+            );
+        } else if state.side_start_requested {
+            state.record_status_message(StatusKind::Info, "side conversation is already opening");
+        } else {
+            state.side_start_requested = true;
+            state.side_initial_question =
+                (!rest.trim().is_empty()).then(|| rest.trim().to_string());
         }
         return;
     }
@@ -5475,6 +5625,13 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         spans.push(Span::styled(
             agent_label.to_string(),
             Style::default().fg(state.theme.primary),
+        ));
+        spans.push(Span::raw("   "));
+    }
+    if let Some(notice) = state.side_main_notice.as_deref() {
+        spans.push(Span::styled(
+            notice.to_string(),
+            Style::default().fg(state.theme.warning),
         ));
         spans.push(Span::raw("   "));
     }
@@ -13668,6 +13825,70 @@ mod tests {
     }
 
     #[test]
+    fn slash_side_with_question_requests_an_isolated_view() {
+        let mut state = AppState::new();
+        state.session_id = Some("main-session".to_string());
+        state.side_session_supported = true;
+        state.input = "/side explain the failure".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert!(state.side_start_requested);
+        assert_eq!(
+            state.side_initial_question.as_deref(),
+            Some("explain the failure")
+        );
+        assert!(state.transcript.is_empty());
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn slash_side_reports_missing_capabilities_without_failing_runtime() {
+        let mut state = AppState::new();
+        state.session_id = Some("main-session".to_string());
+        state.side_session_unsupported_reason = Some(
+            "side conversations are not supported by this agent; missing session/delete"
+                .to_string(),
+        );
+        state.input = "/side".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert!(!state.side_start_requested);
+        assert!(!state.runtime_closed);
+        assert!(cmd_rx.try_recv().is_err());
+        assert_eq!(
+            state
+                .status_line
+                .as_ref()
+                .map(|status| status.text.as_str()),
+            Some("side conversations are not supported by this agent; missing session/delete")
+        );
+    }
+
+    #[test]
+    fn nested_side_command_is_rejected() {
+        let mut state = AppState::new();
+        state.is_side = true;
+        state.session_id = Some("side-session".to_string());
+        state.input = "/side nested".to_string();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert!(!state.side_start_requested);
+        assert_eq!(
+            state
+                .status_line
+                .as_ref()
+                .map(|status| status.text.as_str()),
+            Some("nested side conversations are not supported")
+        );
+    }
+
+    #[test]
     fn prompt_submitted_during_fork_is_queued_until_fork_starts() {
         let mut state = AppState::new();
         state.session_id = Some("s-1".to_string());
@@ -13880,6 +14101,8 @@ mod tests {
             agent_version: Some("1.0".into()),
             prompt_images_supported: false,
             session_fork_supported: false,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         assert!(sink.pending_lines(&state, 80).is_empty());
         assert!(sink.pending_lines(&state, 80).is_empty());
@@ -19858,6 +20081,27 @@ mod tests {
             Some(UiExitReason::Quit),
             "second Ctrl-C quits when everything is empty"
         );
+    }
+
+    #[test]
+    fn ctrl_c_with_empty_side_composer_returns_even_while_streaming() {
+        let mut state = ready_state_with_session();
+        state.is_side = true;
+        state.record_user_prompt("long answer".to_string());
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert!(state.side_exit_requested);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "cleanup is owned by the UI loop"
+        );
+        assert!(state.exit_reason.is_none());
     }
 
     #[test]

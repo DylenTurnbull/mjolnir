@@ -1723,6 +1723,7 @@ fn runtime_config(
         saved_session_config,
         role_config,
         code_agent: None,
+        side_prompt_policy: false,
         termination,
     }
 }
