@@ -51,6 +51,8 @@ pub const MCP_SERVER_NAME: &str = "mj-code-agent";
 pub const PRIMARY_SESSION_DIRECTIVE: &str = r#"<mj-code-agent-policy>
 You are Thor, the primary coordinator and owner of the user's outcome. You are responsible for understanding the request, doing necessary research and context gathering, forming the plan, coordinating implementation, reviewing and verifying the result, and delivering the final answer. You are not a thin handoff between the user and Eitri. This policy applies to every subsequent user request in this ACP session.
 
+Loki is Mjolnir's one persistent read-only observer of your work and implementation Eitri's work. Never create, summon, or substitute another Loki process or session. Loki does not observe Explore. Use pull_advice at good semantic stopping points: do not pull on two consecutive semantic steps, and never let more than eight semantic steps pass without pulling. Automatic Loki receipts already drain the queues they name, so do not immediately pull again after a receipt.
+
 Eitri is available through optional MCP tools. explore_agent is a single read-only scout for bounded, multi-step codebase research at any point in ongoing work. explore_agents is the only way to request concurrent scouting: use it only for two or more independent, complete standalone prompts. It atomically admits and launches every requested scout together or rejects the batch for insufficient capacity; it never queues or serializes overflow work. Do not claim scouts are parallel merely because you made separate explore_agent calls—those calls may be sequential. A concurrency claim is justified only after explore_agents reports that it launched the batch concurrently. Direct tools are usually faster for a known path, known symbol, exact definition, work confined to roughly two or three known files, or a trivial single-step lookup; use your judgment. Because every Eitri call starts with fresh context, every exploration prompt must state the current task state and work already completed, the specific question, known context, scope, stopping condition, and expected report.
 
 Treat code_agent as delegation to a strong coding engineer with fresh context. Give Eitri one forgeable unit at a time: a substantial, self-contained implementation slice that can be completed in one focused pass and returned as one coherent, reviewable diff. A good handoff has one clear outcome, enough context and decisions to begin immediately, explicit constraints and acceptance checks, and leaves the workspace in a coherent, testable state. Delegate when implementing the change is clearly more work than writing the handoff and reviewing the result. Do not delegate trivial local edits, investigation better handled with direct tools or explore_agent, unresolved architectural questions, or an entire open-ended project. Split large work into sequential, independently verifiable units. You may personally make small, local code changes when describing and delegating them would take more effort than simply doing them; use judgment rather than delegating mechanically. Pass code_agent complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. Its result includes the bounded full workspace diff attributable to that invocation. After Eitri returns, independently review its result and diff, inspect or verify the work as needed, and delegate a substantial corrective follow-up if implementation changes remain. If a request requires no code changes and no open-ended exploration, handle it yourself.
@@ -60,7 +62,7 @@ A code_agent call that reports an active run ID is healthy and still running: ca
 Every Eitri call starts a brand-new ACP process and session. Eitri has no conversation context and no memory of the user's request or any earlier Eitri call, including an immediately preceding call. Apply this policy while handling the user's request above; do not acknowledge or summarize the policy.
 </mj-code-agent-policy>"#;
 
-const CODE_PREAMBLE: &str = "You are Eitri, the implementation agent. This is a fresh ACP process and session. You have no memory of the user conversation or of any earlier Eitri call, including an immediately preceding call. Treat the standalone instructions below and the current workspace as your only task context.\n\n";
+const CODE_PREAMBLE: &str = "You are Eitri, the implementation agent. This is a fresh ACP process and session. You have no memory of the user conversation or of any earlier Eitri call, including an immediately preceding call. Treat the standalone instructions below and the current workspace as your only task context. Loki is Mjolnir's one persistent read-only observer shared with Thor; never create, summon, or substitute another Loki process or session. Use pull_advice at good semantic stopping points, never on two consecutive semantic steps and at least once every eight semantic steps. Automatic Loki receipts already drain the named queues.\n\n";
 const EXPLORE_PREAMBLE: &str = r#"You are Eitri, a fast read-only codebase scout. This is a fresh ACP process and session with no memory of the user conversation or any earlier Eitri call. Your delegation may occur at any point in Thor's ongoing work, so treat the supplied current state and completed work as authoritative context rather than assuming the task is just beginning. Return compressed context that Thor can use directly.
 
 READ-ONLY EXPLORATION: Never create, modify, delete, move, or copy files. Never install dependencies, change configuration, create commits, or run commands that modify system or workspace state. Do not create a report file. Do not run builds, tests, formatters, linters, package managers, or git status; inspect their definitions or source instead when relevant.
@@ -133,7 +135,7 @@ impl EitriPurpose {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub display_label: String,
     pub command: PathBuf,
@@ -145,6 +147,40 @@ pub struct Config {
     pub implementation_handoff_counter: Option<Arc<AtomicUsize>>,
     pub active_implementation_workers: ActiveCodeWorkers,
     pub max_parallel_explores: usize,
+    warm: Arc<WarmPool>,
+}
+
+#[derive(Default)]
+struct WarmPool {
+    slots: StdMutex<WarmSlots>,
+}
+
+#[derive(Default)]
+struct WarmSlots {
+    code: Option<WarmRuntime>,
+    explore: Option<WarmRuntime>,
+}
+
+struct WarmRuntime {
+    context: RunContext,
+    events: mpsc::UnboundedReceiver<UiEvent>,
+    commands: mpsc::UnboundedSender<UiCommand>,
+    task: JoinHandle<Result<()>>,
+    cancel: CancellationToken,
+    _pull_server: Option<loki::PullServer>,
+}
+
+impl Drop for WarmPool {
+    fn drop(&mut self) {
+        let slots = self.slots.get_mut().expect("Eitri warm pool poisoned");
+        for runtime in [slots.code.as_ref(), slots.explore.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            runtime.cancel.cancel();
+            let _ = runtime.commands.send(UiCommand::Shutdown);
+        }
+    }
 }
 
 impl Config {
@@ -170,6 +206,7 @@ impl Config {
             implementation_handoff_counter: None,
             active_implementation_workers: ActiveCodeWorkers::default(),
             max_parallel_explores: 6,
+            warm: Arc::default(),
         }
     }
 
@@ -186,6 +223,47 @@ impl Config {
     pub fn with_max_parallel_explores(mut self, max: usize) -> Self {
         self.max_parallel_explores = max.min(16);
         self
+    }
+
+    pub fn with_prewarm(self, context: RunContext) -> Self {
+        self.ensure_warm(EitriPurpose::Code, context.clone());
+        self.ensure_warm(EitriPurpose::Explore, context);
+        self
+    }
+
+    fn ensure_warm(&self, purpose: EitriPurpose, context: RunContext) {
+        let mut slots = self.warm.slots.lock().expect("Eitri warm pool poisoned");
+        let slot = match purpose {
+            EitriPurpose::Code => &mut slots.code,
+            EitriPurpose::Explore => &mut slots.explore,
+        };
+        if slot.is_none() {
+            *slot = Some(spawn_eitri_runtime(self, context, purpose, None));
+        }
+    }
+
+    fn take_warm(&self, purpose: EitriPurpose, context: &RunContext) -> Option<WarmRuntime> {
+        let mut slots = self.warm.slots.lock().expect("Eitri warm pool poisoned");
+        let slot = match purpose {
+            EitriPurpose::Code => &mut slots.code,
+            EitriPurpose::Explore => &mut slots.explore,
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|runtime| runtime.task.is_finished())
+        {
+            let failed = slot.take().expect("finished Eitri warm slot disappeared");
+            failed.cancel.cancel();
+            let _ = failed.commands.send(UiCommand::Shutdown);
+        }
+        if slot
+            .as_ref()
+            .is_some_and(|runtime| runtime.context == *context)
+        {
+            slot.take()
+        } else {
+            None
+        }
     }
 }
 
@@ -214,7 +292,7 @@ impl ActiveCodeWorkers {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunContext {
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
@@ -259,8 +337,16 @@ struct McpHandler {
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     controller: Controller,
     code_runs: CodeRunRegistry,
+    handoff_retry: Arc<Mutex<Option<HandoffRetry>>>,
     tools_listed: watch::Sender<bool>,
     tool_router: ToolRouter<Self>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HandoffRetry {
+    epoch: u64,
+    instructions: String,
+    cwd: Option<PathBuf>,
 }
 
 #[tool_router(router = tool_router)]
@@ -278,6 +364,7 @@ impl McpHandler {
             ui_tx,
             controller,
             code_runs: CodeRunRegistry::default(),
+            handoff_retry: Arc::new(Mutex::new(None)),
             tools_listed,
             tool_router: Self::tool_router(),
         }
@@ -298,6 +385,44 @@ impl McpHandler {
             ));
         }
         let context = resolve_code_context(&self.context, args.cwd.as_deref()).await?;
+        if let Some(reviewer) = self.config.loki.as_ref() {
+            let retry = HandoffRetry {
+                epoch: reviewer.current_epoch(),
+                instructions: args.instructions.clone(),
+                cwd: args.cwd.clone(),
+            };
+            let bypass = {
+                let mut pending = self.handoff_retry.lock().await;
+                if pending.as_ref() == Some(&retry) {
+                    pending.take();
+                    true
+                } else {
+                    *pending = None;
+                    false
+                }
+            };
+            if !bypass {
+                let outcome = reviewer.pull(loki::Consumer::Thor).await;
+                if !outcome.is_empty() {
+                    *self.handoff_retry.lock().await = Some(retry);
+                    let receipt = loki::format_pull_outcome(
+                        &outcome,
+                        reviewer.current_epoch(),
+                        loki::Consumer::Thor,
+                    );
+                    let mut result = CallToolResult::success(vec![Content::text(format!(
+                        "Loki left advice before this implementation handoff. Apply it if relevant; otherwise retry the same delegation. Eitri was not started.\n\n{receipt}"
+                    ))]);
+                    result.structured_content = Some(serde_json::json!({
+                        "delegationStarted": false,
+                        "reason": "loki_advice",
+                        "adviceCount": outcome.advice.len(),
+                        "dropped": outcome.dropped,
+                    }));
+                    return Ok(result);
+                }
+            }
+        }
         let Some((run_id, termination)) =
             self.controller.begin_with_termination(RunKind::Code).await
         else {
@@ -305,6 +430,9 @@ impl McpHandler {
                 "an Eitri implementation run is already active",
             )]));
         };
+        if let Some(reviewer) = self.config.loki.as_ref() {
+            reviewer.begin_eitri_handoff();
+        }
 
         // Arm cancellation before the detached supervisor is launched. This
         // closes the small disconnect window between registry insertion and
@@ -529,6 +657,61 @@ fn implementation_workspace_roots(context: &RunContext) -> Vec<PathBuf> {
 
 async fn capture_implementation_snapshot(context: &RunContext) -> WorkspaceSnapshot {
     WorkspaceSnapshot::capture(&implementation_workspace_roots(context)).await
+}
+
+fn spawn_eitri_runtime(
+    config: &Config,
+    context: RunContext,
+    purpose: EitriPurpose,
+    termination: Option<CancellationToken>,
+) -> WarmRuntime {
+    let (event_tx, events) = mpsc::unbounded_channel();
+    let (commands, command_rx) = mpsc::unbounded_channel();
+    let loki = purpose
+        .marks_implementation_delegation()
+        .then(|| config.loki.clone())
+        .flatten();
+    let pull_server = match loki.as_ref() {
+        Some(reviewer) => match loki::PullServer::start(reviewer.clone(), loki::Consumer::Eitri) {
+            Ok(server) => Some(server),
+            Err(error) => {
+                tracing::warn!("could not expose Loki pull tool to Eitri: {error:#}");
+                None
+            }
+        },
+        None => None,
+    };
+    let cancel = termination.unwrap_or_default();
+    let runtime_config = AcpRuntimeConfig {
+        command: config.command.clone(),
+        args: config.args.clone(),
+        cwd: context.cwd.clone(),
+        additional_directories: context.additional_directories.clone(),
+        mcp_servers: pull_server
+            .as_ref()
+            .map(|server| vec![server.advertised().clone()])
+            .unwrap_or_default(),
+        resume_session: None,
+        env: config.env.clone(),
+        agent_stderr: config.agent_stderr.clone(),
+        fs_max_text_bytes: context.fs_max_text_bytes,
+        access_mode: purpose.access_mode(context.access_mode),
+        agent_source_id: None,
+        config_path: None,
+        saved_session_config: HashMap::new(),
+        role_config: config.role_config.clone(),
+        code_agent: None,
+        termination: Some(cancel.clone()),
+    };
+    let task = tokio::spawn(acp::run(runtime_config, event_tx, command_rx));
+    WarmRuntime {
+        context,
+        events,
+        commands,
+        task,
+        cancel,
+        _pull_server: pull_server,
+    }
 }
 
 impl ServerHandler for McpHandler {
@@ -1556,8 +1739,23 @@ async fn run(
         None
     };
 
-    let (nested_event_tx, mut nested_event_rx) = mpsc::unbounded_channel();
-    let (nested_cmd_tx, nested_cmd_rx) = mpsc::unbounded_channel();
+    let warm = config.take_warm(purpose, &context);
+    let WarmRuntime {
+        events: mut nested_event_rx,
+        commands: nested_cmd_tx,
+        task: mut runtime,
+        cancel: runtime_cancel,
+        _pull_server: _eitri_pull_server,
+        ..
+    } = warm.unwrap_or_else(|| {
+        spawn_eitri_runtime(
+            &config,
+            context.clone(),
+            purpose,
+            Some(termination.token.clone()),
+        )
+    });
+    config.ensure_warm(purpose, context.clone());
     controller.attach(run_id, nested_cmd_tx.clone()).await;
 
     // Share the Council's one persistent Loki session with implementation
@@ -1566,26 +1764,6 @@ async fn run(
         .marks_implementation_delegation()
         .then(|| config.loki.clone())
         .flatten();
-    let runtime_config = AcpRuntimeConfig {
-        command: config.command,
-        args: config.args,
-        cwd: context.cwd,
-        additional_directories: context.additional_directories,
-        mcp_servers: Vec::new(),
-        resume_session: None,
-        env: config.env,
-        agent_stderr: config.agent_stderr,
-        fs_max_text_bytes: context.fs_max_text_bytes,
-        access_mode: purpose.access_mode(context.access_mode),
-        agent_source_id: None,
-        config_path: None,
-        saved_session_config: HashMap::new(),
-        role_config: config.role_config,
-        code_agent: None,
-        termination: Some(termination.token.clone()),
-    };
-    let mut runtime = tokio::spawn(acp::run(runtime_config, nested_event_tx, nested_cmd_rx));
-
     let mut prompt_sent = false;
     let mut collector = AgentMessageCollector::new();
     let epoch = loki.as_ref().map_or(0, loki::Handle::current_epoch);
@@ -1750,20 +1928,22 @@ async fn run(
         }
     };
 
-    // Eitri's completion is a natural turn boundary: hand whatever advice
-    // Loki has queued so far back to Thor inside the tool result. Reviews
-    // still in flight deliver at a later boundary; nothing waits on Loki.
+    // Eitri's completion is a Thor auto-pull boundary. The shared pull path
+    // may wait once for the active relevant Loki generation, but never chases
+    // work that starts later.
     let mut result = result;
     if result.is_ok()
         && let Some(reviewer) = loki.as_ref()
     {
-        let deferred = reviewer.take_deferred();
-        if !deferred.is_empty()
-            && let Ok(message) = result.as_mut()
-        {
-            message.push_str("\n\n<loki_advice target=\"thor\" mode=\"asynchronous; may be superseded by later work\">\n");
-            message.push_str(&loki::format_deferred(&deferred, epoch));
-            message.push_str("\n</loki_advice>");
+        let outcome = reviewer.pull(loki::Consumer::Thor).await;
+        if let Ok(message) = result.as_mut() {
+            message.push_str("\n\n<loki_advice_receipt target=\"thor\" mode=\"asynchronous; may be superseded by later work\">\n");
+            message.push_str(&loki::format_pull_outcome(
+                &outcome,
+                epoch,
+                loki::Consumer::Thor,
+            ));
+            message.push_str("\n</loki_advice_receipt>");
         }
     }
 
@@ -1771,6 +1951,8 @@ async fn run(
     // reaping. Cancelling this token drives that tail even when the MCP request
     // disappeared, and the supervisor retains the slot until the join returns.
     termination.request(TerminationCause::RunCompleted);
+    runtime_cancel.cancel();
+    let _ = nested_cmd_tx.send(UiCommand::Shutdown);
     let cause = termination.cause();
     tracing::info!(
         event = "eitri_termination_requested",
@@ -2672,5 +2854,102 @@ mod tests {
         );
         assert!(!EitriPurpose::Explore.marks_implementation_delegation());
         assert!(EitriPurpose::Code.marks_implementation_delegation());
+        assert!(
+            !EitriPurpose::Explore
+                .standalone_prompt("find it")
+                .contains("Loki")
+        );
+        assert!(
+            EitriPurpose::Code
+                .standalone_prompt("fix it")
+                .contains("pull_advice")
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_pool_claims_only_an_exact_purpose_and_context_match() {
+        let config = Config {
+            display_label: "Eitri".into(),
+            command: PathBuf::from("unused"),
+            args: Vec::new(),
+            env: HashMap::new(),
+            agent_stderr: None,
+            role_config: None,
+            loki: None,
+            implementation_handoff_counter: None,
+            active_implementation_workers: ActiveCodeWorkers::default(),
+            max_parallel_explores: 1,
+            warm: Arc::default(),
+        };
+        let context = RunContext {
+            cwd: PathBuf::from("/workspace"),
+            additional_directories: Vec::new(),
+            fs_max_text_bytes: 42,
+            access_mode: RuntimeAccessMode::Full,
+        };
+        let (commands, _command_rx) = mpsc::unbounded_channel();
+        let (_event_tx, events) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(std::future::pending());
+        config.warm.slots.lock().unwrap().code = Some(WarmRuntime {
+            context: context.clone(),
+            events,
+            commands,
+            task,
+            cancel: cancel.clone(),
+            _pull_server: None,
+        });
+
+        let mut mismatch = context.clone();
+        mismatch.cwd = PathBuf::from("/other");
+        assert!(config.take_warm(EitriPurpose::Code, &mismatch).is_none());
+        assert!(config.take_warm(EitriPurpose::Explore, &context).is_none());
+        let runtime = config
+            .take_warm(EitriPurpose::Code, &context)
+            .expect("matching warm runtime");
+        runtime.cancel.cancel();
+        runtime.task.abort();
+    }
+
+    #[tokio::test]
+    async fn warm_pool_discards_a_runtime_that_failed_during_startup() {
+        let config = Config {
+            display_label: "Eitri".into(),
+            command: PathBuf::from("unused"),
+            args: Vec::new(),
+            env: HashMap::new(),
+            agent_stderr: None,
+            role_config: None,
+            loki: None,
+            implementation_handoff_counter: None,
+            active_implementation_workers: ActiveCodeWorkers::default(),
+            max_parallel_explores: 1,
+            warm: Arc::default(),
+        };
+        let context = RunContext {
+            cwd: PathBuf::from("/workspace"),
+            additional_directories: Vec::new(),
+            fs_max_text_bytes: 42,
+            access_mode: RuntimeAccessMode::Full,
+        };
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let (_event_tx, events) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(async { Ok(()) });
+        tokio::task::yield_now().await;
+        assert!(task.is_finished());
+        config.warm.slots.lock().unwrap().code = Some(WarmRuntime {
+            context: context.clone(),
+            events,
+            commands,
+            task,
+            cancel: cancel.clone(),
+            _pull_server: None,
+        });
+
+        assert!(config.take_warm(EitriPurpose::Code, &context).is_none());
+        assert!(cancel.is_cancelled());
+        assert!(matches!(command_rx.try_recv(), Ok(UiCommand::Shutdown)));
+        assert!(config.warm.slots.lock().unwrap().code.is_none());
     }
 }

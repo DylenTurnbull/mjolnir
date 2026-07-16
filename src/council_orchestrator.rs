@@ -79,7 +79,6 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
         let mut trajectory = loki::BoundaryTracker::default();
         let mut held_completion = None;
         let mut discrete_review_started = false;
-        let mut advice_turn_started = false;
         let mut idle_epoch = None;
         let mut interjected_epoch = None;
         let mut observed_epoch = 0;
@@ -95,7 +94,6 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                         idle_epoch = None;
                         held_completion = None;
                         discrete_review_started = false;
-                        advice_turn_started = false;
                         trajectory = loki::BoundaryTracker::default();
                     }
                     if let Some(boundary) = (active.epoch > 0)
@@ -127,7 +125,6 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                                 &mut trajectory,
                                 &mut held_completion,
                                 &mut discrete_review_started,
-                                &mut advice_turn_started,
                             );
                             idle_epoch = None;
                             interjected_epoch = Some(active.epoch);
@@ -140,7 +137,6 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                                 &mut trajectory,
                                 &mut held_completion,
                                 &mut discrete_review_started,
-                                &mut advice_turn_started,
                             );
                             idle_epoch = None;
                             interjected_epoch = Some(active.epoch);
@@ -165,15 +161,18 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                         continue;
                     }
                     let Some(reviewer) = config.reviewer.as_ref() else { continue; };
-                    let deferred = reviewer.take_deferred();
-                    if deferred.is_empty() {
+                    let outcome = reviewer.pull(loki::Consumer::Thor).await;
+                    if outcome.is_empty() {
                         continue;
                     }
-                    let advice = loki::format_deferred(&deferred, active.epoch);
+                    let advice = loki::format_pull_outcome(
+                        &outcome,
+                        active.epoch,
+                        loki::Consumer::Thor,
+                    );
                     log_advice(config.log_context.as_ref(), &advice, "interjection");
                     idle_epoch = None;
                     interjected_epoch = Some(active.epoch);
-                    advice_turn_started = true;
                     let _ = events_tx.send(UiEvent::Info(
                         "Loki · sharing post-turn review feedback".to_string(),
                     ));
@@ -203,6 +202,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                 continue;
             }
             let active = turn.lock().await.clone();
+            let pulled = pull_advice(config.reviewer.as_ref(), active.epoch).await;
             let handoffs = config.implementation_handoffs.load(Ordering::Acquire);
             let review = review_enabled.load(Ordering::Acquire);
             let delta = if review && handoffs > 1 && !discrete_review_started {
@@ -221,7 +221,6 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
             ) {
                 let initial_result = trajectory.final_message();
                 let context = discrete_review_context(delta.as_ref(), trajectory.trajectory());
-                let advice = take_advice(config.reviewer.as_ref(), active.epoch);
                 held_completion = None;
                 discrete_review_started = true;
                 trajectory.reset_attempt();
@@ -229,7 +228,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                     &active.task,
                     &initial_result,
                     &context,
-                    advice.as_deref(),
+                    pulled.as_ref().map(|(_, receipt)| receipt.as_str()),
                 );
                 let _ = events_tx.send(UiEvent::Info("reviewing the completed work…".to_string()));
                 emit_internal(
@@ -245,12 +244,11 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                 });
                 continue;
             }
-            if !advice_turn_started
-                && let Some(advice) = take_advice(config.reviewer.as_ref(), active.epoch)
+            if let Some((outcome, advice)) = pulled
+                && !outcome.is_empty()
             {
                 log_advice(config.log_context.as_ref(), &advice, "turn_boundary");
                 held_completion = None;
-                advice_turn_started = true;
                 trajectory.reset_attempt();
                 emit_internal(
                     &events_tx,
@@ -271,7 +269,6 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                 &mut trajectory,
                 &mut held_completion,
                 &mut discrete_review_started,
-                &mut advice_turn_started,
             );
             idle_epoch = Some(active.epoch);
         }
@@ -283,9 +280,14 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
     }
 }
 
-fn take_advice(reviewer: Option<&loki::Handle>, epoch: u64) -> Option<String> {
-    let deferred = reviewer?.take_deferred();
-    (!deferred.is_empty()).then(|| loki::format_deferred(&deferred, epoch))
+async fn pull_advice(
+    reviewer: Option<&loki::Handle>,
+    epoch: u64,
+) -> Option<(loki::PullOutcome, String)> {
+    let reviewer = reviewer?;
+    let outcome = reviewer.pull(loki::Consumer::Thor).await;
+    let receipt = loki::format_pull_outcome(&outcome, epoch, loki::Consumer::Thor);
+    Some((outcome, receipt))
 }
 
 fn log_advice(context: Option<&LogContext>, advice: &str, delivery: &str) {
@@ -308,12 +310,10 @@ fn reset_turn_state(
     trajectory: &mut loki::BoundaryTracker,
     held_completion: &mut Option<UiEvent>,
     discrete_review_started: &mut bool,
-    advice_turn_started: &mut bool,
 ) {
     *trajectory = loki::BoundaryTracker::default();
     *held_completion = None;
     *discrete_review_started = false;
-    *advice_turn_started = false;
 }
 
 fn loki_advice_prompt(advice: &str) -> String {

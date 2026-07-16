@@ -2147,6 +2147,16 @@ fn start_server_agent_session(
             format!("remote-{}", std::process::id()),
         )
     });
+    let thor_pull_server = match loki_handle.as_ref() {
+        Some(reviewer) => match loki::PullServer::start(reviewer.clone(), loki::Consumer::Thor) {
+            Ok(server) => Some(server),
+            Err(error) => {
+                council_setup_error = Some(format!("prepare Loki pull tool: {error:#}"));
+                None
+            }
+        },
+        None => None,
+    };
     let role_config = council.as_ref().map(|resolved| acp::RuntimeRoleConfig {
         label: "Thor".to_string(),
         model_id: resolved.thor.model.model.clone(),
@@ -2161,6 +2171,12 @@ fn start_server_agent_session(
             .with_implementation_handoff_counter(implementation_handoffs.clone())
             .with_active_implementation_workers(active_implementation_workers.clone())
             .with_max_parallel_explores(app_config.eitri.max_parallel_explores)
+            .with_prewarm(code_agent::RunContext {
+                cwd: cwd.clone(),
+                additional_directories: additional_directories.clone(),
+                fs_max_text_bytes,
+                access_mode: crate::acp::RuntimeAccessMode::Full,
+            })
     });
     let provenance_thor = council.as_ref().map(|resolved| resolved.thor.clone());
     let provenance_cwd = cwd.clone();
@@ -2172,7 +2188,10 @@ fn start_server_agent_session(
         args: agent.args,
         cwd,
         additional_directories,
-        mcp_servers: Vec::new(),
+        mcp_servers: thor_pull_server
+            .as_ref()
+            .map(|server| vec![server.advertised().clone()])
+            .unwrap_or_default(),
         resume_session: None,
         env: agent.env,
         agent_stderr: None,
@@ -2209,6 +2228,7 @@ fn start_server_agent_session(
 
     let task = tokio::spawn(async move {
         let _council_homes = (loki_codex_home, eitri_codex_home);
+        let _thor_pull_server = thor_pull_server;
         if let Some(error) = council_setup_error {
             tracker.observe_event(&UiEvent::Fatal(error));
             tracker.shutdown().await;

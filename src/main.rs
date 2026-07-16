@@ -1715,6 +1715,13 @@ async fn run_session(
             council_session.clone(),
         )
     });
+    let thor_pull_server = match loki_handle.as_ref() {
+        Some(reviewer) => Some(loki::PullServer::start(
+            reviewer.clone(),
+            loki::Consumer::Thor,
+        )?),
+        None => None,
+    };
     let has_usage_poller = claude_usage_env.is_some() || codex_usage_env.is_some();
     let (usage_turn_tx, usage_shutdown_tx, usage_task) = if has_usage_poller {
         let (tx, mut rx) = mpsc::unbounded_channel::<()>();
@@ -1780,7 +1787,10 @@ async fn run_session(
         args: agent.args.clone(),
         cwd: cwd.clone(),
         additional_directories: runtime_options.additional_directories.clone(),
-        mcp_servers: Vec::new(),
+        mcp_servers: thor_pull_server
+            .as_ref()
+            .map(|server| vec![server.advertised().clone()])
+            .unwrap_or_default(),
         resume_session,
         env: agent.env.clone(),
         agent_stderr: runtime_options.agent_stderr.clone(),
@@ -1809,6 +1819,12 @@ async fn run_session(
                 .with_implementation_handoff_counter(implementation_handoffs_this_turn.clone())
                 .with_active_implementation_workers(active_implementation_workers.clone())
                 .with_max_parallel_explores(eitri_config.max_parallel_explores)
+                .with_prewarm(code_agent::RunContext {
+                    cwd: cwd.clone(),
+                    additional_directories: runtime_options.additional_directories.clone(),
+                    fs_max_text_bytes: runtime_options.fs_max_text_bytes,
+                    access_mode: acp::RuntimeAccessMode::Full,
+                })
         }),
         termination: None,
     };

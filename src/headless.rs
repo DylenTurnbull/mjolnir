@@ -190,6 +190,13 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             format!("headless-{}", std::process::id()),
         )
     });
+    let thor_pull_server = match loki_handle.as_ref() {
+        Some(reviewer) => Some(loki::PullServer::start(
+            reviewer.clone(),
+            loki::Consumer::Thor,
+        )?),
+        None => None,
+    };
     let (eitri, _eitri_codex_home) = match resolved.eitri.clone() {
         Some(role) => {
             let (role, guard) = crate::isolated_council_role(role, "eitri")?;
@@ -204,7 +211,10 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         args: thor.launch.args.clone(),
         cwd: cfg.cwd.clone(),
         additional_directories: cfg.additional_directories.clone(),
-        mcp_servers: Vec::new(),
+        mcp_servers: thor_pull_server
+            .as_ref()
+            .map(|server| vec![server.advertised().clone()])
+            .unwrap_or_default(),
         resume_session: cfg.resume_session.clone(),
         env: thor.launch.env.clone(),
         agent_stderr: cfg.agent_stderr.clone(),
@@ -225,6 +235,12 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 .with_implementation_handoff_counter(implementation_handoffs.clone())
                 .with_active_implementation_workers(active_implementation_workers.clone())
                 .with_max_parallel_explores(app_config.eitri.max_parallel_explores)
+                .with_prewarm(code_agent::RunContext {
+                    cwd: cfg.cwd.clone(),
+                    additional_directories: cfg.additional_directories.clone(),
+                    fs_max_text_bytes: cfg.fs_max_text_bytes,
+                    access_mode: acp::RuntimeAccessMode::Full,
+                })
         }),
         termination: None,
     };

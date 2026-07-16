@@ -1,8 +1,8 @@
 //! Persistent read-only council advisor. Thor and Eitri stream hidden transcript
 //! deltas into one long-lived Loki ACP session; Loki reviews them asynchronously
 //! at his own pace. Advice accumulates in a queue and is pulled by the
-//! orchestrators at natural turn boundaries — Loki never interrupts a running
-//! target and nothing ever waits on him.
+//! orchestrators at natural turn boundaries. Loki never interrupts a running
+//! target; a pull may wait briefly for the one review already in flight.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -35,7 +35,7 @@ use rmcp::{
     },
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -51,14 +51,29 @@ const MAX_CONTEXT_BYTES: usize = 96 * 1024;
 const MAX_DELTA_ITEM_BYTES: usize = 16 * 1024;
 const MCP_PATH: &str = "/mcp";
 const MCP_SERVER_NAME: &str = "mj-loki-advisor";
+const PULL_MCP_SERVER_NAME: &str = "mj-loki-pull";
+const ADVICE_QUEUE_CAPACITY: usize = 10;
+const PULL_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct AdviseArgs {
-    /// Agent whose reviewed work this advice concerns.
-    target: Target,
-    /// One concrete, material, actionable suggestion for the watched agent.
+    /// Material advice keyed to exact steps from this review batch.
+    advice: Vec<AdviseItem>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AdviseItem {
+    step: StepRef,
     note: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StepRef {
+    pub god: Target,
+    pub ordinal: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +102,7 @@ impl ReviewedSpan {
 
 #[derive(Debug, Clone)]
 pub struct Advice {
+    pub id: u64,
     pub epoch: u64,
     pub target: Target,
     pub note: String,
@@ -106,8 +122,13 @@ impl Advice {
 
 #[derive(Debug, Default)]
 struct AdviceState {
-    deferred: VecDeque<Advice>,
-    seen: HashSet<(u64, String)>,
+    thor: VecDeque<Advice>,
+    eitri: VecDeque<Advice>,
+    dropped_thor: u64,
+    dropped_eitri: u64,
+    thor_cutoff: u64,
+    next_advice_id: u64,
+    seen: HashSet<StepRef>,
 }
 
 type SharedAdviceState = Arc<std::sync::Mutex<AdviceState>>;
@@ -117,8 +138,9 @@ struct ActiveAdvice {
     id: u64,
     epoch: u64,
     spans: Vec<ReviewedSpan>,
-    accepted: bool,
-    accepted_advice: Option<Advice>,
+    accepted_steps: HashSet<StepRef>,
+    accepted_advice: Vec<Advice>,
+    submitted: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -128,6 +150,7 @@ struct AdviceSlot {
     /// Incremented for every queued note so idle orchestrators can wake up
     /// and interject advice that became ready after their turn completed.
     posted: Option<watch::Sender<u64>>,
+    finished_reviews: Option<watch::Sender<u64>>,
 }
 
 impl AdviceSlot {
@@ -136,64 +159,138 @@ impl AdviceSlot {
             id,
             epoch,
             spans,
-            accepted: false,
-            accepted_advice: None,
+            accepted_steps: HashSet::new(),
+            accepted_advice: Vec::new(),
+            submitted: false,
         });
     }
 
-    async fn accept(&self, args: AdviseArgs) -> std::result::Result<Advice, &'static str> {
+    async fn accept(&self, args: AdviseArgs) -> std::result::Result<Vec<Advice>, &'static str> {
         let mut active = self.active.lock().await;
         let Some(active) = active.as_mut() else {
             return Err("no advisor update is active");
         };
-        if active.accepted {
-            return Err("only one advice note is allowed per advisor update");
+        if active.submitted {
+            return Err("only one structured advice list is allowed per review turn");
         }
-        let Some(span) = active
-            .spans
-            .iter()
-            .find(|span| span.target == args.target)
-            .cloned()
-        else {
-            return Err("target was not present in this advisor update");
-        };
-        let advice = Advice {
-            epoch: active.epoch,
-            target: args.target,
-            note: args.note,
-            span,
-        };
         let mut state = self.state.lock().expect("Loki advice state poisoned");
-        let dedupe = (advice.epoch, advice.note.to_ascii_lowercase());
-        if !state.seen.insert(dedupe) {
-            return Err("duplicate advice was ignored");
+        let mut referenced = HashSet::new();
+        for item in &args.advice {
+            let valid = active.spans.iter().any(|span| {
+                span.target == item.step.god
+                    && span.first_step == item.step.ordinal
+                    && span.last_step == item.step.ordinal
+            });
+            if !valid {
+                return Err("advice referenced a step outside this review batch");
+            }
+            if item.note.trim().is_empty() || is_content_free(&item.note) {
+                continue;
+            }
+            if !referenced.insert(item.step)
+                || active.accepted_steps.contains(&item.step)
+                || state.seen.contains(&item.step)
+            {
+                return Err("only one advice note is allowed per reviewed step");
+            }
         }
-        active.accepted = true;
-        active.accepted_advice = Some(advice.clone());
-        tracing::info!(
-            event = "advice_routed",
-            advice_id = active.id,
-            epoch = advice.epoch,
-            review_target = advice.target.label(),
-            reviewed_span = %advice.span.marker(),
-            delivery_route = "queued_for_boundary",
-            "Loki advice routed"
-        );
-        state.deferred.push_back(advice.clone());
+        let mut accepted = Vec::new();
+        active.submitted = true;
+        for item in args.advice {
+            let span = active
+                .spans
+                .iter()
+                .find(|span| {
+                    span.target == item.step.god
+                        && span.first_step == item.step.ordinal
+                        && span.last_step == item.step.ordinal
+                })
+                .cloned()
+                .expect("advice step validated before queue mutation");
+            if item.note.trim().is_empty() || is_content_free(&item.note) {
+                continue;
+            }
+            active.accepted_steps.insert(item.step);
+            state.seen.insert(item.step);
+            state.next_advice_id = state.next_advice_id.saturating_add(1);
+            let advice = Advice {
+                id: state.next_advice_id,
+                epoch: active.epoch,
+                target: item.step.god,
+                note: item.note.trim().to_string(),
+                span,
+            };
+            if advice.target == Target::Thor && advice.span.first_step <= state.thor_cutoff {
+                tracing::info!(
+                    event = "advice_cutoff_drop",
+                    advice_id = advice.id,
+                    step = advice.span.first_step,
+                    "discarded stale Thor advice after Eitri handoff"
+                );
+                continue;
+            }
+            let AdviceState {
+                thor,
+                eitri,
+                dropped_thor,
+                dropped_eitri,
+                ..
+            } = &mut *state;
+            match advice.target {
+                Target::Thor => push_bounded(thor, dropped_thor, advice.clone()),
+                Target::Eitri => push_bounded(eitri, dropped_eitri, advice.clone()),
+            }
+            tracing::info!(
+                event = "advice_routed",
+                advice_id = advice.id,
+                epoch = advice.epoch,
+                review_target = advice.target.label(),
+                reviewed_step = advice.span.first_step,
+                delivery_route = match advice.target {
+                    Target::Thor => "thor_queue",
+                    Target::Eitri => "eitri_queue",
+                },
+                advice = %advice.note,
+                "Loki advice routed"
+            );
+            active.accepted_advice.push(advice.clone());
+            accepted.push(advice);
+        }
         drop(state);
-        if let Some(posted) = self.posted.as_ref() {
+        if !accepted.is_empty()
+            && let Some(posted) = self.posted.as_ref()
+        {
             posted.send_modify(|count| *count += 1);
         }
-        Ok(advice)
+        Ok(accepted)
     }
 
-    async fn finish(&self, id: u64) -> Option<Advice> {
+    async fn finish(&self, id: u64) -> Vec<Advice> {
         let mut active = self.active.lock().await;
         if active.as_ref().is_some_and(|active| active.id == id) {
-            return active.take().and_then(|active| active.accepted_advice);
+            let advice = active
+                .take()
+                .map_or_else(Vec::new, |active| active.accepted_advice);
+            if let Some(finished) = self.finished_reviews.as_ref() {
+                let _ = finished.send(id);
+            }
+            return advice;
         }
-        None
+        Vec::new()
     }
+}
+
+fn push_bounded(queue: &mut VecDeque<Advice>, dropped: &mut u64, advice: Advice) {
+    if queue.len() == ADVICE_QUEUE_CAPACITY {
+        queue.pop_front();
+        *dropped = dropped.saturating_add(1);
+        tracing::warn!(
+            event = "advice_queue_overflow",
+            target = advice.target.label(),
+            "unseen Loki advice dropped; Thor should pull advice more often"
+        );
+    }
+    queue.push_back(advice);
 }
 
 #[derive(Clone)]
@@ -215,29 +312,17 @@ impl McpHandler {
 
     #[tool(
         name = "advise",
-        description = "Queue at most one material advisory note about Thor or Eitri. Advice is asynchronous: it is delivered to Thor at the next natural turn boundary and never interrupts running work, so later work may have superseded it by delivery time. Reserve it for material correctness, safety, scope, or strategy problems; otherwise do not call this tool."
+        description = "Queue material advice as a list of exact reviewed steps and notes. Include at most one note per step, omit steps without material correctness, safety, scope, or strategy advice, and call this tool at most once per review turn."
     )]
     async fn advise(
         &self,
         Parameters(args): Parameters<AdviseArgs>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        let note = args.note.trim();
-        if note.is_empty() {
-            return Err(McpError::invalid_params("note must not be empty", None));
-        }
-        if is_content_free(note) {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "Content-free advice was ignored.",
-            )]));
-        }
-        let args = AdviseArgs {
-            target: args.target,
-            note: note.to_string(),
-        };
         match self.advice.accept(args).await {
-            Ok(_) => Ok(CallToolResult::success(vec![Content::text(
-                "Advice accepted.",
-            )])),
+            Ok(advice) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Accepted {} advice item(s).",
+                advice.len()
+            ))])),
             Err(message) => Ok(CallToolResult::error(vec![Content::text(message)])),
         }
     }
@@ -354,6 +439,161 @@ impl Drop for HttpServer {
     }
 }
 
+#[derive(Clone)]
+struct PullMcpHandler {
+    reviewer: Handle,
+    consumer: Consumer,
+    tool_router: ToolRouter<Self>,
+}
+
+#[tool_router(router = tool_router)]
+impl PullMcpHandler {
+    fn new(reviewer: Handle, consumer: Consumer) -> Self {
+        Self {
+            reviewer,
+            consumer,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    #[tool(
+        name = "pull_advice",
+        description = "Drain Loki advice at a good stopping point. Avoid redundant pulls at consecutive semantic steps and do not let more than eight semantic steps pass without pulling. Automatic Council delivery receipts already drain the named queues, so do not immediately pull again after one."
+    )]
+    async fn pull_advice(&self) -> std::result::Result<CallToolResult, McpError> {
+        let outcome = self.reviewer.pull_manual(self.consumer).await;
+        tracing::info!(
+            event = "advice_pulled",
+            consumer = self.consumer.label(),
+            count = outcome.advice.len(),
+            dropped = outcome.dropped,
+            waited = outcome.waited,
+            "Loki advice pulled"
+        );
+        let text = format_pull_outcome(&outcome, self.reviewer.current_epoch(), self.consumer);
+        let items = outcome
+            .advice
+            .iter()
+            .map(|advice| {
+                serde_json::json!({
+                    "adviceId": advice.id,
+                    "step": { "god": advice.target, "ordinal": advice.span.first_step },
+                    "note": advice.note,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut result = CallToolResult::success(vec![Content::text(text)]);
+        result.structured_content = Some(serde_json::json!({
+            "consumer": self.consumer.label().to_ascii_lowercase(),
+            "advice": items,
+            "dropped": outcome.dropped,
+            "waitedForLoki": outcome.waited,
+            "drainedQueues": match self.consumer { Consumer::Thor => vec!["thor", "eitri"], Consumer::Eitri => vec!["eitri"] },
+        }));
+        Ok(result)
+    }
+}
+
+impl ServerHandler for PullMcpHandler {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(PULL_MCP_SERVER_NAME, env!("CARGO_PKG_VERSION")))
+            .with_instructions("Use pull_advice at natural stopping points. This endpoint is scoped to your Council role.")
+    }
+
+    fn list_tools(
+        &self,
+        _: Option<PaginatedRequestParams>,
+        _: RequestContext<RoleServer>,
+    ) -> impl Future<Output = std::result::Result<ListToolsResult, McpError>> + Send + '_ {
+        std::future::ready(Ok(ListToolsResult::with_all_items(
+            self.tool_router.list_all(),
+        )))
+    }
+
+    fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = std::result::Result<CallToolResult, McpError>> + Send + '_ {
+        self.tool_router
+            .call(ToolCallContext::new(self, request, context))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned()
+    }
+}
+
+pub struct PullServer {
+    advertised: McpServer,
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl PullServer {
+    pub fn start(reviewer: Handle, consumer: Consumer) -> Result<Self> {
+        let mut token_bytes = [0_u8; 32];
+        getrandom::fill(&mut token_bytes)
+            .map_err(|error| anyhow!("generate Loki pull MCP bearer token: {error}"))?;
+        let authorization = format!(
+            "Bearer {}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes)
+        );
+        let handler = PullMcpHandler::new(reviewer, consumer);
+        let cancellation = CancellationToken::new();
+        let mut config = StreamableHttpServerConfig::default();
+        config.cancellation_token = cancellation.clone();
+        let service = StreamableHttpService::new(
+            move || Ok(handler.clone()),
+            Arc::new(LocalSessionManager::default()),
+            config,
+        );
+        let protected = axum::Router::new().nest_service(MCP_PATH, service).layer(
+            axum::middleware::from_fn_with_state(authorization.clone(), require_bearer),
+        );
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").context("bind Loki pull MCP listener")?;
+        listener
+            .set_nonblocking(true)
+            .context("configure Loki pull MCP listener")?;
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .context("register Loki pull MCP listener")?;
+        let addr = listener
+            .local_addr()
+            .context("read Loki pull MCP listener address")?;
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, protected)
+                .with_graceful_shutdown(task_cancellation.cancelled_owned())
+                .await
+            {
+                tracing::warn!("Loki pull MCP listener stopped: {error}");
+            }
+        });
+        let advertised = McpServer::Http(
+            McpServerHttp::new(PULL_MCP_SERVER_NAME, format!("http://{addr}{MCP_PATH}"))
+                .headers(vec![HttpHeader::new("Authorization", authorization)]),
+        );
+        Ok(Self {
+            advertised,
+            cancellation,
+            task,
+        })
+    }
+
+    pub fn advertised(&self) -> &McpServer {
+        &self.advertised
+    }
+}
+
+impl Drop for PullServer {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.task.abort();
+    }
+}
+
 async fn require_bearer(
     State(expected): State<String>,
     request: HttpRequest,
@@ -453,7 +693,7 @@ impl BoundaryTracker {
                 );
                 self.tools
                     .insert(call.tool_call_id.to_string(), call.clone());
-                (complete && !terminal_backed).then(|| {
+                (complete && !terminal_backed && !is_pull_advice(call)).then(|| {
                     self.final_message.clear();
                     let activity = tool_activity(call);
                     (
@@ -474,7 +714,8 @@ impl BoundaryTracker {
                         .entry(id.clone())
                         .or_insert_with(|| ToolCall::new(id.clone(), "tool"));
                     tool.update(update.fields.clone());
-                    (completed && !tool_has_terminal(tool)).then(|| render_tool_delta(tool))
+                    (completed && !tool_has_terminal(tool) && !is_pull_advice(tool))
+                        .then(|| render_tool_delta(tool))
                 };
                 rendered.map(|rendered| {
                     self.final_message.clear();
@@ -564,6 +805,11 @@ fn tool_has_terminal(tool: &agent_client_protocol::schema::v1::ToolCall) -> bool
     tool.content
         .iter()
         .any(|content| matches!(content, ToolCallContent::Terminal(_)))
+}
+
+fn is_pull_advice(tool: &agent_client_protocol::schema::v1::ToolCall) -> bool {
+    let activity = tool_activity(tool);
+    activity == "pull_advice" || activity.ends_with("/pull_advice")
 }
 
 fn render_tool_delta(tool: &agent_client_protocol::schema::v1::ToolCall) -> String {
@@ -703,7 +949,7 @@ fn join_boundary(previous: Option<String>, current: String) -> String {
     previous.map_or(current.clone(), |previous| format!("{previous}\n{current}"))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Target {
     Thor,
@@ -711,6 +957,25 @@ pub enum Target {
 }
 
 impl Target {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Thor => "Thor",
+            Self::Eitri => "Eitri",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consumer {
+    Thor,
+    Eitri,
+}
+
+impl Consumer {
+    fn can_see(self, target: Target) -> bool {
+        self == Self::Thor || target == Target::Eitri
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Thor => "Thor",
@@ -719,7 +984,39 @@ impl Target {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PullOutcome {
+    pub advice: Vec<Advice>,
+    pub dropped: u64,
+    pub waited: bool,
+}
+
+impl PullOutcome {
+    pub fn is_empty(&self) -> bool {
+        self.advice.is_empty() && self.dropped == 0
+    }
+}
+
+fn drain_for(state: &mut AdviceState, consumer: Consumer) -> PullOutcome {
+    let mut advice: Vec<Advice> = match consumer {
+        Consumer::Thor => state.thor.drain(..).chain(state.eitri.drain(..)).collect(),
+        Consumer::Eitri => state.eitri.drain(..).collect(),
+    };
+    advice.sort_by_key(|advice: &Advice| advice.id);
+    let dropped = match consumer {
+        Consumer::Thor => std::mem::take(&mut state.dropped_thor)
+            .saturating_add(std::mem::take(&mut state.dropped_eitri)),
+        Consumer::Eitri => std::mem::take(&mut state.dropped_eitri),
+    };
+    PullOutcome {
+        advice,
+        dropped,
+        waited: false,
+    }
+}
+
 enum Request {
+    Warmup,
     Begin {
         epoch: u64,
         task: String,
@@ -746,10 +1043,19 @@ pub struct Handle {
     ids: Arc<AtomicU64>,
     epochs: Arc<AtomicU64>,
     eitri_invocations: Arc<AtomicU64>,
+    thor_steps: Arc<AtomicU64>,
+    eitri_steps: Arc<AtomicU64>,
+    pending_thor: Arc<AtomicU64>,
+    pending_eitri: Arc<AtomicU64>,
+    last_thor_pull: Arc<AtomicU64>,
+    last_eitri_pull: Arc<AtomicU64>,
     advice_state: SharedAdviceState,
+    active: Arc<Mutex<Option<ActiveAdvice>>>,
     abort: watch::Sender<bool>,
     finished: watch::Receiver<bool>,
     posted: watch::Receiver<u64>,
+    finished_reviews: watch::Receiver<u64>,
+    review_started: watch::Receiver<u64>,
 }
 
 impl Handle {
@@ -764,16 +1070,30 @@ impl Handle {
         let (abort, abort_rx) = watch::channel(false);
         let (finished_tx, finished) = watch::channel(false);
         let (posted_tx, posted) = watch::channel(0_u64);
+        let (finished_reviews_tx, finished_reviews) = watch::channel(0_u64);
+        let (review_started_tx, review_started) = watch::channel(0_u64);
         let advice_state = SharedAdviceState::default();
+        let active = Arc::new(Mutex::new(None));
+        let pending_thor = Arc::new(AtomicU64::new(0));
+        let pending_eitri = Arc::new(AtomicU64::new(0));
         let handle = Self {
             requests,
             ids: Arc::new(AtomicU64::new(1)),
             epochs: Arc::new(AtomicU64::new(1)),
             eitri_invocations: Arc::new(AtomicU64::new(1)),
+            thor_steps: Arc::new(AtomicU64::new(1)),
+            eitri_steps: Arc::new(AtomicU64::new(1)),
+            pending_thor: pending_thor.clone(),
+            pending_eitri: pending_eitri.clone(),
+            last_thor_pull: Arc::new(AtomicU64::new(u64::MAX)),
+            last_eitri_pull: Arc::new(AtomicU64::new(u64::MAX)),
             advice_state: advice_state.clone(),
+            active: active.clone(),
             abort,
             finished,
             posted,
+            finished_reviews,
+            review_started,
         };
         tokio::spawn(worker(
             role,
@@ -782,11 +1102,17 @@ impl Handle {
             ui_tx,
             rx,
             advice_state,
+            active,
             abort_rx,
             finished_tx,
             posted_tx,
+            finished_reviews_tx,
+            review_started_tx,
+            pending_thor,
+            pending_eitri,
             council_session,
         ));
+        let _ = handle.requests.send(Request::Warmup);
         handle
     }
 
@@ -800,15 +1126,6 @@ impl Handle {
         let _ = self.abort.send(false);
         let epoch = self.epochs.fetch_add(1, Ordering::Relaxed);
         self.eitri_invocations.store(1, Ordering::Relaxed);
-        {
-            // Advice queued in earlier turns stays deliverable; only the
-            // exact-duplicate guard is scoped to the new turn.
-            let mut state = self
-                .advice_state
-                .lock()
-                .expect("Loki advice state poisoned");
-            state.seen.retain(|(seen_epoch, _)| *seen_epoch == epoch);
-        }
         let _ = self.requests.send(Request::Begin { epoch, task });
         epoch
     }
@@ -824,14 +1141,133 @@ impl Handle {
         invocation
     }
 
-    /// Drain every queued advice note, oldest first, regardless of the turn
-    /// it was produced in. Callers deliver the result at a turn boundary.
-    pub fn take_deferred(&self) -> Vec<Advice> {
+    pub async fn pull(&self, consumer: Consumer) -> PullOutcome {
+        self.pull_inner(consumer).await
+    }
+
+    pub async fn pull_manual(&self, consumer: Consumer) -> PullOutcome {
+        let current = match consumer {
+            Consumer::Thor => self.thor_steps.load(Ordering::Relaxed).saturating_sub(1),
+            Consumer::Eitri => self.eitri_steps.load(Ordering::Relaxed).saturating_sub(1),
+        };
+        let last = match consumer {
+            Consumer::Thor => self.last_thor_pull.swap(current, Ordering::Relaxed),
+            Consumer::Eitri => self.last_eitri_pull.swap(current, Ordering::Relaxed),
+        };
+        let gap = if last == u64::MAX {
+            current
+        } else {
+            current.saturating_sub(last)
+        };
+        if last != u64::MAX && gap == 0 {
+            tracing::warn!(
+                event = "advice_pull_cadence_violation",
+                consumer = consumer.label(),
+                gap,
+                reason = "consecutive",
+                "pull_advice called without an intervening semantic step"
+            );
+        } else if gap > 8 {
+            tracing::warn!(
+                event = "advice_pull_cadence_violation",
+                consumer = consumer.label(),
+                gap,
+                reason = "overdue",
+                "more than eight semantic steps elapsed between pull_advice calls"
+            );
+        }
+        self.pull_inner(consumer).await
+    }
+
+    async fn pull_inner(&self, consumer: Consumer) -> PullOutcome {
+        let deadline = tokio::time::Instant::now() + PULL_WAIT;
+        let mut started = self.review_started.clone();
+        let _ = *started.borrow_and_update();
+        let initial = {
+            let mut state = self
+                .advice_state
+                .lock()
+                .expect("Loki advice state poisoned");
+            drain_for(&mut state, consumer)
+        };
+        if !initial.advice.is_empty() || initial.dropped > 0 {
+            return initial;
+        }
+        let mut review_id = self.active_review_relevant(consumer).await;
+        if review_id.is_none() && self.has_pending_review(consumer) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let _ = tokio::time::timeout(remaining, started.changed()).await;
+            let queued = {
+                let mut state = self
+                    .advice_state
+                    .lock()
+                    .expect("Loki advice state poisoned");
+                drain_for(&mut state, consumer)
+            };
+            if !queued.is_empty() {
+                return PullOutcome {
+                    waited: true,
+                    ..queued
+                };
+            }
+            review_id = self.active_review_relevant(consumer).await;
+        }
+        let Some(review_id) = review_id else {
+            return initial;
+        };
+        let mut finished = self.finished_reviews.clone();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let _ = tokio::time::timeout(
+            remaining,
+            finished.wait_for(|finished_id| *finished_id >= review_id),
+        )
+        .await;
+        let mut outcome = {
+            let mut state = self
+                .advice_state
+                .lock()
+                .expect("Loki advice state poisoned");
+            drain_for(&mut state, consumer)
+        };
+        outcome.waited = true;
+        outcome
+    }
+
+    fn has_pending_review(&self, consumer: Consumer) -> bool {
+        match consumer {
+            Consumer::Thor => {
+                self.pending_thor.load(Ordering::Relaxed) > 0
+                    || self.pending_eitri.load(Ordering::Relaxed) > 0
+            }
+            Consumer::Eitri => self.pending_eitri.load(Ordering::Relaxed) > 0,
+        }
+    }
+
+    async fn active_review_relevant(&self, consumer: Consumer) -> Option<u64> {
+        let active_advice = self.active_advice();
+        let active = active_advice.lock().await;
+        active.as_ref().and_then(|active| {
+            active
+                .spans
+                .iter()
+                .any(|span| consumer.can_see(span.target))
+                .then_some(active.id)
+        })
+    }
+
+    fn active_advice(&self) -> Arc<Mutex<Option<ActiveAdvice>>> {
+        // The worker and handle share this through AdviceState registration below.
+        self.active.clone()
+    }
+
+    pub fn begin_eitri_handoff(&self) {
+        let cutoff = self.thor_steps.load(Ordering::Relaxed).saturating_sub(1);
         let mut state = self
             .advice_state
             .lock()
             .expect("Loki advice state poisoned");
-        state.deferred.drain(..).collect()
+        state.thor.clear();
+        state.thor_cutoff = state.thor_cutoff.max(cutoff);
     }
 
     pub fn current_epoch(&self) -> u64 {
@@ -852,7 +1288,23 @@ impl Handle {
         self.submit(epoch, target, invocation, checkpoint);
     }
 
-    fn submit(&self, epoch: u64, target: Target, invocation: Option<u64>, checkpoint: Checkpoint) {
+    fn submit(
+        &self,
+        epoch: u64,
+        target: Target,
+        invocation: Option<u64>,
+        mut checkpoint: Checkpoint,
+    ) {
+        checkpoint.step = match target {
+            Target::Thor => {
+                self.pending_thor.fetch_add(1, Ordering::Relaxed);
+                self.thor_steps.fetch_add(1, Ordering::Relaxed)
+            }
+            Target::Eitri => {
+                self.pending_eitri.fetch_add(1, Ordering::Relaxed);
+                self.eitri_steps.fetch_add(1, Ordering::Relaxed)
+            }
+        };
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
         let _ = self.requests.send(Request::Review {
             id,
@@ -891,9 +1343,14 @@ async fn worker(
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     mut requests: mpsc::UnboundedReceiver<Request>,
     advice_state: SharedAdviceState,
+    active_advice: Arc<Mutex<Option<ActiveAdvice>>>,
     abort_rx: watch::Receiver<bool>,
     finished: watch::Sender<bool>,
     posted: watch::Sender<u64>,
+    finished_reviews: watch::Sender<u64>,
+    review_started: watch::Sender<u64>,
+    pending_thor: Arc<AtomicU64>,
+    pending_eitri: Arc<AtomicU64>,
     council_session: String,
 ) {
     let mut epoch = 0;
@@ -901,9 +1358,10 @@ async fn worker(
     let mut session: Option<AgentHandle> = None;
     let mut review_state = LokiReviewState::default();
     let advice = AdviceSlot {
-        active: Arc::default(),
+        active: active_advice,
         state: advice_state,
         posted: Some(posted),
+        finished_reviews: Some(finished_reviews),
     };
     let server = match HttpServer::start(advice.clone()).await {
         Ok(server) => Some(server),
@@ -924,6 +1382,7 @@ async fn worker(
         let mut incoming = VecDeque::from([request]);
         while let Some(request) = incoming.pop_front() {
             match request {
+                Request::Warmup => {}
                 Request::Begin {
                     epoch: next,
                     task: next_task,
@@ -962,14 +1421,21 @@ async fn worker(
                         incoming.push_back(next);
                     }
                 }
-                Request::TargetContext { .. } | Request::Review { .. } => {}
+                Request::Review { target, .. } => match target {
+                    Target::Thor => decrement_pending(&pending_thor),
+                    Target::Eitri => decrement_pending(&pending_eitri),
+                },
+                Request::TargetContext { .. } => {}
                 Request::Shutdown => break 'worker,
             }
         }
-        if batch.is_empty() || *abort_rx.borrow() {
-            continue;
-        }
         let Some(server) = server.as_ref() else {
+            for item in &batch {
+                match item.target {
+                    Target::Thor => decrement_pending(&pending_thor),
+                    Target::Eitri => decrement_pending(&pending_eitri),
+                }
+            }
             continue;
         };
         if session.is_none() {
@@ -1014,14 +1480,32 @@ async fn worker(
                     if !*abort_rx.borrow() {
                         emit_warning(&ui_tx, &role, format!("Loki could not start: {error:#}"));
                     }
-                    continue;
                 }
             }
         }
+        if batch.is_empty() || *abort_rx.borrow() {
+            for item in &batch {
+                match item.target {
+                    Target::Thor => decrement_pending(&pending_thor),
+                    Target::Eitri => decrement_pending(&pending_eitri),
+                }
+            }
+            continue;
+        }
+        let spans = reviewed_spans(&batch);
+        let id = batch[0].id;
+        advice.begin(id, epoch, spans.clone()).await;
+        for item in &batch {
+            match item.target {
+                Target::Thor => decrement_pending(&pending_thor),
+                Target::Eitri => decrement_pending(&pending_eitri),
+            }
+        }
+        let _ = review_started.send(id);
         let Some(agent) = session.as_mut() else {
+            advice.finish(id).await;
             continue;
         };
-        let spans = reviewed_spans(&batch);
         let mut context = Vec::new();
         for span in &spans {
             if let Some(value) = pending_context.remove(&(span.target, span.invocation)) {
@@ -1030,9 +1514,7 @@ async fn worker(
         }
         let include_contract = review_state.include_contract();
         let prompt = review_prompt(&batch, &spans, &context, include_contract);
-        let id = batch[0].id;
         tracing::info!(event = "review_started", council_session = %council_session, god = "Loki", model = %role.model.model, adapter = %role.launch.source_id, review_id = id, epoch, batch_size = batch.len(), review_target = %spans.iter().map(ReviewedSpan::marker).collect::<Vec<_>>().join(" | "), "Loki review started");
-        advice.begin(id, epoch, spans.clone()).await;
         let result = agent
             .prompt(prompt, REVIEW_TIMEOUT, |event| match event {
                 TurnEvent::Permission {
@@ -1067,12 +1549,18 @@ async fn worker(
                 old.dismiss().await;
             }
         }
-        tracing::info!(event = "review_finished", council_session = %council_session, god = "Loki", model = %role.model.model, adapter = %role.launch.source_id, review_id = id, epoch, batch_size = batch.len(), advice_accepted = accepted.is_some(), advice_id = accepted.as_ref().map(|_| id), advice_target = accepted.as_ref().map(|a| a.target.label()), advice = accepted.as_ref().map(|a| a.note.as_str()), "Loki review finished");
+        tracing::info!(event = "review_finished", council_session = %council_session, god = "Loki", model = %role.model.model, adapter = %role.launch.source_id, review_id = id, epoch, batch_size = batch.len(), advice_accepted = !accepted.is_empty(), advice_count = accepted.len(), "Loki review finished");
     }
     if let Some(agent) = session {
         agent.dismiss().await;
     }
     let _ = finished.send(true);
+}
+
+fn decrement_pending(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(1))
+    });
 }
 
 fn begin_request(pending_context: &mut HashMap<(Target, Option<u64>), String>, task: String) {
@@ -1158,30 +1646,16 @@ struct ReviewItem {
 }
 
 fn reviewed_spans(batch: &[ReviewItem]) -> Vec<ReviewedSpan> {
-    let mut spans: Vec<ReviewedSpan> = Vec::new();
-    for item in batch {
-        if let Some(span) = spans
-            .iter_mut()
-            .find(|span| span.target == item.target && span.invocation == item.invocation)
-        {
-            span.first_step = span.first_step.min(item.checkpoint.step);
-            span.last_step = span.last_step.max(item.checkpoint.step);
-            for activity in &item.checkpoint.activities {
-                if !span.activities.contains(activity) {
-                    span.activities.push(activity.clone());
-                }
-            }
-        } else {
-            spans.push(ReviewedSpan {
-                target: item.target,
-                invocation: item.invocation,
-                first_step: item.checkpoint.step,
-                last_step: item.checkpoint.step,
-                activities: item.checkpoint.activities.clone(),
-            });
-        }
-    }
-    spans
+    batch
+        .iter()
+        .map(|item| ReviewedSpan {
+            target: item.target,
+            invocation: item.invocation,
+            first_step: item.checkpoint.step,
+            last_step: item.checkpoint.step,
+            activities: item.checkpoint.activities.clone(),
+        })
+        .collect()
 }
 
 async fn connect(
@@ -1226,7 +1700,7 @@ fn review_prompt(
 ) -> String {
     let mut prompt = String::new();
     if include_contract {
-        prompt.push_str("You are Loki, Mjolnir's persistent read-only advisor. Take a different, user-aligned angle from Thor and Eitri and verify assumptions when useful. Do not restate failures they already know. Stay silent for style, uncertainty, optional improvements, incomplete work, or activity that is on track. The advise tool accepts one note per update and is fully asynchronous: your note is queued and delivered to Thor at the next natural turn boundary, never as an interruption, so reserve it for material correctness, safety, scope, or strategy problems that remain worth raising even if later work may have already addressed them. Never implement changes yourself.\n\n");
+        prompt.push_str("You are Loki, Mjolnir's one persistent read-only advisor. Take a different, user-aligned angle from Thor and implementation Eitri and verify assumptions when useful. You do not observe read-only Explore runs. Do not restate failures they already know. Stay silent for style, uncertainty, optional improvements, incomplete work, or activity that is on track. The advise tool accepts one structured list containing at most one note for each exact reviewed (god, ordinal) step. Advice is queued for the associated role and pulled at natural stopping points, never delivered as an interruption, so reserve it for material correctness, safety, scope, or strategy problems that remain worth raising even if later work may have already addressed them. Never implement changes yourself.\n\n");
     }
     for context in context {
         prompt.push_str(context);
@@ -1236,7 +1710,11 @@ fn review_prompt(
     for item in batch {
         let span = spans
             .iter()
-            .find(|span| span.target == item.target && span.invocation == item.invocation)
+            .find(|span| {
+                span.target == item.target
+                    && span.invocation == item.invocation
+                    && span.first_step == item.checkpoint.step
+            })
             .expect("batch span");
         prompt.push_str(&format!(
             "[{}]\n{}\n\n",
@@ -1244,7 +1722,7 @@ fn review_prompt(
             item.checkpoint.text
         ));
     }
-    prompt.push_str("Consider only these new checkpoints in light of your existing context. Use advise at most once, selecting a target present above, only for material actionable guidance; otherwise finish silently.");
+    prompt.push_str("Consider only these new checkpoints in light of your existing context. If material actionable guidance is needed, call advise once with a list containing at most one note for each exact (god, ordinal) step above. Otherwise finish silently.");
     bounded(prompt)
 }
 
@@ -1264,6 +1742,33 @@ pub fn format_deferred(advice: &[Advice], current_epoch: u64) -> String {
         .map(|advice| advice.deferred_text(current_epoch))
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+pub fn format_pull_outcome(
+    outcome: &PullOutcome,
+    current_epoch: u64,
+    consumer: Consumer,
+) -> String {
+    let queues = match consumer {
+        Consumer::Thor => "Thor and Eitri",
+        Consumer::Eitri => "Eitri",
+    };
+    let mut sections = vec![format!(
+        "Loki advice receipt: drained {queues} queues ({} note{}).",
+        outcome.advice.len(),
+        if outcome.advice.len() == 1 { "" } else { "s" }
+    )];
+    if outcome.dropped > 0 {
+        sections.push(format!(
+            "Warning: {} unseen Loki advice note{} dropped because the queue reached its limit. Pull advice more often.",
+            outcome.dropped,
+            if outcome.dropped == 1 { " was" } else { "s were" }
+        ));
+    }
+    if !outcome.advice.is_empty() {
+        sections.push(format_deferred(&outcome.advice, current_epoch));
+    }
+    sections.join("\n\n")
 }
 
 fn identity(role: &ResolvedRole) -> LokiIdentity {
@@ -1293,16 +1798,27 @@ mod tests {
         let (abort, _) = watch::channel(false);
         let (_, finished) = watch::channel(false);
         let (_, posted) = watch::channel(0_u64);
+        let (_, finished_reviews) = watch::channel(0_u64);
+        let (_, review_started) = watch::channel(0_u64);
         (
             Handle {
                 requests,
                 ids: Arc::new(AtomicU64::new(1)),
                 epochs: Arc::new(AtomicU64::new(epoch.saturating_add(1))),
                 eitri_invocations: Arc::new(AtomicU64::new(1)),
+                thor_steps: Arc::new(AtomicU64::new(1)),
+                eitri_steps: Arc::new(AtomicU64::new(1)),
+                pending_thor: Arc::new(AtomicU64::new(0)),
+                pending_eitri: Arc::new(AtomicU64::new(0)),
+                last_thor_pull: Arc::new(AtomicU64::new(u64::MAX)),
+                last_eitri_pull: Arc::new(AtomicU64::new(u64::MAX)),
                 advice_state: SharedAdviceState::default(),
+                active: Arc::default(),
                 abort,
                 finished,
                 posted,
+                finished_reviews,
+                review_started,
             },
             request_rx,
         )
@@ -1321,23 +1837,81 @@ mod tests {
         slot.begin(4, 2, vec![span]).await;
         let advice = slot
             .accept(AdviseArgs {
-                target: Target::Eitri,
-                note: "fix the race".to_string(),
+                advice: vec![AdviseItem {
+                    step: StepRef {
+                        god: Target::Eitri,
+                        ordinal: 4,
+                    },
+                    note: "fix the race".to_string(),
+                }],
             })
             .await
             .unwrap();
-        assert_eq!(advice.epoch, 2);
-        assert_eq!(advice.target, Target::Eitri);
-        assert_eq!(advice.note, "fix the race");
+        assert_eq!(advice[0].epoch, 2);
+        assert_eq!(advice[0].target, Target::Eitri);
+        assert_eq!(advice[0].note, "fix the race");
         assert!(
             slot.accept(AdviseArgs {
-                target: Target::Eitri,
-                note: "second note".to_string(),
+                advice: vec![AdviseItem {
+                    step: StepRef {
+                        god: Target::Eitri,
+                        ordinal: 4
+                    },
+                    note: "second note".to_string(),
+                }],
             })
             .await
             .is_err()
         );
-        assert_eq!(slot.finish(4).await.unwrap().note, "fix the race");
+        assert_eq!(slot.finish(4).await[0].note, "fix the race");
+    }
+
+    #[tokio::test]
+    async fn advice_tool_rejects_an_invalid_empty_item_before_queueing_valid_items() {
+        let state = SharedAdviceState::default();
+        let slot = AdviceSlot {
+            active: Arc::default(),
+            state: state.clone(),
+            posted: None,
+            finished_reviews: None,
+        };
+        slot.begin(
+            4,
+            2,
+            vec![ReviewedSpan {
+                target: Target::Thor,
+                invocation: None,
+                first_step: 4,
+                last_step: 4,
+                activities: vec!["cargo test".to_string()],
+            }],
+        )
+        .await;
+
+        let result = slot
+            .accept(AdviseArgs {
+                advice: vec![
+                    AdviseItem {
+                        step: StepRef {
+                            god: Target::Thor,
+                            ordinal: 4,
+                        },
+                        note: "fix the race".to_string(),
+                    },
+                    AdviseItem {
+                        step: StepRef {
+                            god: Target::Thor,
+                            ordinal: 99,
+                        },
+                        note: String::new(),
+                    },
+                ],
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(state.lock().unwrap().thor.is_empty());
+        assert!(slot.finish(4).await.is_empty());
     }
 
     #[test]
@@ -1394,7 +1968,38 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_spans_combine_steps_and_deduplicate_activities() {
+    fn step_ordinals_are_session_wide_and_independent_per_god() {
+        let (handle, mut requests) = test_handle(1);
+        let checkpoint = || Checkpoint {
+            step: 99,
+            text: "step".into(),
+            activities: vec!["test".into()],
+        };
+        handle.observe(1, Target::Thor, None, checkpoint());
+        handle.observe(1, Target::Eitri, Some(1), checkpoint());
+        handle.observe(1, Target::Thor, None, checkpoint());
+        handle.observe(1, Target::Eitri, Some(2), checkpoint());
+        let ordinals = (0..4)
+            .map(|_| match requests.try_recv().expect("review") {
+                Request::Review {
+                    target, checkpoint, ..
+                } => (target, checkpoint.step),
+                _ => panic!("expected review"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordinals,
+            [
+                (Target::Thor, 1),
+                (Target::Eitri, 1),
+                (Target::Thor, 2),
+                (Target::Eitri, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn reviewed_spans_preserve_each_exact_step() {
         let batch = vec![
             ReviewItem {
                 id: 1,
@@ -1418,11 +2023,14 @@ mod tests {
             },
         ];
         let spans = reviewed_spans(&batch);
-        assert_eq!(spans.len(), 1);
+        assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].first_step, 4);
-        assert_eq!(spans[0].last_step, 5);
-        assert_eq!(spans[0].activities, ["rg", "cargo test"]);
-        assert_eq!(spans[0].marker(), "Eitri #2 · steps 4-5: rg, cargo test");
+        assert_eq!(spans[0].last_step, 4);
+        assert_eq!(spans[0].activities, ["rg"]);
+        assert_eq!(spans[0].marker(), "Eitri #2 · step 4: rg");
+        assert_eq!(spans[1].first_step, 5);
+        assert_eq!(spans[1].last_step, 5);
+        assert_eq!(spans[1].activities, ["rg", "cargo test"]);
     }
 
     #[test]
@@ -1557,6 +2165,7 @@ mod tests {
             active: Arc::default(),
             state: state.clone(),
             posted: Some(posted_tx),
+            finished_reviews: None,
         };
         let span = ReviewedSpan {
             target: Target::Thor,
@@ -1567,25 +2176,32 @@ mod tests {
         };
         slot.begin(8, 3, vec![span]).await;
         slot.accept(AdviseArgs {
-            target: Target::Thor,
-            note: "the test is destructive".into(),
+            advice: vec![AdviseItem {
+                step: StepRef {
+                    god: Target::Thor,
+                    ordinal: 2,
+                },
+                note: "the test is destructive".into(),
+            }],
         })
         .await
         .unwrap();
 
         assert!(posted.has_changed().unwrap());
         assert_eq!(*posted.borrow_and_update(), 1);
-        let deferred = &state.lock().unwrap().deferred;
+        let guard = state.lock().unwrap();
+        let deferred = &guard.thor;
         assert_eq!(deferred.len(), 1);
         assert_eq!(deferred[0].note, "the test is destructive");
     }
 
     #[test]
-    fn take_deferred_drains_advice_across_turns_with_provenance_labels() {
+    fn thor_drain_merges_advice_across_turns_with_provenance_labels() {
         let (handle, _requests) = test_handle(4);
         {
             let mut state = handle.advice_state.lock().unwrap();
             let advice = |epoch, note: &str| Advice {
+                id: epoch,
                 epoch,
                 target: Target::Thor,
                 note: note.to_string(),
@@ -1597,13 +2213,17 @@ mod tests {
                     activities: vec!["cargo test".into()],
                 },
             };
-            state.deferred.push_back(advice(2, "old turn advice"));
-            state.deferred.push_back(advice(4, "current turn advice"));
+            state.thor.push_back(advice(2, "old turn advice"));
+            state.eitri.push_back(advice(4, "current turn advice"));
         }
 
-        let taken = handle.take_deferred();
+        let taken = drain_for(&mut handle.advice_state.lock().unwrap(), Consumer::Thor).advice;
         assert_eq!(taken.len(), 2);
-        assert!(handle.take_deferred().is_empty());
+        assert!(
+            drain_for(&mut handle.advice_state.lock().unwrap(), Consumer::Thor)
+                .advice
+                .is_empty()
+        );
 
         let formatted = format_deferred(&taken, 4);
         assert!(formatted.contains("[reviewed in an earlier turn: Thor · step 1: cargo test]"));
@@ -1617,7 +2237,8 @@ mod tests {
         let (handle, mut requests) = test_handle(1);
         {
             let mut state = handle.advice_state.lock().unwrap();
-            state.deferred.push_back(Advice {
+            state.thor.push_back(Advice {
+                id: 1,
                 epoch: 1,
                 target: Target::Thor,
                 note: "still relevant".to_string(),
@@ -1637,7 +2258,238 @@ mod tests {
             requests.try_recv().expect("begin request"),
             Request::Begin { epoch: 2, .. }
         ));
-        assert_eq!(handle.take_deferred().len(), 1);
+        assert_eq!(
+            drain_for(&mut handle.advice_state.lock().unwrap(), Consumer::Thor)
+                .advice
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn eitri_drain_leaves_thor_advice_and_thor_drain_preserves_global_order() {
+        let advice = |id, target| Advice {
+            id,
+            epoch: 1,
+            target,
+            note: format!("note {id}"),
+            span: ReviewedSpan {
+                target,
+                invocation: None,
+                first_step: id,
+                last_step: id,
+                activities: vec!["test".into()],
+            },
+        };
+        let mut state = AdviceState::default();
+        state.thor.push_back(advice(2, Target::Thor));
+        state.eitri.push_back(advice(1, Target::Eitri));
+        state.eitri.push_back(advice(3, Target::Eitri));
+
+        let eitri = drain_for(&mut state, Consumer::Eitri);
+        assert_eq!(
+            eitri.advice.iter().map(|note| note.id).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert_eq!(state.thor.len(), 1);
+
+        state.eitri.push_back(advice(4, Target::Eitri));
+        let thor = drain_for(&mut state, Consumer::Thor);
+        assert_eq!(
+            thor.advice.iter().map(|note| note.id).collect::<Vec<_>>(),
+            [2, 4]
+        );
+    }
+
+    #[test]
+    fn bounded_queue_drops_oldest_and_reports_overflow() {
+        let mut queue = VecDeque::new();
+        let mut dropped = 0;
+        for id in 1..=ADVICE_QUEUE_CAPACITY as u64 + 2 {
+            push_bounded(
+                &mut queue,
+                &mut dropped,
+                Advice {
+                    id,
+                    epoch: 1,
+                    target: Target::Thor,
+                    note: format!("note {id}"),
+                    span: ReviewedSpan {
+                        target: Target::Thor,
+                        invocation: None,
+                        first_step: id,
+                        last_step: id,
+                        activities: vec!["test".into()],
+                    },
+                },
+            );
+        }
+        assert_eq!(queue.len(), ADVICE_QUEUE_CAPACITY);
+        assert_eq!(queue.front().expect("oldest retained").id, 3);
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn pull_advice_tool_completion_is_not_a_semantic_step() {
+        let mut tracker = BoundaryTracker::default();
+        let pull = UiEvent::SessionUpdate(SessionUpdate::ToolCall(
+            ToolCall::new("pull", "pull_advice").status(ToolCallStatus::Completed),
+        ));
+        assert!(tracker.observe(&pull).is_none());
+    }
+
+    #[test]
+    fn pull_server_registers_only_the_role_scoped_pull_tool() {
+        let router = PullMcpHandler::tool_router();
+        assert!(router.get("pull_advice").is_some());
+        assert_eq!(router.list_all().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pull_waits_for_the_snapshotted_review_to_finish_before_draining() {
+        let (mut handle, _requests) = test_handle(1);
+        let (finished_tx, finished_rx) = watch::channel(0_u64);
+        handle.finished_reviews = finished_rx;
+        let slot = AdviceSlot {
+            active: handle.active.clone(),
+            state: handle.advice_state.clone(),
+            posted: None,
+            finished_reviews: Some(finished_tx),
+        };
+        let span = ReviewedSpan {
+            target: Target::Thor,
+            invocation: None,
+            first_step: 1,
+            last_step: 1,
+            activities: vec!["test".into()],
+        };
+        slot.begin(7, 1, vec![span]).await;
+        let pulling = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.pull(Consumer::Thor).await }
+        });
+        tokio::task::yield_now().await;
+        slot.accept(AdviseArgs {
+            advice: vec![AdviseItem {
+                step: StepRef {
+                    god: Target::Thor,
+                    ordinal: 1,
+                },
+                note: "material advice".into(),
+            }],
+        })
+        .await
+        .unwrap();
+        assert!(
+            !pulling.is_finished(),
+            "accepting advice alone must not release the pull"
+        );
+        slot.finish(7).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(1), pulling)
+            .await
+            .expect("pull released")
+            .expect("pull task");
+        assert!(outcome.waited);
+        assert_eq!(outcome.advice[0].note, "material advice");
+    }
+
+    #[tokio::test]
+    async fn pull_waits_for_a_pending_review_blocked_on_loki_startup() {
+        let (mut handle, _requests) = test_handle(1);
+        let (started_tx, started_rx) = watch::channel(0_u64);
+        let (finished_tx, finished_rx) = watch::channel(0_u64);
+        handle.review_started = started_rx;
+        handle.finished_reviews = finished_rx;
+        handle.pending_thor.store(1, Ordering::Relaxed);
+        let slot = AdviceSlot {
+            active: handle.active.clone(),
+            state: handle.advice_state.clone(),
+            posted: None,
+            finished_reviews: Some(finished_tx),
+        };
+        let pulling = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.pull(Consumer::Thor).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!pulling.is_finished());
+
+        slot.begin(
+            8,
+            1,
+            vec![ReviewedSpan {
+                target: Target::Thor,
+                invocation: None,
+                first_step: 1,
+                last_step: 1,
+                activities: vec!["test".into()],
+            }],
+        )
+        .await;
+        handle.pending_thor.store(0, Ordering::Relaxed);
+        let _ = started_tx.send(8);
+        slot.accept(AdviseArgs {
+            advice: vec![AdviseItem {
+                step: StepRef {
+                    god: Target::Thor,
+                    ordinal: 1,
+                },
+                note: "startup-delayed advice".into(),
+            }],
+        })
+        .await
+        .unwrap();
+        slot.finish(8).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(1), pulling)
+            .await
+            .expect("pull released")
+            .expect("pull task");
+        assert!(outcome.waited);
+        assert_eq!(outcome.advice[0].note, "startup-delayed advice");
+    }
+
+    #[tokio::test]
+    async fn handoff_cutoff_discards_late_thor_advice_but_keeps_eitri_advice() {
+        let state = SharedAdviceState::default();
+        state.lock().unwrap().thor_cutoff = 3;
+        let slot = AdviceSlot {
+            active: Arc::default(),
+            state: state.clone(),
+            posted: None,
+            finished_reviews: None,
+        };
+        let span = |target| ReviewedSpan {
+            target,
+            invocation: None,
+            first_step: 3,
+            last_step: 3,
+            activities: vec!["test".into()],
+        };
+        slot.begin(9, 1, vec![span(Target::Thor), span(Target::Eitri)])
+            .await;
+        slot.accept(AdviseArgs {
+            advice: vec![
+                AdviseItem {
+                    step: StepRef {
+                        god: Target::Thor,
+                        ordinal: 3,
+                    },
+                    note: "stale Thor note".into(),
+                },
+                AdviseItem {
+                    step: StepRef {
+                        god: Target::Eitri,
+                        ordinal: 3,
+                    },
+                    note: "current Eitri note".into(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+        let state = state.lock().unwrap();
+        assert!(state.thor.is_empty());
+        assert_eq!(state.eitri[0].note, "current Eitri note");
     }
 
     #[test]
