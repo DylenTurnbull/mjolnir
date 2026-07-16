@@ -62,6 +62,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 shell-words = "1"
+similar = "2.7"
 tar = "0.4"
 tempfile = "3"
 time = { version = "0.3", features = ["formatting"] }
