@@ -5214,7 +5214,8 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(worktree.path().join("formatted.txt"))
                 .await
-                .expect("formatted file"),
+                .expect("formatted file")
+                .trim_end_matches(['\r', '\n']),
             "formatted"
         );
 
