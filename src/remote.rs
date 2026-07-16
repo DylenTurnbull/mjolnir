@@ -1,6 +1,7 @@
 //! Simple remote-control server and local session registration.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::IsTerminal;
 use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -59,6 +60,9 @@ const REMOTE_CONTROL_UPSERT_URL: &str = "https://localhost:11921/api/sessions";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const REMOTE_INITIAL_CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const REMOTE_CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+/// All final remote-control writes share this budget so shutdown cannot be
+/// delayed once per stale session by a slow or half-open peer.
+const REMOTE_FINAL_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECTED_SESSION_TTL: Duration = Duration::from_secs(75);
 const REMOTE_TOKEN_LEN: usize = 43;
 /// How often `mj server` sweeps dead queue entries out of sqlite.
@@ -1517,24 +1521,46 @@ impl RemoteSessionTracker {
         let session_id = snapshot
             .as_ref()
             .map(|snapshot| snapshot.session_id.clone());
-        if let Some(snapshot) = snapshot
-            && let Err(error) = send_snapshot(connection.clone(), snapshot).await
-        {
-            debug!("final remote-control flush failed: {error:#}");
-        }
         if let Some(current) = session_id.as_ref() {
             sessions_to_disconnect.retain(|id| id != current);
         }
-        for old_session_id in sessions_to_disconnect {
-            if let Err(error) = send_disconnect(connection.clone(), &old_session_id).await {
-                debug!("remote-control stale-session disconnect failed: {error:#}");
-            }
+        let mut requests = Vec::with_capacity(
+            usize::from(snapshot.is_some())
+                + sessions_to_disconnect.len()
+                + usize::from(session_id.is_some()),
+        );
+        if let Some(snapshot) = snapshot {
+            requests.push(FinalRemoteRequest::Snapshot(Box::new(snapshot)));
         }
-        if let Some(session_id) = session_id
-            && let Err(error) = send_disconnect(connection, &session_id).await
-        {
-            debug!("remote-control disconnect failed: {error:#}");
+        requests.extend(
+            sessions_to_disconnect
+                .into_iter()
+                .map(FinalRemoteRequest::StaleDisconnect),
+        );
+        if let Some(session_id) = session_id {
+            requests.push(FinalRemoteRequest::Disconnect(session_id));
         }
+        flush_final_remote_requests(
+            requests.into_iter().map(|request| {
+                let description = request.description();
+                (request, description)
+            }),
+            |request| {
+                let connection = connection.clone();
+                async move {
+                    match request {
+                        FinalRemoteRequest::Snapshot(snapshot) => {
+                            send_snapshot(connection, *snapshot).await
+                        }
+                        FinalRemoteRequest::StaleDisconnect(session_id)
+                        | FinalRemoteRequest::Disconnect(session_id) => {
+                            send_disconnect(connection, &session_id).await
+                        }
+                    }
+                }
+            },
+        )
+        .await;
     }
 
     /// Ask the publisher for a fresh snapshot upload. Signals coalesce: any
@@ -4581,6 +4607,48 @@ fn claim_config_change_record(
     }
 }
 
+enum FinalRemoteRequest {
+    Snapshot(Box<SessionRecord>),
+    StaleDisconnect(String),
+    Disconnect(String),
+}
+
+impl FinalRemoteRequest {
+    fn description(&self) -> &'static str {
+        match self {
+            Self::Snapshot(_) => "final remote-control flush",
+            Self::StaleDisconnect(_) => "remote-control stale-session disconnect",
+            Self::Disconnect(_) => "remote-control disconnect",
+        }
+    }
+}
+
+/// Flush final remote-control updates within one shutdown-wide deadline.
+///
+/// Operations remain ordered, but each receives only the time left from the
+/// shared deadline. On expiry the in-flight request is cancelled and later
+/// best-effort updates are skipped so a growing stale-session list cannot
+/// extend shutdown.
+async fn flush_final_remote_requests<T, F, Fut>(
+    requests: impl IntoIterator<Item = (T, &'static str)>,
+    mut send: F,
+) where
+    F: FnMut(T) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let deadline = tokio::time::Instant::now() + REMOTE_FINAL_FLUSH_TIMEOUT;
+    for (request, description) in requests {
+        match tokio::time::timeout_at(deadline, send(request)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => debug!("{description} failed: {error:#}"),
+            Err(_) => {
+                debug!("remote-control final flush deadline expired before {description}");
+                break;
+            }
+        }
+    }
+}
+
 async fn send_snapshot(connection: RemoteConnection, snapshot: SessionRecord) -> Result<()> {
     let request = connection
         .client
@@ -4942,9 +5010,82 @@ mod tests {
 
     use crate::event::PermissionDecision;
 
+    #[derive(Clone, Copy)]
+    enum TestFinalFlush {
+        Fast,
+        Hanging,
+    }
+
     /// The default cookie lifetime as a `Duration`, derived from the public
     /// day-granularity default so tests stay in lockstep with the CLI default.
     const DEFAULT_SESSION_TTL: Duration = session_ttl_from_days(DEFAULT_SESSION_TTL_DAYS);
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_first_final_remote_flush_is_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sent = calls.clone();
+        let flush = tokio::spawn(async move {
+            flush_final_remote_requests([((), "test final snapshot")], move |()| {
+                sent.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Result<()>>()
+            })
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(REMOTE_FINAL_FLUSH_TIMEOUT).await;
+        flush
+            .await
+            .expect("hanging first flush finishes at the teardown deadline");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_remote_flushes_share_one_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sent = calls.clone();
+        let flush = tokio::spawn(async move {
+            flush_final_remote_requests(
+                [
+                    (TestFinalFlush::Fast, "test final flush"),
+                    (TestFinalFlush::Hanging, "test final flush"),
+                    (TestFinalFlush::Hanging, "test final flush"),
+                ],
+                move |request| {
+                    sent.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        match request {
+                            TestFinalFlush::Fast => {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                Ok(())
+                            }
+                            TestFinalFlush::Hanging => std::future::pending::<Result<()>>().await,
+                        }
+                    }
+                },
+            )
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // The second operation gets only the remaining second, not a fresh
+        // two-second budget, and the third is never started.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        flush
+            .await
+            .expect("flush task finishes at the shared deadline");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     fn test_session_manager() -> Arc<ServerSessionManager> {
         Arc::new(ServerSessionManager::new(
