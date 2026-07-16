@@ -421,8 +421,15 @@ fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bo
         Entry::EphemeralSystem(_) => false,
         Entry::AgentThought(thought) => thought.completed,
         Entry::CodeAgentThought(thought) => thought.completed,
-        Entry::AgentMessage(_) => !(state.is_streaming() && idx + 1 == state.transcript.len()),
-        Entry::CodeAgentMessage(_) => !state.code_agent_active || idx + 1 != state.transcript.len(),
+        // An actor may append coordination activity after its active message.
+        // Hold only that exact owned entry; historical messages from the same
+        // actor are already immutable and must remain flushable.
+        Entry::AgentMessage(_) => {
+            !state.is_streaming() || state.agent_open_message_index() != Some(idx)
+        }
+        Entry::CodeAgentMessage(_) => {
+            !state.code_agent_active || state.code_agent_open_message_index() != Some(idx)
+        }
         Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
             state.tool_calls.get(id).is_some_and(|view| {
                 matches!(
@@ -14132,6 +14139,50 @@ mod tests {
     }
 
     #[test]
+    fn transcript_sink_flushes_old_thor_message_while_later_one_streams() {
+        // Do not drain the first turn before beginning the second. The sink
+        // must still flush its completed Thor result even though a later Thor
+        // entry is the exact one currently receiving chunks.
+        let mut state = AppState::new();
+        let mut sink = TranscriptSink::default();
+
+        state.record_user_prompt("first prompt".to_string());
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk("first result"),
+        )));
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+
+        state.record_user_prompt("second prompt".to_string());
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk("second result"),
+        )));
+
+        let flushed = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flushed,
+            vec![
+                "You",
+                "first prompt",
+                "",
+                "Thor",
+                "first result",
+                "",
+                "You",
+                "second prompt",
+                "",
+            ]
+        );
+        assert!(sink.pending_lines(&state, 80).is_empty());
+    }
+
+    #[test]
     fn transcript_sink_holds_mutable_thor_thought_during_eitri_activity() {
         let mut state = AppState::new();
         let mut sink = TranscriptSink::default();
@@ -14583,7 +14634,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_handoff_detaches_thor_flushes_loki_and_reattaches_thor() {
+    fn foreground_handoff_holds_active_eitri_result_across_loki_and_reattaches_thor() {
         let mut state = AppState::new();
         let mut sink = TranscriptSink::default();
         state.record_user_prompt("delegate this".to_string());
@@ -14634,12 +14685,15 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            interjection.contains("first Eitri segment"),
-            "{interjection}"
-        );
-        assert!(interjection.contains("Loki"), "{interjection}");
-        assert!(interjection.contains("material concern"), "{interjection}");
+        assert!(interjection.is_empty(), "{interjection}");
+        let live = inline_transcript_tail_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(live.contains("first Eitri segment"), "{live}");
+        assert!(live.contains("Loki"), "{live}");
+        assert!(live.contains("material concern"), "{live}");
 
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
             SessionUpdate::AgentMessageChunk(text_chunk("Eitri final")),
@@ -14672,6 +14726,85 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(thor_resumed.contains("Thor resumed"), "{thor_resumed}");
+    }
+
+    #[test]
+    fn transcript_sink_keeps_alternating_thor_activity_out_of_eitri_result_fragments() {
+        let mut state = AppState::new();
+        let mut sink = TranscriptSink::default();
+        let first = "EITRI-FIRST ".repeat(30);
+        let second = "EITRI-SECOND ".repeat(30);
+        let full_result = format!("{first}{second}");
+
+        state.record_user_prompt("forge this".to_string());
+        let _ = sink.pending_lines(&state, 20);
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "Eitri · builder".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentMessageChunk(text_chunk(&first)),
+        )));
+        assert!(sink.pending_lines(&state, 20).is_empty());
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk("waiting for Eitri's first result"),
+        )));
+        assert!(sink.pending_lines(&state, 20).is_empty());
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk("; coordinating the next step"),
+        )));
+        assert!(sink.pending_lines(&state, 20).is_empty());
+
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentMessageChunk(text_chunk(&second)),
+        )));
+        assert!(sink.pending_lines(&state, 20).is_empty());
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::UserPrompt(_), Entry::CodeAgentMessage(result), Entry::AgentThought(thought)]
+                if result == &full_result
+                    && thought.text == "waiting for Eitri's first result; coordinating the next step"
+                    && !thought.completed
+        ));
+
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
+            outcome: CodeAgentOutcome::Completed,
+        }));
+        let eitri = sink
+            .pending_lines(&state, 20)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(eitri.contains("EITRI-FIRST"), "{eitri}");
+        assert!(eitri.contains("EITRI-SECOND"), "{eitri}");
+        assert!(!eitri.contains("waiting for Eitri"), "{eitri}");
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk("Thor completed coordination."),
+        )));
+        let thor_thought = sink
+            .pending_lines(&state, 20)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(thor_thought.contains("thought · 1 line"), "{thor_thought}");
+        assert!(!thor_thought.contains("EITRI-FIRST"), "{thor_thought}");
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        let thor = sink
+            .pending_lines(&state, 20)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(thor.contains("Thor completed"), "{thor}");
+        assert!(thor.contains("coordination."), "{thor}");
+        assert!(!thor.contains("EITRI-FIRST"), "{thor}");
+        assert!(!thor.contains("EITRI-SECOND"), "{thor}");
     }
 
     #[test]

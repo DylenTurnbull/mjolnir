@@ -676,6 +676,12 @@ pub struct AppState {
     pub prompt_images_supported: bool,
     pub session_fork_supported: bool,
     pub transcript: Vec<Entry>,
+    /// Actor-owned streaming message blocks.  Unlike thoughts, a message can
+    /// remain open while another actor reports coordination activity after it.
+    /// Keeping that ownership separate from transcript position prevents a
+    /// later Thor/Loki row from splitting Eitri's result into immutable pieces.
+    agent_open_message_index: Option<usize>,
+    code_agent_open_message_index: Option<usize>,
     pub tool_calls: HashMap<String, ToolCallView>,
     /// Per-tool expansion choices, keyed by ACP tool-call ID. `true` means
     /// expanded; entries matching the renderer's default are omitted.
@@ -1074,6 +1080,8 @@ impl AppState {
             prompt_images_supported: false,
             session_fork_supported: false,
             transcript: Vec::new(),
+            agent_open_message_index: None,
+            code_agent_open_message_index: None,
             tool_calls: HashMap::new(),
             tool_detail_overrides: HashMap::new(),
             workspace_diffs: Vec::new(),
@@ -1142,6 +1150,14 @@ impl AppState {
             queued_prompts: VecDeque::new(),
             pending_workspace_diff_total: None,
         }
+    }
+
+    pub(crate) fn agent_open_message_index(&self) -> Option<usize> {
+        self.agent_open_message_index
+    }
+
+    pub(crate) fn code_agent_open_message_index(&self) -> Option<usize> {
+        self.code_agent_open_message_index
     }
 
     /// Select the Anvil provider reported by valid metadata and clear its stale peer.
@@ -1734,6 +1750,8 @@ impl AppState {
     }
 
     pub fn push_session_boundary(&mut self, text: impl Into<String>) {
+        self.finalize_message(EntryKind::Agent);
+        self.finalize_message(EntryKind::CodeAgent);
         self.transcript.push(Entry::SessionBoundary(text.into()));
         self.bump_transcript_revision();
     }
@@ -2000,6 +2018,8 @@ impl AppState {
     /// command reaches the runtime. Keeps the UI responsive.
     pub fn record_user_prompt(&mut self, text: String) {
         self.pending_workspace_diff_total = None;
+        self.agent_open_message_index = None;
+        self.code_agent_open_message_index = None;
         let prompt_index = self.transcript.len();
         self.transcript.push(Entry::UserPrompt(text.clone()));
         self.prompt_turns.push(PromptTurn {
@@ -2401,6 +2421,8 @@ impl AppState {
             }
             UiEvent::PromptDone { stop_reason, usage } => {
                 self.finalize_thinking(EntryKind::Thought);
+                self.finalize_message(EntryKind::Agent);
+                self.finalize_message(EntryKind::CodeAgent);
                 self.finish_prompt_turn(matches!(stop_reason, StopReason::Cancelled));
                 if let Some(usage) = usage {
                     self.token_usage.apply_prompt_usage(usage);
@@ -2436,6 +2458,8 @@ impl AppState {
             }
             UiEvent::PromptFailed { message } => {
                 self.finalize_thinking(EntryKind::Thought);
+                self.finalize_message(EntryKind::Agent);
+                self.finalize_message(EntryKind::CodeAgent);
                 self.finish_prompt_turn(true);
                 self.pending_workspace_diff_total = None;
                 // Drop queued prompts: finish_prompt_turn flips back to
@@ -2469,6 +2493,8 @@ impl AppState {
             }
             UiEvent::Fatal(msg) => {
                 self.finalize_thinking(EntryKind::Thought);
+                self.finalize_message(EntryKind::Agent);
+                self.finalize_message(EntryKind::CodeAgent);
                 self.set_connection_state(ConnectionState::Fatal);
                 self.record_status_message(StatusKind::Fatal, msg);
                 self.mark_runtime_closed();
@@ -2480,6 +2506,7 @@ impl AppState {
         const PREFIX: &str = "codeagent:";
         match event {
             CodeAgentEvent::Started { label } => {
+                self.code_agent_open_message_index = None;
                 self.code_agent_active = true;
                 self.code_agent_label = Some(label.clone());
                 self.code_agent_token_usage = TokenUsage::default();
@@ -2560,6 +2587,7 @@ impl AppState {
             }
             CodeAgentEvent::Finished { outcome } => {
                 self.finalize_thinking(EntryKind::CodeAgentThought);
+                self.finalize_message(EntryKind::CodeAgent);
                 self.code_agent_active = false;
                 self.code_agent_label = None;
                 self.cancel_code_agent_prompts();
@@ -2589,20 +2617,39 @@ impl AppState {
         }
     }
 
+    fn finalize_message(&mut self, kind: EntryKind) {
+        match kind {
+            EntryKind::Agent => self.agent_open_message_index = None,
+            EntryKind::CodeAgent => self.code_agent_open_message_index = None,
+            _ => unreachable!("finalize_message requires a message entry kind"),
+        }
+    }
+
+    fn append_message_chunk(&mut self, kind: EntryKind, text: String) {
+        let open_entry = match kind {
+            EntryKind::Agent => &mut self.agent_open_message_index,
+            EntryKind::CodeAgent => &mut self.code_agent_open_message_index,
+            _ => unreachable!("append_message_chunk requires a message entry kind"),
+        };
+        *open_entry = Some(append_or_start_owned(
+            &mut self.transcript,
+            kind,
+            text,
+            *open_entry,
+        ));
+    }
+
     fn apply_code_agent_update(&mut self, update: SessionUpdate) {
         const PREFIX: &str = "codeagent:";
         match update {
             SessionUpdate::UserMessageChunk(_) => {}
             SessionUpdate::AgentMessageChunk(chunk) => {
                 self.finalize_thinking(EntryKind::CodeAgentThought);
-                append_or_start(
-                    &mut self.transcript,
-                    EntryKind::CodeAgent,
-                    content_block_text(&chunk.content),
-                );
+                self.append_message_chunk(EntryKind::CodeAgent, content_block_text(&chunk.content));
                 self.bump_transcript_revision();
             }
             SessionUpdate::AgentThoughtChunk(chunk) => {
+                self.finalize_message(EntryKind::CodeAgent);
                 append_thinking_chunk(
                     &mut self.transcript,
                     EntryKind::CodeAgentThought,
@@ -2612,6 +2659,7 @@ impl AppState {
             }
             SessionUpdate::ToolCall(tool_call) => {
                 self.finalize_thinking(EntryKind::CodeAgentThought);
+                self.finalize_message(EntryKind::CodeAgent);
                 let key = format!("{PREFIX}{}", tool_call.tool_call_id);
                 let mut view = ToolCallView::from_tool_call(&tool_call);
                 view.namespace_terminal_ids(PREFIX);
@@ -2621,6 +2669,7 @@ impl AppState {
             }
             SessionUpdate::ToolCallUpdate(update) => {
                 self.finalize_thinking(EntryKind::CodeAgentThought);
+                self.finalize_message(EntryKind::CodeAgent);
                 let key = format!("{PREFIX}{}", update.tool_call_id);
                 if let Some(view) = self.tool_calls.get_mut(&key) {
                     view.apply_update(&update);
@@ -2647,6 +2696,7 @@ impl AppState {
             }
             SessionUpdate::Plan(Plan { entries, .. }) => {
                 self.finalize_thinking(EntryKind::CodeAgentThought);
+                self.finalize_message(EntryKind::CodeAgent);
                 if let Some(Entry::CodeAgentPlan(existing)) = self
                     .transcript
                     .iter_mut()
@@ -2789,6 +2839,8 @@ impl AppState {
                 if self.is_streaming() {
                     return;
                 }
+                self.finalize_message(EntryKind::Agent);
+                self.finalize_message(EntryKind::CodeAgent);
                 let text = content_block_text(&c.content);
                 append_or_start(&mut self.transcript, EntryKind::User, text);
                 self.bump_transcript_revision();
@@ -2796,16 +2848,18 @@ impl AppState {
             SessionUpdate::AgentMessageChunk(c) => {
                 self.finalize_thinking(EntryKind::Thought);
                 let text = content_block_text(&c.content);
-                append_or_start(&mut self.transcript, EntryKind::Agent, text);
+                self.append_message_chunk(EntryKind::Agent, text);
                 self.bump_transcript_revision();
             }
             SessionUpdate::AgentThoughtChunk(c) => {
+                self.finalize_message(EntryKind::Agent);
                 let text = content_block_text(&c.content);
                 append_thinking_chunk(&mut self.transcript, EntryKind::Thought, text);
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCall(tc) => {
                 self.finalize_thinking(EntryKind::Thought);
+                self.finalize_message(EntryKind::Agent);
                 let id = tc.tool_call_id.to_string();
                 let suppressed = is_code_agent_transport_call(&tc);
                 self.tool_calls
@@ -2819,6 +2873,7 @@ impl AppState {
             }
             SessionUpdate::ToolCallUpdate(u) => {
                 self.finalize_thinking(EntryKind::Thought);
+                self.finalize_message(EntryKind::Agent);
                 let id = u.tool_call_id.to_string();
                 let suppressed =
                     self.suppressed_tool_calls.contains(&id) || is_code_agent_transport_update(&u);
@@ -2851,6 +2906,7 @@ impl AppState {
             }
             SessionUpdate::Plan(Plan { entries, .. }) => {
                 self.finalize_thinking(EntryKind::Thought);
+                self.finalize_message(EntryKind::Agent);
                 // Replace the most recent Plan entry if present, else push.
                 if let Some(Entry::Plan(existing)) = self
                     .transcript
@@ -3076,6 +3132,36 @@ fn append_or_start(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) {
             completed: false,
         }),
     });
+}
+
+/// Append a chunk to its actor-owned open message, even when coordination
+/// activity from another actor was appended after it.  Once the owner reaches
+/// a content boundary, callers close the stream and the next chunk starts a
+/// distinct transcript entry.
+fn append_or_start_owned(
+    transcript: &mut Vec<Entry>,
+    kind: EntryKind,
+    text: String,
+    open_entry: Option<usize>,
+) -> usize {
+    if let Some(index) = open_entry {
+        let existing = match (kind, transcript.get_mut(index)) {
+            (EntryKind::Agent, Some(Entry::AgentMessage(message))) => Some(message),
+            (EntryKind::CodeAgent, Some(Entry::CodeAgentMessage(message))) => Some(message),
+            _ => None,
+        };
+        if let Some(message) = existing {
+            message.push_str(&text);
+            return index;
+        }
+    }
+    let index = transcript.len();
+    transcript.push(match kind {
+        EntryKind::Agent => Entry::AgentMessage(text),
+        EntryKind::CodeAgent => Entry::CodeAgentMessage(text),
+        _ => unreachable!("append_or_start_owned requires a message entry kind"),
+    });
+    index
 }
 
 fn append_thinking_chunk(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) {
@@ -6029,6 +6115,28 @@ mod tests {
             Entry::UserPrompt(t) => assert_eq!(t, "replayed"),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn replayed_user_chunk_closes_the_previous_agent_message() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk("first response"),
+        )));
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UserMessageChunk(
+            text_chunk("second prompt"),
+        )));
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk("second response"),
+        )));
+
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::AgentMessage(first), Entry::UserPrompt(prompt), Entry::AgentMessage(second)]
+                if first == "first response"
+                    && prompt == "second prompt"
+                    && second == "second response"
+        ));
     }
 
     fn cmd(name: &str) -> AvailableCommand {
