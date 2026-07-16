@@ -738,6 +738,7 @@ fn spawn_eitri_runtime(
         saved_session_config: HashMap::new(),
         role_config: config.role_config.clone(),
         code_agent: None,
+        side_prompt_policy: false,
         termination: Some(cancel.clone()),
     };
     let task = tokio::spawn(acp::run(runtime_config, event_tx, command_rx));
@@ -1870,6 +1871,7 @@ async fn run(
                     reviewer.observe(epoch, loki::Target::Eitri, eitri_invocation, boundary);
                 }
                 match event {
+                    UiEvent::Side(_) | UiEvent::SideStartFailed { .. } => {}
                     UiEvent::Connected { .. } => {}
                     UiEvent::ContextCompacted => {}
                     UiEvent::SessionStarted { session_id: started, .. } if !prompt_sent => {

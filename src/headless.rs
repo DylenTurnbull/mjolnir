@@ -255,6 +255,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     access_mode: acp::RuntimeAccessMode::Full,
                 })
         }),
+        side_prompt_policy: false,
         termination: Some(cfg.termination.clone()),
     };
 
@@ -319,6 +320,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         }
 
         match event {
+            UiEvent::Side(_) | UiEvent::SideStartFailed { .. } => {}
             UiEvent::Connected {
                 agent_name,
                 agent_version,

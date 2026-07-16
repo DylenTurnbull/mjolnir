@@ -50,6 +50,7 @@ const BUILTIN_CLEAR_COMMAND: &str = "clear";
 const BUILTIN_COMPACT_COMMAND: &str = "compact";
 const BUILTIN_LOAD_COMMAND: &str = "load";
 const BUILTIN_FORK_COMMAND: &str = "fork";
+const BUILTIN_SIDE_COMMAND: &str = "side";
 const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
 const BUILTIN_MODELS_COMMAND: &str = "models";
@@ -84,6 +85,13 @@ fn builtin_fork_command() -> AvailableCommand {
     AvailableCommand::new(
         BUILTIN_FORK_COMMAND,
         "fork the current session (unstable ACP extension)",
+    )
+}
+
+fn builtin_side_command() -> AvailableCommand {
+    AvailableCommand::new(
+        BUILTIN_SIDE_COMMAND,
+        "open an isolated ephemeral conversation",
     )
 }
 
@@ -123,13 +131,18 @@ fn builtin_ragnarok_command() -> AvailableCommand {
     )
 }
 
-fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: bool) {
+fn install_builtin_commands(
+    commands: &mut Vec<AvailableCommand>,
+    include_fork: bool,
+    include_side: bool,
+) {
     commands.retain(|command| {
         command.name != BUILTIN_NEW_COMMAND
             && command.name != BUILTIN_CLEAR_COMMAND
             && command.name != BUILTIN_COMPACT_COMMAND
             && command.name != BUILTIN_LOAD_COMMAND
             && command.name != BUILTIN_FORK_COMMAND
+            && command.name != BUILTIN_SIDE_COMMAND
             && command.name != BUILTIN_EXPORT_COMMAND
             && command.name != BUILTIN_MJCONFIG_COMMAND
             && command.name != BUILTIN_MODELS_COMMAND
@@ -139,6 +152,9 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
     });
     if include_fork {
         commands.insert(0, builtin_fork_command());
+    }
+    if include_side {
+        commands.insert(0, builtin_side_command());
     }
     commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_mjconfig_command());
@@ -150,6 +166,27 @@ fn install_builtin_commands(commands: &mut Vec<AvailableCommand>, include_fork: 
     commands.insert(0, builtin_compact_command());
     commands.insert(0, builtin_clear_command());
     commands.insert(0, builtin_new_command());
+}
+
+fn install_side_builtin_commands(commands: &mut Vec<AvailableCommand>) {
+    commands.retain(|command| {
+        ![
+            BUILTIN_NEW_COMMAND,
+            BUILTIN_CLEAR_COMMAND,
+            BUILTIN_COMPACT_COMMAND,
+            BUILTIN_LOAD_COMMAND,
+            BUILTIN_FORK_COMMAND,
+            BUILTIN_SIDE_COMMAND,
+            BUILTIN_MJCONFIG_COMMAND,
+            BUILTIN_MODELS_COMMAND,
+            BUILTIN_COUNCIL_COMMAND,
+            BUILTIN_REVIEWS_COMMAND,
+            BUILTIN_RAGNAROK_COMMAND,
+        ]
+        .contains(&command.name.as_str())
+    });
+    commands.insert(0, builtin_side_command());
+    commands.insert(0, builtin_export_command());
 }
 
 /// How the UI loop ends, so `main` can decide whether to quit entirely
@@ -671,6 +708,13 @@ pub struct AppState {
     pub session_config_targets: Vec<SessionConfigTarget>,
     pub prompt_images_supported: bool,
     pub session_fork_supported: bool,
+    pub side_session_supported: bool,
+    pub side_session_unsupported_reason: Option<String>,
+    pub is_side: bool,
+    pub side_start_requested: bool,
+    pub side_initial_question: Option<String>,
+    pub side_exit_requested: bool,
+    pub side_main_notice: Option<String>,
     pub transcript: Vec<Entry>,
     /// Actor-owned streaming message blocks.  Unlike thoughts, a message can
     /// remain open while another actor reports coordination activity after it.
@@ -1066,13 +1110,20 @@ impl AppState {
             current_mode: None,
             available_commands: {
                 let mut commands = Vec::new();
-                install_builtin_commands(&mut commands, false);
+                install_builtin_commands(&mut commands, false, false);
                 commands
             },
             session_config_options: Vec::new(),
             session_config_targets: Vec::new(),
             prompt_images_supported: false,
             session_fork_supported: false,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
+            is_side: false,
+            side_start_requested: false,
+            side_initial_question: None,
+            side_exit_requested: false,
+            side_main_notice: None,
             transcript: Vec::new(),
             agent_open_message_index: None,
             code_agent_open_message_index: None,
@@ -1144,6 +1195,36 @@ impl AppState {
             queued_prompts: VecDeque::new(),
             pending_workspace_diff_total: None,
         }
+    }
+
+    pub fn side_conversation(&self, question: Option<String>) -> Self {
+        let mut side = Self::new();
+        side.is_side = true;
+        side.side_initial_question = question;
+        side.theme_kind = self.theme_kind;
+        side.theme = self.theme;
+        side.spinner_style = self.spinner_style;
+        side.project_label = self.project_label.clone();
+        side.worktree_label = self.worktree_label.clone();
+        side.additional_roots = self.additional_roots;
+        side.session_cwd = self.session_cwd.clone();
+        side.agent_label = format!("Side · {}", self.agent_label.trim_start_matches("Thor · "));
+        side.primary_acp_name = self.primary_acp_name.clone();
+        side.agent_source_id = self.agent_source_id.clone();
+        side.active_agent_launch = self.active_agent_launch.clone();
+        side.transcript_export_dir = self.transcript_export_dir.clone();
+        side.prompt_images_supported = self.prompt_images_supported;
+        side.side_main_notice = Some(
+            if self.has_pending_permission() || self.has_pending_elicitation() {
+                "Main needs input".to_string()
+            } else if self.is_busy() {
+                "Main running".to_string()
+            } else {
+                "Main idle".to_string()
+            },
+        );
+        install_side_builtin_commands(&mut side.available_commands);
+        side
     }
 
     pub(crate) fn agent_open_message_index(&self) -> Option<usize> {
@@ -2265,6 +2346,8 @@ impl AppState {
             UiEvent::Connected {
                 prompt_images_supported,
                 session_fork_supported,
+                side_session_supported,
+                side_session_unsupported_reason,
                 ..
             } => {
                 // Keep the pre-filled agent_label (the configured
@@ -2273,7 +2356,17 @@ impl AppState {
                 // binary they wired up in config.
                 self.prompt_images_supported = prompt_images_supported;
                 self.session_fork_supported = session_fork_supported;
-                install_builtin_commands(&mut self.available_commands, session_fork_supported);
+                self.side_session_supported = side_session_supported;
+                self.side_session_unsupported_reason = side_session_unsupported_reason;
+                if self.is_side {
+                    install_side_builtin_commands(&mut self.available_commands);
+                } else {
+                    install_builtin_commands(
+                        &mut self.available_commands,
+                        session_fork_supported,
+                        side_session_supported,
+                    );
+                }
                 if !self.is_streaming() {
                     self.set_connection_state(ConnectionState::Initializing);
                 }
@@ -2455,6 +2548,10 @@ impl AppState {
                 }
                 self.record_status_message(StatusKind::Warning, message);
                 self.update_autocomplete();
+            }
+            UiEvent::Side(event) => self.apply_event(*event),
+            UiEvent::SideStartFailed { message } => {
+                self.record_status_message(StatusKind::Warning, message);
             }
             UiEvent::Warning(msg) => {
                 self.record_status_message(StatusKind::Warning, msg);
@@ -2893,7 +2990,15 @@ impl AppState {
             }
             SessionUpdate::AvailableCommandsUpdate(u) => {
                 self.available_commands = u.available_commands;
-                install_builtin_commands(&mut self.available_commands, self.session_fork_supported);
+                if self.is_side {
+                    install_side_builtin_commands(&mut self.available_commands);
+                } else {
+                    install_builtin_commands(
+                        &mut self.available_commands,
+                        self.session_fork_supported,
+                        self.side_session_supported,
+                    );
+                }
                 // The catalog changed mid-typing; rebuild the popover so
                 // a `/` already in the buffer reflects the new commands
                 // (and so a previously-empty filter can become non-empty).
@@ -3849,6 +3954,34 @@ mod tests {
 
     fn text_chunk(s: &str) -> ContentChunk {
         ContentChunk::new(ContentBlock::Text(TextContent::new(s)))
+    }
+
+    #[test]
+    fn side_conversation_keeps_main_transcript_and_usage_independent() {
+        let mut main = AppState::new();
+        main.agent_label = "Thor · model".to_string();
+        main.session_id = Some("main-session".to_string());
+        main.set_connection_state(ConnectionState::Streaming);
+        let side = main.side_conversation(None);
+
+        main.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk("main answer"),
+        )));
+        main.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: Some(Usage::new(42, 30, 12)),
+        });
+
+        assert!(
+            main.transcript
+                .iter()
+                .any(|entry| matches!(entry, Entry::AgentMessage(text) if text == "main answer"))
+        );
+        assert_eq!(main.token_usage.total_tokens, Some(42));
+        assert!(side.transcript.is_empty());
+        assert_eq!(side.token_usage.total_tokens, None);
+        assert!(side.is_side);
+        assert_eq!(side.side_main_notice.as_deref(), Some("Main running"));
     }
 
     #[test]
@@ -5154,6 +5287,8 @@ mod tests {
             agent_version: Some("0.1".into()),
             prompt_images_supported: false,
             session_fork_supported: false,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         assert_eq!(s.connection_state, ConnectionState::Initializing);
 
@@ -5188,6 +5323,8 @@ mod tests {
             agent_version: None,
             prompt_images_supported: false,
             session_fork_supported: false,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         assert_eq!(state.connection_state, ConnectionState::Streaming);
         state.apply_event(UiEvent::SessionStarted {
@@ -5221,6 +5358,8 @@ mod tests {
             agent_version: Some("1.0".into()),
             prompt_images_supported: false,
             session_fork_supported: false,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         state.announce_waiting_for_primary();
 
@@ -5238,6 +5377,8 @@ mod tests {
             agent_version: None,
             prompt_images_supported: false,
             session_fork_supported: false,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -5273,6 +5414,8 @@ mod tests {
             agent_version: None,
             prompt_images_supported: false,
             session_fork_supported: false,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -5312,6 +5455,8 @@ mod tests {
             agent_version: None,
             prompt_images_supported: false,
             session_fork_supported: false,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -5335,6 +5480,8 @@ mod tests {
             agent_version: None,
             prompt_images_supported: false,
             session_fork_supported: false,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -5811,6 +5958,8 @@ mod tests {
             agent_version: None,
             prompt_images_supported: false,
             session_fork_supported: false,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -6574,6 +6723,8 @@ mod tests {
             agent_version: None,
             prompt_images_supported: false,
             session_fork_supported: true,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         s.input = "/".to_string();
         s.update_autocomplete();
@@ -6602,6 +6753,8 @@ mod tests {
             agent_version: None,
             prompt_images_supported: false,
             session_fork_supported: true,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         s.apply_event(UiEvent::SessionUpdate(
             SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
@@ -6867,6 +7020,8 @@ mod tests {
             agent_version: None,
             prompt_images_supported: false,
             session_fork_supported: false,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
         });
         assert!(
             !s.is_streaming(),

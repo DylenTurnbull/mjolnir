@@ -83,6 +83,8 @@ pub struct AcpRuntimeConfig {
     /// Optional model-visible code-agent MCP service. Interactive TUI sessions
     /// set this; nested and non-interactive runtimes leave it absent.
     pub code_agent: Option<code_agent::Config>,
+    /// Apply the model-visible policy used by ephemeral side conversations.
+    pub side_prompt_policy: bool,
     /// Forces the runtime through its normal process-tree teardown path. This
     /// is used by supervised nested Eitri runs; ordinary runtimes get a fresh,
     /// never-cancelled token.
@@ -100,6 +102,7 @@ pub struct RuntimeRoleConfig {
 }
 
 const MAX_LOGGED_UPDATE_BYTES: usize = 4096;
+const SIDE_FORK_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn bounded_log_text(mut text: String) -> String {
     if text.len() <= MAX_LOGGED_UPDATE_BYTES {
@@ -201,6 +204,27 @@ struct ConnectedEventFields {
     agent_version: Option<String>,
     prompt_images_supported: bool,
     session_fork_supported: bool,
+    side_session_supported: bool,
+    side_session_unsupported_reason: Option<String>,
+}
+
+fn side_session_capability_error(capabilities: &AgentCapabilities) -> Option<String> {
+    let mut missing = Vec::new();
+    if capabilities.session_capabilities.fork.is_none() {
+        missing.push("session/fork");
+    }
+    if capabilities.session_capabilities.resume.is_none() && !capabilities.load_session {
+        missing.push("session/resume or session/load");
+    }
+    if capabilities.session_capabilities.delete.is_none() {
+        missing.push("session/delete");
+    }
+    (!missing.is_empty()).then(|| {
+        format!(
+            "side conversations are not supported by this agent; missing {}",
+            missing.join(", ")
+        )
+    })
 }
 
 impl RuntimeSessionState {
@@ -832,6 +856,7 @@ pub async fn run(
             cfg.saved_session_config.clone(),
             cfg.role_config.clone(),
             cfg.code_agent.clone(),
+            cfg.side_prompt_policy,
         );
         tokio::pin!(drive);
         tokio::select! {
@@ -1379,6 +1404,7 @@ where
         HashMap::new(),
         None,
         None,
+        false,
     )
     .await
 }
@@ -1412,6 +1438,7 @@ where
         HashMap::new(),
         None,
         None,
+        false,
     )
     .await
 }
@@ -1433,6 +1460,7 @@ async fn drive_client_with_fs_limit<T>(
     saved_session_config: HashMap<String, String>,
     role_config: Option<RuntimeRoleConfig>,
     code_agent: Option<code_agent::Config>,
+    side_prompt_policy: bool,
 ) -> Result<()>
 where
     T: ConnectTo<Client>,
@@ -1689,6 +1717,7 @@ where
                 saved_session_config,
                 role_config,
                 code_agent,
+                side_prompt_policy,
                 drive_code_agent_controller,
                 context_usage,
                 advertised_commands,
@@ -1733,6 +1762,7 @@ async fn drive_session(
     saved_session_config: HashMap<String, String>,
     role_config: Option<RuntimeRoleConfig>,
     code_agent: Option<code_agent::Config>,
+    side_prompt_policy: bool,
     code_agent_controller: code_agent::Controller,
     context_usage: Arc<ContextUsageTracker>,
     advertised_commands: Arc<std::sync::Mutex<HashMap<String, HashSet<String>>>>,
@@ -1815,6 +1845,8 @@ async fn drive_session(
     if let Some(server) = code_agent_http.as_ref() {
         mcp_servers.push(server.advertised().clone());
     }
+    let side_session_unsupported_reason =
+        side_session_capability_error(&init_resp.agent_capabilities);
     let connected_fields = ConnectedEventFields {
         agent_name: init_resp.agent_info.as_ref().map(|i| i.name.clone()),
         agent_version: init_resp.agent_info.as_ref().map(|i| i.version.clone()),
@@ -1826,6 +1858,8 @@ async fn drive_session(
             .session_capabilities
             .fork
             .is_some(),
+        side_session_supported: side_session_unsupported_reason.is_none(),
+        side_session_unsupported_reason,
     };
     emit_connected(ui_tx, &connected_fields);
 
@@ -2013,7 +2047,7 @@ async fn drive_session(
                     );
                 }
                 session_state.clear_permissions_cancelled(&session_id).await;
-                let prompt = prompt_content_blocks(text, images);
+                let prompt = prompt_content_blocks(text, images, side_prompt_policy);
                 let req = PromptRequest::new(session_id.clone(), prompt);
                 if !drive_prompt_turn(
                     &conn,
@@ -2075,6 +2109,17 @@ async fn drive_session(
                 {
                     break;
                 }
+            }
+            UiCommand::ForkSideSession { responder } => {
+                let result = if let Some(reason) =
+                    connected_fields.side_session_unsupported_reason.clone()
+                {
+                    Err(reason)
+                } else {
+                    fork_side_session(&conn, &session_id, cwd.clone(), &additional_directories)
+                        .await
+                };
+                let _ = responder.send(result);
             }
             UiCommand::LoadSession {
                 session_id: requested_session_id,
@@ -2204,6 +2249,7 @@ async fn drive_session(
                 let _ = responder.send(outcome);
             }
             UiCommand::CancelPrompt => {}
+            UiCommand::StartSide | UiCommand::ExitSide | UiCommand::Main(_) => {}
             UiCommand::Shutdown => break,
         }
     }
@@ -2234,6 +2280,8 @@ fn emit_connected(ui_tx: &mpsc::UnboundedSender<UiEvent>, fields: &ConnectedEven
         agent_version: fields.agent_version.clone(),
         prompt_images_supported: fields.prompt_images_supported,
         session_fork_supported: fields.session_fork_supported,
+        side_session_supported: fields.side_session_supported,
+        side_session_unsupported_reason: fields.side_session_unsupported_reason.clone(),
     });
 }
 
@@ -2454,6 +2502,12 @@ async fn drive_fork_session(
                             "session fork already in flight".to_string(),
                         ));
                     }
+                    Some(UiCommand::ForkSideSession { responder }) => {
+                        let _ = responder.send(Err(
+                            "side session fork is unavailable while another fork is in flight"
+                                .to_string(),
+                        ));
+                    }
                     Some(UiCommand::LoadSession { responder, .. }) => {
                         let _ = responder.send(LoadSessionResult::Fallback {
                             message: "session fork already in flight".to_string(),
@@ -2467,6 +2521,9 @@ async fn drive_fork_session(
                             "session fork already in flight".to_string(),
                         ));
                     }
+                    Some(UiCommand::StartSide)
+                    | Some(UiCommand::ExitSide)
+                    | Some(UiCommand::Main(_)) => {}
                 }
             }
         }
@@ -2492,6 +2549,24 @@ async fn fork_session(
     let config = session_config_from_parts(resp.config_options, resp.modes)
         .map(|(options, targets)| SessionConfigCache { options, targets });
     Ok((resp.session_id, config))
+}
+
+async fn fork_side_session(
+    conn: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    cwd: PathBuf,
+    additional_directories: &[PathBuf],
+) -> std::result::Result<String, String> {
+    match tokio::time::timeout(
+        SIDE_FORK_TIMEOUT,
+        fork_session(conn, session_id, cwd, additional_directories, &[]),
+    )
+    .await
+    {
+        Ok(Ok((child_id, _))) => Ok(child_id.to_string()),
+        Ok(Err(error)) => Err(format!("side session fork failed: {error}")),
+        Err(_) => Err("side session fork timed out".to_string()),
+    }
 }
 
 /// How a spawned agent relates to the controlling terminal.
@@ -4298,6 +4373,11 @@ async fn drive_config_update(
                             "session fork is only supported while idle".to_string(),
                         ));
                     }
+                    Some(UiCommand::ForkSideSession { responder }) => {
+                        let _ = responder.send(Err(
+                            "side session fork is unavailable during a config update".to_string(),
+                        ));
+                    }
                     Some(UiCommand::LoadSession { responder, .. }) => {
                         let _ = responder.send(LoadSessionResult::Fallback {
                             message: "config update already in flight".to_string(),
@@ -4311,6 +4391,9 @@ async fn drive_config_update(
                             "session config update already in flight".to_string(),
                         ));
                     }
+                    Some(UiCommand::StartSide)
+                    | Some(UiCommand::ExitSide)
+                    | Some(UiCommand::Main(_)) => {}
                 }
             }
         }
@@ -4448,6 +4531,16 @@ async fn drive_prompt_turn(
                             "session fork is only supported while idle".to_string(),
                         ));
                     }
+                    Some(UiCommand::ForkSideSession { responder }) => {
+                        let result = fork_side_session(
+                            conn,
+                            session_id,
+                            diff_config.workspace_roots[0].clone(),
+                            &diff_config.workspace_roots[1..],
+                        )
+                        .await;
+                        let _ = responder.send(result);
+                    }
                     Some(UiCommand::LoadSession { responder, .. }) => {
                         let _ = responder.send(LoadSessionResult::Fallback {
                             message: "prompt already in flight".to_string(),
@@ -4460,6 +4553,9 @@ async fn drive_prompt_turn(
                             "prompt already in flight".to_string(),
                         ));
                     }
+                    Some(UiCommand::StartSide)
+                    | Some(UiCommand::ExitSide)
+                    | Some(UiCommand::Main(_)) => {}
                 }
             }
         }
@@ -4714,9 +4810,22 @@ fn git_head_object_spec(rel_path: &Path) -> Option<String> {
     Some(format!("HEAD:{path}"))
 }
 
-fn prompt_content_blocks(text: String, images: Vec<PromptImage>) -> Vec<ContentBlock> {
+const SIDE_PROMPT_POLICY: &str = "<mj-side-policy>\nThis is an ephemeral side conversation. Treat inherited conversation context as reference-only. Do not modify the workspace or invoke mutating tools unless the user's current side-conversation request explicitly asks for a mutation. Requests made only in the inherited main conversation do not authorize mutations here.\n</mj-side-policy>";
+
+fn prompt_content_blocks(
+    text: String,
+    images: Vec<PromptImage>,
+    side_prompt_policy: bool,
+) -> Vec<ContentBlock> {
     let mut content = Vec::new();
-    if !text.is_empty() {
+    if side_prompt_policy {
+        let effective = if text.is_empty() {
+            SIDE_PROMPT_POLICY.to_string()
+        } else {
+            format!("{SIDE_PROMPT_POLICY}\n\n{text}")
+        };
+        content.push(ContentBlock::Text(TextContent::new(effective)));
+    } else if !text.is_empty() {
         content.push(ContentBlock::Text(TextContent::new(text)));
     }
     content.extend(
@@ -4737,8 +4846,8 @@ mod tests {
         ForkSessionResponse, InitializeResponse, LoadSessionResponse, NewSessionResponse,
         PermissionOption, PermissionOptionKind, PromptResponse, ResumeSessionResponse,
         SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
-        SessionConfigId, SessionConfigValueId, SessionForkCapabilities, SessionId,
-        SessionNotification, SessionResumeCapabilities, SessionUpdate,
+        SessionConfigId, SessionConfigValueId, SessionDeleteCapabilities, SessionForkCapabilities,
+        SessionId, SessionNotification, SessionResumeCapabilities, SessionUpdate,
         SetSessionConfigOptionRequest, StopReason, TextContent, ToolCallUpdate,
         ToolCallUpdateFields,
     };
@@ -4943,6 +5052,7 @@ mod tests {
                 width: 640,
                 height: 480,
             }],
+            false,
         );
 
         assert_eq!(blocks.len(), 2);
@@ -4962,7 +5072,7 @@ mod tests {
     #[test]
     fn first_and_subsequent_text_prompts_preserve_exact_user_text_without_primary_policy() {
         for expected in ["build the thing", "continue normally"] {
-            let blocks = prompt_content_blocks(expected.to_string(), Vec::new());
+            let blocks = prompt_content_blocks(expected.to_string(), Vec::new(), false);
 
             assert_eq!(blocks.len(), 1);
             let ContentBlock::Text(text) = &blocks[0] else {
@@ -4979,7 +5089,7 @@ mod tests {
         assert!(!usage.observe(20_000));
         assert!(usage.observe(7_000));
 
-        let blocks = prompt_content_blocks("continue work".to_string(), Vec::new());
+        let blocks = prompt_content_blocks("continue work".to_string(), Vec::new(), false);
         let ContentBlock::Text(text) = &blocks[0] else {
             panic!("expected text block");
         };
@@ -4997,10 +5107,22 @@ mod tests {
                 width: 1,
                 height: 1,
             }],
+            false,
         );
 
         assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0], ContentBlock::Image(_)));
+    }
+
+    #[test]
+    fn side_prompt_policy_is_model_visible_without_replacing_user_text() {
+        let blocks = prompt_content_blocks("inspect this".to_string(), Vec::new(), true);
+        let ContentBlock::Text(text) = &blocks[0] else {
+            panic!("expected text block");
+        };
+        assert!(text.text.starts_with(SIDE_PROMPT_POLICY));
+        assert!(text.text.ends_with("inspect this"));
+        assert!(text.text.contains("reference-only"));
     }
 
     #[test]
@@ -6148,7 +6270,8 @@ mod tests {
                                     .session_capabilities(
                                         SessionCapabilities::new()
                                             .fork(SessionForkCapabilities::new())
-                                            .resume(SessionResumeCapabilities::new()),
+                                            .resume(SessionResumeCapabilities::new())
+                                            .delete(SessionDeleteCapabilities::new()),
                                     ),
                             ),
                     )
@@ -6179,6 +6302,7 @@ mod tests {
                 async move |req: ForkSessionRequest,
                             responder,
                             cx: ConnectionTo<agent_client_protocol::Client>| {
+                    assert!(req.mcp_servers.is_empty());
                     let old_session_id = req.session_id.clone();
                     let response = responder
                         .respond(ForkSessionResponse::new(SessionId::new("forked-session")));
@@ -7682,6 +7806,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn side_fork_keeps_main_session_active_and_forwards_main_events() {
+        let root = tempfile::tempdir().expect("root");
+        let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
+        let agent_task = tokio::spawn(run_mock_agent(agent_side));
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+        let client_task = tokio::spawn(drive_client(
+            client_transport,
+            root.path().to_path_buf(),
+            None,
+            ui_tx,
+            cmd_rx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        wait_for_session_started(&mut ui_rx, "test-session").await;
+        let (responder, response) = oneshot::channel();
+        cmd_tx
+            .send(UiCommand::ForkSideSession { responder })
+            .expect("request side fork");
+        assert_eq!(
+            response
+                .await
+                .expect("side fork response")
+                .expect("side fork"),
+            "forked-session"
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = ui_rx.recv().await.expect("event channel");
+                match event {
+                    UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(chunk))
+                        if content_block_text(&chunk.content) == "stale parent update" =>
+                    {
+                        break "main update";
+                    }
+                    UiEvent::SessionStarted { session_id, .. } => {
+                        assert_ne!(session_id, "forked-session");
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("main event after side fork");
+        assert_eq!(event, "main update");
+
+        cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
+        client_task
+            .await
+            .expect("client task")
+            .expect("drive client");
+        agent_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drive_client_rejects_additional_directories_without_agent_capability() {
         let root = tempfile::tempdir().expect("root");
         let additional = tempfile::tempdir().expect("additional");
@@ -8574,6 +8757,7 @@ mod tests {
             saved_session_config: HashMap::new(),
             role_config: None,
             code_agent: None,
+            side_prompt_policy: false,
             termination: None,
         };
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
@@ -8634,6 +8818,7 @@ mod tests {
             saved_session_config: HashMap::new(),
             role_config: None,
             code_agent: None,
+            side_prompt_policy: false,
             termination: None,
         };
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
@@ -8773,6 +8958,7 @@ mod tests {
             saved_session_config: HashMap::new(),
             role_config: None,
             code_agent: None,
+            side_prompt_policy: false,
             termination: None,
         };
         assert_run_reports_agent_exited(cfg).await;
@@ -8802,6 +8988,7 @@ mod tests {
             saved_session_config: HashMap::new(),
             role_config: None,
             code_agent: None,
+            side_prompt_policy: false,
             termination: None,
         };
         assert_run_reports_agent_exited(cfg).await;
@@ -8926,6 +9113,36 @@ mod tests {
 
         let supported = AgentCapabilities::new().load_session(true);
         assert!(require_load_session(&supported).is_ok());
+    }
+
+    #[test]
+    fn side_sessions_require_fork_reopen_and_delete() {
+        let supported = AgentCapabilities::new().session_capabilities(
+            SessionCapabilities::new()
+                .fork(SessionForkCapabilities::new())
+                .resume(SessionResumeCapabilities::new())
+                .delete(SessionDeleteCapabilities::new()),
+        );
+        assert_eq!(side_session_capability_error(&supported), None);
+
+        let missing_delete = AgentCapabilities::new().session_capabilities(
+            SessionCapabilities::new()
+                .fork(SessionForkCapabilities::new())
+                .resume(SessionResumeCapabilities::new()),
+        );
+        assert_eq!(
+            side_session_capability_error(&missing_delete).as_deref(),
+            Some("side conversations are not supported by this agent; missing session/delete")
+        );
+
+        let load_fallback = AgentCapabilities::new()
+            .load_session(true)
+            .session_capabilities(
+                SessionCapabilities::new()
+                    .fork(SessionForkCapabilities::new())
+                    .delete(SessionDeleteCapabilities::new()),
+            );
+        assert_eq!(side_session_capability_error(&load_fallback), None);
     }
 
     #[test]
