@@ -360,15 +360,25 @@ fn code_agent_identity_from_raw_input(raw_input: Option<&serde_json::Value>) -> 
         && object
             .get("tool")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|tool| matches!(tool, "code_agent" | "explore_agent" | "explore_agents"))
+            .is_some_and(|tool| {
+                matches!(
+                    tool,
+                    "code_agent" | "code_agent_wait" | "explore_agent" | "explore_agents"
+                )
+            })
 }
 
 fn code_agent_identity_from_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name.contains("mj-code-agent")
-        && ["code_agent", "explore_agent", "explore_agents"]
-            .into_iter()
-            .any(|tool| contains_tool_identifier(&name, tool))
+        && [
+            "code_agent",
+            "code_agent_wait",
+            "explore_agent",
+            "explore_agents",
+        ]
+        .into_iter()
+        .any(|tool| contains_tool_identifier(&name, tool))
 }
 
 /// Tool titles arrive in a few transport-specific forms (for example
@@ -4063,10 +4073,29 @@ mod tests {
     }
 
     #[test]
+    fn primary_code_agent_wait_transport_call_is_tracked_but_not_transcribed() {
+        let mut state = AppState::new();
+        let call = ToolCall::new("wait-bridge", "mcp__mj-code-agent__code_agent_wait")
+            .status(ToolCallStatus::InProgress)
+            .raw_input(serde_json::json!({
+                "server": "mj-code-agent",
+                "tool": "code_agent_wait",
+                "arguments": { "run_id": 42 }
+            }));
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)));
+
+        assert!(state.tool_calls.contains_key("wait-bridge"));
+        assert!(state.transcript.is_empty());
+    }
+
+    #[test]
     fn similarly_named_mcp_tools_are_not_filtered_as_eitri_transport() {
         let call = ToolCall::new("other-tool", "mcp.mj-code-agent.explore_agents_extra");
+        let wait = ToolCall::new("other-wait", "mcp.mj-code-agent.code_agent_wait_extra");
 
         assert!(!is_code_agent_transport_call(&call));
+        assert!(!is_code_agent_transport_call(&wait));
     }
 
     #[test]

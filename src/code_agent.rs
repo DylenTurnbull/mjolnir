@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
@@ -55,6 +55,8 @@ Eitri is available through optional MCP tools. explore_agent is a single read-on
 
 Treat code_agent as delegation to a strong coding engineer with fresh context. Give Eitri one forgeable unit at a time: a substantial, self-contained implementation slice that can be completed in one focused pass and returned as one coherent, reviewable diff. A good handoff has one clear outcome, enough context and decisions to begin immediately, explicit constraints and acceptance checks, and leaves the workspace in a coherent, testable state. Delegate when implementing the change is clearly more work than writing the handoff and reviewing the result. Do not delegate trivial local edits, investigation better handled with direct tools or explore_agent, unresolved architectural questions, or an entire open-ended project. Split large work into sequential, independently verifiable units. You may personally make small, local code changes when describing and delegating them would take more effort than simply doing them; use judgment rather than delegating mechanically. Pass code_agent complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. Its result includes the bounded full workspace diff attributable to that invocation. After Eitri returns, independently review its result and diff, inspect or verify the work as needed, and delegate a substantial corrective follow-up if implementation changes remain. If a request requires no code changes and no open-ended exploration, handle it yourself.
 
+A code_agent call that reports an active run ID is healthy and still running: call code_agent_wait repeatedly with that ID until it returns the authoritative final result. Never inspect, test, commit, or otherwise act on the workspace while a Code run is active.
+
 Every Eitri call starts a brand-new ACP process and session. Eitri has no conversation context and no memory of the user's request or any earlier Eitri call, including an immediately preceding call. Apply this policy while handling the user's request above; do not acknowledge or summarize the policy.
 </mj-code-agent-policy>"#;
 
@@ -80,6 +82,12 @@ Do not narrate your search chronology, paste large search results, include nones
 
 "#;
 const MCP_PATH: &str = "/mcp";
+/// Stay below the primary MCP client's fixed five minute request deadline.
+const CODE_AGENT_POLL_INTERVAL: Duration = Duration::from_secs(240);
+/// Give the client a bounded window to begin its next wait after an Active
+/// response. A run abandoned between polls is cancelled and reaped.
+const CODE_AGENT_POLL_LEASE: Duration = Duration::from_secs(300);
+const CODE_AGENT_RESULT_RETENTION: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EitriPurpose {
@@ -225,6 +233,13 @@ pub struct CodeAgentArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct CodeAgentWaitArgs {
+    /// Active implementation run ID returned by code_agent.
+    pub run_id: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExploreAgentArgs {
     /// Complete, standalone read-only research request for the delegated agent.
     pub prompt: String,
@@ -243,6 +258,7 @@ struct McpHandler {
     context: RunContext,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     controller: Controller,
+    code_runs: CodeRunRegistry,
     tools_listed: watch::Sender<bool>,
     tool_router: ToolRouter<Self>,
 }
@@ -261,6 +277,7 @@ impl McpHandler {
             context,
             ui_tx,
             controller,
+            code_runs: CodeRunRegistry::default(),
             tools_listed,
             tool_router: Self::tool_router(),
         }
@@ -281,32 +298,54 @@ impl McpHandler {
             ));
         }
         let context = resolve_code_context(&self.context, args.cwd.as_deref()).await?;
-        let Some(run_id) = self.controller.begin(RunKind::Code).await else {
+        let Some((run_id, termination)) =
+            self.controller.begin_with_termination(RunKind::Code).await
+        else {
             return Ok(CallToolResult::error(vec![Content::text(
                 "an Eitri implementation run is already active",
             )]));
         };
 
-        let result = await_supervisor(
+        // Arm cancellation before the detached supervisor is launched. This
+        // closes the small disconnect window between registry insertion and
+        // the bounded wait installing its own per-request guard.
+        let mut request_guard =
+            RequestDropGuard::new(termination.clone(), run_id, EitriPurpose::Code);
+        self.code_runs.insert(run_id, termination.clone());
+        let lease = RunLease {
+            controller: self.controller.clone(),
+            run_id,
+            termination,
+        };
+        launch_code_supervisor(
+            self.code_runs.clone(),
             self.config.clone(),
             context,
             args.instructions,
-            EitriPurpose::Code,
             self.ui_tx.clone(),
-            self.controller.clone(),
-            run_id,
-        )
-        .await;
-        Ok(match result.outcome {
-            Ok(message) => CallToolResult::success(vec![Content::text(with_workspace_diff(
-                &message,
-                result.workspace_delta.as_ref(),
-            ))]),
-            Err(error) => CallToolResult::error(vec![Content::text(with_workspace_diff(
-                &error.to_string(),
-                result.workspace_delta.as_ref(),
-            ))]),
-        })
+            lease,
+        );
+        let poll = self
+            .code_runs
+            .wait(run_id, CODE_AGENT_POLL_INTERVAL)
+            .await?;
+        request_guard.disarm();
+        Ok(code_poll_tool_result(poll))
+    }
+
+    #[tool(
+        name = "code_agent_wait",
+        description = "WAIT FOR ACTIVE EITRI IMPLEMENTATION. Use only with the run_id returned by code_agent. This waits for a bounded interval; if it reports the run is still active, call it again with the same ID. When it completes, this returns Eitri's single authoritative final result and workspace diff. Do not inspect, test, commit, or otherwise act on the workspace while the run is active."
+    )]
+    async fn code_agent_wait(
+        &self,
+        Parameters(args): Parameters<CodeAgentWaitArgs>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        Ok(code_poll_tool_result(
+            self.code_runs
+                .wait(args.run_id, CODE_AGENT_POLL_INTERVAL)
+                .await?,
+        ))
     }
 
     #[tool(
@@ -497,7 +536,7 @@ impl ServerHandler for McpHandler {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("mj-code-agent", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "EITRI DELEGATION POLICY: explore_agent is one optional read-only scout. For two or more independent scouts that must actually overlap, use explore_agents with complete standalone prompts: it atomically launches the whole batch concurrently or rejects it without queueing. Do not claim separate explore_agent calls ran in parallel. Give code_agent one forgeable implementation unit at a time. Thor chooses and sequences tools, retains planning, coordination, review, verification, and the final answer, and must give each fresh Eitri call complete standalone context including the current task state and work already completed.",
+                "EITRI DELEGATION POLICY: explore_agent is one optional read-only scout. For two or more independent scouts that must actually overlap, use explore_agents with complete standalone prompts: it atomically launches the whole batch concurrently or rejects it without queueing. A long code_agent call may return an active run ID; call code_agent_wait repeatedly with that ID until its authoritative final result arrives, and never inspect, test, commit, or otherwise act on its workspace while active. Thor chooses and sequences tools, retains planning, coordination, review, verification, and the final answer.",
             )
     }
 
@@ -695,6 +734,14 @@ impl Controller {
     }
 
     async fn begin(&self, kind: RunKind) -> Option<u64> {
+        self.begin_with_termination(kind)
+            .await
+            .map(|(run_id, _)| run_id)
+    }
+
+    /// Atomically admit a run and return its termination handle so callers
+    /// can install a disconnect guard without an await gap after admission.
+    async fn begin_with_termination(&self, kind: RunKind) -> Option<(u64, RunTermination)> {
         let mut state = self.state.lock().await;
         let allowed = match kind {
             RunKind::Code => !state.runs.values().any(|run| run.kind() == RunKind::Code),
@@ -711,12 +758,17 @@ impl Controller {
             return None;
         }
         let id = state.insert_starting(kind);
+        let termination = state
+            .runs
+            .get(&id)
+            .expect("newly admitted run is retained by the controller")
+            .termination();
         if matches!(kind, RunKind::Code) {
             state.active_implementation_workers.set(1);
         }
         let active = state.runs.len();
         state.active_runs.send_replace(active);
-        Some(id)
+        Some((id, termination))
     }
 
     /// Atomically reserves all requested read-only slots. Unlike repeated
@@ -1041,6 +1093,211 @@ fn exploration_activity(update: &SessionUpdate) -> Option<String> {
 struct EitriRunResult {
     outcome: Result<String>,
     workspace_delta: Option<WorkspaceDelta>,
+}
+
+/// Completion state outlives an individual MCP request.  A completed result is
+/// removed when it is delivered, so clients cannot receive competing answers.
+#[derive(Clone, Default)]
+struct CodeRunRegistry {
+    runs: Arc<StdMutex<HashMap<u64, Arc<CodeRunEntry>>>>,
+}
+
+struct CodeRunEntry {
+    termination: RunTermination,
+    completed: watch::Sender<bool>,
+    result: Mutex<Option<EitriRunResult>>,
+    waiter_claimed: AtomicBool,
+    lease_generation: AtomicU64,
+}
+
+enum CodePoll {
+    Active(u64),
+    Complete(EitriRunResult),
+}
+
+impl CodeRunRegistry {
+    fn lock_runs(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<CodeRunEntry>>> {
+        self.runs.lock().expect("code run registry lock poisoned")
+    }
+
+    fn insert(&self, run_id: u64, termination: RunTermination) {
+        let (completed, _) = watch::channel(false);
+        self.lock_runs().insert(
+            run_id,
+            Arc::new(CodeRunEntry {
+                termination,
+                completed,
+                result: Mutex::new(None),
+                waiter_claimed: AtomicBool::new(false),
+                lease_generation: AtomicU64::new(0),
+            }),
+        );
+    }
+
+    async fn complete(&self, run_id: u64, result: EitriRunResult) {
+        let entry = self.lock_runs().get(&run_id).cloned();
+        if let Some(entry) = entry {
+            *entry.result.lock().await = Some(result);
+            entry.completed.send_replace(true);
+        }
+    }
+
+    async fn retire_completed(&self, run_id: u64) {
+        let entry = self.lock_runs().get(&run_id).cloned();
+        let Some(entry) = entry else {
+            return;
+        };
+        if *entry.completed.borrow() && entry.result.lock().await.is_some() {
+            let mut runs = self.lock_runs();
+            if runs
+                .get(&run_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                runs.remove(&run_id);
+            }
+        }
+    }
+
+    async fn wait(
+        &self,
+        run_id: u64,
+        interval: Duration,
+    ) -> std::result::Result<CodePoll, McpError> {
+        let entry = self.lock_runs().get(&run_id).cloned().ok_or_else(|| {
+            McpError::invalid_params("unknown or already delivered Eitri code run ID", None)
+        })?;
+        if entry.waiter_claimed.swap(true, Ordering::AcqRel) {
+            return Err(McpError::invalid_params(
+                "another code_agent or code_agent_wait request is already awaiting this run ID",
+                None,
+            ));
+        }
+        let _claim = WaitClaim(&entry.waiter_claimed);
+        // Beginning a wait is the heartbeat for an Active run. Invalidate the
+        // lease left by the preceding Active response before blocking.
+        entry.lease_generation.fetch_add(1, Ordering::AcqRel);
+        let mut request_guard =
+            RequestDropGuard::new(entry.termination.clone(), run_id, EitriPurpose::Code);
+        let mut completed = entry.completed.subscribe();
+        if !*completed.borrow_and_update()
+            && tokio::time::timeout(interval, completed.changed())
+                .await
+                .is_err()
+        {
+            request_guard.disarm();
+            entry.arm_abandonment_lease(run_id);
+            return Ok(CodePoll::Active(run_id));
+        }
+        let result = entry.result.lock().await.take().ok_or_else(|| {
+            McpError::internal_error("Eitri code run completed without a stored result", None)
+        })?;
+        let mut runs = self.lock_runs();
+        if runs
+            .get(&run_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &entry))
+        {
+            runs.remove(&run_id);
+        }
+        request_guard.disarm();
+        Ok(CodePoll::Complete(result))
+    }
+}
+
+impl CodeRunEntry {
+    fn arm_abandonment_lease(self: &Arc<Self>, run_id: u64) {
+        let generation = self.lease_generation.load(Ordering::Acquire);
+        let entry = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CODE_AGENT_POLL_LEASE).await;
+            if entry.lease_generation.load(Ordering::Acquire) == generation
+                && !*entry.completed.borrow()
+            {
+                tracing::warn!(
+                    event = "eitri_code_poll_lease_expired",
+                    run_id,
+                    lease_seconds = CODE_AGENT_POLL_LEASE.as_secs(),
+                    "Eitri code run was abandoned after an Active response; terminating worker"
+                );
+                entry
+                    .termination
+                    .request(TerminationCause::RequestDisconnected);
+            }
+        });
+    }
+}
+
+struct WaitClaim<'a>(&'a AtomicBool);
+
+impl Drop for WaitClaim<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn code_poll_tool_result(poll: CodePoll) -> CallToolResult {
+    match poll {
+        CodePoll::Active(run_id) => CallToolResult::success(vec![Content::text(format!(
+            "Eitri code run {run_id} is still active. This is not a failure or queued work. Thor MUST call code_agent_wait with run_id {run_id} until it returns the authoritative final result; do not inspect, test, commit, or otherwise act on the workspace while it is active."
+        ))]),
+        CodePoll::Complete(result) => match result.outcome {
+            Ok(message) => CallToolResult::success(vec![Content::text(with_workspace_diff(
+                &message,
+                result.workspace_delta.as_ref(),
+            ))]),
+            Err(error) => CallToolResult::error(vec![Content::text(with_workspace_diff(
+                &error.to_string(),
+                result.workspace_delta.as_ref(),
+            ))]),
+        },
+    }
+}
+
+fn launch_code_supervisor(
+    registry: CodeRunRegistry,
+    config: Config,
+    context: RunContext,
+    task: String,
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
+    lease: RunLease,
+) {
+    let controller = lease.controller.clone();
+    let run_id = lease.run_id;
+    launch_code_supervisor_task(
+        registry,
+        controller,
+        run_id,
+        run_boxed(config, context, task, EitriPurpose::Code, ui_tx, lease),
+    );
+}
+
+/// Own the worker independently of MCP request/session futures and release its
+/// controller slot only after the worker has terminated and its result is stored.
+fn launch_code_supervisor_task<F>(
+    registry: CodeRunRegistry,
+    controller: Controller,
+    run_id: u64,
+    worker: F,
+) where
+    F: Future<Output = EitriRunResult> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let worker = tokio::spawn(worker);
+        let result = match worker.await {
+            Ok(result) => result,
+            Err(error) => EitriRunResult {
+                outcome: Err(anyhow!("Eitri worker task failed: {error}")),
+                workspace_delta: None,
+            },
+        };
+        registry.complete(run_id, result).await;
+        let cleanup = registry.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CODE_AGENT_RESULT_RETENTION).await;
+            cleanup.retire_completed(run_id).await;
+        });
+        controller.finish(run_id).await;
+        tracing::info!(event = "eitri_slot_released", run_id, purpose = ?EitriPurpose::Code, "Eitri controller slot released after reap and result storage");
+    });
 }
 
 #[derive(Clone)]
@@ -1800,6 +2057,248 @@ mod tests {
     #[test]
     fn fanout_tool_is_registered_on_the_mcp_router() {
         assert!(McpHandler::tool_router().get("explore_agents").is_some());
+        assert!(McpHandler::tool_router().get("code_agent_wait").is_some());
+    }
+
+    #[test]
+    fn code_wait_arguments_are_strict() {
+        let args: CodeAgentWaitArgs =
+            serde_json::from_str(r#"{"run_id":42}"#).expect("valid wait args");
+        assert_eq!(args.run_id, 42);
+        assert!(
+            serde_json::from_str::<CodeAgentWaitArgs>(r#"{"run_id":42,"extra":true}"#).is_err()
+        );
+        assert!(serde_json::from_str::<CodeAgentWaitArgs>(r#"{}"#).is_err());
+    }
+
+    fn test_result(message: &str) -> EitriRunResult {
+        EitriRunResult {
+            outcome: Ok(message.to_string()),
+            workspace_delta: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn code_poll_expiry_reports_active_without_requesting_cancellation() {
+        let registry = CodeRunRegistry::default();
+        let termination = RunTermination::default();
+        registry.insert(7, termination.clone());
+        let poll = registry
+            .wait(7, Duration::ZERO)
+            .await
+            .expect("bounded poll");
+        assert!(matches!(poll, CodePoll::Active(7)));
+        assert_eq!(termination.cause(), TerminationCause::None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_code_run_abandoned_between_polls_is_cancelled_and_held_until_reaped() {
+        let controller = Controller::default();
+        controller.configure(1, ActiveCodeWorkers::default()).await;
+        let (run_id, termination) = controller
+            .begin_with_termination(RunKind::Code)
+            .await
+            .expect("code run");
+        let registry = CodeRunRegistry::default();
+        registry.insert(run_id, termination.clone());
+        let cancellation_seen = Arc::new(tokio::sync::Notify::new());
+        let allow_reap = Arc::new(tokio::sync::Notify::new());
+        let worker_runs = Arc::new(AtomicUsize::new(0));
+        launch_code_supervisor_task(registry.clone(), controller.clone(), run_id, {
+            let termination = termination.clone();
+            let cancellation_seen = cancellation_seen.clone();
+            let allow_reap = allow_reap.clone();
+            let worker_runs = worker_runs.clone();
+            async move {
+                worker_runs.fetch_add(1, Ordering::SeqCst);
+                termination.cancelled().await;
+                cancellation_seen.notify_one();
+                allow_reap.notified().await;
+                test_result("cancelled and reaped")
+            }
+        });
+
+        assert!(matches!(
+            registry.wait(run_id, Duration::ZERO).await.expect("poll"),
+            CodePoll::Active(id) if id == run_id
+        ));
+        assert_eq!(termination.cause(), TerminationCause::None);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(CODE_AGENT_POLL_LEASE).await;
+        tokio::task::yield_now().await;
+        assert_eq!(termination.cause(), TerminationCause::RequestDisconnected);
+        cancellation_seen.notified().await;
+        assert!(
+            controller.begin(RunKind::Code).await.is_none(),
+            "cancellation cannot release the implementation slot before reap"
+        );
+
+        allow_reap.notify_one();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if controller.state.lock().await.runs.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            controller.begin(RunKind::Code).await.is_some(),
+            "the independent supervisor reaps without another result poll"
+        );
+        let CodePoll::Complete(result) = registry
+            .wait(run_id, Duration::ZERO)
+            .await
+            .expect("stored cancellation result")
+        else {
+            panic!("reaped run must retain its authoritative result");
+        };
+        assert_eq!(
+            result.outcome.expect("controlled worker result"),
+            "cancelled and reaped"
+        );
+        assert_eq!(worker_runs.load(Ordering::SeqCst), 1);
+        assert!(
+            registry.wait(run_id, Duration::ZERO).await.is_err(),
+            "the authoritative result is delivered exactly once"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_code_wait_renews_the_active_run_lease() {
+        let registry = CodeRunRegistry::default();
+        let termination = RunTermination::default();
+        registry.insert(11, termination.clone());
+        assert!(matches!(
+            registry.wait(11, Duration::ZERO).await.expect("first poll"),
+            CodePoll::Active(11)
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(CODE_AGENT_POLL_LEASE - Duration::from_secs(1)).await;
+        assert!(matches!(
+            registry
+                .wait(11, Duration::ZERO)
+                .await
+                .expect("heartbeat poll"),
+            CodePoll::Active(11)
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(termination.cause(), TerminationCause::None);
+
+        registry.complete(11, test_result("done")).await;
+        assert!(matches!(
+            registry.wait(11, Duration::ZERO).await.expect("completion"),
+            CodePoll::Complete(_)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn code_completion_after_old_client_boundary_is_delivered_by_later_wait() {
+        let registry = CodeRunRegistry::default();
+        registry.insert(8, RunTermination::default());
+        let initial_wait = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.wait(8, Duration::from_secs(240)).await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(240)).await;
+        assert!(matches!(
+            initial_wait
+                .await
+                .expect("initial waiter")
+                .expect("initial poll"),
+            CodePoll::Active(8)
+        ));
+
+        // Cross the former five-minute client boundary while the same
+        // supervised run remains healthy, then publish its single result.
+        tokio::time::advance(Duration::from_secs(61)).await;
+        registry
+            .complete(8, test_result("finished after 300 seconds"))
+            .await;
+        let CodePoll::Complete(result) =
+            registry.wait(8, Duration::ZERO).await.expect("later wait")
+        else {
+            panic!("completion must be authoritative");
+        };
+        assert_eq!(
+            result.outcome.expect("success"),
+            "finished after 300 seconds"
+        );
+        assert!(registry.wait(8, Duration::ZERO).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dropped_wait_requests_disconnect_cancellation() {
+        let controller = Controller::default();
+        let workers = ActiveCodeWorkers::default();
+        controller.configure(1, workers).await;
+        let run_id = controller.begin(RunKind::Code).await.expect("code run");
+        let registry = CodeRunRegistry::default();
+        let termination = self_termination(&controller, run_id).await;
+        registry.insert(run_id, termination.clone());
+        let task = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.wait(run_id, Duration::from_secs(60)).await }
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(termination.cause(), TerminationCause::RequestDisconnected);
+        assert!(controller.begin(RunKind::Code).await.is_none());
+        controller.finish(run_id).await;
+        assert!(controller.begin(RunKind::Code).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn code_admission_provides_termination_before_any_follow_up_await() {
+        let controller = Controller::default();
+        let (run_id, termination) = controller
+            .begin_with_termination(RunKind::Code)
+            .await
+            .expect("code run");
+
+        {
+            let _request = RequestDropGuard::new(termination.clone(), run_id, EitriPurpose::Code);
+        }
+        assert_eq!(termination.cause(), TerminationCause::RequestDisconnected);
+        assert!(controller.begin(RunKind::Code).await.is_none());
+
+        controller.finish(run_id).await;
+        assert!(controller.begin(RunKind::Code).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_code_admission_cannot_orphan_a_controller_slot() {
+        let controller = Controller::default();
+        let state_lock = controller.state.lock().await;
+        let pending = tokio::spawn({
+            let controller = controller.clone();
+            async move { controller.begin_with_termination(RunKind::Code).await }
+        });
+        tokio::task::yield_now().await;
+        pending.abort();
+        assert!(pending.await.is_err());
+        drop(state_lock);
+
+        assert!(controller.begin(RunKind::Code).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn fast_code_completion_returns_directly() {
+        let registry = CodeRunRegistry::default();
+        registry.insert(10, RunTermination::default());
+        registry.complete(10, test_result("fast result")).await;
+        let CodePoll::Complete(result) = registry
+            .wait(10, Duration::from_secs(1))
+            .await
+            .expect("fast completion")
+        else {
+            panic!("fast completion was not returned directly");
+        };
+        assert_eq!(result.outcome.expect("success"), "fast result");
     }
 
     #[tokio::test]
