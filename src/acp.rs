@@ -7019,6 +7019,7 @@ mod tests {
     async fn run_mock_agent_without_resume_capability(
         stream: tokio::io::DuplexStream,
         close_seen: Arc<StdAtomicBool>,
+        new_session_seen: Arc<StdAtomicBool>,
     ) {
         let (r, w) = split(stream);
         let transport = ByteStreams::new(w.compat_write(), r.compat());
@@ -7042,6 +7043,7 @@ mod tests {
                 async move |_req: agent_client_protocol::schema::v1::NewSessionRequest,
                             responder,
                             _cx| {
+                    new_session_seen.store(true, Ordering::SeqCst);
                     responder.respond(NewSessionResponse::new(SessionId::new("old-session")))
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -7050,6 +7052,63 @@ mod tests {
                 async move |_req: CloseSessionRequest, responder, _cx| {
                     close_seen.store(true, Ordering::SeqCst);
                     responder.respond(CloseSessionResponse::new())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(transport, |_cx| async move {
+                futures::future::pending::<()>().await;
+                Ok(())
+            })
+            .await;
+    }
+
+    async fn run_mock_agent_rejecting_resume(
+        stream: tokio::io::DuplexStream,
+        new_session_seen: Arc<StdAtomicBool>,
+        load_session_seen: Arc<StdAtomicBool>,
+    ) {
+        let (r, w) = split(stream);
+        let transport = ByteStreams::new(w.compat_write(), r.compat());
+        let _ = AgentRole
+            .builder()
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::v1::InitializeRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(
+                            AgentCapabilities::new()
+                                .load_session(true)
+                                .session_capabilities(
+                                    SessionCapabilities::new()
+                                        .resume(SessionResumeCapabilities::new()),
+                                ),
+                        ),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::v1::NewSessionRequest,
+                            responder,
+                            _cx| {
+                    new_session_seen.store(true, Ordering::SeqCst);
+                    responder.respond(NewSessionResponse::new(SessionId::new("unexpected-new")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::v1::LoadSessionRequest,
+                            responder,
+                            _cx| {
+                    load_session_seen.store(true, Ordering::SeqCst);
+                    responder.respond(LoadSessionResponse::new())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: ResumeSessionRequest, responder, _cx| {
+                    responder.respond_with_internal_error("resume rejected")
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -7072,6 +7131,18 @@ mod tests {
             if let UiEvent::SessionStarted { session_id, .. } = ev {
                 assert_eq!(session_id, expected_session_id);
                 return;
+            }
+        }
+    }
+
+    async fn wait_for_fatal(ui_rx: &mut mpsc::UnboundedReceiver<UiEvent>) -> String {
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timed out waiting for fatal ACP startup error")
+                .expect("ui event channel closed");
+            if let UiEvent::Fatal(message) = ev {
+                return message;
             }
         }
     }
@@ -7846,6 +7917,71 @@ mod tests {
         }
 
         cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
+        agent_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_resume_without_resume_or_load_capability_never_starts_a_new_session() {
+        let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
+        let close_seen = Arc::new(StdAtomicBool::new(false));
+        let new_session_seen = Arc::new(StdAtomicBool::new(false));
+        let agent_task = tokio::spawn(run_mock_agent_without_resume_capability(
+            agent_side,
+            close_seen,
+            new_session_seen.clone(),
+        ));
+
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+        let client_task = tokio::spawn(drive_client(
+            client_transport,
+            std::env::temp_dir(),
+            Some("retained-session".to_string()),
+            ui_tx,
+            cmd_rx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let fatal = wait_for_fatal(&mut ui_rx).await;
+        assert!(fatal.contains("sessionCapabilities.resume or loadSession"));
+        assert!(!new_session_seen.load(Ordering::SeqCst));
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
+        agent_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_resume_failure_never_falls_back_to_load_or_new_session() {
+        let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
+        let new_session_seen = Arc::new(StdAtomicBool::new(false));
+        let load_session_seen = Arc::new(StdAtomicBool::new(false));
+        let agent_task = tokio::spawn(run_mock_agent_rejecting_resume(
+            agent_side,
+            new_session_seen.clone(),
+            load_session_seen.clone(),
+        ));
+
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+        let client_task = tokio::spawn(drive_client(
+            client_transport,
+            std::env::temp_dir(),
+            Some("retained-session".to_string()),
+            ui_tx,
+            cmd_rx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let fatal = wait_for_fatal(&mut ui_rx).await;
+        assert!(fatal.contains("resume rejected"));
+        assert!(!load_session_seen.load(Ordering::SeqCst));
+        assert!(!new_session_seen.load(Ordering::SeqCst));
+
         let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
         agent_task.abort();
     }
@@ -9105,10 +9241,12 @@ mod tests {
         let (cr, cw) = split(client_side);
         let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
         let close_seen = Arc::new(StdAtomicBool::new(false));
+        let new_session_seen = Arc::new(StdAtomicBool::new(false));
 
         let agent_task = tokio::spawn(run_mock_agent_without_resume_capability(
             agent_side,
             close_seen.clone(),
+            new_session_seen,
         ));
 
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();

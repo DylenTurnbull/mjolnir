@@ -30,6 +30,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
 
 use crate::acp;
 use crate::council;
@@ -1174,6 +1175,8 @@ pub(crate) struct AgentHandle {
     config_targets: Vec<SessionConfigTarget>,
     abort: watch::Receiver<bool>,
     access_mode: acp::RuntimeAccessMode,
+    session_started: Option<(String, bool)>,
+    termination: CancellationToken,
 }
 
 impl AgentHandle {
@@ -1248,26 +1251,48 @@ impl AgentHandle {
         role_config: Option<acp::RuntimeRoleConfig>,
         mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
     ) -> Result<Self> {
-        let (event_tx, events) = mpsc::unbounded_channel();
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let runtime_cfg = acp::AcpRuntimeConfig {
-            command: launch.program.clone(),
-            args: launch.args.clone(),
-            cwd: cwd.to_path_buf(),
-            additional_directories: additional_directories.to_vec(),
-            mcp_servers,
-            resume_session: None,
-            env: launch.env.clone(),
-            agent_stderr: None,
-            fs_max_text_bytes: acp::DEFAULT_FS_TEXT_BYTES,
+        Self::connect_with_role_config_and_mcp_resuming(
+            launch,
+            cwd,
+            additional_directories,
+            abort,
             access_mode,
-            agent_source_id: None,
-            config_path: None,
             saved_session_config,
             role_config,
-            code_agent: None,
-            termination: None,
-        };
+            mcp_servers,
+            None,
+        )
+        .await
+    }
+
+    /// Connect with an explicit ACP session to resume. Ordinary callers use
+    /// [`Self::connect_with_role_config_and_mcp`], which always starts new.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn connect_with_role_config_and_mcp_resuming(
+        launch: &Launch,
+        cwd: &Path,
+        additional_directories: &[PathBuf],
+        abort: watch::Receiver<bool>,
+        access_mode: acp::RuntimeAccessMode,
+        saved_session_config: HashMap<String, String>,
+        role_config: Option<acp::RuntimeRoleConfig>,
+        mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
+        resume_session: Option<String>,
+    ) -> Result<Self> {
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let termination = CancellationToken::new();
+        let runtime_cfg = runtime_config(
+            launch,
+            cwd,
+            additional_directories,
+            access_mode,
+            saved_session_config,
+            role_config,
+            mcp_servers,
+            resume_session,
+            Some(termination.clone()),
+        );
         let runtime = tokio::spawn(acp::run(runtime_cfg, event_tx, cmd_rx));
         let mut handle = Self {
             cmd_tx,
@@ -1277,8 +1302,15 @@ impl AgentHandle {
             config_targets: Vec::new(),
             abort,
             access_mode,
+            session_started: None,
+            termination,
         };
-        handle.wait_session_started().await?;
+        if let Err(error) = handle.wait_session_started().await {
+            // `JoinHandle` detaches when dropped. Explicitly dismiss here so
+            // a failed startup cannot leave the ACP runtime/process behind.
+            handle.dismiss().await;
+            return Err(error);
+        }
         Ok(handle)
     }
 
@@ -1293,8 +1325,10 @@ impl AgentHandle {
             let Some(ev) = ev else {
                 bail!("agent runtime closed before a session started");
             };
+            if self.capture_session_started(&ev) {
+                return Ok(());
+            }
             match ev {
-                UiEvent::SessionStarted { .. } => return Ok(()),
                 UiEvent::SessionConfigOptions { options, targets } => {
                     self.store_config(options, targets);
                 }
@@ -1307,6 +1341,30 @@ impl AgentHandle {
                 _ => {}
             }
         }
+    }
+
+    fn record_session_started(&mut self, session_id: String, resumed: bool) {
+        self.session_started = Some((session_id, resumed));
+    }
+
+    /// Records the ACP session identity from the production event stream.
+    /// Returns true once the connection handshake is complete.
+    fn capture_session_started(&mut self, event: &UiEvent) -> bool {
+        let UiEvent::SessionStarted {
+            session_id,
+            resumed,
+        } = event
+        else {
+            return false;
+        };
+        self.record_session_started(session_id.clone(), *resumed);
+        true
+    }
+
+    pub(crate) fn session_started(&self) -> Option<(&str, bool)> {
+        self.session_started
+            .as_ref()
+            .map(|(session_id, resumed)| (session_id.as_str(), *resumed))
     }
 
     fn store_config(
@@ -1591,7 +1649,50 @@ impl AgentHandle {
     /// the runtime loop and kills the agent process tree in any case.
     pub(crate) async fn dismiss(self) {
         let _ = self.cmd_tx.send(UiCommand::Shutdown);
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.runtime).await;
+        // During a failed startup, `drive_client` may not yet be consuming
+        // commands. Cancellation still reaches `acp::run`'s supervised
+        // teardown path, which reaps the whole agent process tree.
+        self.termination.cancel();
+        let mut runtime = self.runtime;
+        if tokio::time::timeout(Duration::from_secs(3), &mut runtime)
+            .await
+            .is_err()
+        {
+            runtime.abort();
+            let _ = runtime.await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_config(
+    launch: &Launch,
+    cwd: &Path,
+    additional_directories: &[PathBuf],
+    access_mode: acp::RuntimeAccessMode,
+    saved_session_config: HashMap<String, String>,
+    role_config: Option<acp::RuntimeRoleConfig>,
+    mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
+    resume_session: Option<String>,
+    termination: Option<CancellationToken>,
+) -> acp::AcpRuntimeConfig {
+    acp::AcpRuntimeConfig {
+        command: launch.program.clone(),
+        args: launch.args.clone(),
+        cwd: cwd.to_path_buf(),
+        additional_directories: additional_directories.to_vec(),
+        mcp_servers,
+        resume_session,
+        env: launch.env.clone(),
+        agent_stderr: None,
+        fs_max_text_bytes: acp::DEFAULT_FS_TEXT_BYTES,
+        access_mode,
+        agent_source_id: None,
+        config_path: None,
+        saved_session_config,
+        role_config,
+        code_agent: None,
+        termination,
     }
 }
 
@@ -4219,6 +4320,8 @@ mod tests {
             config_targets: Vec::new(),
             abort,
             access_mode,
+            session_started: None,
+            termination: CancellationToken::new(),
         };
         TestRig {
             handle,
@@ -4226,6 +4329,36 @@ mod tests {
             cmd_rx,
             _abort_tx: abort_tx,
         }
+    }
+
+    #[tokio::test]
+    async fn dismiss_cancels_runtime_through_its_teardown_signal() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let (_event_tx, events) = mpsc::unbounded_channel();
+        let (_abort_tx, abort) = watch::channel(false);
+        let termination = CancellationToken::new();
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_by_runtime = observed.clone();
+        let runtime_termination = termination.clone();
+        let runtime = tokio::spawn(async move {
+            runtime_termination.cancelled().await;
+            observed_by_runtime.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let handle = AgentHandle {
+            cmd_tx,
+            events,
+            runtime,
+            config_options: Vec::new(),
+            config_targets: Vec::new(),
+            abort,
+            access_mode: acp::RuntimeAccessMode::ReadOnly,
+            session_started: None,
+            termination,
+        };
+
+        handle.dismiss().await;
+        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     fn model_options(current: &str) -> (Vec<SessionConfigOption>, Vec<SessionConfigTarget>) {
@@ -4243,6 +4376,48 @@ mod tests {
             config_id: option.id.clone(),
         };
         (vec![option], vec![target])
+    }
+
+    #[tokio::test]
+    async fn session_started_event_captures_identity_and_resume_status() {
+        let mut rig = test_rig();
+        rig.event_tx
+            .send(UiEvent::SessionStarted {
+                session_id: "loki-acp-session".to_string(),
+                resumed: true,
+            })
+            .expect("send session start");
+
+        rig.handle
+            .wait_session_started()
+            .await
+            .expect("session started");
+        assert_eq!(
+            rig.handle.session_started(),
+            Some(("loki-acp-session", true))
+        );
+    }
+
+    #[test]
+    fn agent_runtime_config_forwards_exact_resume_session() {
+        let launch = Launch {
+            program: PathBuf::from("mock-agent"),
+            args: vec!["--acp".to_string()],
+            env: HashMap::new(),
+        };
+        let config = runtime_config(
+            &launch,
+            Path::new("/workspace"),
+            &[],
+            acp::RuntimeAccessMode::ReadOnly,
+            HashMap::new(),
+            None,
+            Vec::new(),
+            Some("loki-acp-session".to_string()),
+            None,
+        );
+
+        assert_eq!(config.resume_session.as_deref(), Some("loki-acp-session"));
     }
 
     #[tokio::test]

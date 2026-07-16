@@ -897,10 +897,9 @@ async fn worker(
     council_session: String,
 ) {
     let mut epoch = 0;
-    let mut outer_task = String::new();
-    let mut recent_trajectory = String::new();
     let mut pending_context: HashMap<(Target, Option<u64>), String> = HashMap::new();
     let mut session: Option<AgentHandle> = None;
+    let mut review_state = LokiReviewState::default();
     let advice = AdviceSlot {
         active: Arc::default(),
         state: advice_state,
@@ -917,7 +916,6 @@ async fn worker(
             None
         }
     };
-    let mut primed = false;
     'worker: loop {
         let Some(request) = requests.recv().await else {
             break;
@@ -931,13 +929,7 @@ async fn worker(
                     task: next_task,
                 } => {
                     epoch = next;
-                    outer_task = next_task.clone();
-                    recent_trajectory.clear();
-                    pending_context.clear();
-                    pending_context.insert(
-                        (Target::Thor, None),
-                        format!("New outer user request:\n{next_task}"),
-                    );
+                    begin_request(&mut pending_context, next_task);
                 }
                 Request::TargetContext {
                     epoch: request_epoch,
@@ -981,6 +973,7 @@ async fn worker(
             continue;
         };
         if session.is_none() {
+            let requested_session_id = review_state.resume_session();
             match connect(
                 &role,
                 &cwd,
@@ -988,22 +981,35 @@ async fn worker(
                 abort_rx.clone(),
                 server.advertised.clone(),
                 &council_session,
+                requested_session_id.clone(),
             )
             .await
             {
-                Ok(agent) => {
-                    session = Some(agent);
-                    if let Err(error) = server.wait_until_tools_listed().await {
-                        emit_warning(
-                            &ui_tx,
-                            &role,
-                            format!("Loki could not load advise: {error:#}"),
-                        );
-                        if let Some(old) = session.take() {
-                            old.dismiss().await;
+                Ok(agent) => match review_state.accept_session(agent.session_started()) {
+                    Ok(()) => {
+                        session = Some(agent);
+                        if let Err(error) = server.wait_until_tools_listed().await {
+                            emit_warning(
+                                &ui_tx,
+                                &role,
+                                format!("Loki could not load advise: {error:#}"),
+                            );
+                            if let Some(old) = session.take() {
+                                old.dismiss().await;
+                            }
                         }
                     }
-                }
+                    Err(error) => {
+                        if !*abort_rx.borrow() {
+                            emit_warning(
+                                &ui_tx,
+                                &role,
+                                format!("Loki continuity failure: {error}"),
+                            );
+                        }
+                        agent.dismiss().await;
+                    }
+                },
                 Err(error) => {
                     if !*abort_rx.borrow() {
                         emit_warning(&ui_tx, &role, format!("Loki could not start: {error:#}"));
@@ -1022,13 +1028,8 @@ async fn worker(
                 context.push(value);
             }
         }
-        if !primed && !recent_trajectory.is_empty() {
-            context.push(format!(
-                "Current outer user request:\n{outer_task}\n\nRecent semantic trajectory before reconnect:\n{recent_trajectory}"
-            ));
-        }
-        let prompt = review_prompt(&batch, &spans, &context, !primed);
-        primed = true;
+        let include_contract = review_state.include_contract();
+        let prompt = review_prompt(&batch, &spans, &context, include_contract);
         let id = batch[0].id;
         tracing::info!(event = "review_started", council_session = %council_session, god = "Loki", model = %role.model.model, adapter = %role.launch.source_id, review_id = id, epoch, batch_size = batch.len(), review_target = %spans.iter().map(ReviewedSpan::marker).collect::<Vec<_>>().join(" | "), "Loki review started");
         advice.begin(id, epoch, spans.clone()).await;
@@ -1049,6 +1050,7 @@ async fn worker(
             })
             .await;
         if let Ok(outcome) = &result {
+            review_state.contract_succeeded(include_contract);
             let _ = ui_tx.send(UiEvent::CouncilUsage(Record {
                 role: Role::Loki,
                 purpose: None,
@@ -1057,25 +1059,10 @@ async fn worker(
             }));
         }
         let accepted = advice.finish(id).await;
-        for item in &batch {
-            recent_trajectory.push_str(&format!(
-                "[{}]\n{}\n",
-                spans
-                    .iter()
-                    .find(|span| {
-                        span.target == item.target && span.invocation == item.invocation
-                    })
-                    .expect("batch span")
-                    .marker(),
-                item.checkpoint.text
-            ));
-        }
-        recent_trajectory = bounded(recent_trajectory);
         if let Err(error) = result {
             if !*abort_rx.borrow() {
                 emit_warning(&ui_tx, &role, format!("Loki review failed open: {error}"));
             }
-            primed = false;
             if let Some(old) = session.take() {
                 old.dismiss().await;
             }
@@ -1086,6 +1073,81 @@ async fn worker(
         agent.dismiss().await;
     }
     let _ = finished.send(true);
+}
+
+fn begin_request(pending_context: &mut HashMap<(Target, Option<u64>), String>, task: String) {
+    pending_context.clear();
+    pending_context.insert(
+        (Target::Thor, None),
+        format!("New outer user request:\n{task}"),
+    );
+}
+
+/// Tracks the only continuity Loki permits: an exact ACP session resume.
+/// This state deliberately outlives request resets and failed replacement
+/// attempts so a later retry asks for the original backing session again.
+#[derive(Default)]
+struct LokiSessionContinuity {
+    session_id: Option<String>,
+}
+
+impl LokiSessionContinuity {
+    fn resume_session(&self) -> Option<String> {
+        self.session_id.clone()
+    }
+
+    /// Accept a connection's `SessionStarted` notification.
+    fn accept(&mut self, started: Option<(&str, bool)>) -> Result<()> {
+        let Some((session_id, resumed)) = started else {
+            return Err(anyhow!(
+                "agent connected without a SessionStarted notification"
+            ));
+        };
+        match self.session_id.as_deref() {
+            None if !resumed => {
+                self.session_id = Some(session_id.to_string());
+                Ok(())
+            }
+            None => Err(anyhow!(
+                "agent reported an unexpected resumed ACP session '{session_id}'"
+            )),
+            Some(requested) if !resumed => Err(anyhow!(
+                "requested ACP session '{requested}' but agent reported a new session '{session_id}'"
+            )),
+            Some(requested) if session_id != requested => Err(anyhow!(
+                "requested ACP session '{requested}' but agent resumed '{session_id}'"
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+}
+
+/// The logical contract state is separate from ACP session continuity. It is
+/// advanced only after the prompt that carries the contract succeeds.
+#[derive(Default)]
+struct LokiReviewState {
+    continuity: LokiSessionContinuity,
+    primed: bool,
+}
+
+impl LokiReviewState {
+    fn resume_session(&self) -> Option<String> {
+        self.continuity.resume_session()
+    }
+
+    fn accept_session(&mut self, started: Option<(&str, bool)>) -> Result<()> {
+        self.continuity.accept(started)
+    }
+
+    fn include_contract(&self) -> bool {
+        !self.primed
+    }
+
+    fn contract_succeeded(&mut self, include_contract: bool) {
+        if include_contract {
+            self.primed = true;
+        }
+    }
 }
 
 struct ReviewItem {
@@ -1129,13 +1191,14 @@ async fn connect(
     abort: watch::Receiver<bool>,
     advise_server: McpServer,
     council_session: &str,
+    resume_session: Option<String>,
 ) -> Result<AgentHandle> {
     let launch = Launch {
         program: role.launch.command.clone(),
         args: role.launch.args.clone(),
         env: role.launch.env.clone(),
     };
-    AgentHandle::connect_with_role_config_and_mcp(
+    AgentHandle::connect_with_role_config_and_mcp_resuming(
         &launch,
         cwd,
         additional_directories,
@@ -1150,6 +1213,7 @@ async fn connect(
             council_session: Some(council_session.to_string()),
         }),
         vec![advise_server],
+        resume_session,
     )
     .await
 }
@@ -1574,5 +1638,76 @@ mod tests {
             Request::Begin { epoch: 2, .. }
         ));
         assert_eq!(handle.take_deferred().len(), 1);
+    }
+
+    #[test]
+    fn loki_priming_requires_a_successful_contract_prompt() {
+        let mut state = LokiReviewState::default();
+        assert_eq!(
+            state.resume_session(),
+            None,
+            "initial connection starts new"
+        );
+        state
+            .accept_session(Some(("first", false)))
+            .expect("capture the initial ACP identity");
+        assert_eq!(state.resume_session().as_deref(), Some("first"));
+        assert!(state.include_contract());
+
+        // Setup loss before the first prompt must leave the retry unprimed.
+        assert!(state.include_contract());
+        state
+            .accept_session(Some(("first", true)))
+            .expect("exact resume after setup loss");
+        assert!(state.include_contract());
+
+        state.contract_succeeded(state.include_contract());
+        assert!(
+            !state.include_contract(),
+            "successful contract prompt primes Loki"
+        );
+
+        // A later prompt failure and its reconnect preserve the logical state.
+        assert!(!state.include_contract());
+        state
+            .accept_session(Some(("first", true)))
+            .expect("exact resume after prompt failure");
+        assert!(!state.include_contract());
+        state.contract_succeeded(state.include_contract());
+        assert!(
+            !state.include_contract(),
+            "non-contract success stays primed"
+        );
+
+        let retained_id = state.resume_session();
+        let prior_primed = state.primed;
+        assert!(
+            state.accept_session(Some(("first", false))).is_err(),
+            "a replacement that starts new is rejected"
+        );
+        assert_eq!(state.resume_session(), retained_id);
+        assert_eq!(state.primed, prior_primed);
+        assert!(
+            state.accept_session(Some(("other", true))).is_err(),
+            "a different resumed ID is rejected"
+        );
+        assert_eq!(state.resume_session(), retained_id);
+        assert_eq!(state.primed, prior_primed);
+
+        // Begin only replaces pending per-turn context.
+        let mut pending_context = HashMap::new();
+        pending_context.insert((Target::Thor, Some(1)), "old per-turn context".to_string());
+        begin_request(&mut pending_context, "new request".to_string());
+        assert_eq!(pending_context.len(), 1);
+        assert_eq!(state.resume_session(), retained_id);
+        assert_eq!(state.primed, prior_primed);
+        assert!(
+            review_prompt(&[], &[], &[], true).contains("persistent read-only advisor"),
+            "an initial session receives Loki's contract"
+        );
+        assert!(
+            !review_prompt(&[], &[], &[], false).contains("persistent read-only advisor"),
+            "a primed session does not repeat Loki's contract"
+        );
     }
 }
