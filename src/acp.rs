@@ -5154,6 +5154,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn narrowed_worktree_root_allows_filesystem_and_terminal_mutations() {
+        let worktree = tempfile::tempdir().expect("delegated worktree");
+        let outside = tempfile::tempdir().expect("undelegated sibling");
+        let session_id = SessionId::new("session-1");
+        let state = RuntimeSessionState::new();
+        state
+            .set_active_session(session_id.clone(), worktree.path())
+            .await
+            .expect("active delegated worktree");
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let filesystem = LocalFileSystem::new(
+            state.clone(),
+            ui_tx.clone(),
+            DEFAULT_FS_TEXT_BYTES,
+            RuntimeAccessMode::Full,
+        );
+        let terminals = ManagedTerminals::with_session_state(ui_tx, state, RuntimeAccessMode::Full);
+
+        let patch_path = worktree.path().join("patched.txt");
+        let write = filesystem.write_text_file(WriteTextFileRequest::new(
+            session_id.clone(),
+            patch_path.clone(),
+            "patched",
+        ));
+        tokio::pin!(write);
+        tokio::select! {
+            _ = allow_next_permission(&mut ui_rx) => {}
+            result = &mut write => panic!("write completed before permission: {result:?}"),
+        }
+        write.await.expect("filesystem patch write");
+        assert_eq!(
+            tokio::fs::read_to_string(&patch_path)
+                .await
+                .expect("patched"),
+            "patched"
+        );
+
+        #[cfg(windows)]
+        let formatter = "echo formatted> formatted.txt";
+        #[cfg(not(windows))]
+        let formatter = "printf formatted > formatted.txt";
+        let (command, args) = terminal_test_command(formatter);
+        let created = terminals
+            .create(
+                CreateTerminalRequest::new(session_id.clone(), command)
+                    .args(args)
+                    .cwd(worktree.path().to_path_buf()),
+            )
+            .await
+            .expect("formatter-equivalent terminal command");
+        terminals
+            .wait_for_exit(WaitForTerminalExitRequest::new(
+                session_id.clone(),
+                created.terminal_id,
+            ))
+            .await
+            .expect("formatter command exits");
+        assert_eq!(
+            tokio::fs::read_to_string(worktree.path().join("formatted.txt"))
+                .await
+                .expect("formatted file"),
+            "formatted"
+        );
+
+        let outside_error = filesystem
+            .write_text_file(WriteTextFileRequest::new(
+                session_id.clone(),
+                outside.path().join("outside.txt"),
+                "outside",
+            ))
+            .await
+            .expect_err("filesystem write outside delegated worktree is denied");
+        assert!(
+            format!("{outside_error}").contains("outside active workspace roots"),
+            "error: {outside_error}"
+        );
+
+        let terminal_error = terminals
+            .resolve_terminal_cwd(
+                &CreateTerminalRequest::new(session_id, "formatter")
+                    .cwd(outside.path().to_path_buf()),
+            )
+            .await
+            .expect_err("terminal cwd outside delegated worktree is denied");
+        assert!(
+            format!("{terminal_error}").contains("outside active workspace roots"),
+            "error: {terminal_error}"
+        );
+    }
+
+    #[tokio::test]
     async fn local_filesystem_write_emits_diff_for_overwrite() {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_id = SessionId::new("session-1");

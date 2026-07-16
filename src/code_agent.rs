@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -219,6 +219,8 @@ pub struct RunContext {
 pub struct CodeAgentArgs {
     /// Complete, standalone coding task for the delegated agent.
     pub instructions: String,
+    /// Optional absolute implementation directory for this delegation.
+    pub cwd: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -259,7 +261,7 @@ impl McpHandler {
 
     #[tool(
         name = "code_agent",
-        description = "IMPLEMENTATION DELEGATE (EITRI). Treat this as delegation to a strong coding engineer with fresh context. Give Eitri one forgeable unit: a substantial, self-contained implementation slice that can be completed in one focused pass and returned as one coherent, reviewable diff. A good handoff has one clear outcome, enough context and decisions to begin immediately, explicit constraints and acceptance checks, and leaves the workspace coherent and testable. Delegate when implementation is clearly more work than writing the handoff and reviewing the result. Do NOT delegate trivial local edits, investigation better handled directly or with explore_agent, unresolved architectural questions, or an entire open-ended project; split large work into sequential, independently verifiable units. Thor owns research, planning, coordination, review, verification, and the final response, and should make small local changes directly when delegation would cost more effort. Every call starts a fresh ACP process/session with zero conversation or prior-call memory. Pass complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. The result includes the bounded full workspace diff attributable to this invocation. Review Eitri's result and diff independently and call it again for substantial corrections."
+        description = "IMPLEMENTATION DELEGATE (EITRI). Treat this as delegation to a strong coding engineer with fresh context. Give Eitri one forgeable unit: a substantial, self-contained implementation slice that can be completed in one focused pass and returned as one coherent, reviewable diff. A good handoff has one clear outcome, enough context and decisions to begin immediately, explicit constraints and acceptance checks, and leaves the workspace coherent and testable. For an explicitly authorized implementation worktree, pass its absolute cwd argument; do not infer a worktree from instructions. Delegate when implementation is clearly more work than writing the handoff and reviewing the result. Do NOT delegate trivial local edits, investigation better handled directly or with explore_agent, unresolved architectural questions, or an entire open-ended project; split large work into sequential, independently verifiable units. Thor owns research, planning, coordination, review, verification, and the final response, and should make small local changes directly when delegation would cost more effort. Every call starts a fresh ACP process/session with zero conversation or prior-call memory. Pass complete standalone instructions with the task, plan, relevant findings, current workspace state, and acceptance criteria. The result includes the bounded full workspace diff attributable to this invocation. Review Eitri's result and diff independently and call it again for substantial corrections."
     )]
     async fn code_agent(
         &self,
@@ -271,6 +273,7 @@ impl McpHandler {
                 None,
             ));
         }
+        let context = resolve_code_context(&self.context, args.cwd.as_deref()).await?;
         let Some(run_id) = self.controller.begin(RunKind::Code).await else {
             return Ok(CallToolResult::error(vec![Content::text(
                 "an Eitri implementation run is already active",
@@ -279,7 +282,7 @@ impl McpHandler {
 
         let result = await_supervisor(
             self.config.clone(),
-            self.context.clone(),
+            context,
             args.instructions,
             EitriPurpose::Code,
             self.ui_tx.clone(),
@@ -332,6 +335,80 @@ impl McpHandler {
             Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
         })
     }
+}
+
+/// Narrows an explicit implementation delegation to its requested worktree.
+/// The outer runtime has already authorized `cwd` and `additional_directories`;
+/// a delegation cannot use those roots to gain access to an arbitrary sibling.
+async fn resolve_code_context(
+    outer: &RunContext,
+    delegated_cwd: Option<&Path>,
+) -> std::result::Result<RunContext, McpError> {
+    let Some(delegated_cwd) = delegated_cwd else {
+        return Ok(outer.clone());
+    };
+    if !delegated_cwd.is_absolute() {
+        return Err(McpError::invalid_params(
+            "delegated cwd must be an absolute path",
+            None,
+        ));
+    }
+    let delegated_cwd = tokio::fs::canonicalize(delegated_cwd)
+        .await
+        .map_err(|error| {
+            McpError::invalid_params(
+                format!("delegated cwd must be an existing, accessible directory: {error}"),
+                None,
+            )
+        })?;
+    if !tokio::fs::metadata(&delegated_cwd)
+        .await
+        .map_err(|error| {
+            McpError::invalid_params(
+                format!("delegated cwd must be an existing, accessible directory: {error}"),
+                None,
+            )
+        })?
+        .is_dir()
+    {
+        return Err(McpError::invalid_params(
+            "delegated cwd must be an existing directory",
+            None,
+        ));
+    }
+
+    let mut authorized_roots = Vec::with_capacity(1 + outer.additional_directories.len());
+    authorized_roots.push(outer.cwd.clone());
+    authorized_roots.extend(outer.additional_directories.iter().cloned());
+    let mut contains_delegated_cwd = false;
+    for root in authorized_roots {
+        let root = tokio::fs::canonicalize(&root).await.map_err(|error| {
+            McpError::invalid_params(
+                format!("configured workspace root is inaccessible: {error}"),
+                None,
+            )
+        })?;
+        if delegated_cwd.starts_with(root) {
+            contains_delegated_cwd = true;
+            break;
+        }
+    }
+    if !contains_delegated_cwd {
+        return Err(McpError::invalid_params(
+            format!(
+                "delegated cwd {} is outside the authorized workspace roots; code_agent may only delegate within the current workspace root or configured additional workspace roots. Configure the target as an additional workspace root before delegating",
+                delegated_cwd.display()
+            ),
+            None,
+        ));
+    }
+
+    Ok(RunContext {
+        cwd: delegated_cwd,
+        additional_directories: Vec::new(),
+        fs_max_text_bytes: outer.fs_max_text_bytes,
+        access_mode: outer.access_mode,
+    })
 }
 
 impl ServerHandler for McpHandler {
@@ -1446,9 +1523,16 @@ mod tests {
 
     #[test]
     fn tool_arguments_are_strict() {
-        let parsed: CodeAgentArgs =
+        let parsed_without_cwd: CodeAgentArgs =
             serde_json::from_str(r#"{"instructions":"fix it"}"#).expect("valid arguments");
+        assert_eq!(parsed_without_cwd.instructions, "fix it");
+        assert_eq!(parsed_without_cwd.cwd, None);
+
+        let parsed: CodeAgentArgs =
+            serde_json::from_str(r#"{"instructions":"fix it","cwd":"/tmp/worktree"}"#)
+                .expect("valid arguments");
         assert_eq!(parsed.instructions, "fix it");
+        assert_eq!(parsed.cwd, Some(PathBuf::from("/tmp/worktree")));
         assert!(
             serde_json::from_str::<CodeAgentArgs>(r#"{"instructions":"fix it","unexpected":true}"#)
                 .is_err()
@@ -1465,6 +1549,58 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_str::<ExploreAgentArgs>("{}").is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_delegated_cwd_becomes_the_only_nested_workspace_root() {
+        let primary = tempfile::tempdir().expect("primary workspace");
+        let delegated = tempfile::tempdir().expect("delegated worktree");
+        let context = RunContext {
+            cwd: std::fs::canonicalize(primary.path()).expect("canonical primary"),
+            additional_directories: vec![
+                std::fs::canonicalize(delegated.path()).expect("canonical delegated worktree"),
+            ],
+            fs_max_text_bytes: 1,
+            access_mode: RuntimeAccessMode::Full,
+        };
+
+        let resolved = resolve_code_context(&context, Some(delegated.path()))
+            .await
+            .expect("authorized delegated worktree");
+
+        assert_eq!(
+            resolved.cwd,
+            std::fs::canonicalize(delegated.path()).expect("canonical delegated worktree")
+        );
+        assert!(resolved.additional_directories.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_delegated_cwd_rejects_undelegated_sibling_with_workspace_boundary() {
+        let workspace = tempfile::tempdir().expect("workspace parent");
+        let primary = workspace.path().join("primary");
+        let sibling = workspace.path().join("sibling");
+        tokio::fs::create_dir_all(&primary).await.expect("primary");
+        tokio::fs::create_dir_all(&sibling).await.expect("sibling");
+        let context = RunContext {
+            cwd: std::fs::canonicalize(&primary).expect("canonical primary"),
+            additional_directories: Vec::new(),
+            fs_max_text_bytes: 1,
+            access_mode: RuntimeAccessMode::Full,
+        };
+
+        let error = resolve_code_context(&context, Some(&sibling))
+            .await
+            .expect_err("sibling is not an authorized workspace root");
+        let diagnostic = format!("{error:?}");
+        assert!(
+            diagnostic.contains("authorized workspace roots"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("additional workspace root"),
+            "{diagnostic}"
+        );
     }
 
     #[test]
