@@ -411,6 +411,20 @@ async fn resolve_code_context(
     })
 }
 
+/// Returns the Git roots whose changes belong to one implementation delegation.
+/// An explicit `code_agent` cwd has already been narrowed by
+/// `resolve_code_context`, so this deliberately cannot reach outer siblings.
+fn implementation_workspace_roots(context: &RunContext) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(1 + context.additional_directories.len());
+    roots.push(context.cwd.clone());
+    roots.extend(context.additional_directories.iter().cloned());
+    roots
+}
+
+async fn capture_implementation_snapshot(context: &RunContext) -> WorkspaceSnapshot {
+    WorkspaceSnapshot::capture(&implementation_workspace_roots(context)).await
+}
+
 impl ServerHandler for McpHandler {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -1075,10 +1089,7 @@ async fn run(
     let _ = ui_tx.send(UiEvent::CodeAgent(start_event));
 
     let invocation_snapshot = if purpose.marks_implementation_delegation() {
-        let mut workspace_roots = Vec::with_capacity(1 + context.additional_directories.len());
-        workspace_roots.push(context.cwd.clone());
-        workspace_roots.extend(context.additional_directories.iter().cloned());
-        Some(WorkspaceSnapshot::capture(&workspace_roots).await)
+        Some(capture_implementation_snapshot(&context).await)
     } else {
         None
     };
@@ -1379,6 +1390,26 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
 
+    fn init_repo(root: &Path) {
+        for args in [
+            ["init", "-q"].as_slice(),
+            ["config", "user.email", "mjolnir@example.test"].as_slice(),
+            ["config", "user.name", "Mjolnir Tests"].as_slice(),
+            ["commit", "--allow-empty", "-qm", "baseline"].as_slice(),
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     #[test]
     fn collector_returns_last_agent_message() {
         let mut collector = AgentMessageCollector::new();
@@ -1573,6 +1604,123 @@ mod tests {
             std::fs::canonicalize(delegated.path()).expect("canonical delegated worktree")
         );
         assert!(resolved.additional_directories.is_empty());
+    }
+
+    #[tokio::test]
+    async fn external_delegated_worktree_snapshot_reports_external_changes_only() {
+        let workspace = tempfile::tempdir().expect("workspace parent");
+        let primary = workspace.path().join("primary");
+        let external = workspace.path().join("external");
+        std::fs::create_dir_all(&primary).expect("primary directory");
+        std::fs::create_dir_all(&external).expect("external directory");
+        init_repo(&primary);
+        init_repo(&external);
+        let primary = std::fs::canonicalize(&primary).expect("canonical primary");
+        let external = std::fs::canonicalize(&external).expect("canonical external");
+        let outer = RunContext {
+            cwd: primary.clone(),
+            additional_directories: vec![external.clone()],
+            fs_max_text_bytes: 1,
+            access_mode: RuntimeAccessMode::Full,
+        };
+
+        let delegated = resolve_code_context(&outer, Some(&external))
+            .await
+            .expect("authorized external worktree");
+        assert_eq!(
+            implementation_workspace_roots(&delegated),
+            vec![external.clone()]
+        );
+        let snapshot = capture_implementation_snapshot(&delegated).await;
+
+        std::fs::write(external.join("eitri-external.txt"), "changed by Eitri\n")
+            .expect("external change");
+
+        let delta = snapshot.delta().await;
+        assert!(delta.changed());
+        assert!(
+            delta
+                .receipt()
+                .contains(&format!("Repository: {}", external.display()))
+        );
+        assert!(
+            !delta
+                .receipt()
+                .contains(&format!("Repository: {}", primary.display()))
+        );
+        assert!(delta.receipt().contains("eitri-external.txt"));
+        let patch = delta.review_patch().expect("external review patch");
+        assert!(patch.contains(&format!("Repository: {}", external.display())));
+        assert!(patch.contains("eitri-external.txt"));
+    }
+
+    #[tokio::test]
+    async fn external_delegated_worktree_snapshot_reports_no_change_without_mutation() {
+        let workspace = tempfile::tempdir().expect("workspace parent");
+        let primary = workspace.path().join("primary");
+        let external = workspace.path().join("external");
+        std::fs::create_dir_all(&primary).expect("primary directory");
+        std::fs::create_dir_all(&external).expect("external directory");
+        init_repo(&primary);
+        init_repo(&external);
+        let outer = RunContext {
+            cwd: std::fs::canonicalize(&primary).expect("canonical primary"),
+            additional_directories: vec![
+                std::fs::canonicalize(&external).expect("canonical external worktree"),
+            ],
+            fs_max_text_bytes: 1,
+            access_mode: RuntimeAccessMode::Full,
+        };
+        let delegated = resolve_code_context(&outer, Some(&external))
+            .await
+            .expect("authorized external worktree");
+
+        let delta = capture_implementation_snapshot(&delegated)
+            .await
+            .delta()
+            .await;
+        assert!(!delta.changed());
+        assert_eq!(delta.receipt(), "No workspace changes.");
+        assert!(delta.review_patch().is_none());
+    }
+
+    #[tokio::test]
+    async fn delegation_without_cwd_keeps_primary_and_additional_snapshot_roots() {
+        let workspace = tempfile::tempdir().expect("workspace parent");
+        let primary = workspace.path().join("primary");
+        let additional = workspace.path().join("additional");
+        std::fs::create_dir_all(&primary).expect("primary directory");
+        std::fs::create_dir_all(&additional).expect("additional directory");
+        init_repo(&primary);
+        init_repo(&additional);
+        let context = RunContext {
+            cwd: std::fs::canonicalize(&primary).expect("canonical primary"),
+            additional_directories: vec![
+                std::fs::canonicalize(&additional).expect("canonical additional workspace"),
+            ],
+            fs_max_text_bytes: 1,
+            access_mode: RuntimeAccessMode::Full,
+        };
+
+        let resolved = resolve_code_context(&context, None)
+            .await
+            .expect("ordinary delegation context");
+        assert_eq!(
+            implementation_workspace_roots(&resolved),
+            vec![
+                context.cwd.clone(),
+                context.additional_directories[0].clone(),
+            ]
+        );
+        let snapshot = capture_implementation_snapshot(&resolved).await;
+        std::fs::write(
+            context.additional_directories[0].join("additional-change.txt"),
+            "changed\n",
+        )
+        .expect("additional change");
+        let delta = snapshot.delta().await;
+        assert!(delta.changed());
+        assert!(delta.receipt().contains("additional-change.txt"));
     }
 
     #[tokio::test]
