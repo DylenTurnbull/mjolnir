@@ -326,60 +326,22 @@ impl RuntimeSessionState {
     }
 }
 
-#[derive(Debug)]
-struct PrimaryPolicyState {
-    enabled: bool,
-    append_to_next_prompt: bool,
-    context_usage: Arc<ContextUsageTracker>,
-}
-
-impl PrimaryPolicyState {
-    fn new(code_agent_enabled: bool, context_usage: Arc<ContextUsageTracker>) -> Self {
-        Self {
-            enabled: code_agent_enabled,
-            append_to_next_prompt: code_agent_enabled,
-            context_usage,
-        }
-    }
-
-    fn take_for_prompt(&mut self) -> bool {
-        let compacted = self.context_usage.take_reinjection_needed();
-        (std::mem::take(&mut self.append_to_next_prompt) || compacted) && self.enabled
-    }
-
-    fn loaded_existing_session(&mut self) {
-        self.context_usage.reset_for_session();
-        self.append_to_next_prompt = self.enabled;
-    }
-}
-
 /// ACP does not expose a dedicated compaction notification. A decrease in the
 /// reported number of tokens currently in context is the portable signal that
-/// the agent replaced its history with a compacted one. A false positive only
-/// costs one redundant policy suffix on the next user prompt.
+/// the agent replaced its history with a compacted one.
 #[derive(Debug, Default)]
 struct ContextUsageTracker {
     last_used: AtomicU64,
-    reinjection_needed: AtomicBool,
 }
 
 impl ContextUsageTracker {
     fn observe(&self, used: u64) -> bool {
         let previous = self.last_used.swap(used, Ordering::AcqRel);
-        let compacted = previous > 0 && used < previous;
-        if compacted {
-            self.reinjection_needed.store(true, Ordering::Release);
-        }
-        compacted
+        previous > 0 && used < previous
     }
 
     fn reset_for_session(&self) {
         self.last_used.store(0, Ordering::Release);
-        self.reinjection_needed.store(false, Ordering::Release);
-    }
-
-    fn take_reinjection_needed(&self) -> bool {
-        self.reinjection_needed.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -1984,13 +1946,9 @@ async fn drive_session(
     // waits for the first prompt before it lists tools.
     //
     // The code-agent MCP server stays advertised for the session, and the
-    // first substantive prompt below still carries Thor's policy requiring use
-    // of `code_agent`/`explore_agent` when delegation is needed.
-    // Thor's policy rides as a suffix on the first real user message of any
-    // session (new, resumed, or loaded) and again after a detected context
-    // compaction, so the delegation contract survives history replacement.
+    // first substantive prompt below still has the code-agent MCP server
+    // available when delegation is needed.
     context_usage.reset_for_session();
-    let mut primary_policy = PrimaryPolicyState::new(code_agent_http.is_some(), context_usage);
     if !resumed && !saved_session_config.is_empty() {
         apply_saved_session_config(
             &conn,
@@ -2055,7 +2013,7 @@ async fn drive_session(
                     );
                 }
                 session_state.clear_permissions_cancelled(&session_id).await;
-                let prompt = prompt_content_blocks(text, images, primary_policy.take_for_prompt());
+                let prompt = prompt_content_blocks(text, images);
                 let req = PromptRequest::new(session_id.clone(), prompt);
                 if !drive_prompt_turn(
                     &conn,
@@ -2144,7 +2102,7 @@ async fn drive_session(
                     {
                         Ok(()) => {
                             let _ = responder.send(LoadSessionResult::Switched);
-                            primary_policy.loaded_existing_session();
+                            context_usage.reset_for_session();
                         }
                         Err(launch_err) => {
                             let _ = responder.send(LoadSessionResult::Fallback {
@@ -2188,7 +2146,7 @@ async fn drive_session(
                 {
                     Ok(switched_session_id) => {
                         session_id = switched_session_id;
-                        primary_policy.loaded_existing_session();
+                        context_usage.reset_for_session();
                         let _ = responder.send(LoadSessionResult::Switched);
                     }
                     Err(launch_err) => {
@@ -4756,16 +4714,7 @@ fn git_head_object_spec(rel_path: &Path) -> Option<String> {
     Some(format!("HEAD:{path}"))
 }
 
-fn prompt_content_blocks(
-    mut text: String,
-    images: Vec<PromptImage>,
-    append_primary_policy: bool,
-) -> Vec<ContentBlock> {
-    let policy_after_images = append_primary_policy && text.is_empty();
-    if append_primary_policy && !text.is_empty() {
-        text.push_str("\n\n");
-        text.push_str(code_agent::PRIMARY_SESSION_DIRECTIVE);
-    }
+fn prompt_content_blocks(text: String, images: Vec<PromptImage>) -> Vec<ContentBlock> {
     let mut content = Vec::new();
     if !text.is_empty() {
         content.push(ContentBlock::Text(TextContent::new(text)));
@@ -4775,11 +4724,6 @@ fn prompt_content_blocks(
             ContentBlock::Image(ImageContent::new(image.data_base64, image.mime_type))
         }),
     );
-    if policy_after_images {
-        content.push(ContentBlock::Text(TextContent::new(
-            code_agent::PRIMARY_SESSION_DIRECTIVE,
-        )));
-    }
     content
 }
 
@@ -4824,39 +4768,6 @@ mod tests {
     }
 
     #[test]
-    fn primary_policy_is_appended_once_for_a_new_session() {
-        let mut policy = PrimaryPolicyState::new(true, Arc::default());
-
-        assert!(policy.take_for_prompt());
-        assert!(!policy.take_for_prompt());
-    }
-
-    #[test]
-    fn loading_an_existing_session_rearms_the_policy() {
-        let mut policy = PrimaryPolicyState::new(true, Arc::default());
-        assert!(policy.take_for_prompt());
-
-        policy.loaded_existing_session();
-        assert!(policy.take_for_prompt());
-        assert!(!policy.take_for_prompt());
-    }
-
-    #[test]
-    fn context_usage_drop_requests_policy_reinjection() {
-        let usage = Arc::new(ContextUsageTracker::default());
-        let mut policy = PrimaryPolicyState::new(true, usage.clone());
-        assert!(policy.take_for_prompt());
-
-        usage.observe(20_000);
-        usage.observe(24_000);
-        assert!(!policy.take_for_prompt());
-
-        usage.observe(7_000);
-        assert!(policy.take_for_prompt());
-        assert!(!policy.take_for_prompt());
-    }
-
-    #[test]
     fn exact_command_discovery_does_not_guess_aliases_or_case() {
         let commands = HashSet::from(["compact".to_string(), "clear".to_string()]);
 
@@ -4882,23 +4793,10 @@ mod tests {
     fn context_usage_reset_does_not_treat_new_session_as_compaction() {
         let usage = ContextUsageTracker::default();
         usage.observe(20_000);
-        usage.observe(7_000);
-        assert!(usage.take_reinjection_needed());
+        assert!(usage.observe(7_000));
 
         usage.reset_for_session();
-        usage.observe(2_000);
-        assert!(!usage.take_reinjection_needed());
-    }
-
-    #[test]
-    fn compaction_reinjection_is_suppressed_without_code_agent() {
-        let usage = Arc::new(ContextUsageTracker::default());
-        let mut policy = PrimaryPolicyState::new(false, usage.clone());
-        assert!(!policy.take_for_prompt());
-
-        usage.observe(20_000);
-        usage.observe(7_000);
-        assert!(!policy.take_for_prompt());
+        assert!(!usage.observe(2_000));
     }
 
     #[test]
@@ -5045,7 +4943,6 @@ mod tests {
                 width: 640,
                 height: 480,
             }],
-            false,
         );
 
         assert_eq!(blocks.len(), 2);
@@ -5063,23 +4960,35 @@ mod tests {
     }
 
     #[test]
-    fn first_prompt_appends_primary_policy_after_user_text() {
-        let blocks = prompt_content_blocks("build the thing".to_string(), Vec::new(), true);
+    fn first_and_subsequent_text_prompts_preserve_exact_user_text_without_primary_policy() {
+        for expected in ["build the thing", "continue normally"] {
+            let blocks = prompt_content_blocks(expected.to_string(), Vec::new());
 
-        assert_eq!(blocks.len(), 1);
-        let ContentBlock::Text(text) = &blocks[0] else {
-            panic!("expected text block");
-        };
-        assert!(
-            text.text
-                .starts_with("build the thing\n\n<mj-code-agent-policy>")
-        );
-        assert!(text.text.ends_with("</mj-code-agent-policy>"));
-        assert!(!text.text.contains("MJ_CODE_AGENT_POLICY_READY"));
+            assert_eq!(blocks.len(), 1);
+            let ContentBlock::Text(text) = &blocks[0] else {
+                panic!("expected text block");
+            };
+            assert_eq!(text.text, expected);
+            assert!(!text.text.contains("<mj-code-agent-policy>"));
+        }
     }
 
     #[test]
-    fn image_only_first_prompt_puts_primary_policy_last() {
+    fn prompt_after_compaction_preserves_exact_user_text_without_primary_policy() {
+        let usage = ContextUsageTracker::default();
+        assert!(!usage.observe(20_000));
+        assert!(usage.observe(7_000));
+
+        let blocks = prompt_content_blocks("continue work".to_string(), Vec::new());
+        let ContentBlock::Text(text) = &blocks[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(text.text, "continue work");
+        assert!(!text.text.contains("<mj-code-agent-policy>"));
+    }
+
+    #[test]
+    fn image_only_prompt_does_not_gain_primary_policy_text_block() {
         let blocks = prompt_content_blocks(
             String::new(),
             vec![PromptImage {
@@ -5088,14 +4997,10 @@ mod tests {
                 width: 1,
                 height: 1,
             }],
-            true,
         );
 
+        assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0], ContentBlock::Image(_)));
-        let ContentBlock::Text(policy) = &blocks[1] else {
-            panic!("expected policy text after image");
-        };
-        assert!(policy.text.starts_with("<mj-code-agent-policy>"));
     }
 
     #[test]

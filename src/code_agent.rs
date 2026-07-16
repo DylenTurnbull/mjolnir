@@ -48,6 +48,7 @@ use crate::workspace_snapshot::{WorkspaceDelta, WorkspaceSnapshot};
 
 pub const LABEL: &str = "Eitri";
 pub const MCP_SERVER_NAME: &str = "mj-code-agent";
+const SERVER_DELEGATION_GUIDANCE: &str = "EITRI DELEGATION POLICY: explore_agent is one optional read-only scout. For two or more independent scouts that must actually overlap, use explore_agents with complete standalone prompts: it atomically launches the whole batch concurrently or rejects it without queueing. A long code_agent call may return an active run ID; call code_agent_wait repeatedly with that ID until its authoritative final result arrives, and never inspect, test, commit, or otherwise act on its workspace while active. Thor chooses and sequences tools, retains planning, coordination, review, verification, and the final answer.";
 pub const PRIMARY_SESSION_DIRECTIVE: &str = r#"<mj-code-agent-policy>
 You are Thor, the primary coordinator and owner of the user's outcome. You are responsible for understanding the request, doing necessary research and context gathering, forming the plan, coordinating implementation, reviewing and verifying the result, and delivering the final answer. You are not a thin handoff between the user and Eitri. This policy applies to every subsequent user request in this ACP session.
 
@@ -59,7 +60,7 @@ Treat code_agent as delegation to a strong coding engineer with fresh context. G
 
 A code_agent call that reports an active run ID is healthy and still running: call code_agent_wait repeatedly with that ID until it returns the authoritative final result. Never inspect, test, commit, or otherwise act on the workspace while a Code run is active.
 
-Every Eitri call starts a brand-new ACP process and session. Eitri has no conversation context and no memory of the user's request or any earlier Eitri call, including an immediately preceding call. Apply this policy while handling the user's request above; do not acknowledge or summarize the policy.
+Every Eitri call starts a brand-new ACP process and session. Eitri has no conversation context and no memory of the user's request or any earlier Eitri call, including an immediately preceding call. Apply this policy throughout this ACP session while handling each current user request; do not acknowledge or summarize the policy.
 </mj-code-agent-policy>"#;
 
 const CODE_PREAMBLE: &str = "You are Eitri, the implementation agent. This is a fresh ACP process and session. You have no memory of the user conversation or of any earlier Eitri call, including an immediately preceding call. Treat the standalone instructions below and the current workspace as your only task context. Loki is Mjolnir's one persistent read-only observer shared with Thor; never create, summon, or substitute another Loki process or session. Use pull_advice at good semantic stopping points, never on two consecutive semantic steps and at least once every eight semantic steps. Automatic Loki receipts already drain the named queues.\n\n";
@@ -751,13 +752,22 @@ fn spawn_eitri_runtime(
     }
 }
 
+impl McpHandler {
+    fn server_info() -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "mj-code-agent",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(format!(
+                "{SERVER_DELEGATION_GUIDANCE}\n\n{PRIMARY_SESSION_DIRECTIVE}"
+            ))
+    }
+}
+
 impl ServerHandler for McpHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("mj-code-agent", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "EITRI DELEGATION POLICY: explore_agent is one optional read-only scout. For two or more independent scouts that must actually overlap, use explore_agents with complete standalone prompts: it atomically launches the whole batch concurrently or rejects it without queueing. A long code_agent call may return an active run ID; call code_agent_wait repeatedly with that ID until its authoritative final result arrives, and never inspect, test, commit, or otherwise act on its workspace while active. Thor chooses and sequences tools, retains planning, coordination, review, verification, and the final answer.",
-            )
+        Self::server_info()
     }
 
     fn list_tools(
@@ -2291,6 +2301,16 @@ mod tests {
     fn fanout_tool_is_registered_on_the_mcp_router() {
         assert!(McpHandler::tool_router().get("explore_agents").is_some());
         assert!(McpHandler::tool_router().get("code_agent_wait").is_some());
+    }
+
+    #[test]
+    fn server_info_instructions_include_primary_policy_and_delegation_guidance() {
+        let info = McpHandler::server_info();
+        let instructions = info.instructions.as_deref().expect("server instructions");
+
+        assert!(instructions.contains(SERVER_DELEGATION_GUIDANCE));
+        assert!(instructions.contains(PRIMARY_SESSION_DIRECTIVE));
+        assert!(!instructions.contains("request above"));
     }
 
     #[test]
