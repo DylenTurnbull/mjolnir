@@ -2340,6 +2340,11 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             UiEvent::CouncilUsage(record) => self.council_usage.observe(record),
+            UiEvent::CouncilRoleChanged { role, model } => match role {
+                crate::council_usage::Role::Thor => self.active_council_models.thor = model,
+                crate::council_usage::Role::Loki => self.active_council_models.loki = model,
+                crate::council_usage::Role::Eitri => self.active_council_models.eitri = model,
+            },
             UiEvent::WorkspaceDiff(diff) => {
                 self.pending_workspace_diff_total = Some(diff.total_files);
                 self.workspace_diffs.push(diff);

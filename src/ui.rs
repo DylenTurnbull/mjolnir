@@ -716,6 +716,7 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::ClaudeUsage(_)
         | UiEvent::CodexUsage(_)
         | UiEvent::CouncilUsage(_)
+        | UiEvent::CouncilRoleChanged { .. }
         | UiEvent::PromptFailed { .. }
         | UiEvent::SessionForkFailed { .. }
         | UiEvent::RemotePermissionDecision { .. }

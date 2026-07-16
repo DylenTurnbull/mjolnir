@@ -39,6 +39,9 @@ pub struct Config {
     /// Eitri's model preference.
     #[serde(default, skip_serializing_if = "EitriConfig::is_default")]
     pub eitri: EitriConfig,
+    /// Council-wide runtime behavior.
+    #[serde(default, skip_serializing_if = "CouncilConfig::is_default")]
+    pub council: CouncilConfig,
     /// ACP adapter enablement and explicit user-provisioned servers.
     #[serde(default, skip_serializing_if = "AcpConfig::is_default")]
     pub acp: AcpConfig,
@@ -56,9 +59,30 @@ impl Default for Config {
             thor: ThorConfig::default(),
             loki: LokiConfig::default(),
             eitri: EitriConfig::default(),
+            council: CouncilConfig::default(),
             acp: AcpConfig::default(),
             ragnarok: RagnarokConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CouncilConfig {
+    #[serde(default = "default_true")]
+    pub auto_failover: bool,
+}
+
+impl Default for CouncilConfig {
+    fn default() -> Self {
+        Self {
+            auto_failover: true,
+        }
+    }
+}
+
+impl CouncilConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -604,6 +628,9 @@ mod tests {
                 model: "gpt-5-6-sol".to_string(),
                 discrete_review: false,
             },
+            council: CouncilConfig {
+                auto_failover: false,
+            },
             acp: AcpConfig {
                 servers: vec![ConfiguredAcpServer {
                     id: "custom:company".to_string(),
@@ -623,6 +650,7 @@ mod tests {
         assert_eq!(loaded.theme, TerminalThemeKind::Light);
         assert_eq!(loaded.thor.model, "gpt-5-6-sol");
         assert!(!loaded.thor.discrete_review);
+        assert!(!loaded.council.auto_failover);
         assert_eq!(loaded.acp.servers[0].id, "custom:company");
         assert_eq!(loaded.acp.servers[0].args, vec!["--stdio"]);
     }

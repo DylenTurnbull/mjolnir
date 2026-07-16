@@ -147,6 +147,7 @@ pub struct Config {
     pub implementation_handoff_counter: Option<Arc<AtomicUsize>>,
     pub active_implementation_workers: ActiveCodeWorkers,
     pub max_parallel_explores: usize,
+    role_pool: Option<crate::quota::RolePool>,
     warm: Arc<WarmPool>,
 }
 
@@ -163,6 +164,7 @@ struct WarmSlots {
 
 struct WarmRuntime {
     context: RunContext,
+    role_key: String,
     events: mpsc::UnboundedReceiver<UiEvent>,
     commands: mpsc::UnboundedSender<UiCommand>,
     task: JoinHandle<Result<()>>,
@@ -185,10 +187,11 @@ impl Drop for WarmPool {
 
 impl Config {
     pub fn council(
-        role: ResolvedRole,
+        role_pool: crate::quota::RolePool,
         agent_stderr: Option<PathBuf>,
         loki: Option<loki::Handle>,
     ) -> Self {
+        let role = role_pool.current();
         Self {
             display_label: format!("Eitri · {}", role.model.model),
             command: role.launch.command,
@@ -206,6 +209,7 @@ impl Config {
             implementation_handoff_counter: None,
             active_implementation_workers: ActiveCodeWorkers::default(),
             max_parallel_explores: 6,
+            role_pool: Some(role_pool),
             warm: Arc::default(),
         }
     }
@@ -237,6 +241,15 @@ impl Config {
             EitriPurpose::Code => &mut slots.code,
             EitriPurpose::Explore => &mut slots.explore,
         };
+        let role_key = self.role_key();
+        if slot
+            .as_ref()
+            .is_some_and(|runtime| runtime.context != context || runtime.role_key != role_key)
+        {
+            let stale = slot.take().expect("checked warm slot disappeared");
+            stale.cancel.cancel();
+            let _ = stale.commands.send(UiCommand::Shutdown);
+        }
         if slot.is_none() {
             *slot = Some(spawn_eitri_runtime(self, context, purpose, None));
         }
@@ -256,14 +269,40 @@ impl Config {
             failed.cancel.cancel();
             let _ = failed.commands.send(UiCommand::Shutdown);
         }
+        let role_key = self.role_key();
         if slot
             .as_ref()
-            .is_some_and(|runtime| runtime.context == *context)
+            .is_some_and(|runtime| runtime.context == *context && runtime.role_key == role_key)
         {
             slot.take()
         } else {
             None
         }
+    }
+
+    fn role_key(&self) -> String {
+        self.role_config
+            .as_ref()
+            .map(|role| format!("{}\0{}", role.adapter_source_id, role.model_id))
+            .unwrap_or_else(|| self.display_label.clone())
+    }
+
+    fn apply_role(&mut self, role: ResolvedRole) {
+        self.display_label = format!("Eitri · {}", role.model.model);
+        self.command = role.launch.command;
+        self.args = role.launch.args;
+        self.env = role.launch.env;
+        let council_session = self
+            .role_config
+            .as_ref()
+            .and_then(|config| config.council_session.clone());
+        self.role_config = Some(acp::RuntimeRoleConfig {
+            label: LABEL.to_string(),
+            model_id: role.model.model,
+            model_value: role.model_value,
+            adapter_source_id: role.launch.source_id,
+            council_session,
+        });
     }
 }
 
@@ -703,6 +742,7 @@ fn spawn_eitri_runtime(
     let task = tokio::spawn(acp::run(runtime_config, event_tx, command_rx));
     WarmRuntime {
         context,
+        role_key: config.role_key(),
         events,
         commands,
         task,
@@ -1655,7 +1695,7 @@ impl Drop for RequestDropGuard {
 }
 
 async fn run(
-    config: Config,
+    mut config: Config,
     context: RunContext,
     task: String,
     purpose: EitriPurpose,
@@ -1667,6 +1707,23 @@ async fn run(
         run_id,
         termination,
     } = lease;
+    let mut quota_role = None;
+    if let Some(pool) = config.role_pool.clone() {
+        match pool.select_for_work().await {
+            Ok(selection) => {
+                quota_role = Some(selection.role.clone());
+                config.apply_role(selection.role);
+            }
+            Err(message) => {
+                return EitriRunResult {
+                    outcome: Err(anyhow!(
+                        "{message}. The delegation was not started; Thor should decide how to proceed."
+                    )),
+                    workspace_delta: None,
+                };
+            }
+        }
+    }
     let log_role = config.role_config.clone();
     tracing::info!(
         event = "eitri_worker_started",
@@ -1757,6 +1814,7 @@ async fn run(
     };
     let mut tracker = loki::BoundaryTracker::default();
     let mut latest_usage_update: Option<UsageUpdate> = None;
+    let mut session_id = None;
     let mut joined_runtime_result = None;
     let result = loop {
         tokio::select! {
@@ -1804,7 +1862,8 @@ async fn run(
                 match event {
                     UiEvent::Connected { .. } => {}
                     UiEvent::ContextCompacted => {}
-                    UiEvent::SessionStarted { .. } if !prompt_sent => {
+                    UiEvent::SessionStarted { session_id: started, .. } if !prompt_sent => {
+                        session_id = Some(started);
                         prompt_sent = true;
                         if nested_cmd_tx
                             .send(UiCommand::SendPrompt {
@@ -1885,6 +1944,7 @@ async fn run(
                             }),
                             usage,
                             update: latest_usage_update.take(),
+                            session_id: session_id.clone(),
                         }));
                         if matches!(stop_reason, StopReason::Cancelled) {
                             break Err(anyhow!("Eitri cancelled"));
@@ -1899,6 +1959,7 @@ async fn run(
                     UiEvent::ClaudeUsage(_)
                     | UiEvent::CodexUsage(_)
                     | UiEvent::CouncilUsage(_)
+                    | UiEvent::CouncilRoleChanged { .. }
                     | UiEvent::RemotePermissionDecision { .. }
                     | UiEvent::LokiActivity(_)
                     | UiEvent::InternalMessage(_) => {}
@@ -1960,6 +2021,14 @@ async fn run(
         Some(snapshot) => Some(snapshot.delta().await),
         None => None,
     };
+
+    if result
+        .as_ref()
+        .is_err_and(|error| !error.to_string().contains("cancelled"))
+        && let (Some(pool), Some(role)) = (config.role_pool.as_ref(), quota_role.as_ref())
+    {
+        pool.observe_failure(role).await;
+    }
 
     let outcome = match &result {
         Ok(_) => CodeAgentOutcome::Completed,
@@ -2861,6 +2930,7 @@ mod tests {
             implementation_handoff_counter: None,
             active_implementation_workers: ActiveCodeWorkers::default(),
             max_parallel_explores: 1,
+            role_pool: None,
             warm: Arc::default(),
         };
         let context = RunContext {
@@ -2875,6 +2945,7 @@ mod tests {
         let task = tokio::spawn(std::future::pending());
         config.warm.slots.lock().unwrap().code = Some(WarmRuntime {
             context: context.clone(),
+            role_key: config.role_key(),
             events,
             commands,
             task,
@@ -2906,6 +2977,7 @@ mod tests {
             implementation_handoff_counter: None,
             active_implementation_workers: ActiveCodeWorkers::default(),
             max_parallel_explores: 1,
+            role_pool: None,
             warm: Arc::default(),
         };
         let context = RunContext {
@@ -2922,6 +2994,7 @@ mod tests {
         assert!(task.is_finished());
         config.warm.slots.lock().unwrap().code = Some(WarmRuntime {
             context: context.clone(),
+            role_key: config.role_key(),
             events,
             commands,
             task,

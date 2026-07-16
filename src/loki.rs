@@ -1258,7 +1258,7 @@ pub struct Handle {
 
 impl Handle {
     pub fn start(
-        role: ResolvedRole,
+        role_pool: crate::quota::RolePool,
         cwd: PathBuf,
         additional_directories: Vec<PathBuf>,
         ui_tx: mpsc::UnboundedSender<UiEvent>,
@@ -1294,7 +1294,7 @@ impl Handle {
             review_started,
         };
         tokio::spawn(worker(
-            role,
+            role_pool,
             cwd,
             additional_directories,
             ui_tx,
@@ -1550,7 +1550,7 @@ impl Handle {
 
 #[allow(clippy::too_many_arguments)]
 async fn worker(
-    role: ResolvedRole,
+    role_pool: crate::quota::RolePool,
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
@@ -1566,6 +1566,7 @@ async fn worker(
     pending_eitri: Arc<AtomicU64>,
     council_session: String,
 ) {
+    let mut role = role_pool.current();
     let mut epoch = 0;
     let mut pending_context: HashMap<(Target, Option<u64>), String> = HashMap::new();
     let mut session: Option<AgentHandle> = None;
@@ -1655,6 +1656,32 @@ async fn worker(
                     compact_requests.push((trigger, responder));
                 }
                 Request::Shutdown => break 'worker,
+            }
+        }
+        if !batch.is_empty() {
+            match role_pool.select_for_work().await {
+                Ok(selection) => {
+                    if selection.role.model.model != role.model.model
+                        || selection.role.launch.source_id != role.launch.source_id
+                    {
+                        if let Some(old) = session.take() {
+                            old.dismiss().await;
+                        }
+                        role = selection.role;
+                        review_state = LokiReviewState::default();
+                        compact_threshold = CompactThreshold::default();
+                        automatic_compact = None;
+                    }
+                }
+                Err(_) => {
+                    for item in &batch {
+                        match item.target {
+                            Target::Thor => decrement_pending(&pending_thor),
+                            Target::Eitri => decrement_pending(&pending_eitri),
+                        }
+                    }
+                    continue;
+                }
             }
         }
         let Some(server) = server.as_ref() else {
@@ -1799,6 +1826,9 @@ async fn worker(
                 purpose: None,
                 usage: outcome.usage.clone(),
                 update: outcome.usage_update.clone(),
+                session_id: agent
+                    .session_started()
+                    .map(|(session_id, _)| session_id.to_string()),
             }));
             if let Some(used) = outcome.usage_update.as_ref().map(|usage| usage.used)
                 && compact_threshold.observe(used)
@@ -1808,7 +1838,8 @@ async fn worker(
         }
         let accepted = advice.finish(id).await;
         if let Err(error) = result {
-            if !*abort_rx.borrow() {
+            let quota_failure = role_pool.observe_failure(&role).await;
+            if !quota_failure && !*abort_rx.borrow() {
                 emit_warning(&ui_tx, &role, format!("Loki review failed open: {error}"));
             }
             if let Some(old) = session.take() {

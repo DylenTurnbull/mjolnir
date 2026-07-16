@@ -1,0 +1,414 @@
+//! Proactive quota gating for Council background roles.
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
+
+use crate::claude_usage::{ClaudeUsageReport, ClaudeUsageStatus};
+use crate::codex_usage::{CodexUsageClient, CodexUsageReport, CodexUsageStatus};
+use crate::council::{AdapterKind, ResolvedRole};
+use crate::event::UiEvent;
+
+const CACHE_TTL: Duration = Duration::from_secs(60);
+const REMAINING_LIMIT_PERCENT: u8 = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Check {
+    Clear,
+    NearLimit { resets_at: Option<i64> },
+    Unavailable,
+}
+
+struct Cached {
+    checked_at: Instant,
+    result: Check,
+}
+
+#[derive(Clone)]
+pub struct Gate {
+    cwd: PathBuf,
+    cache: Arc<AsyncMutex<HashMap<String, Cached>>>,
+    probe_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    codex: Arc<AsyncMutex<Option<CodexUsageClient>>>,
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
+}
+
+impl Gate {
+    pub fn new(cwd: PathBuf, ui_tx: mpsc::UnboundedSender<UiEvent>) -> Self {
+        Self {
+            cwd,
+            cache: Arc::default(),
+            probe_locks: Arc::default(),
+            codex: Arc::default(),
+            ui_tx,
+        }
+    }
+
+    pub async fn check(&self, role: &ResolvedRole) -> Check {
+        self.check_inner(role, false).await
+    }
+
+    async fn refresh(&self, role: &ResolvedRole) -> Check {
+        self.check_inner(role, true).await
+    }
+
+    async fn check_inner(&self, role: &ResolvedRole, force: bool) -> Check {
+        let key = role.launch.source_id.clone();
+        if !force {
+            let cached = self.cache.lock().await.get(&key).and_then(|cached| {
+                (cached.checked_at.elapsed() <= CACHE_TTL).then(|| cached.result.clone())
+            });
+            if let Some(cached) = cached {
+                return cached;
+            }
+        }
+        let probe_lock = self
+            .probe_locks
+            .lock()
+            .await
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        let _probe = probe_lock.lock().await;
+        if !force {
+            let cached = self.cache.lock().await.get(&key).and_then(|cached| {
+                (cached.checked_at.elapsed() <= CACHE_TTL).then(|| cached.result.clone())
+            });
+            if let Some(cached) = cached {
+                return cached;
+            }
+        }
+
+        let result = match role.launch.kind {
+            AdapterKind::Claude => {
+                match crate::claude_usage::query(self.cwd.clone(), role.launch.env.clone()).await {
+                    Ok(report) => {
+                        let result = claude_check(&report);
+                        let _ = self
+                            .ui_tx
+                            .send(UiEvent::ClaudeUsage(ClaudeUsageStatus::Available(report)));
+                        result
+                    }
+                    Err(error) => {
+                        let _ =
+                            self.ui_tx
+                                .send(UiEvent::ClaudeUsage(ClaudeUsageStatus::Unavailable(
+                                    error.user_reason().to_string(),
+                                )));
+                        Check::Unavailable
+                    }
+                }
+            }
+            AdapterKind::Codex => {
+                let mut client = self.codex.lock().await;
+                match crate::codex_usage::refresh(
+                    &mut client,
+                    self.cwd.clone(),
+                    role.launch.env.clone(),
+                )
+                .await
+                {
+                    CodexUsageStatus::Available(report) => {
+                        let result = codex_check(&report);
+                        let _ = self
+                            .ui_tx
+                            .send(UiEvent::CodexUsage(CodexUsageStatus::Available(report)));
+                        result
+                    }
+                    CodexUsageStatus::Unavailable(reason) => {
+                        let _ = self
+                            .ui_tx
+                            .send(UiEvent::CodexUsage(CodexUsageStatus::Unavailable(reason)));
+                        Check::Unavailable
+                    }
+                }
+            }
+            AdapterKind::Anvil | AdapterKind::OpenCode | AdapterKind::Custom => Check::Unavailable,
+        };
+        self.cache.lock().await.insert(
+            key,
+            Cached {
+                checked_at: Instant::now(),
+                result: result.clone(),
+            },
+        );
+        result
+    }
+}
+
+fn claude_check(report: &ClaudeUsageReport) -> Check {
+    let near = [&report.five_hour, &report.week]
+        .into_iter()
+        .flatten()
+        .any(|window| window.remaining_percent <= REMAINING_LIMIT_PERCENT);
+    if near {
+        Check::NearLimit { resets_at: None }
+    } else {
+        Check::Clear
+    }
+}
+
+fn codex_check(report: &CodexUsageReport) -> Check {
+    let windows = [&report.primary, &report.secondary]
+        .into_iter()
+        .flatten()
+        .filter(|window| window.remaining_percent <= REMAINING_LIMIT_PERCENT)
+        .collect::<Vec<_>>();
+    if windows.is_empty() {
+        Check::Clear
+    } else {
+        Check::NearLimit {
+            resets_at: windows.iter().filter_map(|window| window.resets_at).min(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Selection {
+    pub role: ResolvedRole,
+}
+
+#[derive(Clone)]
+pub struct RolePool {
+    roles: Arc<Vec<ResolvedRole>>,
+    state: Arc<Mutex<PoolState>>,
+    gate: Gate,
+    auto_failover: bool,
+    role: crate::council_usage::Role,
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
+}
+
+#[derive(Default)]
+struct PoolState {
+    current: usize,
+    excluded_providers: HashSet<String>,
+    announced_block: bool,
+}
+
+impl RolePool {
+    pub fn new(
+        roles: Vec<ResolvedRole>,
+        gate: Gate,
+        auto_failover: bool,
+        role: crate::council_usage::Role,
+        ui_tx: mpsc::UnboundedSender<UiEvent>,
+    ) -> Self {
+        assert!(!roles.is_empty(), "role pool requires an initial role");
+        Self {
+            roles: Arc::new(roles),
+            state: Arc::default(),
+            gate,
+            auto_failover,
+            role,
+            ui_tx,
+        }
+    }
+
+    pub fn current(&self) -> ResolvedRole {
+        let state = self.state.lock().expect("role pool poisoned");
+        self.roles[state.current].clone()
+    }
+
+    pub async fn select_for_work(&self) -> Result<Selection, String> {
+        loop {
+            let role = {
+                let state = self.state.lock().expect("role pool poisoned");
+                self.roles[state.current].clone()
+            };
+            match self.gate.check(&role).await {
+                Check::Clear | Check::Unavailable => {
+                    self.state
+                        .lock()
+                        .expect("role pool poisoned")
+                        .announced_block = false;
+                    return Ok(Selection { role });
+                }
+                Check::NearLimit { resets_at } => {
+                    if self.handle_near_limit(&role, resets_at) {
+                        continue;
+                    }
+                    return Err(format!(
+                        "{} is paused because {} quota has 5% or less remaining",
+                        self.label(),
+                        role.launch.source_id
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Recheck a provider after an agent error. A positive quota result is
+    /// handled here so callers can suppress the ordinary failure message.
+    pub async fn observe_failure(&self, role: &ResolvedRole) -> bool {
+        match self.gate.refresh(role).await {
+            Check::NearLimit { resets_at } => {
+                self.handle_near_limit(role, resets_at);
+                true
+            }
+            Check::Clear | Check::Unavailable => false,
+        }
+    }
+
+    /// Returns true when the current role moved to a fallback.
+    fn handle_near_limit(&self, failed: &ResolvedRole, resets_at: Option<i64>) -> bool {
+        let provider = failed.launch.source_id.clone();
+        let mut state = self.state.lock().expect("role pool poisoned");
+        state.excluded_providers.insert(provider.clone());
+        if self.roles[state.current].launch.source_id != provider {
+            return true;
+        }
+        let next = self.auto_failover.then(|| {
+            self.roles.iter().enumerate().find(|(_, candidate)| {
+                !state
+                    .excluded_providers
+                    .contains(&candidate.launch.source_id)
+            })
+        });
+        if let Some((next, replacement)) = next.flatten() {
+            state.current = next;
+            state.announced_block = false;
+            let _ = self.ui_tx.send(UiEvent::Info(format!(
+                "{} quota guard switched {} to {}",
+                self.label(),
+                failed.model.model,
+                replacement.model.model
+            )));
+            let _ = self.ui_tx.send(UiEvent::CouncilRoleChanged {
+                role: self.role,
+                model: replacement.model.model.clone(),
+            });
+            return true;
+        }
+        if !state.announced_block {
+            let reset = resets_at
+                .and_then(crate::usage_format::format_reset_local_seconds)
+                .map(|value| format!(" until {value}"))
+                .unwrap_or_default();
+            let _ = self.ui_tx.send(UiEvent::Warning(format!(
+                "{} paused: {} quota has 5% or less remaining{}",
+                self.label(),
+                provider,
+                reset
+            )));
+            state.announced_block = true;
+        }
+        false
+    }
+
+    fn label(&self) -> &'static str {
+        match self.role {
+            crate::council_usage::Role::Thor => "Thor",
+            crate::council_usage::Role::Loki => "Loki",
+            crate::council_usage::Role::Eitri => "Eitri",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude_usage::ClaudeUsageWindow;
+    use crate::codex_usage::CodexUsageWindow;
+    use crate::council::{AdapterKind, AdapterLaunch};
+    use crate::deepswe::Row;
+
+    fn role(model: &str, source_id: &str, kind: AdapterKind) -> ResolvedRole {
+        ResolvedRole {
+            model: Row {
+                model: model.into(),
+                reasoning_effort: None,
+                pass_at_1: 0.5,
+                mean_cost_usd: 1.0,
+            },
+            model_value: model.into(),
+            launch: AdapterLaunch {
+                kind,
+                source_id: source_id.into(),
+                command: PathBuf::from(source_id),
+                args: Vec::new(),
+                env: HashMap::new(),
+            },
+            ranked: true,
+        }
+    }
+
+    #[test]
+    fn claude_any_window_at_five_percent_is_near_limit() {
+        let report = ClaudeUsageReport {
+            five_hour: Some(ClaudeUsageWindow {
+                remaining_percent: 5,
+                reset_context: None,
+            }),
+            week: None,
+        };
+        assert_eq!(claude_check(&report), Check::NearLimit { resets_at: None });
+    }
+
+    #[test]
+    fn codex_uses_earliest_near_limit_reset() {
+        let report = CodexUsageReport {
+            primary: Some(CodexUsageWindow {
+                label: "primary".into(),
+                remaining_percent: 3,
+                resets_at: Some(20),
+            }),
+            secondary: Some(CodexUsageWindow {
+                label: "secondary".into(),
+                remaining_percent: 5,
+                resets_at: Some(10),
+            }),
+        };
+        assert_eq!(
+            codex_check(&report),
+            Check::NearLimit {
+                resets_at: Some(10)
+            }
+        );
+    }
+
+    #[test]
+    fn near_limit_advances_to_a_different_provider() {
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let claude = role("claude-opus", "claude-acp", AdapterKind::Claude);
+        let codex = role("gpt-codex", "codex-acp", AdapterKind::Codex);
+        let pool = RolePool::new(
+            vec![claude.clone(), codex.clone()],
+            Gate::new(PathBuf::from("."), ui_tx.clone()),
+            true,
+            crate::council_usage::Role::Loki,
+            ui_tx,
+        );
+
+        assert!(pool.handle_near_limit(&claude, None));
+        assert_eq!(pool.current().launch.source_id, codex.launch.source_id);
+        assert!(matches!(ui_rx.try_recv(), Ok(UiEvent::Info(_))));
+        assert!(matches!(
+            ui_rx.try_recv(),
+            Ok(UiEvent::CouncilRoleChanged {
+                role: crate::council_usage::Role::Loki,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn disabled_failover_coalesces_block_warnings() {
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let claude = role("claude-opus", "claude-acp", AdapterKind::Claude);
+        let pool = RolePool::new(
+            vec![claude.clone()],
+            Gate::new(PathBuf::from("."), ui_tx.clone()),
+            false,
+            crate::council_usage::Role::Loki,
+            ui_tx,
+        );
+
+        assert!(!pool.handle_near_limit(&claude, None));
+        assert!(!pool.handle_near_limit(&claude, None));
+        assert!(matches!(ui_rx.try_recv(), Ok(UiEvent::Warning(_))));
+        assert!(ui_rx.try_recv().is_err());
+    }
+}

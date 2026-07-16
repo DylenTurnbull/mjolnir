@@ -941,6 +941,7 @@ impl TrackerState {
                 );
                 self.touch();
             }
+            UiEvent::CouncilRoleChanged { .. } => {}
             UiEvent::CancelPendingPermissions => {
                 self.pending_permissions.clear();
                 self.touch();
@@ -2155,31 +2156,52 @@ fn start_server_agent_session(
         }
     }
     let mut council_setup_error = None;
-    let (isolated_loki, loki_codex_home) =
-        match council.as_ref().and_then(|resolved| resolved.loki.clone()) {
-            Some(role) => match crate::isolated_council_role(role, "loki") {
-                Ok(pair) => (Some(pair.0), pair.1),
+    let (loki_roles, loki_codex_home) = match council.as_ref() {
+        Some(resolved) => {
+            match crate::isolated_council_roles(resolved.loki_failover_roles(), "loki") {
+                Ok(pair) => pair,
                 Err(error) => {
                     council_setup_error = Some(format!("prepare Loki: {error:#}"));
-                    (None, None)
+                    (Vec::new(), None)
                 }
-            },
-            None => (None, None),
-        };
-    let (isolated_eitri, eitri_codex_home) =
-        match council.as_ref().and_then(|resolved| resolved.eitri.clone()) {
-            Some(role) => match crate::isolated_council_role(role, "eitri") {
-                Ok(pair) => (Some(pair.0), pair.1),
+            }
+        }
+        None => (Vec::new(), None),
+    };
+    let (eitri_roles, eitri_codex_home) = match council.as_ref() {
+        Some(resolved) => {
+            match crate::isolated_council_roles(resolved.eitri_failover_roles(), "eitri") {
+                Ok(pair) => pair,
                 Err(error) => {
                     council_setup_error = Some(format!("prepare Eitri: {error:#}"));
-                    (None, None)
+                    (Vec::new(), None)
                 }
-            },
-            None => (None, None),
-        };
-    let loki_handle = isolated_loki.map(|role| {
+            }
+        }
+        None => (Vec::new(), None),
+    };
+    let quota_gate = crate::quota::Gate::new(cwd.clone(), runtime_event_tx.clone());
+    let loki_pool = (!loki_roles.is_empty()).then(|| {
+        crate::quota::RolePool::new(
+            loki_roles,
+            quota_gate.clone(),
+            app_config.council.auto_failover,
+            crate::council_usage::Role::Loki,
+            runtime_event_tx.clone(),
+        )
+    });
+    let eitri_pool = (!eitri_roles.is_empty()).then(|| {
+        crate::quota::RolePool::new(
+            eitri_roles,
+            quota_gate,
+            app_config.council.auto_failover,
+            crate::council_usage::Role::Eitri,
+            runtime_event_tx.clone(),
+        )
+    });
+    let loki_handle = loki_pool.map(|pool| {
         loki::Handle::start(
-            role,
+            pool,
             cwd.clone(),
             additional_directories.clone(),
             runtime_event_tx.clone(),
@@ -2205,8 +2227,8 @@ fn start_server_agent_session(
     });
     let implementation_handoffs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let active_implementation_workers = code_agent::ActiveCodeWorkers::default();
-    let code_agent = isolated_eitri.as_ref().map(|eitri| {
-        code_agent::Config::council(eitri.clone(), None, loki_handle.clone())
+    let code_agent = eitri_pool.map(|eitri_pool| {
+        code_agent::Config::council(eitri_pool, None, loki_handle.clone())
             .with_implementation_handoff_counter(implementation_handoffs.clone())
             .with_active_implementation_workers(active_implementation_workers.clone())
             .with_max_parallel_explores(app_config.eitri.max_parallel_explores)

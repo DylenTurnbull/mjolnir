@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use agent_client_protocol::schema::v1::{Usage, UsageUpdate};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     Thor,
@@ -11,7 +11,7 @@ pub enum Role {
     Eitri,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Purpose {
     Code,
@@ -24,6 +24,7 @@ pub struct Record {
     pub purpose: Option<Purpose>,
     pub usage: Option<Usage>,
     pub update: Option<UsageUpdate>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -45,29 +46,96 @@ pub struct Snapshot {
     pub loki: RoleUsage,
     pub eitri_code: RoleUsage,
     pub eitri_explore: RoleUsage,
+    #[serde(skip)]
+    baselines: HashMap<(Role, Option<Purpose>), Baseline>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Baseline {
+    session_id: String,
+    total_tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    thought_tokens: u64,
+    costs: BTreeMap<String, f64>,
+}
+
+fn counter_delta(current: u64, previous: u64) -> u64 {
+    current.checked_sub(previous).unwrap_or(current)
+}
+
+fn cost_delta(current: f64, previous: f64) -> f64 {
+    if current >= previous {
+        current - previous
+    } else {
+        current
+    }
 }
 
 impl Snapshot {
     pub fn observe(&mut self, record: Record) {
-        let usage = match (record.role, record.purpose) {
+        let lane = (record.role, record.purpose);
+        let usage = match lane {
             (Role::Thor, _) => &mut self.thor,
             (Role::Loki, _) => &mut self.loki,
             (Role::Eitri, Some(Purpose::Explore)) => &mut self.eitri_explore,
             (Role::Eitri, _) => &mut self.eitri_code,
         };
         usage.prompts += 1;
+        let same_session = record.session_id.as_ref().is_some_and(|session_id| {
+            self.baselines
+                .get(&lane)
+                .is_some_and(|baseline| baseline.session_id == *session_id)
+        });
+        let previous = same_session
+            .then(|| self.baselines.get(&lane).cloned())
+            .flatten()
+            .unwrap_or_default();
+        let mut next = record.session_id.as_ref().map(|session_id| {
+            if same_session {
+                let mut next = previous.clone();
+                next.session_id = session_id.clone();
+                next
+            } else {
+                Baseline {
+                    session_id: session_id.clone(),
+                    ..Baseline::default()
+                }
+            }
+        });
         if let Some(value) = record.usage {
-            usage.total_tokens += value.total_tokens;
-            usage.input_tokens += value.input_tokens;
-            usage.output_tokens += value.output_tokens;
-            usage.thought_tokens += value.thought_tokens.unwrap_or_default();
+            usage.total_tokens += counter_delta(value.total_tokens, previous.total_tokens);
+            usage.input_tokens += counter_delta(value.input_tokens, previous.input_tokens);
+            usage.output_tokens += counter_delta(value.output_tokens, previous.output_tokens);
+            usage.thought_tokens += counter_delta(
+                value.thought_tokens.unwrap_or_default(),
+                previous.thought_tokens,
+            );
+            if let Some(next) = next.as_mut() {
+                next.total_tokens = value.total_tokens;
+                next.input_tokens = value.input_tokens;
+                next.output_tokens = value.output_tokens;
+                next.thought_tokens = value.thought_tokens.unwrap_or_default();
+            }
         }
         if let Some(update) = record.update {
             usage.context_used = update.used;
             usage.context_size = update.size;
             if let Some(cost) = update.cost {
-                *usage.costs.entry(cost.currency).or_default() += cost.amount;
+                let previous_cost = previous
+                    .costs
+                    .get(&cost.currency)
+                    .copied()
+                    .unwrap_or_default();
+                *usage.costs.entry(cost.currency.clone()).or_default() +=
+                    cost_delta(cost.amount, previous_cost);
+                if let Some(next) = next.as_mut() {
+                    next.costs.insert(cost.currency, cost.amount);
+                }
             }
+        }
+        if let Some(next) = next {
+            self.baselines.insert(lane, next);
         }
     }
 
@@ -99,16 +167,48 @@ mod tests {
             purpose: Some(Purpose::Code),
             usage: Some(Usage::new(10, 7, 3)),
             update: None,
+            session_id: None,
         });
         snapshot.observe(Record {
             role: Role::Eitri,
             purpose: Some(Purpose::Explore),
             usage: Some(Usage::new(20, 15, 5)),
             update: None,
+            session_id: None,
         });
 
         assert_eq!(snapshot.eitri_code.total_tokens, 10);
         assert_eq!(snapshot.eitri_explore.total_tokens, 20);
         assert_eq!(snapshot.eitri().total_tokens, 30);
+    }
+
+    #[test]
+    fn cumulative_session_usage_is_added_as_deltas() {
+        let mut snapshot = Snapshot::default();
+        for total in [100, 140, 140] {
+            snapshot.observe(Record {
+                role: Role::Loki,
+                purpose: None,
+                usage: Some(Usage::new(total, total, 0)),
+                update: None,
+                session_id: Some("loki-1".into()),
+            });
+        }
+        assert_eq!(snapshot.loki.total_tokens, 140);
+    }
+
+    #[test]
+    fn a_new_session_establishes_a_new_usage_baseline() {
+        let mut snapshot = Snapshot::default();
+        for (session_id, total) in [("one", 100), ("two", 25)] {
+            snapshot.observe(Record {
+                role: Role::Loki,
+                purpose: None,
+                usage: Some(Usage::new(total, total, 0)),
+                update: None,
+                session_id: Some(session_id.into()),
+            });
+        }
+        assert_eq!(snapshot.loki.total_tokens, 125);
     }
 }

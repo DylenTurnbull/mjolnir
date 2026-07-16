@@ -201,7 +201,7 @@ impl SettingsEditor {
 
     fn row_count(&self) -> usize {
         match self.tab {
-            SettingsTab::Council => 5,
+            SettingsTab::Council => 6,
             SettingsTab::AcpServers => self.inventory.servers.len() + 1,
             SettingsTab::Appearance => 2,
         }
@@ -275,6 +275,9 @@ impl SettingsEditor {
         match self.tab {
             SettingsTab::Council if self.selected == 3 => {
                 self.config.thor.discrete_review = !self.config.thor.discrete_review;
+            }
+            SettingsTab::Council if self.selected == 5 => {
+                self.config.council.auto_failover = !self.config.council.auto_failover;
             }
             SettingsTab::AcpServers => {
                 let Some(server) = self.inventory.servers.get(self.selected) else {
@@ -878,6 +881,18 @@ fn draw_council(
         ),
         theme,
     ));
+    lines.push(selected_line(
+        editor.selected == 5,
+        format!(
+            "Automatic quota failover [{}]",
+            on_off(editor.config.council.auto_failover)
+        ),
+        theme,
+    ));
+    lines.push(Line::from(Span::styled(
+        "         checks Claude/Codex before Loki or Eitri work; reloads with /new or /clear",
+        Style::default().fg(theme.muted),
+    )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
@@ -1225,6 +1240,17 @@ mod tests {
             editor.config.acp.policy("codex-acp"),
             AcpServerPolicy::Disabled
         );
+    }
+
+    #[test]
+    fn council_quota_failover_can_be_disabled() {
+        let mut editor = SettingsEditor::new(Config::default(), Vec::new(), None);
+        editor.selected = 5;
+        assert_eq!(
+            editor.handle_key(KeyCode::Char(' ')),
+            SettingsAction::Changed
+        );
+        assert!(!editor.config.council.auto_failover);
     }
 
     #[test]

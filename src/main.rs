@@ -34,6 +34,7 @@ mod paths;
 mod probe;
 mod probe_cache;
 mod qr;
+mod quota;
 mod ragnarok;
 mod ragnarok_sprites;
 mod registry;
@@ -1173,6 +1174,7 @@ async fn run_app(
             council.clone(),
             cfg.thor.clone(),
             cfg.eitri.clone(),
+            cfg.council.clone(),
             council_updates.take(),
             std::mem::take(&mut pending_probe_servers),
         )
@@ -1560,6 +1562,7 @@ async fn run_session(
     council: council::ResolvedCouncil,
     thor_config: config::ThorConfig,
     eitri_config: config::EitriConfig,
+    council_config: config::CouncilConfig,
     council_updates: Option<tokio::sync::watch::Receiver<council::ResolvedCouncil>>,
     pending_probe_servers: Vec<String>,
 ) -> Result<RunSessionResult> {
@@ -1572,25 +1575,34 @@ async fn run_session(
             .unwrap_or_default()
             .as_millis()
     );
-    let (eitri_role, _eitri_codex_home) = match council.eitri.clone() {
-        Some(role) => {
-            let (role, guard) = isolated_council_role(role, "eitri")?;
-            (Some(role), guard)
-        }
-        None => (None, None),
-    };
-    let (loki_role, _loki_codex_home) = match council.loki.clone() {
-        Some(role) => {
-            let (role, guard) = isolated_council_role(role, "loki")?;
-            (Some(role), guard)
-        }
-        None => (None, None),
-    };
+    let (eitri_roles, _eitri_codex_home) =
+        isolated_council_roles(council.eitri_failover_roles(), "eitri")?;
+    let (loki_roles, _loki_codex_home) =
+        isolated_council_roles(council.loki_failover_roles(), "loki")?;
 
     let (event_tx, runtime_event_rx) = mpsc::unbounded_channel();
     let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
     let (runtime_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel();
+    let quota_gate = quota::Gate::new(cwd.clone(), ui_event_tx.clone());
+    let loki_pool = (!loki_roles.is_empty()).then(|| {
+        quota::RolePool::new(
+            loki_roles.clone(),
+            quota_gate.clone(),
+            council_config.auto_failover,
+            council_usage::Role::Loki,
+            ui_event_tx.clone(),
+        )
+    });
+    let eitri_pool = (!eitri_roles.is_empty()).then(|| {
+        quota::RolePool::new(
+            eitri_roles.clone(),
+            quota_gate.clone(),
+            council_config.auto_failover,
+            council_usage::Role::Eitri,
+            ui_event_tx.clone(),
+        )
+    });
     let implementation_handoffs_this_turn = Arc::new(AtomicUsize::new(0));
     let active_implementation_workers = code_agent::ActiveCodeWorkers::default();
     tracing::info!(
@@ -1693,8 +1705,8 @@ async fn run_session(
         })
     });
     let usage_roles = std::iter::once(&council.thor)
-        .chain(eitri_role.as_ref())
-        .chain(loki_role.as_ref());
+        .chain(eitri_roles.iter())
+        .chain(loki_roles.iter());
     let mut claude_usage_env = None;
     let mut codex_usage_env = None;
     for role in usage_roles {
@@ -1708,9 +1720,9 @@ async fn run_session(
             _ => {}
         }
     }
-    let loki_handle = loki_role.map(|role| {
+    let loki_handle = loki_pool.map(|pool| {
         loki::Handle::start(
-            role,
+            pool,
             cwd.clone(),
             runtime_options.additional_directories.clone(),
             ui_event_tx.clone(),
@@ -1808,9 +1820,9 @@ async fn run_session(
             adapter_source_id: council.thor.launch.source_id.clone(),
             council_session: Some(council_session.clone()),
         }),
-        code_agent: eitri_role.map(|eitri_role| {
+        code_agent: eitri_pool.map(|eitri_pool| {
             let mut config = code_agent::Config::council(
-                eitri_role,
+                eitri_pool,
                 runtime_options.agent_stderr.clone(),
                 loki_handle.clone(),
             );
@@ -2235,6 +2247,34 @@ fn isolated_council_role(
         isolated.path().display().to_string(),
     );
     Ok((role, Some(isolated)))
+}
+
+fn isolated_council_roles(
+    mut roles: Vec<council::ResolvedRole>,
+    label: &str,
+) -> Result<(Vec<council::ResolvedRole>, Option<tempfile::TempDir>)> {
+    let Some(index) = roles
+        .iter()
+        .position(|role| role.launch.kind == council::AdapterKind::Codex)
+    else {
+        return Ok((roles, None));
+    };
+    let (prepared, guard) = isolated_council_role(roles[index].clone(), label)?;
+    let codex_home = prepared
+        .launch
+        .env
+        .get("CODEX_HOME")
+        .cloned()
+        .expect("isolated Codex role has CODEX_HOME");
+    roles[index] = prepared;
+    for role in &mut roles {
+        if role.launch.kind == council::AdapterKind::Codex {
+            role.launch
+                .env
+                .insert("CODEX_HOME".to_string(), codex_home.clone());
+        }
+    }
+    Ok((roles, guard))
 }
 
 fn setup_session_terminal(

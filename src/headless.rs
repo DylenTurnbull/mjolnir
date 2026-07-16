@@ -174,16 +174,21 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     for warning in &resolved.warnings {
         let _ = event_tx.send(UiEvent::Warning(warning.clone()));
     }
-    let (loki_role, _loki_codex_home) = match resolved.loki.clone() {
-        Some(role) => {
-            let (role, guard) = crate::isolated_council_role(role, "loki")?;
-            (Some(role), guard)
-        }
-        None => (None, None),
-    };
-    let loki_handle = loki_role.map(|role| {
+    let (loki_roles, _loki_codex_home) =
+        crate::isolated_council_roles(resolved.loki_failover_roles(), "loki")?;
+    let quota_gate = crate::quota::Gate::new(cfg.cwd.clone(), event_tx.clone());
+    let loki_pool = (!loki_roles.is_empty()).then(|| {
+        crate::quota::RolePool::new(
+            loki_roles,
+            quota_gate.clone(),
+            app_config.council.auto_failover,
+            crate::council_usage::Role::Loki,
+            event_tx.clone(),
+        )
+    });
+    let loki_handle = loki_pool.map(|pool| {
         loki::Handle::start(
-            role,
+            pool,
             cfg.cwd.clone(),
             cfg.additional_directories.clone(),
             event_tx.clone(),
@@ -197,13 +202,17 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         )?),
         None => None,
     };
-    let (eitri, _eitri_codex_home) = match resolved.eitri.clone() {
-        Some(role) => {
-            let (role, guard) = crate::isolated_council_role(role, "eitri")?;
-            (Some(role), guard)
-        }
-        None => (None, None),
-    };
+    let (eitri_roles, _eitri_codex_home) =
+        crate::isolated_council_roles(resolved.eitri_failover_roles(), "eitri")?;
+    let eitri_pool = (!eitri_roles.is_empty()).then(|| {
+        crate::quota::RolePool::new(
+            eitri_roles,
+            quota_gate,
+            app_config.council.auto_failover,
+            crate::council_usage::Role::Eitri,
+            event_tx.clone(),
+        )
+    });
     let implementation_handoffs = Arc::new(AtomicUsize::new(0));
     let active_implementation_workers = code_agent::ActiveCodeWorkers::default();
     let runtime_cfg = AcpRuntimeConfig {
@@ -230,8 +239,8 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             adapter_source_id: thor.launch.source_id.clone(),
             council_session: None,
         }),
-        code_agent: eitri.map(|eitri| {
-            code_agent::Config::council(eitri, cfg.agent_stderr.clone(), loki_handle.clone())
+        code_agent: eitri_pool.map(|eitri_pool| {
+            code_agent::Config::council(eitri_pool, cfg.agent_stderr.clone(), loki_handle.clone())
                 .with_implementation_handoff_counter(implementation_handoffs.clone())
                 .with_active_implementation_workers(active_implementation_workers.clone())
                 .with_max_parallel_explores(app_config.eitri.max_parallel_explores)
@@ -428,6 +437,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             UiEvent::CancelPendingPermissions => {}
             UiEvent::ClaudeUsage(_) | UiEvent::CodexUsage(_) => {}
             UiEvent::CouncilUsage(record) => council_usage.observe(record),
+            UiEvent::CouncilRoleChanged { .. } => {}
             // Headless runs never receive remote decisions (no UI event
             // channel is registered with the tracker).
             UiEvent::RemotePermissionDecision { .. } => {}

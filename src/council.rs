@@ -65,6 +65,52 @@ pub struct ResolvedCouncil {
     pub inventory: AcpInventory,
 }
 
+impl ResolvedCouncil {
+    pub fn loki_failover_roles(&self) -> Vec<ResolvedRole> {
+        let Some(initial) = self.loki.clone() else {
+            return Vec::new();
+        };
+        failover_roles(initial, &self.available, true)
+    }
+
+    pub fn eitri_failover_roles(&self) -> Vec<ResolvedRole> {
+        let Some(initial) = self.eitri.clone() else {
+            return Vec::new();
+        };
+        failover_roles(initial, &self.available, false)
+    }
+}
+
+fn failover_roles(
+    initial: ResolvedRole,
+    available: &[ResolvedRole],
+    prefer_other_provider: bool,
+) -> Vec<ResolvedRole> {
+    let mut roles = vec![initial.clone()];
+    let mut alternatives = available
+        .iter()
+        .filter(|candidate| candidate.ranked)
+        .filter(|candidate| {
+            candidate.model.model != initial.model.model
+                || candidate.launch.source_id != initial.launch.source_id
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if prefer_other_provider {
+        alternatives
+            .sort_by_key(|candidate| candidate.launch.source_id == initial.launch.source_id);
+    }
+    for candidate in alternatives {
+        if !roles.iter().any(|role| {
+            role.model.model == candidate.model.model
+                && role.launch.source_id == candidate.launch.source_id
+        }) {
+            roles.push(candidate);
+        }
+    }
+    roles
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AcpInventory {
     pub servers: Vec<AcpServerInfo>,

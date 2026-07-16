@@ -144,6 +144,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
         let mut interjected_epoch = None;
         let mut observed_epoch = 0;
         let mut latest_usage_update: Option<UsageUpdate> = None;
+        let mut session_id = None;
 
         loop {
             tokio::select! {
@@ -175,12 +176,16 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                     if let UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(update)) = &event {
                         latest_usage_update = Some(update.clone());
                     }
+                    if let UiEvent::SessionStarted { session_id: started, .. } = &event {
+                        session_id = Some(started.clone());
+                    }
                     if let UiEvent::PromptDone { usage, .. } = &event {
                         let _ = events_tx.send(UiEvent::CouncilUsage(Record {
                             role: Role::Thor,
                             purpose: None,
                             usage: usage.clone(),
                             update: latest_usage_update.take(),
+                            session_id: session_id.clone(),
                         }));
                     }
 

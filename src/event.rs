@@ -128,6 +128,11 @@ pub enum UiEvent {
     InternalMessage(InternalMessage),
     /// Completed prompt usage attributed to one Council role.
     CouncilUsage(crate::council_usage::Record),
+    /// A background Council role moved to a fallback model for this session.
+    CouncilRoleChanged {
+        role: crate::council_usage::Role,
+        model: String,
+    },
     /// `session/request_permission` from the agent. The UI is expected to
     /// render a modal and answer through `responder` exactly once.
     PermissionRequest(PermissionPrompt),
