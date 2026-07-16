@@ -352,38 +352,26 @@ impl McpHandler {
         Parameters(args): Parameters<ExploreAgentsArgs>,
     ) -> std::result::Result<CallToolResult, McpError> {
         validate_explore_batch(&args.prompts)?;
-        let run_ids = match self.controller.begin_explores(args.prompts.len()).await {
-            Ok(ids) => ids,
+        let results = match run_explore_fanout(&self.controller, args.prompts, |prompt, run_id| {
+            await_supervisor(
+                self.config.clone(),
+                self.context.clone(),
+                prompt,
+                EitriPurpose::Explore,
+                self.ui_tx.clone(),
+                self.controller.clone(),
+                run_id,
+            )
+        })
+        .await
+        {
+            Ok(results) => results,
             Err(rejection) => {
                 return Ok(CallToolResult::error(vec![Content::text(
                     rejection.message(),
                 )]));
             }
         };
-        tracing::info!(
-            event = "eitri_explore_fanout_admitted",
-            requested = args.prompts.len(),
-            reserved = run_ids.len(),
-            "Eitri exploration fan-out atomically admitted; preparing supervisor futures"
-        );
-        let results = await_explore_fanout(
-            args.prompts
-                .into_iter()
-                .zip(run_ids)
-                .map(|(prompt, run_id)| {
-                    await_supervisor(
-                        self.config.clone(),
-                        self.context.clone(),
-                        prompt,
-                        EitriPurpose::Explore,
-                        self.ui_tx.clone(),
-                        self.controller.clone(),
-                        run_id,
-                    )
-                })
-                .collect(),
-        )
-        .await;
         let completed = results
             .iter()
             .filter(|result| result.outcome.is_ok())
@@ -870,6 +858,17 @@ impl Controller {
         let active = state.runs.len();
         state.active_runs.send_replace(active);
     }
+
+    #[cfg(test)]
+    async fn active_explore_count(&self) -> usize {
+        self.state
+            .lock()
+            .await
+            .runs
+            .values()
+            .filter(|run| run.kind() == RunKind::Explore)
+            .count()
+    }
 }
 
 impl ControllerState {
@@ -1119,6 +1118,33 @@ where
     F: Future<Output = EitriRunResult>,
 {
     futures::future::join_all(supervisors).await
+}
+
+/// Atomically admit an ordered batch, construct every scout future, and drive
+/// them together. Keeping those steps inseparable prevents a fan-out from
+/// regressing into sequential admission or launch.
+async fn run_explore_fanout<F, Fut>(
+    controller: &Controller,
+    prompts: Vec<String>,
+    mut supervise: F,
+) -> std::result::Result<Vec<EitriRunResult>, ExploreAdmission>
+where
+    F: FnMut(String, u64) -> Fut,
+    Fut: Future<Output = EitriRunResult>,
+{
+    let run_ids = controller.begin_explores(prompts.len()).await?;
+    tracing::info!(
+        event = "eitri_explore_fanout_admitted",
+        requested = prompts.len(),
+        reserved = run_ids.len(),
+        "Eitri exploration fan-out atomically admitted; preparing supervisor futures"
+    );
+    let supervisors = prompts
+        .into_iter()
+        .zip(run_ids)
+        .map(|(prompt, run_id)| supervise(prompt, run_id))
+        .collect();
+    Ok(await_explore_fanout(supervisors).await)
 }
 
 fn format_explore_fanout(results: &[EitriRunResult]) -> String {
@@ -1816,31 +1842,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fanout_polls_all_siblings_before_awaiting_completion() {
+    async fn shared_fanout_orchestration_admits_and_drives_scouts_concurrently() {
+        let controller = Controller::default();
+        controller.configure(2, ActiveCodeWorkers::default()).await;
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let active = Arc::new(AtomicUsize::new(0));
-        let supervisors = (0..2)
-            .map(|index| {
-                let barrier = barrier.clone();
-                let active = active.clone();
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let results = tokio::time::timeout(
+            Duration::from_millis(100),
+            run_explore_fanout(
+                &controller,
+                vec!["first".to_string(), "second".to_string()],
+                |prompt, run_id| {
+                    let controller = controller.clone();
+                    let barrier = barrier.clone();
+                    let active = active.clone();
+                    let max_active = max_active.clone();
+                    async move {
+                        let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(now_active, Ordering::SeqCst);
+                        assert_eq!(
+                            controller.active_explore_count().await,
+                            2,
+                            "atomic admission must reserve both Explore slots before either scout can finish"
+                        );
+                        barrier.wait().await;
+                        controller.finish(run_id).await;
+                        EitriRunResult {
+                            outcome: Ok(format!("report {prompt}")),
+                            workspace_delta: None,
+                        }
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("both admitted scout futures were polled")
+        .expect("batch admitted");
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(controller.active_explore_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_shared_fanout_does_not_construct_scouts_or_leak_slots() {
+        let controller = Controller::default();
+        controller.configure(2, ActiveCodeWorkers::default()).await;
+        let occupied = controller
+            .begin(RunKind::Explore)
+            .await
+            .expect("occupied slot");
+        let runner_calls = Arc::new(AtomicUsize::new(0));
+        let calls = runner_calls.clone();
+
+        let result = run_explore_fanout(
+            &controller,
+            vec!["first".to_string(), "second".to_string()],
+            move |_, _| {
+                let calls = calls.clone();
                 async move {
-                    active.fetch_add(1, Ordering::SeqCst);
-                    barrier.wait().await;
+                    calls.fetch_add(1, Ordering::SeqCst);
                     EitriRunResult {
-                        outcome: Ok(format!("report {index}")),
+                        outcome: Ok("unexpected".to_string()),
                         workspace_delta: None,
                     }
                 }
-            })
-            .collect();
-        let results = tokio::time::timeout(
-            Duration::from_millis(100),
-            await_explore_fanout(supervisors),
+            },
         )
-        .await
-        .expect("both sibling futures were polled");
-        assert_eq!(active.load(Ordering::SeqCst), 2);
-        assert_eq!(results.len(), 2);
+        .await;
+        let Err(rejection) = result else {
+            panic!("one free slot cannot admit a two-scout batch");
+        };
+        assert_eq!(rejection.available, 1);
+        assert_eq!(runner_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(controller.active_explore_count().await, 1);
+        controller.finish(occupied).await;
+        assert_eq!(controller.active_explore_count().await, 0);
     }
 
     #[tokio::test]
