@@ -1754,12 +1754,7 @@ async fn run_session(
     for warning in &council.warnings {
         let _ = ui_event_tx.send(crate::event::UiEvent::Warning(warning.clone()));
     }
-    if !pending_probe_servers.is_empty() {
-        let _ = ui_event_tx.send(crate::event::UiEvent::Info(format!(
-            "probing ACP servers in the background: {}",
-            pending_probe_servers.join(", ")
-        )));
-    }
+    let _ = pending_probe_servers;
     let council_update_task = council_updates.map(|mut updates| {
         let tx = ui_event_tx.clone();
         let mut surfaced: std::collections::HashSet<String> =

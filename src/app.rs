@@ -194,8 +194,6 @@ pub enum Entry {
     InternalMessage(InternalMessage),
     /// System-level note (errors, warnings, mode changes).
     System(String),
-    /// Live system note that becomes durable once its text is finalized.
-    EphemeralSystem(String),
     /// Visual separator inserted at local session boundaries so a freshly
     /// started session is not confused with the previous transcript.
     SessionBoundary(String),
@@ -649,8 +647,6 @@ pub struct AppState {
     /// Human-readable ACP adapter backing the primary model, such as Codex or
     /// Claude Code. Kept separate from the role/model label in the header.
     primary_acp_name: String,
-    primary_connection_announcement: Option<usize>,
-    primary_connected_announced: bool,
     /// Registry `source_id` of the launched agent (e.g. `claude-acp`,
     /// `opencode`, `custom:foo`, `anvil`). Distinct from `agent_label`,
     /// which is a *display* string; this is the stable id the model-score
@@ -1062,8 +1058,6 @@ impl AppState {
             session_cwd: PathBuf::from("."),
             agent_label: String::new(),
             primary_acp_name: "ACP server".to_string(),
-            primary_connection_announcement: None,
-            primary_connected_announced: false,
             agent_source_id: String::new(),
             active_agent_launch: None,
             session_id: None,
@@ -1601,7 +1595,6 @@ impl AppState {
             | Entry::LokiActivity(_)
             | Entry::InternalMessage(_)
             | Entry::System(_)
-            | Entry::EphemeralSystem(_)
             | Entry::SessionBoundary(_) => None,
         })
     }
@@ -1711,28 +1704,7 @@ impl AppState {
     }
 
     pub fn announce_waiting_for_primary(&mut self) {
-        if self.primary_connected_announced {
-            return;
-        }
-        let message = format!("Waiting for {}", self.primary_acp_name);
-        self.set_status_line(StatusKind::Info, message.clone());
-        if self.primary_connection_announcement.is_none() {
-            self.primary_connection_announcement = Some(self.transcript.len());
-            self.transcript.push(Entry::EphemeralSystem(message));
-            self.bump_transcript_revision();
-        }
-    }
-
-    fn announce_connected_to_primary(&mut self) {
-        let message = format!("Connected to {}", self.primary_acp_name);
-        self.set_status_line(StatusKind::Info, message.clone());
-        self.primary_connected_announced = true;
-        if let Some(index) = self.primary_connection_announcement.take()
-            && let Some(entry @ Entry::EphemeralSystem(_)) = self.transcript.get_mut(index)
-        {
-            *entry = Entry::System(message);
-            self.bump_transcript_revision();
-        }
+        self.set_status_line(StatusKind::Info, "session is still starting");
     }
 
     fn set_status_line(&mut self, kind: StatusKind, text: impl Into<String>) {
@@ -2305,7 +2277,6 @@ impl AppState {
                 if !self.is_streaming() {
                     self.set_connection_state(ConnectionState::Initializing);
                 }
-                self.announce_connected_to_primary();
             }
             UiEvent::SessionStarted { session_id, .. } => {
                 if self.connection_state == ConnectionState::Forking {
@@ -5234,20 +5205,16 @@ mod tests {
     }
 
     #[test]
-    fn primary_acp_connection_lifecycle_is_named_and_announced_once() {
+    fn primary_acp_connection_lifecycle_uses_generic_starting_status() {
         let mut state = AppState::new();
         state.set_primary_acp_name("Claude Code");
 
         state.announce_waiting_for_primary();
         state.announce_waiting_for_primary();
-        assert!(matches!(
-            state.transcript.as_slice(),
-            [Entry::EphemeralSystem(text)] if text == "Waiting for Claude Code"
-        ));
-        assert_eq!(
-            state.status_line.as_ref().expect("waiting status").kind,
-            StatusKind::Info
-        );
+        assert!(state.transcript.is_empty());
+        let status = state.status_line.as_ref().expect("waiting status");
+        assert_eq!(status.kind, StatusKind::Info);
+        assert_eq!(status.text, "session is still starting");
 
         state.apply_event(UiEvent::Connected {
             agent_name: Some("claude-agent-acp".into()),
@@ -5257,13 +5224,10 @@ mod tests {
         });
         state.announce_waiting_for_primary();
 
-        assert!(matches!(
-            state.transcript.as_slice(),
-            [Entry::System(connected)] if connected == "Connected to Claude Code"
-        ));
-        let status = state.status_line.as_ref().expect("connected status");
+        assert!(state.transcript.is_empty());
+        let status = state.status_line.as_ref().expect("starting status");
         assert_eq!(status.kind, StatusKind::Info);
-        assert_eq!(status.text, "Connected to Claude Code");
+        assert_eq!(status.text, "session is still starting");
     }
 
     #[test]

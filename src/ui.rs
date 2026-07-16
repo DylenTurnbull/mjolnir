@@ -419,7 +419,6 @@ fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bo
         | Entry::CodeAgentPlan(_)
         | Entry::LokiActivity(_)
         | Entry::InternalMessage(_) => true,
-        Entry::EphemeralSystem(_) => false,
         Entry::AgentThought(thought) => thought.completed,
         Entry::CodeAgentThought(thought) => thought.completed,
         // An actor may append coordination activity after its active message.
@@ -799,7 +798,6 @@ async fn ui_loop(
     if let Some(boundary) = initial.session_boundary {
         state.push_session_boundary(boundary);
     }
-    state.announce_waiting_for_primary();
     let mut transcript_scroll = TranscriptScrollState::default();
     let mut transcript_sink = TranscriptSink::default();
     let mut inline_resize_reflow = InlineResizeReflow::default();
@@ -3944,9 +3942,7 @@ fn transcript_export_markdown(state: &AppState) -> String {
                 };
                 push_export_text(&mut out, &heading, &message.text);
             }
-            Entry::System(text) | Entry::EphemeralSystem(text) => {
-                push_export_text(&mut out, "System", text)
-            }
+            Entry::System(text) => push_export_text(&mut out, "System", text),
             Entry::SessionBoundary(text) => push_export_text(&mut out, "Session", text),
             Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
                 let heading = if matches!(entry, Entry::CodeAgentPlan(_)) {
@@ -5968,7 +5964,7 @@ fn render_transcript_entry_range(
                     }
                 }
             }
-            Entry::System(text) | Entry::EphemeralSystem(text) => {
+            Entry::System(text) => {
                 push_styled_message(&mut out, text, theme.accent, collapse_message, theme);
             }
             Entry::SessionBoundary(text) => {
@@ -6062,7 +6058,7 @@ fn entry_speaker(entry: &Entry) -> Option<String> {
         | Entry::CodeAgentPlan(_) => Some("Eitri".to_string()),
         Entry::LokiActivity(activity) => Some(loki_role_name(loki_for_activity(activity))),
         Entry::InternalMessage(message) => Some(message.source.clone()),
-        Entry::System(_) | Entry::EphemeralSystem(_) | Entry::SessionBoundary(_) => None,
+        Entry::System(_) | Entry::SessionBoundary(_) => None,
     }
 }
 
@@ -13871,7 +13867,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_sink_waits_for_ephemeral_connection_message_to_finalize() {
+    fn transcript_sink_has_no_connection_announcement_to_finalize() {
         let mut state = AppState::new();
         let mut sink = TranscriptSink::default();
         state.set_primary_acp_name("Claude Code");
@@ -13885,12 +13881,7 @@ mod tests {
             prompt_images_supported: false,
             session_fork_supported: false,
         });
-        let connected: Vec<String> = sink
-            .pending_lines(&state, 80)
-            .iter()
-            .map(line_text)
-            .collect();
-        assert_eq!(connected, vec!["Connected to Claude Code", ""]);
+        assert!(sink.pending_lines(&state, 80).is_empty());
         assert!(sink.pending_lines(&state, 80).is_empty());
     }
 
@@ -19388,11 +19379,8 @@ mod tests {
         assert_eq!(state.image_attachments.len(), 1);
         let status = state.status_line.expect("status");
         assert_eq!(status.kind, StatusKind::Info);
-        assert_eq!(status.text, "Waiting for Codex");
-        assert!(matches!(
-            state.transcript.as_slice(),
-            [Entry::EphemeralSystem(text)] if text == "Waiting for Codex"
-        ));
+        assert_eq!(status.text, "session is still starting");
+        assert!(state.transcript.is_empty());
     }
 
     #[test]
