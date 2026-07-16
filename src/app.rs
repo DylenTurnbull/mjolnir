@@ -677,6 +677,9 @@ pub struct AppState {
     pub session_fork_supported: bool,
     pub transcript: Vec<Entry>,
     pub tool_calls: HashMap<String, ToolCallView>,
+    /// Per-tool expansion choices, keyed by ACP tool-call ID. `true` means
+    /// expanded; entries matching the renderer's default are omitted.
+    tool_detail_overrides: HashMap<String, bool>,
     /// Workspace diffs observed locally after prompt turns. These deliberately
     /// remain outside ACP tool-call and transcript state.
     pub workspace_diffs: Vec<crate::event::WorkspaceDiffEvent>,
@@ -1066,6 +1069,7 @@ impl AppState {
             session_fork_supported: false,
             transcript: Vec::new(),
             tool_calls: HashMap::new(),
+            tool_detail_overrides: HashMap::new(),
             workspace_diffs: Vec::new(),
             suppressed_tool_calls: HashSet::new(),
             terminal_outputs: HashMap::new(),
@@ -1470,7 +1474,36 @@ impl AppState {
     /// new line budget.
     pub fn toggle_expand_transcript_details(&mut self) {
         self.expand_transcript_details = !self.expand_transcript_details;
+        self.tool_detail_overrides.clear();
         self.bump_transcript_revision();
+    }
+
+    /// Toggle one tool's details relative to the current renderer default.
+    /// Returns `false` when the tool is unknown or has no output to display.
+    pub fn toggle_tool_detail(&mut self, id: &str, default_expanded: bool) -> bool {
+        if self
+            .tool_calls
+            .get(id)
+            .is_none_or(|view| view.body.is_empty())
+        {
+            return false;
+        }
+        let expanded = !self
+            .tool_detail_overrides
+            .get(id)
+            .copied()
+            .unwrap_or(default_expanded);
+        if expanded == default_expanded {
+            self.tool_detail_overrides.remove(id);
+        } else {
+            self.tool_detail_overrides.insert(id.to_string(), expanded);
+        }
+        self.bump_transcript_revision();
+        true
+    }
+
+    pub fn tool_detail_expanded(&self, id: &str) -> Option<bool> {
+        self.tool_detail_overrides.get(id).copied()
     }
 
     /// Open the inline full-transcript reader. The reader starts pinned to
@@ -2212,6 +2245,10 @@ impl AppState {
                 if self.session_id.as_deref() != Some(&session_id) {
                     self.workspace_diffs.clear();
                     self.pending_workspace_diff_total = None;
+                    if !self.tool_detail_overrides.is_empty() {
+                        self.tool_detail_overrides.clear();
+                        self.bump_transcript_revision();
+                    }
                 }
                 self.session_id = Some(session_id);
                 if !self.is_streaming() {
@@ -3696,6 +3733,50 @@ mod tests {
 
     fn text_chunk(s: &str) -> ContentChunk {
         ContentChunk::new(ContentBlock::Text(TextContent::new(s)))
+    }
+
+    #[test]
+    fn tool_detail_overrides_are_per_id_reset_by_global_toggle_and_session_change() {
+        let mut state = AppState::new();
+        for id in ["first", "second"] {
+            state.tool_calls.insert(
+                id.to_string(),
+                ToolCallView {
+                    title: id.to_string(),
+                    kind: ToolKind::Execute,
+                    status: ToolCallStatus::Completed,
+                    body: vec![ToolCallOutput::Text("output".to_string())],
+                },
+            );
+        }
+        let revision = state.transcript_revision();
+        assert!(state.toggle_tool_detail("first", false));
+        assert_eq!(state.tool_detail_expanded("first"), Some(true));
+        assert_eq!(state.tool_detail_expanded("second"), None);
+        assert_ne!(state.transcript_revision(), revision);
+
+        state.toggle_expand_transcript_details();
+        assert!(state.expand_transcript_details);
+        assert_eq!(state.tool_detail_expanded("first"), None);
+        assert!(state.toggle_tool_detail("second", true));
+        assert_eq!(state.tool_detail_expanded("second"), Some(false));
+
+        state.apply_event(UiEvent::SessionStarted {
+            session_id: "one".to_string(),
+            resumed: false,
+        });
+        assert_eq!(state.tool_detail_expanded("second"), None);
+        assert!(state.toggle_tool_detail("first", true));
+        state.apply_event(UiEvent::SessionStarted {
+            session_id: "one".to_string(),
+            resumed: true,
+        });
+        assert_eq!(state.tool_detail_expanded("first"), Some(false));
+        state.apply_event(UiEvent::SessionStarted {
+            session_id: "two".to_string(),
+            resumed: false,
+        });
+        assert_eq!(state.tool_detail_expanded("first"), None);
     }
 
     #[test]

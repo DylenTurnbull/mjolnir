@@ -1922,6 +1922,10 @@ fn handle_crossterm(
                 state.exit_reason = Some(UiExitReason::NewSession);
                 return TerminalRequest::None;
             }
+            (KeyModifiers::ALT, KeyCode::Char('t' | 'T')) if mode == UiMode::FullscreenTui => {
+                toggle_latest_visible_tool(state, true);
+                return TerminalRequest::None;
+            }
             (modifiers, KeyCode::Char('t' | 'T'))
                 if modifiers.contains(KeyModifiers::CONTROL)
                     && !modifiers.intersects(
@@ -2097,6 +2101,9 @@ fn handle_crossterm(
         }
         (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
             state.exit_reason = Some(UiExitReason::NewSession);
+        }
+        (KeyModifiers::ALT, KeyCode::Char('t' | 'T')) if mode == UiMode::FullscreenTui => {
+            toggle_latest_visible_tool(state, true);
         }
         (modifiers, KeyCode::Char('t' | 'T'))
             if modifiers.contains(KeyModifiers::CONTROL)
@@ -3197,6 +3204,46 @@ fn toggle_transcript_expansion(state: &mut AppState, mode: UiMode) {
     }
 }
 
+/// The latest tool which is both rendered in this view and has an output body.
+/// Compact completed turns omit successful tools, but failed tools remain visible.
+fn latest_visible_tool_call_id(state: &AppState, compact_completed_turns: bool) -> Option<String> {
+    let turns = compact_completed_turns.then(|| transcript_turns(state));
+    state
+        .transcript
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, entry)| {
+            let (Entry::ToolCall(id) | Entry::CodeAgentToolCall(id)) = entry else {
+                return None;
+            };
+            let hidden = turns.as_ref().is_some_and(|turns| {
+                turns.iter().any(|turn| {
+                    turn.is_compactable
+                        && (turn.prompt_index..turn.end).contains(&index)
+                        && tool_entry_is_successful(state, entry)
+                })
+            });
+            (!hidden
+                && state
+                    .tool_calls
+                    .get(id)
+                    .is_some_and(|view| !view.body.is_empty()))
+            .then(|| id.clone())
+        })
+}
+
+fn toggle_latest_visible_tool(state: &mut AppState, compact_completed_turns: bool) {
+    let Some(id) = latest_visible_tool_call_id(state, compact_completed_turns) else {
+        state.status_line = Some(StatusMessage::info("no visible tool output to toggle"));
+        return;
+    };
+    let default_expanded = !compact_completed_turns || state.expand_transcript_details;
+    if !state.toggle_tool_detail(&id, default_expanded) {
+        state.status_line = Some(StatusMessage::info("no visible tool output to toggle"));
+    }
+}
+
 /// Keyboard handling while the inline full-transcript reader is open. The
 /// reader reuses `scroll_offset` as the index of the top visible line (0 =
 /// top); it is clamped to the last screen of content during draw, so adding
@@ -3219,6 +3266,11 @@ fn handle_transcript_viewer_key(
         // Shrinking the viewport back down needs an inline repair so the
         // vacated rows are cleared cleanly.
         return inline_repair_request(mode);
+    }
+
+    if modifiers == KeyModifiers::ALT && matches!(code, KeyCode::Char('t' | 'T')) {
+        toggle_latest_visible_tool(state, false);
+        return TerminalRequest::None;
     }
 
     match code {
@@ -5139,7 +5191,7 @@ fn draw_inline_transcript_viewer(f: &mut ratatui::Frame, area: Rect, state: &mut
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" transcript — full history · details expanded ")
+        .title(" transcript — full history · Alt-T toggles latest tool ")
         .style(Style::default().fg(state.theme.agent));
     let inner = block.inner(layout[0]);
     f.render_widget(block, layout[0]);
@@ -5162,7 +5214,7 @@ fn draw_inline_transcript_viewer(f: &mut ratatui::Frame, area: Rect, state: &mut
 
     f.render_widget(
         Paragraph::new(
-            "All details expanded · Up/Down PgUp/PgDn scroll · Home/End top/bottom · Esc or Ctrl-T to close",
+            "Alt-T latest tool · Up/Down PgUp/PgDn scroll · Home/End top/bottom · Esc or Ctrl-T to close",
         )
             .style(Style::default().fg(state.theme.muted)),
         layout[1],
@@ -5662,12 +5714,17 @@ fn render_transcript_entry_range(
                     // color carries the tool status. See issue #257.
                     let content_width = width.saturating_sub(TOOL_GUTTER_WIDTH);
                     let mut block: Vec<Line<'static>> = vec![Line::from(spans)];
+                    let tool_collapse_limit = match state.tool_detail_expanded(id) {
+                        Some(true) => None,
+                        Some(false) => Some(TOOL_OUTPUT_COLLAPSED_LINES),
+                        None => collapse_limit,
+                    };
                     push_tool_outputs(
                         &mut block,
                         &view.body,
                         view.status,
                         content_width,
-                        collapse_limit,
+                        tool_collapse_limit,
                         theme,
                     );
                     for line in block {
@@ -5994,7 +6051,7 @@ fn message_preview(text: &str, collapse: bool) -> (String, bool) {
 
 fn push_message_collapse_hint(out: &mut Vec<Line<'static>>, theme: TerminalTheme) {
     out.push(Line::from(Span::styled(
-        "… details hidden (Ctrl-T to expand)",
+        "… details hidden",
         Style::default()
             .fg(theme.muted)
             .add_modifier(Modifier::ITALIC),
@@ -6889,7 +6946,7 @@ fn push_tool_collapse_hint(
         ToolOutputHidden::Details => {
             let prefix = " ".repeat(indent);
             out.push(Line::from(Span::styled(
-                format!("{prefix}… details hidden (Ctrl-T to expand)"),
+                format!("{prefix}… details hidden"),
                 Style::default()
                     .fg(theme.muted)
                     .add_modifier(Modifier::ITALIC),
@@ -6909,8 +6966,7 @@ fn collapsed_head_len(total_lines: usize, collapse_limit: Option<usize>) -> usiz
 
 /// Leading "K earlier lines hidden" hint shown above collapsed tool outputs
 /// so the user can tell the head was elided rather than assuming the output
-/// started there. "Show all" is accurate in both modes: fullscreen Ctrl-T
-/// expands outputs in place, inline Ctrl-T opens the full-transcript reader.
+/// started there.
 fn push_collapse_hint(
     out: &mut Vec<Line<'static>>,
     indent: usize,
@@ -6919,7 +6975,7 @@ fn push_collapse_hint(
 ) {
     let prefix = " ".repeat(indent);
     out.push(Line::from(Span::styled(
-        format!("{prefix}... {hidden} earlier lines hidden (Ctrl-T to show all)"),
+        format!("{prefix}... {hidden} earlier lines hidden"),
         Style::default()
             .fg(theme.muted)
             .add_modifier(Modifier::ITALIC),
@@ -9071,6 +9127,7 @@ fn help_modal_lines(
                 "",
                 theme,
             ),
+            help_binding_line("Alt-T", "expand/collapse latest visible tool output", theme),
             help_blank_line(),
         ]);
     } else {
@@ -10975,6 +11032,214 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::NONE,
         })
+    }
+
+    fn long_tool_output(hidden_marker: &str, visible_marker: &str) -> String {
+        [
+            hidden_marker.to_string(),
+            format!("{hidden_marker}_SECOND"),
+            "tool output line 3".to_string(),
+            "tool output line 4".to_string(),
+            "tool output line 5".to_string(),
+            "tool output line 6".to_string(),
+            "tool output line 7".to_string(),
+            visible_marker.to_string(),
+        ]
+        .join("\n")
+    }
+
+    fn insert_tool_output(state: &mut AppState, id: &str, status: ToolCallStatus, output: String) {
+        state.tool_calls.insert(
+            id.to_string(),
+            crate::app::ToolCallView {
+                title: id.to_string(),
+                kind: ToolKind::Execute,
+                status,
+                body: vec![ToolCallOutput::Text(output)],
+            },
+        );
+        state.transcript.push(Entry::ToolCall(id.to_string()));
+    }
+
+    #[test]
+    fn alt_t_in_fullscreen_expands_only_latest_visible_failed_tool() {
+        let mut state = AppState::new();
+        insert_tool_output(
+            &mut state,
+            "older",
+            ToolCallStatus::Completed,
+            long_tool_output("OLDER_HIDDEN_HEAD", "OLDER_VISIBLE_TAIL"),
+        );
+        insert_tool_output(
+            &mut state,
+            "latest-failed",
+            ToolCallStatus::Failed,
+            long_tool_output("LATEST_HIDDEN_HEAD", "LATEST_VISIBLE_TAIL"),
+        );
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        let before = render_transcript_lines(&state, 100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(!before.iter().any(|line| line.contains("OLDER_HIDDEN_HEAD")));
+        assert!(
+            !before
+                .iter()
+                .any(|line| line.contains("LATEST_HIDDEN_HEAD"))
+        );
+        assert!(
+            before
+                .iter()
+                .any(|line| line.contains("OLDER_VISIBLE_TAIL"))
+        );
+        assert!(
+            before
+                .iter()
+                .any(|line| line.contains("LATEST_VISIBLE_TAIL"))
+        );
+
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('t'), KeyModifiers::ALT),
+        );
+
+        assert!(!state.expand_transcript_details);
+        assert_eq!(state.tool_detail_expanded("older"), None);
+        assert_eq!(state.tool_detail_expanded("latest-failed"), Some(true));
+        let after = render_transcript_lines(&state, 100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(!after.iter().any(|line| line.contains("OLDER_HIDDEN_HEAD")));
+        assert!(after.iter().any(|line| line.contains("LATEST_HIDDEN_HEAD")));
+        assert!(after.iter().any(|line| line.contains("OLDER_VISIBLE_TAIL")));
+        assert!(
+            after
+                .iter()
+                .any(|line| line.contains("LATEST_VISIBLE_TAIL"))
+        );
+    }
+
+    #[test]
+    fn alt_t_in_inline_reader_collapses_only_latest_failed_tool() {
+        let mut state = AppState::new();
+        insert_tool_output(
+            &mut state,
+            "older",
+            ToolCallStatus::Completed,
+            long_tool_output("INLINE_OLDER_HIDDEN_HEAD", "INLINE_OLDER_VISIBLE_TAIL"),
+        );
+        insert_tool_output(
+            &mut state,
+            "latest-failed",
+            ToolCallStatus::Failed,
+            long_tool_output("INLINE_LATEST_HIDDEN_HEAD", "INLINE_LATEST_VISIBLE_TAIL"),
+        );
+        state.open_transcript_viewer();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        let before = render_full_transcript_lines(&state, 100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(
+            before
+                .iter()
+                .any(|line| line.contains("INLINE_OLDER_HIDDEN_HEAD"))
+        );
+        assert!(
+            before
+                .iter()
+                .any(|line| line.contains("INLINE_LATEST_HIDDEN_HEAD"))
+        );
+
+        handle_inline_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('t'), KeyModifiers::ALT),
+        );
+
+        assert!(state.transcript_viewer);
+        assert!(!state.expand_transcript_details);
+        assert_eq!(state.tool_detail_expanded("older"), None);
+        assert_eq!(state.tool_detail_expanded("latest-failed"), Some(false));
+        let after = render_full_transcript_lines(&state, 100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(
+            after
+                .iter()
+                .any(|line| line.contains("INLINE_OLDER_HIDDEN_HEAD"))
+        );
+        assert!(
+            !after
+                .iter()
+                .any(|line| line.contains("INLINE_LATEST_HIDDEN_HEAD"))
+        );
+        assert!(
+            after
+                .iter()
+                .any(|line| line.contains("INLINE_OLDER_VISIBLE_TAIL"))
+        );
+        assert!(
+            after
+                .iter()
+                .any(|line| line.contains("INLINE_LATEST_VISIBLE_TAIL"))
+        );
+        assert!(
+            after
+                .iter()
+                .filter(|line| line.contains("hidden"))
+                .all(|line| !line.contains("Ctrl-T")),
+            "collapsed inline rows must not promise a Ctrl-T expansion: {after:?}"
+        );
+    }
+
+    #[test]
+    fn alt_t_skips_successful_tool_omitted_by_compact_completed_turn() {
+        let mut state = AppState::new();
+        state.record_user_prompt("prompt".to_string());
+        for (id, status, text) in [
+            ("successful", ToolCallStatus::Completed, "SUCCESS_UNIQUE"),
+            ("failed", ToolCallStatus::Failed, "FAILED_UNIQUE"),
+        ] {
+            state.tool_calls.insert(
+                id.to_string(),
+                crate::app::ToolCallView {
+                    title: id.to_string(),
+                    kind: ToolKind::Execute,
+                    status,
+                    body: vec![ToolCallOutput::Text(text.to_string())],
+                },
+            );
+            state.transcript.push(Entry::ToolCall(id.to_string()));
+        }
+        state
+            .transcript
+            .push(Entry::AgentMessage("done".to_string()));
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('t'), KeyModifiers::ALT),
+        );
+
+        assert_eq!(state.tool_detail_expanded("failed"), Some(true));
+        assert_eq!(state.tool_detail_expanded("successful"), None);
+        let rendered: Vec<String> = render_transcript_lines(&state, 100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(rendered.iter().any(|line| line.contains("FAILED_UNIQUE")));
+        assert!(!rendered.iter().any(|line| line.contains("SUCCESS_UNIQUE")));
     }
 
     fn test_clipboard_image() -> ClipboardImage {
@@ -14810,7 +15075,7 @@ mod tests {
         assert_eq!(
             rendered
                 .iter()
-                .filter(|line| line.as_str() == "… details hidden (Ctrl-T to expand)")
+                .filter(|line| line.as_str() == "… details hidden")
                 .count(),
             6,
             "rendered: {rendered:?}"
@@ -14962,8 +15227,9 @@ mod tests {
         );
         // And a leading hint tells the user the head was elided.
         assert!(
-            rendered.iter().any(|line| line
-                == &format!("│   ... {hidden} earlier lines hidden (Ctrl-T to show all)")),
+            rendered
+                .iter()
+                .any(|line| line == &format!("│   ... {hidden} earlier lines hidden")),
             "missing collapse hint, got: {rendered:?}"
         );
 
