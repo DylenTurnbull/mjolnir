@@ -536,12 +536,17 @@ fn primary_session_routes(council: &council::ResolvedCouncil) -> Vec<council::Re
     routes
 }
 
-fn select_primary_agent(council: &mut council::ResolvedCouncil, role_index: usize) -> bool {
-    let Some(role) = council.available.get(role_index) else {
-        return false;
+fn council_reload_message(council: &council::ResolvedCouncil) -> String {
+    let role = |role: Option<&council::ResolvedRole>| {
+        role.map(|role| format!("{} via {}", role.model.model, role.launch.source_id))
+            .unwrap_or_else(|| "off".to_string())
     };
-    council.thor = role.clone();
-    true
+    format!(
+        "Council reloaded after /clear: Thor {}; Loki {}; Eitri {}",
+        role(Some(&council.thor)),
+        role(council.loki.as_ref()),
+        role(council.eitri.as_ref())
+    )
 }
 
 async fn list_council_sessions(
@@ -986,7 +991,6 @@ struct RunSessionResult {
     session_title: Option<String>,
     theme_kind: theme::TerminalThemeKind,
     spinner_style: spinner::SpinnerStyle,
-    selected_agent_role: Option<usize>,
 }
 
 impl From<ui::UiRunResult> for RunSessionResult {
@@ -997,7 +1001,6 @@ impl From<ui::UiRunResult> for RunSessionResult {
             session_title: result.session_title,
             theme_kind: result.theme_kind,
             spinner_style: result.spinner_style,
-            selected_agent_role: result.selected_agent_role,
         }
     }
 }
@@ -1138,14 +1141,14 @@ async fn run_app(
     let mut initial_resume = resume_target;
     let mut initial_agent = initial_agent.or_else(|| Some(council_agent.clone()));
     let mut pending_new_session_boundary = false;
-    let mut pending_agent_switch_boundary = None;
+    let mut pending_council_boundary = None;
     loop {
         let resume = initial_resume.take();
         let agent = initial_agent
             .take()
             .unwrap_or_else(|| council_agent.clone());
 
-        let session_boundary = pending_agent_switch_boundary.take().or_else(|| {
+        let session_boundary = pending_council_boundary.take().or_else(|| {
             new_session_boundary_for_agent(
                 std::mem::take(&mut pending_new_session_boundary),
                 &agent,
@@ -1177,7 +1180,8 @@ async fn run_app(
         apply_session_result_to_config(&mut cfg, &session_result);
         match session_result.reason {
             UiExitReason::Quit => return Ok(session_result.session_id),
-            UiExitReason::NewSession => {
+            UiExitReason::NewSession | UiExitReason::ClearSession => {
+                let show_new_session_boundary = session_result.reason == UiExitReason::NewSession;
                 cfg = Config::load(&config_path)?;
                 let resolution = resolve_council_streaming_for_tui(&cfg, &cwd).await?;
                 council = resolution.council;
@@ -1185,26 +1189,9 @@ async fn run_app(
                 pending_probe_servers = resolution.pending_servers;
                 council_agent = selected_agent_for_role(&council.thor);
                 initial_agent = Some(council_agent.clone());
-                pending_new_session_boundary = true;
-                continue;
-            }
-            UiExitReason::ClearSession => {
-                initial_agent = Some(agent);
-                continue;
-            }
-            UiExitReason::CycleAgent => {
-                if session_result
-                    .selected_agent_role
-                    .is_some_and(|index| select_primary_agent(&mut council, index))
-                {
-                    pending_agent_switch_boundary = Some(format!(
-                        "Thor switched to {} via {}",
-                        council.thor.model.model, council.thor.launch.source_id
-                    ));
-                    council_agent = selected_agent_for_role(&council.thor);
-                    initial_agent = Some(council_agent.clone());
-                } else {
-                    initial_agent = Some(agent);
+                pending_new_session_boundary = show_new_session_boundary;
+                if session_result.reason == UiExitReason::ClearSession {
+                    pending_council_boundary = Some(council_reload_message(&council));
                 }
                 continue;
             }
@@ -2052,7 +2039,6 @@ async fn run_session(
                 session_title: current_session_title,
                 theme_kind,
                 spinner_style,
-                selected_agent_role: None,
             });
         };
 
@@ -2067,7 +2053,6 @@ async fn run_session(
                 session_title: target_title,
                 theme_kind,
                 spinner_style,
-                selected_agent_role: None,
             });
         }
 
@@ -2106,7 +2091,6 @@ async fn run_session(
                     session_title: target_title,
                     theme_kind,
                     spinner_style,
-                    selected_agent_role: None,
                 });
             }
         }
@@ -2512,22 +2496,23 @@ mod tests {
     }
 
     #[test]
-    fn select_primary_agent_uses_the_picker_role_index() {
+    fn clear_boundary_reports_each_reloaded_council_role() {
         let codex = test_council_role("gpt-test", "codex-acp");
         let claude = test_council_role("claude-test", "claude-acp");
-        let mut council = council::ResolvedCouncil {
+        let council = council::ResolvedCouncil {
             thor: codex.clone(),
-            loki: None,
-            eitri: Some(codex.clone()),
+            loki: Some(claude.clone()),
+            eitri: None,
             available: vec![codex, claude],
             choices: Vec::new(),
             warnings: Vec::new(),
             inventory: council::AcpInventory::default(),
         };
 
-        assert!(select_primary_agent(&mut council, 1));
-        assert_eq!(council.thor.launch.source_id, "claude-acp");
-        assert!(!select_primary_agent(&mut council, 2));
+        assert_eq!(
+            council_reload_message(&council),
+            "Council reloaded after /clear: Thor gpt-test via codex-acp; Loki claude-test via claude-acp; Eitri off"
+        );
     }
 
     #[test]
@@ -2658,7 +2643,6 @@ mod tests {
             session_title: Some("Current".to_string()),
             theme_kind: theme::TerminalThemeKind::AnsiLight,
             spinner_style: spinner::SpinnerStyle::Bars,
-            selected_agent_role: None,
         };
 
         apply_session_result_to_config(&mut cfg, &result);

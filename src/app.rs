@@ -151,7 +151,6 @@ pub enum UiExitReason {
     ClearSession,
     LoadSession,
     SwitchSession,
-    CycleAgent,
 }
 
 /// One entry in the scrolling transcript.
@@ -725,7 +724,6 @@ pub struct AppState {
     /// `*_pending_elicitation*` helpers.
     elicitation_queue: VecDeque<PendingElicitation>,
     pub agent_picker: Option<AgentPicker>,
-    pub selected_agent_role: Option<usize>,
     pub config_picker: Option<ConfigPicker>,
     /// Scroll offset measured in rendered lines from the bottom of the
     /// transcript. `0` keeps the view pinned to the newest line.
@@ -804,8 +802,8 @@ pub struct AppState {
     pub config_path: Option<PathBuf>,
     /// DeepSWE model catalog and current model-first council selectors.
     pub council_choices: Vec<crate::council::ModelChoice>,
-    /// Preferences saved for the next session and immutable resolutions used
-    /// by the current session are deliberately shown separately.
+    /// Preferences saved for the next `/new` or `/clear` boundary and immutable
+    /// resolutions used by the current session are deliberately shown separately.
     pub council_models: crate::config::ModelsConfig,
     pub active_council_models: crate::config::ModelsConfig,
     pub thor_review_enabled: bool,
@@ -986,11 +984,11 @@ impl InputPasteBurst {
     }
 }
 
-/// ACP agent picker overlay state.
+/// Deferred Thor model picker overlay state.
 #[derive(Debug, Clone)]
 pub struct AgentPicker {
     pub selected: usize,
-    /// Indices into `ragnarok_models`, deduplicated by ACP source ID.
+    /// Indices into `ragnarok_models`, deduplicated by configured model ID.
     pub role_indices: Vec<usize>,
     pub confirming: bool,
 }
@@ -1071,7 +1069,6 @@ impl AppState {
             permission_queue: VecDeque::new(),
             elicitation_queue: VecDeque::new(),
             agent_picker: None,
-            selected_agent_role: None,
             config_picker: None,
             scroll_offset: 0,
             expand_transcript_details: false,
@@ -1179,16 +1176,16 @@ impl AppState {
             .ragnarok_models
             .iter()
             .enumerate()
-            .filter_map(|(index, role)| {
-                seen.insert(role.launch.source_id.as_str()).then_some(index)
-            })
+            .filter_map(|(index, role)| seen.insert(role.model.model.as_str()).then_some(index))
             .collect::<Vec<_>>();
         if role_indices.len() < 2 {
             return false;
         }
         let selected = role_indices
             .iter()
-            .position(|&index| self.ragnarok_models[index].launch.source_id == self.agent_source_id)
+            .position(|&index| {
+                self.ragnarok_models[index].model.model == self.active_council_models.thor
+            })
             .unwrap_or(0);
         self.agent_picker = Some(AgentPicker {
             selected,
@@ -1216,7 +1213,7 @@ impl AppState {
         let Some(role) = self.ragnarok_models.get(role_index) else {
             return false;
         };
-        if role.launch.source_id == self.agent_source_id {
+        if role.model.model == self.active_council_models.thor {
             self.agent_picker = None;
             return false;
         }
@@ -1224,15 +1221,13 @@ impl AppState {
         true
     }
 
-    pub fn agent_picker_confirm(&mut self) -> bool {
-        let Some(picker) = self.agent_picker.take() else {
-            return false;
-        };
+    pub fn agent_picker_confirm(&mut self) -> Option<crate::council::ResolvedRole> {
+        let picker = self.agent_picker.take()?;
         if !picker.confirming {
-            return false;
+            return None;
         }
-        self.selected_agent_role = picker.role_indices.get(picker.selected).copied();
-        self.selected_agent_role.is_some()
+        let role_index = picker.role_indices.get(picker.selected).copied()?;
+        self.ragnarok_models.get(role_index).cloned()
     }
 
     /// Open `/mjconfig`, seeded from the same persisted config startup edits.

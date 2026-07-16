@@ -830,7 +830,13 @@ fn draw_council(
     editor: &SettingsEditor,
     theme: TerminalTheme,
 ) {
-    let mut lines = Vec::new();
+    let mut lines = vec![
+        Line::styled(
+            "Thor and Loki stay active until /new or /clear reloads the saved Council.",
+            Style::default().fg(theme.muted),
+        ),
+        Line::raw(""),
+    ];
     for (index, (role, description)) in ROLE_DESCRIPTIONS.iter().enumerate() {
         let model = match index {
             0 => &editor.config.thor.model,
@@ -952,7 +958,7 @@ fn draw_servers(
                 if server.model_count == 1 { "" } else { "s" }
             )
         } else if server.selected && !server.detected {
-            "explicitly enabled; starts next session".to_string()
+            "explicitly enabled; starts on /new or /clear".to_string()
         } else if server.detected {
             "detected".to_string()
         } else {

@@ -496,7 +496,6 @@ pub struct UiRunResult {
     pub session_title: Option<String>,
     pub theme_kind: TerminalThemeKind,
     pub spinner_style: SpinnerStyle,
-    pub selected_agent_role: Option<usize>,
 }
 
 struct UiInitialState {
@@ -528,7 +527,6 @@ struct UiLoopOutcome {
     session_title: Option<String>,
     theme_kind: TerminalThemeKind,
     spinner_style: SpinnerStyle,
-    selected_agent_role: Option<usize>,
     history: Vec<String>,
 }
 
@@ -552,7 +550,6 @@ pub async fn run(
         session_title,
         theme_kind,
         spinner_style,
-        selected_agent_role,
         history,
     } = ui_loop(
         terminal,
@@ -595,7 +592,6 @@ pub async fn run(
         session_title,
         theme_kind,
         spinner_style,
-        selected_agent_role,
     })
 }
 
@@ -1061,7 +1057,6 @@ async fn ui_loop(
                 session_title: state.session_title.clone(),
                 theme_kind: state.theme_kind,
                 spinner_style: state.spinner_style,
-                selected_agent_role: state.selected_agent_role,
                 history: state.prompt_history(),
             });
         }
@@ -1143,7 +1138,6 @@ async fn ui_loop(
         session_title: None,
         theme_kind: state.theme_kind,
         spinner_style: state.spinner_style,
-        selected_agent_role: state.selected_agent_role,
         history: state.prompt_history(),
     })
 }
@@ -2001,15 +1995,7 @@ fn handle_crossterm(
     }
 
     if matches!(key.code, KeyCode::BackTab) {
-        if state.runtime_closed {
-            state.status_line = Some(StatusMessage::warning(
-                "the ACP runtime is closed; start a new session to switch agents",
-            ));
-        } else if state.is_busy() {
-            state.status_line = Some(StatusMessage::warning(
-                "wait for the current turn to finish before switching agents",
-            ));
-        } else if !state.open_agent_picker() {
+        if !state.open_agent_picker() {
             state.status_line = Some(StatusMessage::info(
                 "no other ACP agent is currently available",
             ));
@@ -3629,7 +3615,7 @@ fn persist_mjconfig_selection(
                 }
                 state.record_status_message(
                     StatusKind::Info,
-                    format!("config saved — theme {theme}, spinner {style}; model and ACP changes apply next session"),
+                    format!("config saved — theme {theme}, spinner {style}; Council model and ACP changes apply on /new or /clear"),
                 );
             }
             Err(e) => state.record_status_message(
@@ -4267,8 +4253,8 @@ fn handle_agent_picker_key(
                 .as_ref()
                 .is_some_and(|picker| picker.confirming);
             if confirming {
-                if state.agent_picker_confirm() {
-                    state.exit_reason = Some(UiExitReason::CycleAgent);
+                if let Some(role) = state.agent_picker_confirm() {
+                    persist_thor_picker_selection(state, role);
                 }
             } else if !state.agent_picker_request_confirmation() {
                 state.status_line =
@@ -4287,6 +4273,40 @@ fn handle_agent_picker_key(
             TerminalRequest::None
         }
         PickerKeyAction::Other => TerminalRequest::None,
+    }
+}
+
+fn persist_thor_picker_selection(state: &mut AppState, role: crate::council::ResolvedRole) {
+    let Some(path) = state.config_path.as_deref() else {
+        state.record_status_message(StatusKind::Warning, "config path is unavailable");
+        return;
+    };
+    let mut config = match config::Config::load(path) {
+        Ok(config) => config,
+        Err(error) => {
+            state.record_status_message(
+                StatusKind::Warning,
+                format!("could not load config: {error:#}"),
+            );
+            return;
+        }
+    };
+    config.thor.model.clone_from(&role.model.model);
+    match config.save(path) {
+        Ok(()) => {
+            state.council_models = config.role_models();
+            state.record_status_message(
+                StatusKind::Info,
+                format!(
+                    "Thor {} saved; use /new or /clear to apply",
+                    role.model.model
+                ),
+            );
+        }
+        Err(error) => state.record_status_message(
+            StatusKind::Warning,
+            format!("Thor selection was not saved: {error:#}"),
+        ),
     }
 }
 
@@ -4891,10 +4911,10 @@ fn agent_picker_items(state: &AppState, width: u16, visible: usize) -> Vec<ListI
         .filter_map(|(offset, &role_index)| {
             let position = range.start + offset;
             let role = state.ragnarok_models.get(role_index)?;
-            let current = role.launch.source_id == state.agent_source_id;
+            let current = role.model.model == state.active_council_models.thor;
             let suffix = if current { "  current" } else { "" };
             Some(truncate_line(
-                format!("{}{suffix}", role.launch.source_id),
+                format!("{} via {}{suffix}", role.model.model, role.launch.source_id),
                 width,
                 position == picker.selected,
                 state.theme,
@@ -4919,7 +4939,7 @@ fn draw_inline_agent_picker(f: &mut ratatui::Frame, area: Rect, state: &AppState
         ])
         .split(content);
     f.render_widget(
-        Paragraph::new("Select Thor's ACP agent").style(
+        Paragraph::new("Select Thor model").style(
             Style::default()
                 .fg(state.theme.primary)
                 .add_modifier(Modifier::BOLD),
@@ -4931,9 +4951,9 @@ fn draw_inline_agent_picker(f: &mut ratatui::Frame, area: Rect, state: &AppState
         .as_ref()
         .is_some_and(|picker| picker.confirming);
     let detail = if confirming {
-        "Start a fresh Thor session with this agent?"
+        "Save this Thor model for /new or /clear?"
     } else {
-        "Choose an ACP agent for Thor"
+        "Choose a model for Thor"
     };
     f.render_widget(
         Paragraph::new(detail).style(Style::default().fg(state.theme.muted)),
@@ -9128,7 +9148,7 @@ fn draw_agent_picker_modal(f: &mut ratatui::Frame, area: Rect, state: &AppState)
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Select Thor's ACP agent ")
+        .title(" Select Thor model ")
         .style(Style::default().fg(state.theme.primary));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -9143,12 +9163,12 @@ fn draw_agent_picker_modal(f: &mut ratatui::Frame, area: Rect, state: &AppState)
     let confirming = picker.confirming;
     let header = if confirming {
         vec![
-            Line::from("Start a fresh Thor session with this agent?"),
+            Line::from("Save this Thor model for /new or /clear?"),
             Line::from("Enter confirm | Esc back"),
         ]
     } else {
         vec![
-            Line::from("Choose an ACP agent for Thor."),
+            Line::from("Choose a model for Thor."),
             Line::from("Enter continue | Esc cancel"),
         ]
     };
@@ -12505,9 +12525,16 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_opens_primary_agent_selector_when_idle() {
+    fn shift_tab_saves_thor_for_the_next_clear_or_new_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        config::Config::default()
+            .save(&config_path)
+            .expect("save config");
         let mut state = AppState::new();
+        state.config_path = Some(config_path.clone());
         state.agent_source_id = "codex-acp".to_string();
+        state.active_council_models.thor = "codex-acp".to_string();
         state.ragnarok_models = [
             (crate::council::AdapterKind::Codex, "codex-acp"),
             (crate::council::AdapterKind::Claude, "claude-acp"),
@@ -12554,14 +12581,27 @@ mod tests {
         handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Enter));
 
         assert!(state.agent_picker.is_none());
-        assert_eq!(state.selected_agent_role, Some(1));
-        assert_eq!(state.exit_reason, Some(UiExitReason::CycleAgent));
+        assert_eq!(state.exit_reason, None);
+        assert_eq!(
+            config::Config::load(&config_path)
+                .expect("load config")
+                .thor
+                .model,
+            "claude-acp"
+        );
+        assert!(
+            state
+                .status_line
+                .as_ref()
+                .is_some_and(|status| status.text.contains("use /new or /clear to apply"))
+        );
     }
 
     #[test]
     fn agent_selector_navigation_wraps() {
         let mut state = AppState::new();
         state.agent_source_id = "codex-acp".to_string();
+        state.active_council_models.thor = "codex-acp".to_string();
         state.ragnarok_models = ["codex-acp", "claude-acp"]
             .into_iter()
             .map(|source_id| crate::council::ResolvedRole {
@@ -12595,6 +12635,7 @@ mod tests {
     fn selecting_current_agent_closes_selector_without_restart() {
         let mut state = AppState::new();
         state.agent_source_id = "codex-acp".to_string();
+        state.active_council_models.thor = "codex-acp".to_string();
         state.ragnarok_models = ["codex-acp", "claude-acp"]
             .into_iter()
             .map(|source_id| crate::council::ResolvedRole {
@@ -12621,12 +12662,11 @@ mod tests {
         handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Enter));
 
         assert!(state.agent_picker.is_none());
-        assert_eq!(state.selected_agent_role, None);
         assert_eq!(state.exit_reason, None);
     }
 
     #[test]
-    fn shift_tab_does_not_switch_agents_during_a_turn() {
+    fn shift_tab_can_stage_a_thor_change_during_a_turn() {
         let mut state = AppState::new();
         state.ragnarok_models = ["codex-acp", "claude-acp"]
             .into_iter()
@@ -12654,13 +12694,7 @@ mod tests {
         handle_crossterm(&mut state, &cmd_tx, key(KeyCode::BackTab));
 
         assert_eq!(state.exit_reason, None);
-        assert_eq!(
-            state
-                .status_line
-                .as_ref()
-                .map(|status| status.text.as_str()),
-            Some("wait for the current turn to finish before switching agents")
-        );
+        assert!(state.agent_picker.is_some());
     }
 
     #[test]
