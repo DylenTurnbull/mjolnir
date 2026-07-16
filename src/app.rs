@@ -9,9 +9,12 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::claude_usage::ClaudeUsageReport;
+use crate::bedrock_credits::BedrockCreditsStatus;
+use crate::claude_usage::ClaudeUsageStatus;
 use crate::clipboard::ClipboardLease;
 use crate::codex_usage::CodexUsageStatus;
+use crate::deepseek_balance::DeepSeekBalanceStatus;
+use crate::openrouter_balance::OpenRouterBalanceStatus;
 use agent_client_protocol::schema::v1::{
     AvailableCommand, Diff, ElicitationContentValue, ElicitationMode, ElicitationPropertySchema,
     EnumOption, Plan, PlanEntry, SessionConfigKind, SessionConfigOption,
@@ -34,6 +37,13 @@ use crate::theme::TerminalThemeKind;
 /// Maximum width of the queued-prompt preview shown above the input.
 /// Beyond this we truncate with an ellipsis.
 pub const QUEUED_PROMPT_PREVIEW_WIDTH: usize = 40;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnvilQuotaSource {
+    Bedrock,
+    OpenRouter,
+    DeepSeek,
+}
 
 const BUILTIN_NEW_COMMAND: &str = "new";
 const BUILTIN_CLEAR_COMMAND: &str = "clear";
@@ -145,6 +155,12 @@ pub enum UiExitReason {
 }
 
 /// One entry in the scrolling transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThoughtEntry {
+    pub text: String,
+    pub completed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum Entry {
     /// Plain user prompt (echoed locally as soon as it is sent).
@@ -152,10 +168,10 @@ pub enum Entry {
     /// Streaming agent reply. Mutated in place as chunks arrive.
     AgentMessage(String),
     /// Streaming agent reasoning ("thoughts").
-    AgentThought(String),
+    AgentThought(ThoughtEntry),
     /// Nested agent response and reasoning, kept visually distinct from the primary.
     CodeAgentMessage(String),
-    CodeAgentThought(String),
+    CodeAgentThought(ThoughtEntry),
     /// A tool call slot identified by id. The body is rendered from
     /// `tool_calls[id]`; we keep an entry pointer so it shows up in order.
     ToolCall(String),
@@ -623,6 +639,9 @@ pub struct AppState {
     pub session_fork_supported: bool,
     pub transcript: Vec<Entry>,
     pub tool_calls: HashMap<String, ToolCallView>,
+    /// Workspace diffs observed locally after prompt turns. These deliberately
+    /// remain outside ACP tool-call and transcript state.
+    pub workspace_diffs: Vec<crate::event::WorkspaceDiffEvent>,
     /// Primary-agent MCP calls that transport an Eitri turn. Their protocol
     /// state remains available, but the redundant parent row is omitted from
     /// the transcript so it cannot pin nested activity behind a pending tool.
@@ -723,9 +742,17 @@ pub struct AppState {
     /// Kept separate so the header never presents Thor's context as Eitri's.
     code_agent_token_usage: TokenUsage,
     /// Last Claude Code `/usage` quota scrape, when the active agent is Claude.
-    pub claude_usage: Option<ClaudeUsageReport>,
+    pub claude_usage: Option<ClaudeUsageStatus>,
     /// Last Codex app-server quota query, including explicit unavailable states.
     pub codex_usage: Option<CodexUsageStatus>,
+    /// AWS promotional/account credits applicable to the active Bedrock route.
+    pub bedrock_credits: Option<BedrockCreditsStatus>,
+    /// OpenRouter balance supplied by Anvil for the active OpenRouter route.
+    pub openrouter_balance: Option<OpenRouterBalanceStatus>,
+    /// DeepSeek balances supplied by Anvil for the active DeepSeek route.
+    pub deepseek_balance: Option<DeepSeekBalanceStatus>,
+    /// The active provider reported in Anvil metadata.
+    pub anvil_quota_source: Option<AnvilQuotaSource>,
     /// Slash-command autocomplete state, recomputed on every input edit.
     pub autocomplete: Autocomplete,
     /// True while the keyboard help overlay is visible.
@@ -998,6 +1025,7 @@ impl AppState {
             session_fork_supported: false,
             transcript: Vec::new(),
             tool_calls: HashMap::new(),
+            workspace_diffs: Vec::new(),
             suppressed_tool_calls: HashSet::new(),
             terminal_outputs: HashMap::new(),
             transcript_revision: 0,
@@ -1039,6 +1067,10 @@ impl AppState {
             code_agent_token_usage: TokenUsage::default(),
             claude_usage: None,
             codex_usage: None,
+            bedrock_credits: None,
+            openrouter_balance: None,
+            deepseek_balance: None,
+            anvil_quota_source: None,
             autocomplete: Autocomplete::default(),
             help_overlay: false,
             help_scroll: 0,
@@ -1056,6 +1088,48 @@ impl AppState {
             clipboard_lease: None,
             queued_prompts: VecDeque::new(),
         }
+    }
+
+    /// Select the Anvil provider reported by valid metadata and clear its stale peer.
+    fn select_anvil_quota_source(&mut self, source: AnvilQuotaSource) {
+        match source {
+            AnvilQuotaSource::Bedrock => {
+                self.openrouter_balance = None;
+                self.deepseek_balance = None;
+            }
+            AnvilQuotaSource::OpenRouter => {
+                self.bedrock_credits = None;
+                self.deepseek_balance = None;
+            }
+            AnvilQuotaSource::DeepSeek => {
+                self.bedrock_credits = None;
+                self.openrouter_balance = None;
+            }
+        }
+        self.anvil_quota_source = Some(source);
+    }
+
+    pub(crate) fn set_bedrock_credits(&mut self, status: BedrockCreditsStatus) {
+        self.select_anvil_quota_source(AnvilQuotaSource::Bedrock);
+        self.bedrock_credits = Some(status);
+    }
+
+    pub(crate) fn set_openrouter_balance(&mut self, status: OpenRouterBalanceStatus) {
+        self.select_anvil_quota_source(AnvilQuotaSource::OpenRouter);
+        self.openrouter_balance = Some(status);
+    }
+
+    pub(crate) fn set_deepseek_balance(&mut self, status: DeepSeekBalanceStatus) {
+        self.select_anvil_quota_source(AnvilQuotaSource::DeepSeek);
+        self.deepseek_balance = Some(status);
+    }
+
+    pub(crate) fn set_codex_usage(&mut self, status: CodexUsageStatus) {
+        self.codex_usage = Some(status);
+    }
+
+    pub(crate) fn set_claude_usage(&mut self, status: ClaudeUsageStatus) {
+        self.claude_usage = Some(status);
     }
 
     pub fn set_theme(&mut self, theme_kind: TerminalThemeKind) {
@@ -2073,17 +2147,6 @@ impl AppState {
     }
 
     pub fn apply_event(&mut self, event: UiEvent) {
-        let is_thinking_update = matches!(
-            &event,
-            UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(_))
-                | UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-                    SessionUpdate::AgentThoughtChunk(_)
-                ))
-        );
-        if !is_thinking_update && remove_trailing_thinking(&mut self.transcript) {
-            self.bump_transcript_revision();
-        }
-
         match event {
             UiEvent::Connected {
                 prompt_images_supported,
@@ -2104,6 +2167,9 @@ impl AppState {
                 if self.connection_state == ConnectionState::Forking {
                     self.finish_turn_timer();
                 }
+                if self.session_id.as_deref() != Some(&session_id) {
+                    self.workspace_diffs.clear();
+                }
                 self.session_id = Some(session_id);
                 self.set_connection_state(ConnectionState::Ready);
             }
@@ -2112,6 +2178,7 @@ impl AppState {
                 self.apply_known_terminal_outputs();
             }
             UiEvent::TerminalOutput(snapshot) => {
+                self.finalize_thinking(EntryKind::Thought);
                 self.terminal_outputs
                     .insert(snapshot.terminal_id.clone(), snapshot);
                 self.apply_known_terminal_outputs();
@@ -2140,7 +2207,9 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             UiEvent::CouncilUsage(record) => self.council_usage.observe(record),
+            UiEvent::WorkspaceDiff(diff) => self.workspace_diffs.push(diff),
             UiEvent::PermissionRequest(prompt) => {
+                self.finalize_thinking(EntryKind::Thought);
                 // Append to the queue rather than replacing the current
                 // pending prompt: overwriting would drop the prior
                 // oneshot responder, which the agent reads as a silent
@@ -2157,11 +2226,13 @@ impl AppState {
                 self.update_autocomplete();
             }
             UiEvent::CancelPendingPermissions => {
+                self.finalize_thinking(EntryKind::Thought);
                 self.cancel_all_pending_permissions();
                 self.mark_unfinished_tool_calls_failed("tool call cancelled");
                 self.update_autocomplete();
             }
             UiEvent::ElicitationRequest(prompt) => {
+                self.finalize_thinking(EntryKind::Thought);
                 // Append to the queue rather than replacing the front prompt:
                 // overwriting would drop the prior oneshot responder, which the
                 // agent reads as a silent cancel. Render unconditionally (no
@@ -2184,9 +2255,7 @@ impl AppState {
                 self.resolve_permission_remotely(&request_id, &option_id);
             }
             UiEvent::PromptDone { stop_reason, usage } => {
-                if remove_trailing_thinking(&mut self.transcript) {
-                    self.bump_transcript_revision();
-                }
+                self.finalize_thinking(EntryKind::Thought);
                 self.finish_prompt_turn(matches!(stop_reason, StopReason::Cancelled));
                 if let Some(usage) = usage {
                     self.token_usage.apply_prompt_usage(usage);
@@ -2201,15 +2270,13 @@ impl AppState {
                 self.update_autocomplete();
             }
             UiEvent::ClaudeUsage(report) => {
-                self.claude_usage = Some(report);
+                self.set_claude_usage(report);
             }
             UiEvent::CodexUsage(status) => {
-                self.codex_usage = Some(status);
+                self.set_codex_usage(status);
             }
             UiEvent::PromptFailed { message } => {
-                if remove_trailing_thinking(&mut self.transcript) {
-                    self.bump_transcript_revision();
-                }
+                self.finalize_thinking(EntryKind::Thought);
                 self.finish_prompt_turn(true);
                 // Drop queued prompts: finish_prompt_turn flips back to
                 // Ready, which the next drain pass would otherwise read as
@@ -2241,6 +2308,7 @@ impl AppState {
                 self.record_status_message(StatusKind::Info, msg);
             }
             UiEvent::Fatal(msg) => {
+                self.finalize_thinking(EntryKind::Thought);
                 self.set_connection_state(ConnectionState::Fatal);
                 self.record_status_message(StatusKind::Fatal, msg);
                 self.mark_runtime_closed();
@@ -2290,18 +2358,14 @@ impl AppState {
             }
             CodeAgentEvent::SessionUpdate(update) => self.apply_code_agent_update(update),
             CodeAgentEvent::TerminalOutput(mut snapshot) => {
-                if remove_trailing_thinking(&mut self.transcript) {
-                    self.bump_transcript_revision();
-                }
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 snapshot.terminal_id = format!("{PREFIX}{}", snapshot.terminal_id);
                 self.terminal_outputs
                     .insert(snapshot.terminal_id.clone(), snapshot);
                 self.apply_known_terminal_outputs();
             }
             CodeAgentEvent::PermissionRequest(prompt) => {
-                if remove_trailing_thinking(&mut self.transcript) {
-                    self.bump_transcript_revision();
-                }
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 self.help_overlay = false;
                 self.permission_queue.push_back(PendingPermission {
                     prompt,
@@ -2314,9 +2378,7 @@ impl AppState {
                 self.update_autocomplete();
             }
             CodeAgentEvent::ElicitationRequest(prompt) => {
-                if remove_trailing_thinking(&mut self.transcript) {
-                    self.bump_transcript_revision();
-                }
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 self.help_overlay = false;
                 self.elicitation_queue.push_back(PendingElicitation {
                     prompt,
@@ -2328,17 +2390,16 @@ impl AppState {
                 self.update_autocomplete();
             }
             CodeAgentEvent::CancelPendingPermissions => {
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 self.cancel_code_agent_prompts();
                 self.mark_code_agent_tools_failed("tool call cancelled");
             }
             CodeAgentEvent::Status(message) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 self.push_system_message(format!("Eitri · {message}"));
             }
             CodeAgentEvent::Finished { outcome } => {
-                if remove_trailing_thinking(&mut self.transcript) {
-                    self.bump_transcript_revision();
-                }
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 self.code_agent_active = false;
                 self.code_agent_label = None;
                 self.cancel_code_agent_prompts();
@@ -2362,12 +2423,18 @@ impl AppState {
         }
     }
 
+    fn finalize_thinking(&mut self, kind: EntryKind) {
+        if finalize_active_thinking(&mut self.transcript, kind) {
+            self.bump_transcript_revision();
+        }
+    }
+
     fn apply_code_agent_update(&mut self, update: SessionUpdate) {
         const PREFIX: &str = "codeagent:";
         match update {
             SessionUpdate::UserMessageChunk(_) => {}
             SessionUpdate::AgentMessageChunk(chunk) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 append_or_start(
                     &mut self.transcript,
                     EntryKind::CodeAgent,
@@ -2384,7 +2451,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCall(tool_call) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 let key = format!("{PREFIX}{}", tool_call.tool_call_id);
                 let mut view = ToolCallView::from_tool_call(&tool_call);
                 view.namespace_terminal_ids(PREFIX);
@@ -2393,7 +2460,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCallUpdate(update) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 let key = format!("{PREFIX}{}", update.tool_call_id);
                 if let Some(view) = self.tool_calls.get_mut(&key) {
                     view.apply_update(&update);
@@ -2419,7 +2486,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::Plan(Plan { entries, .. }) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::CodeAgentThought);
                 if let Some(Entry::CodeAgentPlan(existing)) = self
                     .transcript
                     .iter_mut()
@@ -2441,7 +2508,6 @@ impl AppState {
     }
 
     fn apply_loki_activity(&mut self, activity: LokiActivity) {
-        remove_trailing_thinking(&mut self.transcript);
         self.transcript
             .push(Entry::LokiActivity(Box::new(activity)));
         self.bump_transcript_revision();
@@ -2568,7 +2634,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::AgentMessageChunk(c) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::Thought);
                 let text = content_block_text(&c.content);
                 append_or_start(&mut self.transcript, EntryKind::Agent, text);
                 self.bump_transcript_revision();
@@ -2579,7 +2645,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCall(tc) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::Thought);
                 let id = tc.tool_call_id.to_string();
                 let suppressed = is_code_agent_transport_call(&tc);
                 self.tool_calls
@@ -2592,7 +2658,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCallUpdate(u) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::Thought);
                 let id = u.tool_call_id.to_string();
                 let suppressed =
                     self.suppressed_tool_calls.contains(&id) || is_code_agent_transport_update(&u);
@@ -2624,7 +2690,7 @@ impl AppState {
                 self.bump_transcript_revision();
             }
             SessionUpdate::Plan(Plan { entries, .. }) => {
-                remove_trailing_thinking(&mut self.transcript);
+                self.finalize_thinking(EntryKind::Thought);
                 // Replace the most recent Plan entry if present, else push.
                 if let Some(Entry::Plan(existing)) = self
                     .transcript
@@ -2667,6 +2733,15 @@ impl AppState {
                 }
             }
             SessionUpdate::UsageUpdate(u) => {
+                if let Some(status) = crate::bedrock_credits::from_usage_meta(u.meta.as_ref()) {
+                    self.set_bedrock_credits(status);
+                }
+                if let Some(status) = crate::openrouter_balance::from_usage_meta(u.meta.as_ref()) {
+                    self.set_openrouter_balance(status);
+                }
+                if let Some(status) = crate::deepseek_balance::from_usage_meta(u.meta.as_ref()) {
+                    self.set_deepseek_balance(status);
+                }
                 if let Some(rate_limit) = self.token_usage.apply_usage_update(u) {
                     // The line is self-describing ("Current session: …"), so
                     // surface it verbatim rather than wrapping it.
@@ -2805,7 +2880,7 @@ fn config_option_targets(options: &[SessionConfigOption]) -> Vec<SessionConfigTa
         .collect()
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
     User,
     Agent,
@@ -2831,37 +2906,61 @@ fn append_or_start(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) {
     transcript.push(match kind {
         EntryKind::User => Entry::UserPrompt(text),
         EntryKind::Agent => Entry::AgentMessage(text),
-        EntryKind::Thought => Entry::AgentThought(text),
+        EntryKind::Thought => Entry::AgentThought(ThoughtEntry {
+            text,
+            completed: false,
+        }),
         EntryKind::CodeAgent => Entry::CodeAgentMessage(text),
-        EntryKind::CodeAgentThought => Entry::CodeAgentThought(text),
+        EntryKind::CodeAgentThought => Entry::CodeAgentThought(ThoughtEntry {
+            text,
+            completed: false,
+        }),
     });
 }
 
 fn append_thinking_chunk(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) {
-    match (kind, transcript.last_mut()) {
-        (EntryKind::Thought, Some(Entry::AgentThought(existing)))
-        | (EntryKind::CodeAgentThought, Some(Entry::CodeAgentThought(existing))) => {
-            existing.push_str(&text);
-        }
-        (EntryKind::Thought, _) => {
-            remove_trailing_thinking(transcript);
-            transcript.push(Entry::AgentThought(text));
-        }
-        (EntryKind::CodeAgentThought, _) => {
-            remove_trailing_thinking(transcript);
-            transcript.push(Entry::CodeAgentThought(text));
-        }
+    let existing = match kind {
+        EntryKind::Thought => transcript.iter_mut().rev().find_map(|entry| match entry {
+            Entry::AgentThought(thought) if !thought.completed => Some(thought),
+            _ => None,
+        }),
+        EntryKind::CodeAgentThought => transcript.iter_mut().rev().find_map(|entry| match entry {
+            Entry::CodeAgentThought(thought) if !thought.completed => Some(thought),
+            _ => None,
+        }),
+        _ => unreachable!("append_thinking_chunk requires a thought entry kind"),
+    };
+    if let Some(thought) = existing {
+        thought.text.push_str(&text);
+        return;
+    }
+    match kind {
+        EntryKind::Thought => transcript.push(Entry::AgentThought(ThoughtEntry {
+            text,
+            completed: false,
+        })),
+        EntryKind::CodeAgentThought => transcript.push(Entry::CodeAgentThought(ThoughtEntry {
+            text,
+            completed: false,
+        })),
         _ => unreachable!("append_thinking_chunk requires a thought entry kind"),
     }
 }
 
-fn remove_trailing_thinking(transcript: &mut Vec<Entry>) -> bool {
-    let thinking = matches!(
-        transcript.last(),
-        Some(Entry::AgentThought(_) | Entry::CodeAgentThought(_))
-    );
-    if thinking {
-        transcript.pop();
+fn finalize_active_thinking(transcript: &mut [Entry], kind: EntryKind) -> bool {
+    let thought = match kind {
+        EntryKind::Thought => transcript.iter_mut().rev().find_map(|entry| match entry {
+            Entry::AgentThought(thought) if !thought.completed => Some(thought),
+            _ => None,
+        }),
+        EntryKind::CodeAgentThought => transcript.iter_mut().rev().find_map(|entry| match entry {
+            Entry::CodeAgentThought(thought) if !thought.completed => Some(thought),
+            _ => None,
+        }),
+        _ => unreachable!("finalize_active_thinking requires a thought entry kind"),
+    };
+    if let Some(thought) = thought {
+        thought.completed = true;
         true
     } else {
         false
@@ -3525,10 +3624,10 @@ mod tests {
         ContentBlock, ContentChunk, Cost, CreateElicitationRequest, CreateElicitationResponse,
         Diff, ElicitationAcceptAction, ElicitationAction, ElicitationFormMode, ElicitationId,
         ElicitationSchema, ElicitationSessionScope, ElicitationUrlMode, EmbeddedResource,
-        EmbeddedResourceResource, ImageContent, PermissionOption, PermissionOptionKind,
-        ResourceLink, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-        StopReason, StringPropertySchema, Terminal, TextContent, TextResourceContents, Usage,
-        UsageUpdate,
+        EmbeddedResourceResource, ImageContent, PermissionOption, PermissionOptionKind, Plan,
+        PlanEntry, PlanEntryPriority, PlanEntryStatus, ResourceLink, SessionConfigOption,
+        SessionConfigOptionCategory, SessionConfigSelectOption, StopReason, StringPropertySchema,
+        Terminal, TextContent, TextResourceContents, Usage, UsageUpdate,
     };
 
     fn text_chunk(s: &str) -> ContentChunk {
@@ -3552,7 +3651,78 @@ mod tests {
     }
 
     #[test]
-    fn thinking_chunks_accumulate_and_non_thinking_activity_removes_them() {
+    fn plan_updates_replace_entries_without_changing_priority_or_status() {
+        let mut state = AppState::new();
+        let initial = vec![PlanEntry::new(
+            "inspect renderer",
+            PlanEntryPriority::High,
+            PlanEntryStatus::InProgress,
+        )];
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::Plan(Plan::new(
+            initial.clone(),
+        ))));
+        assert!(
+            matches!(state.transcript.last(), Some(Entry::Plan(entries)) if entries == &initial)
+        );
+
+        let replacement = vec![
+            PlanEntry::new(
+                "inspect renderer",
+                PlanEntryPriority::High,
+                PlanEntryStatus::Completed,
+            ),
+            PlanEntry::new(
+                "verify narrow layout",
+                PlanEntryPriority::Low,
+                PlanEntryStatus::Pending,
+            ),
+        ];
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::Plan(Plan::new(
+            replacement.clone(),
+        ))));
+
+        assert_eq!(state.transcript.len(), 1);
+        assert!(
+            matches!(state.transcript.last(), Some(Entry::Plan(entries)) if entries == &replacement)
+        );
+    }
+
+    #[test]
+    fn workspace_diffs_are_retained_without_transcript_or_tool_call_entries() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::SessionStarted {
+            session_id: "first-session".to_string(),
+            resumed: false,
+        });
+        let revision = state.transcript_revision;
+
+        state.apply_event(UiEvent::WorkspaceDiff(crate::event::WorkspaceDiffEvent {
+            turn_id: 7,
+            diffs: vec![crate::event::WorkspaceDiff {
+                path: PathBuf::from("src/lib.rs"),
+                old_text: Some("before\n".to_string()),
+                new_text: "after\n".to_string(),
+            }],
+            total_files: 1,
+            max_files: 20,
+            truncated: false,
+        }));
+
+        assert_eq!(state.workspace_diffs.len(), 1);
+        assert_eq!(state.workspace_diffs[0].turn_id, 7);
+        assert!(state.transcript.is_empty());
+        assert!(state.tool_calls.is_empty());
+        assert_eq!(state.transcript_revision, revision);
+
+        state.apply_event(UiEvent::SessionStarted {
+            session_id: "next-session".to_string(),
+            resumed: false,
+        });
+        assert!(state.workspace_diffs.is_empty());
+    }
+
+    #[test]
+    fn thinking_chunks_accumulate_and_same_actor_activity_finalizes_them() {
         let mut state = AppState::new();
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
             text_chunk("first"),
@@ -3563,7 +3733,7 @@ mod tests {
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::AgentThought(text)] if text == "first thought"
+            [Entry::AgentThought(text)] if text.text == "first thought" && !text.completed
         ));
 
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(
@@ -3571,7 +3741,8 @@ mod tests {
         )));
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::ToolCall(id)] if id == "call-1"
+            [Entry::AgentThought(thought), Entry::ToolCall(id)]
+                if thought.text == "first thought" && thought.completed && id == "call-1"
         ));
     }
 
@@ -3590,7 +3761,93 @@ mod tests {
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::CodeAgentThought(text)] if text == "forging now"
+            [Entry::CodeAgentThought(text)] if text.text == "forging now" && !text.completed
+        ));
+    }
+
+    #[test]
+    fn turn_completion_and_failure_finalize_primary_thoughts() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk("first turn"),
+        )));
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        assert!(matches!(
+            &state.transcript[0],
+            Entry::AgentThought(thought) if thought.text == "first turn" && thought.completed
+        ));
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk("failed turn"),
+        )));
+        state.apply_event(UiEvent::PromptFailed {
+            message: "boom".to_string(),
+        });
+        assert!(state.transcript.iter().any(|entry| matches!(
+            entry,
+            Entry::AgentThought(thought) if thought.text == "failed turn" && thought.completed
+        )));
+    }
+
+    #[test]
+    fn code_agent_finish_finalizes_thought_without_reply() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "Eitri · builder".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentThoughtChunk(text_chunk("forging")),
+        )));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
+            outcome: CodeAgentOutcome::Completed,
+        }));
+
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::CodeAgentThought(thought)]
+                if thought.text == "forging" && thought.completed
+        ));
+    }
+
+    #[test]
+    fn thor_and_eitri_thoughts_finalize_without_reordering_each_other() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk("planning"),
+        )));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+            label: "Eitri · builder".to_string(),
+        }));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentThoughtChunk(text_chunk("forging")),
+        )));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentMessageChunk(text_chunk("built")),
+        )));
+
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::AgentThought(thor), Entry::CodeAgentThought(eitri), Entry::CodeAgentMessage(message)]
+                if thor.text == "planning" && !thor.completed
+                    && eitri.text == "forging" && eitri.completed
+                    && message == "built"
+        ));
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk(" more"),
+        )));
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk("answer"),
+        )));
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::AgentThought(thor), Entry::CodeAgentThought(eitri), Entry::CodeAgentMessage(eitri_message), Entry::AgentMessage(thor_message)]
+                if thor.text == "planning more" && thor.completed
+                    && eitri.text == "forging" && eitri.completed
+                    && eitri_message == "built" && thor_message == "answer"
         ));
     }
 
@@ -3614,7 +3871,8 @@ mod tests {
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::CodeAgentMessage(text)] if text == "done"
+            [Entry::CodeAgentThought(thought), Entry::CodeAgentMessage(text)]
+                if thought.text == "forging" && thought.completed && text == "done"
         ));
     }
 
@@ -4762,23 +5020,35 @@ mod tests {
     }
 
     #[test]
-    fn claude_usage_event_records_latest_report() {
+    fn claude_usage_event_replaces_available_with_unavailable() {
         let mut s = AppState::new();
 
-        s.apply_event(UiEvent::ClaudeUsage(ClaudeUsageReport {
-            five_hour: Some(crate::claude_usage::ClaudeUsageWindow {
-                remaining_percent: 88,
-            }),
-            week: Some(crate::claude_usage::ClaudeUsageWindow {
-                remaining_percent: 63,
-            }),
-        }));
+        s.apply_event(UiEvent::ClaudeUsage(ClaudeUsageStatus::Available(
+            crate::claude_usage::ClaudeUsageReport {
+                five_hour: Some(crate::claude_usage::ClaudeUsageWindow {
+                    remaining_percent: 88,
+                    reset_context: None,
+                }),
+                week: Some(crate::claude_usage::ClaudeUsageWindow {
+                    remaining_percent: 63,
+                    reset_context: None,
+                }),
+            },
+        )));
 
         assert_eq!(
             s.claude_usage
                 .as_ref()
-                .map(ClaudeUsageReport::compact_label),
+                .map(ClaudeUsageStatus::compact_label),
             Some("Claude usage: 5H 88% left · week 63% left".to_string())
+        );
+
+        s.apply_event(UiEvent::ClaudeUsage(ClaudeUsageStatus::Unavailable(
+            "not signed in".to_string(),
+        )));
+        assert_eq!(
+            s.claude_usage,
+            Some(ClaudeUsageStatus::Unavailable("not signed in".to_string()))
         );
     }
 
@@ -4807,6 +5077,184 @@ mod tests {
             state.codex_usage,
             Some(CodexUsageStatus::Unavailable("not signed in".to_string()))
         );
+    }
+
+    #[test]
+    fn usage_update_bedrock_credits_replaces_available_with_unavailable() {
+        let mut state = AppState::new();
+        let available = serde_json::json!({"anvil":{"bedrockCredits":{"status":"available","amounts":[{"currency":"USD","amount":12.5}],"earliestExpiration":"2026-12-31","asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(available.as_object().unwrap().clone()),
+        )));
+        assert!(matches!(
+            state.bedrock_credits,
+            Some(BedrockCreditsStatus::Available(_))
+        ));
+
+        let unavailable = serde_json::json!({"anvil":{"bedrockCredits":{"status":"unavailable","reason":"billing credentials are unavailable","asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(unavailable.as_object().unwrap().clone()),
+        )));
+        assert_eq!(
+            state.bedrock_credits,
+            Some(BedrockCreditsStatus::Unavailable(
+                "billing credentials are unavailable".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn usage_update_openrouter_balance_replaces_available_with_unavailable() {
+        let mut state = AppState::new();
+        let available = serde_json::json!({"anvil":{"openrouterBalance":{"status":"available","remainingUsd":12.5,"totalCreditsUsd":20.0,"totalUsageUsd":7.5,"asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(available.as_object().unwrap().clone()),
+        )));
+        assert!(matches!(
+            state.openrouter_balance,
+            Some(OpenRouterBalanceStatus::Available(_))
+        ));
+
+        let unavailable = serde_json::json!({"anvil":{"openrouterBalance":{"status":"unavailable","reason":"billing credentials are unavailable","asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(unavailable.as_object().unwrap().clone()),
+        )));
+        assert_eq!(
+            state.openrouter_balance,
+            Some(OpenRouterBalanceStatus::Unavailable(
+                "billing credentials are unavailable".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn usage_update_deepseek_balance_extracts_metadata_and_preserves_malformed_status() {
+        let mut state = AppState::new();
+        let available = serde_json::json!({"anvil":{"deepseekBalance":{"status":"available","balances":[{"currency":"CNY","totalBalance":"123.4500","grantedBalance":"23.0000","toppedUpBalance":"100.4500"},{"currency":"USD","totalBalance":"0.010","grantedBalance":"0.000","toppedUpBalance":"0.010"}],"asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(available.as_object().unwrap().clone()),
+        )));
+
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::DeepSeek));
+        assert!(matches!(
+            state.deepseek_balance,
+            Some(DeepSeekBalanceStatus::Available(_))
+        ));
+
+        let invalid = serde_json::json!({"anvil":{"deepseekBalance":{"status":"available","balances":[{"currency":"CNY","totalBalance":123.45,"grantedBalance":"23.0000","toppedUpBalance":"100.4500"}],"asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(12_000, 128_000).meta(invalid.as_object().unwrap().clone()),
+        )));
+
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::DeepSeek));
+        assert_eq!(
+            state.deepseek_balance,
+            crate::deepseek_balance::from_usage_meta(available.as_object())
+        );
+    }
+
+    #[test]
+    fn valid_deepseek_and_peer_updates_clear_each_other() {
+        let mut state = AppState::new();
+        state.set_bedrock_credits(BedrockCreditsStatus::Unavailable(
+            "bedrock unavailable".into(),
+        ));
+
+        state.set_deepseek_balance(DeepSeekBalanceStatus::Unavailable(
+            crate::deepseek_balance::DeepSeekBalanceUnavailable {
+                reason: "deepseek unavailable".into(),
+                as_of: "2026-07-15T18:42:00Z".into(),
+            },
+        ));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::DeepSeek));
+        assert!(state.bedrock_credits.is_none());
+        assert!(state.openrouter_balance.is_none());
+
+        state.set_openrouter_balance(OpenRouterBalanceStatus::Unavailable(
+            "openrouter unavailable".into(),
+        ));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::OpenRouter));
+        assert!(state.deepseek_balance.is_none());
+        assert!(state.bedrock_credits.is_none());
+    }
+
+    #[test]
+    fn malformed_openrouter_metadata_preserves_last_known_status() {
+        let mut state = AppState::new();
+        state.set_openrouter_balance(OpenRouterBalanceStatus::Unavailable(
+            "request timed out".into(),
+        ));
+        let invalid = serde_json::json!({"anvil":{"openrouterBalance":{"status":"future"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(1, 2).meta(invalid.as_object().unwrap().clone()),
+        )));
+
+        assert_eq!(
+            state.openrouter_balance,
+            Some(OpenRouterBalanceStatus::Unavailable(
+                "request timed out".into()
+            ))
+        );
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::OpenRouter));
+    }
+
+    #[test]
+    fn valid_anvil_provider_observations_clear_only_their_stale_peer() {
+        let mut state = AppState::new();
+        let bedrock = serde_json::json!({"anvil":{"bedrockCredits":{"status":"available","amounts":[],"asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(1, 2).meta(bedrock.as_object().unwrap().clone()),
+        )));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::Bedrock));
+        assert!(state.openrouter_balance.is_none());
+
+        let openrouter = serde_json::json!({"anvil":{"openrouterBalance":{"status":"available","remainingUsd":0.0,"totalCreditsUsd":20.0,"totalUsageUsd":20.0,"asOf":"2026-07-15T18:42:00Z"}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(1, 2).meta(openrouter.as_object().unwrap().clone()),
+        )));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::OpenRouter));
+        assert!(state.bedrock_credits.is_none());
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(1, 2).meta(bedrock.as_object().unwrap().clone()),
+        )));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::Bedrock));
+        assert!(state.openrouter_balance.is_none());
+
+        state.apply_event(UiEvent::CodexUsage(CodexUsageStatus::Unavailable(
+            "not signed in".to_string(),
+        )));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::Bedrock));
+        assert!(state.bedrock_credits.is_some());
+        assert!(state.codex_usage.is_some());
+
+        state.apply_event(UiEvent::ClaudeUsage(ClaudeUsageStatus::Unavailable(
+            "not signed in".to_string(),
+        )));
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::Bedrock));
+        assert!(state.bedrock_credits.is_some());
+        assert!(state.codex_usage.is_some());
+        assert!(state.claude_usage.is_some());
+    }
+
+    #[test]
+    fn malformed_bedrock_credit_metadata_preserves_last_known_status() {
+        let mut state = AppState::new();
+        state.set_bedrock_credits(BedrockCreditsStatus::Unavailable(
+            "request timed out".into(),
+        ));
+        let invalid =
+            serde_json::json!({"anvil":{"bedrockCredits":{"status":"future","amounts":[]}}});
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(1, 2).meta(invalid.as_object().unwrap().clone()),
+        )));
+        assert_eq!(
+            state.bedrock_credits,
+            Some(BedrockCreditsStatus::Unavailable(
+                "request timed out".into()
+            ))
+        );
+        assert_eq!(state.anvil_quota_source, Some(AnvilQuotaSource::Bedrock));
     }
 
     #[test]

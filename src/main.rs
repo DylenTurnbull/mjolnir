@@ -8,6 +8,7 @@ mod acp;
 mod anvil;
 mod app;
 mod archive;
+mod bedrock_credits;
 mod claude_usage;
 mod clipboard;
 mod code_agent;
@@ -16,6 +17,7 @@ mod config;
 mod council;
 mod council_orchestrator;
 mod council_usage;
+mod deepseek_balance;
 mod deepswe;
 mod event;
 mod headless;
@@ -26,6 +28,7 @@ mod menu;
 mod model_resolve;
 mod notifications;
 mod onboarding;
+mod openrouter_balance;
 mod palette;
 mod paths;
 mod probe;
@@ -1718,9 +1721,8 @@ async fn run_session(
             council_session.clone(),
         )
     });
-    let (usage_turn_tx, usage_shutdown_tx, usage_task) = if claude_usage_env.is_some()
-        || codex_usage_env.is_some()
-    {
+    let has_usage_poller = claude_usage_env.is_some() || codex_usage_env.is_some();
+    let (usage_turn_tx, usage_shutdown_tx, usage_task) = if has_usage_poller {
         let (tx, mut rx) = mpsc::unbounded_channel::<()>();
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
         let usage_ui_tx = ui_event_tx.clone();
@@ -1741,11 +1743,20 @@ async fn run_session(
                 if completed_turns.is_multiple_of(2)
                     && let Some(env) = claude_usage_env.as_ref()
                 {
-                    match claude_usage::query(usage_cwd.clone(), env.clone()).await {
-                        Ok(report) => {
-                            let _ = usage_ui_tx.send(crate::event::UiEvent::ClaudeUsage(report));
+                    let status = match claude_usage::query(usage_cwd.clone(), env.clone()).await {
+                        Ok(report) => claude_usage::ClaudeUsageStatus::Available(report),
+                        Err(error) => {
+                            tracing::warn!("claude /usage failed: {error}");
+                            claude_usage::ClaudeUsageStatus::Unavailable(
+                                error.user_reason().to_string(),
+                            )
                         }
-                        Err(error) => tracing::warn!("claude /usage failed: {error}"),
+                    };
+                    if usage_ui_tx
+                        .send(crate::event::UiEvent::ClaudeUsage(status))
+                        .is_err()
+                    {
+                        break;
                     }
                 }
                 if let Some(env) = codex_usage_env.as_ref() {

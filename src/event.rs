@@ -22,6 +22,27 @@ pub struct PromptImage {
     pub height: u32,
 }
 
+/// A text-file change observed in the workspace during one prompt turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDiff {
+    pub path: PathBuf,
+    pub old_text: Option<String>,
+    pub new_text: String,
+}
+
+/// Workspace changes captured around a prompt turn, independent of ACP tool
+/// calls reported by the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDiffEvent {
+    pub turn_id: u64,
+    pub diffs: Vec<WorkspaceDiff>,
+    /// Number of changed files before the payload was capped.
+    pub total_files: usize,
+    /// Maximum number of file diffs retained in `diffs`.
+    pub max_files: usize,
+    pub truncated: bool,
+}
+
 /// Loki identity attached to reviewer activity rendered in the transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LokiIdentity {
@@ -107,6 +128,9 @@ pub enum UiEvent {
     /// `session/request_permission` from the agent. The UI is expected to
     /// render a modal and answer through `responder` exactly once.
     PermissionRequest(PermissionPrompt),
+    /// Changes observed in the local workspace after a prompt turn. This is
+    /// Mjolnir-native state, not an ACP tool call or transcript entry.
+    WorkspaceDiff(WorkspaceDiffEvent),
     /// `elicitation/create` from the agent (single-select form or URL). The
     /// UI renders a modal and answers through `responder` exactly once. Used
     /// by agent-driven `/setup` menus, which are global (not per-session) and
@@ -127,7 +151,7 @@ pub enum UiEvent {
     },
     /// Latest Claude Code `/usage` quota scrape. This is UI-only side-channel
     /// data; it never goes through ACP.
-    ClaudeUsage(crate::claude_usage::ClaudeUsageReport),
+    ClaudeUsage(crate::claude_usage::ClaudeUsageStatus),
     /// Latest Codex subscription quota query. This is UI-only side-channel
     /// data; it never goes through ACP.
     CodexUsage(crate::codex_usage::CodexUsageStatus),

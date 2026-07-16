@@ -1108,7 +1108,8 @@ async fn run(
                     }
                     UiEvent::SessionStarted { .. }
                     | UiEvent::SessionConfigOptions { .. }
-                    | UiEvent::CouncilUpdate { .. } => {}
+                    | UiEvent::CouncilUpdate { .. }
+                    | UiEvent::WorkspaceDiff(_) => {}
                     UiEvent::SessionUpdate(update) => {
                         if let SessionUpdate::UsageUpdate(value) = &update {
                             latest_usage_update = Some(value.clone());

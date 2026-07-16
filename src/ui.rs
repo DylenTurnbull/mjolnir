@@ -412,12 +412,10 @@ fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bo
         | Entry::LokiActivity(_)
         | Entry::InternalMessage(_) => true,
         Entry::EphemeralSystem(_) => false,
-        Entry::AgentMessage(_) | Entry::AgentThought(_) => {
-            !(state.is_streaming() && idx + 1 == state.transcript.len())
-        }
-        Entry::CodeAgentMessage(_) | Entry::CodeAgentThought(_) => {
-            !state.code_agent_active || idx + 1 != state.transcript.len()
-        }
+        Entry::AgentThought(thought) => thought.completed,
+        Entry::CodeAgentThought(thought) => thought.completed,
+        Entry::AgentMessage(_) => !(state.is_streaming() && idx + 1 == state.transcript.len()),
+        Entry::CodeAgentMessage(_) => !state.code_agent_active || idx + 1 != state.transcript.len(),
         Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
             state.tool_calls.get(id).is_some_and(|view| {
                 matches!(
@@ -706,6 +704,7 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         UiEvent::Connected { .. }
         | UiEvent::SessionStarted { .. }
         | UiEvent::SessionConfigOptions { .. }
+        | UiEvent::WorkspaceDiff(_)
         | UiEvent::PermissionRequest(_)
         | UiEvent::ElicitationRequest(_)
         | UiEvent::CancelPendingPermissions
@@ -1803,7 +1802,7 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
         // the input box keeps its full height while the queue is visible.
         usize::from(INLINE_CHAT_HEIGHT)
             + usize::from(queued_prompt_row_count(state))
-            + usize::from(usage_quota_label(state).is_some())
+            + usage_quota_row_count(state, width)
             + inline_transcript_tail_row_count(state, width)
     };
 
@@ -3770,9 +3769,11 @@ fn transcript_export_markdown(state: &AppState) -> String {
         match entry {
             Entry::UserPrompt(text) => push_export_text(&mut out, "You", text),
             Entry::AgentMessage(text) => push_export_text(&mut out, "Agent", text),
-            Entry::AgentThought(text) => push_export_text(&mut out, "Thought", text),
+            Entry::AgentThought(thought) => push_export_text(&mut out, "Thought", &thought.text),
             Entry::CodeAgentMessage(text) => push_export_text(&mut out, "Eitri", text),
-            Entry::CodeAgentThought(text) => push_export_text(&mut out, "Eitri Thought", text),
+            Entry::CodeAgentThought(thought) => {
+                push_export_text(&mut out, "Eitri Thought", &thought.text)
+            }
             Entry::LokiActivity(activity) => push_export_text(
                 &mut out,
                 &loki_activity_label(activity),
@@ -3967,6 +3968,59 @@ fn plan_status_label(status: &agent_client_protocol::schema::v1::PlanEntryStatus
         agent_client_protocol::schema::v1::PlanEntryStatus::Completed => "done",
         _ => "unknown",
     }
+}
+
+fn plan_status_style(
+    status: &agent_client_protocol::schema::v1::PlanEntryStatus,
+    theme: TerminalTheme,
+) -> Style {
+    let color = match status {
+        agent_client_protocol::schema::v1::PlanEntryStatus::Pending => theme.muted,
+        agent_client_protocol::schema::v1::PlanEntryStatus::InProgress => theme.primary,
+        agent_client_protocol::schema::v1::PlanEntryStatus::Completed => theme.success,
+        _ => theme.error,
+    };
+    Style::default().fg(color)
+}
+
+fn plan_row(
+    entry: &agent_client_protocol::schema::v1::PlanEntry,
+    theme: TerminalTheme,
+) -> Line<'static> {
+    use agent_client_protocol::schema::v1::{PlanEntryPriority, PlanEntryStatus};
+
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("[{}]", plan_status_label(&entry.status)),
+            plan_status_style(&entry.status, theme),
+        ),
+    ];
+    match entry.priority {
+        PlanEntryPriority::Medium => {}
+        PlanEntryPriority::High => spans.push(Span::styled(
+            format!(" [{}]", plan_priority_label(&entry.priority)),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        )),
+        PlanEntryPriority::Low => spans.push(Span::styled(
+            format!(" [{}]", plan_priority_label(&entry.priority)),
+            Style::default().fg(theme.muted),
+        )),
+        _ => spans.push(Span::styled(
+            format!(" [{}]", plan_priority_label(&entry.priority)),
+            Style::default().fg(theme.error),
+        )),
+    }
+    let content_style = if matches!(entry.status, PlanEntryStatus::Completed) {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    };
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(entry.content.clone(), content_style));
+    Line::from(spans)
 }
 
 /// Re-issue a previously queued prompt now that the in-flight turn has
@@ -4565,7 +4619,7 @@ fn draw(
     }
 
     let has_config_options = !state.selectable_config_options().is_empty();
-    let has_usage_quota = usage_quota_label(state).is_some();
+    let usage_quota_rows = usage_quota_row_count(state, f.area().width) as u16;
 
     // Dynamic input height: borders (2) + chip rows + text lines, clamped.
     let chip_rows = attachment_count(state);
@@ -4582,7 +4636,7 @@ fn draw(
             Constraint::Length(1),
             Constraint::Length(queued_row),
             Constraint::Length(input_height),
-            Constraint::Length(if has_usage_quota { 1 } else { 0 }),
+            Constraint::Length(usage_quota_rows),
             Constraint::Length(if has_config_options { 1 } else { 0 }),
         ])
         .split(f.area());
@@ -4736,7 +4790,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
     }
 
     let has_config_options = !state.selectable_config_options().is_empty();
-    let has_usage_quota = usage_quota_label(state).is_some();
+    let usage_quota_rows = usage_quota_row_count(state, f.area().width) as u16;
     let queued_row = queued_prompt_row_count(state);
     let live_rows = inline_transcript_tail_row_count(state, f.area().width)
         .min(usize::from(f.area().height)) as u16;
@@ -4747,7 +4801,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
             Constraint::Length(1),
             Constraint::Length(queued_row),
             Constraint::Min(MIN_INPUT_HEIGHT),
-            Constraint::Length(if has_usage_quota { 1 } else { 0 }),
+            Constraint::Length(usage_quota_rows),
             Constraint::Length(if has_config_options { 1 } else { 0 }),
         ])
         .split(f.area());
@@ -5444,10 +5498,10 @@ fn render_transcript_entry_range(
                 }
             }
             Entry::AgentMessage(text) | Entry::CodeAgentMessage(text) => {
-                push_markdown_message(&mut out, text, collapse_message, theme)
+                push_markdown_message(&mut out, text, collapse_message, width, theme)
             }
-            Entry::AgentThought(text) | Entry::CodeAgentThought(text) => {
-                push_thinking(&mut out, text, theme)
+            Entry::AgentThought(thought) | Entry::CodeAgentThought(thought) => {
+                push_thinking(&mut out, thought, collapse_limit.is_some(), theme)
             }
             Entry::LokiActivity(activity) => {
                 let text = loki_activity_text(activity);
@@ -5494,7 +5548,7 @@ fn render_transcript_entry_range(
                         .fg(theme.muted)
                         .add_modifier(Modifier::BOLD),
                 )));
-                push_markdown_message(&mut out, &message.text, collapse_message, theme);
+                push_markdown_message(&mut out, &message.text, collapse_message, width, theme);
             }
             Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
                 out.push(Line::from(Span::styled(
@@ -5502,19 +5556,7 @@ fn render_transcript_entry_range(
                     Style::default().fg(theme.tool).add_modifier(Modifier::BOLD),
                 )));
                 for e in entries {
-                    let bullet = match e.priority {
-                        agent_client_protocol::schema::v1::PlanEntryPriority::High => "[!]",
-                        agent_client_protocol::schema::v1::PlanEntryPriority::Medium => "[*]",
-                        agent_client_protocol::schema::v1::PlanEntryPriority::Low => "[ ]",
-                        _ => "[?]",
-                    };
-                    let status = match e.status {
-                        agent_client_protocol::schema::v1::PlanEntryStatus::Pending => " ",
-                        agent_client_protocol::schema::v1::PlanEntryStatus::InProgress => "~",
-                        agent_client_protocol::schema::v1::PlanEntryStatus::Completed => "x",
-                        _ => "?",
-                    };
-                    out.push(Line::from(format!("  {bullet}{status} {}", e.content)));
+                    out.push(plan_row(e, theme));
                 }
                 out.push(Line::from(""));
             }
@@ -5728,25 +5770,63 @@ fn god_name_color(role: &str, theme: TerminalTheme) -> Color {
     }
 }
 
-fn push_thinking(out: &mut Vec<Line<'static>>, text: &str, theme: TerminalTheme) {
+const ACTIVE_THOUGHT_TAIL_LINES: usize = 3;
+const ACTIVE_THOUGHT_TAIL_CHARS: usize = 360;
+
+fn push_thinking(
+    out: &mut Vec<Line<'static>>,
+    thought: &crate::app::ThoughtEntry,
+    compact: bool,
+    theme: TerminalTheme,
+) {
     let mut in_html_comment = false;
-    let text = text
+    let text = thought
+        .text
         .split('\n')
         .map(|line| strip_html_comments(line, &mut in_html_comment))
         .collect::<Vec<_>>()
-        .join("\n")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+        .join("\n");
     if text.is_empty() {
         return;
     }
     let thought_style = Style::default().fg(theme.thought);
-    out.push(Line::from(inline_markdown_spans_with_style(
-        &text,
-        theme,
-        thought_style,
-    )));
+    if compact && thought.completed {
+        let lines = text.lines().count();
+        let unit = if lines == 1 { "line" } else { "lines" };
+        out.push(Line::from(Span::styled(
+            format!("thought · {lines} {unit}"),
+            thought_style,
+        )));
+    } else {
+        let text = if compact {
+            active_thought_tail(&text)
+        } else {
+            text
+        };
+        for line in text.lines() {
+            out.push(Line::from(inline_markdown_spans_with_style(
+                line,
+                theme,
+                thought_style,
+            )));
+        }
+    }
+}
+
+fn active_thought_tail(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let tail = lines
+        .iter()
+        .rev()
+        .take(ACTIVE_THOUGHT_TAIL_LINES)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+    if tail.chars().count() > ACTIVE_THOUGHT_TAIL_CHARS {
+        let keep = tail.chars().count() - ACTIVE_THOUGHT_TAIL_CHARS;
+        tail = format!("…{}", tail.chars().skip(keep).collect::<String>());
+    }
+    tail
 }
 
 fn push_plain_message(
@@ -5789,10 +5869,11 @@ fn push_markdown_message(
     out: &mut Vec<Line<'static>>,
     text: &str,
     collapse: bool,
+    width: u16,
     theme: TerminalTheme,
 ) {
     let (preview, collapsed) = message_preview(text, collapse);
-    push_markdown_lines(out, preview, 0, theme);
+    push_markdown_lines(out, preview, 0, width, theme);
     if collapsed {
         push_message_collapse_hint(out, theme);
     }
@@ -5855,25 +5936,27 @@ fn push_markdown_lines(
     out: &mut Vec<Line<'static>>,
     text: String,
     indent: usize,
+    width: u16,
     theme: TerminalTheme,
 ) {
-    push_markdown_lines_limited_inner(out, text, indent, None, theme, false);
+    push_markdown_lines_limited_inner(out, text, indent, width, None, theme, false);
 }
 
 fn push_tool_markdown_lines_limited(
     out: &mut Vec<Line<'static>>,
     text: String,
     indent: usize,
+    width: u16,
     collapse_limit: Option<usize>,
     theme: TerminalTheme,
 ) {
     let (_, hidden) = tool_output_preview(&text, collapse_limit);
     if let Some(ToolOutputHidden::Lines(lines)) = hidden {
         push_tool_collapse_hint(out, indent, ToolOutputHidden::Lines(lines), theme);
-        push_markdown_lines_limited_inner(out, text, indent, collapse_limit, theme, true);
+        push_markdown_lines_limited_inner(out, text, indent, width, collapse_limit, theme, true);
     } else {
         let (preview, hidden) = tool_output_preview(&text, collapse_limit);
-        push_markdown_lines_limited_inner(out, preview, indent, None, theme, true);
+        push_markdown_lines_limited_inner(out, preview, indent, width, None, theme, true);
         if let Some(ToolOutputHidden::Details) = hidden {
             push_tool_collapse_hint(out, indent, ToolOutputHidden::Details, theme);
         }
@@ -5941,6 +6024,7 @@ fn push_markdown_lines_limited_inner(
     out: &mut Vec<Line<'static>>,
     text: String,
     indent: usize,
+    width: u16,
     collapse_limit: Option<usize>,
     theme: TerminalTheme,
     use_tool_output_style: bool,
@@ -5973,24 +6057,29 @@ fn push_markdown_lines_limited_inner(
     if hidden > 0 {
         push_collapse_hint(out, indent, hidden, theme);
     }
-    for original in &lines[hidden..] {
+    let mut line_index = hidden;
+    while line_index < lines.len() {
+        let original = lines[line_index];
         if let Some((marker, length)) = code_fence {
             if markdown_fence(original)
                 .is_some_and(|(next, count, _)| next == marker && count >= length)
             {
                 code_fence = None;
                 code_lang.clear();
+                line_index += 1;
                 continue;
             }
             out.push(Line::from(Span::styled(
                 format!("{prefix}  {original}"),
                 Style::default().fg(theme.quote),
             )));
+            line_index += 1;
             continue;
         }
 
         let filtered = strip_html_comments(original, &mut in_html_comment);
         if filtered.trim().is_empty() && !original.trim().is_empty() {
+            line_index += 1;
             continue;
         }
         let raw = filtered.as_str();
@@ -6008,12 +6097,14 @@ fn push_markdown_lines_limited_inner(
                     .fg(theme.muted)
                     .add_modifier(Modifier::BOLD),
             )));
+            line_index += 1;
             continue;
         }
         let trimmed = raw.trim_start();
 
         if raw.trim().is_empty() {
             out.push(Line::from(""));
+            line_index += 1;
             continue;
         }
 
@@ -6023,26 +6114,44 @@ fn push_markdown_lines_limited_inner(
             Style::default()
         };
 
+        if let Some(header) = markdown_table_header(raw, lines.get(line_index + 1)) {
+            push_markdown_table_row(out, &prefix, &header, true, theme, base_style);
+            line_index += 2;
+            while let Some(row) = lines
+                .get(line_index)
+                .and_then(|row| markdown_table_row(row))
+            {
+                push_markdown_table_row(out, &prefix, &row, false, theme, base_style);
+                line_index += 1;
+            }
+            continue;
+        }
+
         if let Some((level, heading)) = markdown_heading(raw) {
             let marker = "#".repeat(level);
+            let heading_style =
+                markdown_heading_style(level, theme, base_style, use_tool_output_style);
             out.push(Line::from(vec![
-                Span::styled(
-                    format!("{prefix}{marker} "),
-                    Style::default().fg(theme.muted),
-                ),
-                Span::styled(
-                    heading.to_string(),
-                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(format!("{prefix}{marker} "), heading_style),
+                Span::styled(heading.to_string(), heading_style),
             ]));
+            line_index += 1;
             continue;
         }
 
         if markdown_rule(raw) {
             out.push(Line::from(Span::styled(
-                format!("{prefix}--------"),
-                Style::default().fg(theme.muted),
+                format!(
+                    "{prefix}{}",
+                    "─".repeat(usize::from(width).saturating_sub(indent).max(1))
+                ),
+                base_style.fg(if use_tool_output_style {
+                    theme.subtle
+                } else {
+                    theme.muted
+                }),
             )));
+            line_index += 1;
             continue;
         }
 
@@ -6051,32 +6160,36 @@ fn push_markdown_lines_limited_inner(
                 Span::styled(format!("{prefix}> "), Style::default().fg(theme.muted)),
                 Span::styled(quoted.to_string(), Style::default().fg(theme.quote)),
             ]));
+            line_index += 1;
             continue;
         }
 
-        if let Some(item) = markdown_unordered_item(raw) {
+        if let Some((source_indent, item)) = markdown_unordered_item(raw) {
             let mut spans = vec![Span::styled(
-                format!("{prefix}- "),
+                format!("{prefix}{source_indent}- "),
                 Style::default().fg(theme.muted),
             )];
             spans.extend(inline_markdown_spans_with_style(item, theme, base_style));
             out.push(Line::from(spans));
+            line_index += 1;
             continue;
         }
 
-        if let Some((number, item)) = markdown_ordered_item(raw) {
+        if let Some((source_indent, number, item)) = markdown_ordered_item(raw) {
             let mut spans = vec![Span::styled(
-                format!("{prefix}{number}. "),
+                format!("{prefix}{source_indent}{number}. "),
                 Style::default().fg(theme.muted),
             )];
             spans.extend(inline_markdown_spans_with_style(item, theme, base_style));
             out.push(Line::from(spans));
+            line_index += 1;
             continue;
         }
 
         let mut spans = vec![Span::styled(prefix.clone(), base_style)];
         spans.extend(inline_markdown_spans_with_style(raw, theme, base_style));
         out.push(Line::from(spans));
+        line_index += 1;
     }
 }
 
@@ -6153,19 +6266,105 @@ fn markdown_rule(raw: &str) -> bool {
             || trimmed.chars().all(|c| c == '_'))
 }
 
-fn markdown_unordered_item(raw: &str) -> Option<&str> {
+fn markdown_table_header<'a>(raw: &'a str, next: Option<&&str>) -> Option<Vec<&'a str>> {
+    let header = markdown_table_row(raw)?;
+    let separator = markdown_table_row(next?)?;
+    (header.len() == separator.len()
+        && header.len() >= 2
+        && separator
+            .iter()
+            .all(|cell| markdown_table_separator_cell(cell)))
+    .then_some(header)
+}
+
+fn markdown_table_row(raw: &str) -> Option<Vec<&str>> {
+    let trimmed = raw.trim();
+    trimmed.contains('|').then(|| {
+        trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect()
+    })
+}
+
+fn markdown_table_separator_cell(cell: &str) -> bool {
+    let content = cell.trim_matches(':');
+    content.len() >= 3 && content.chars().all(|ch| ch == '-')
+}
+
+fn push_markdown_table_row(
+    out: &mut Vec<Line<'static>>,
+    prefix: &str,
+    cells: &[&str],
+    header: bool,
+    theme: TerminalTheme,
+    base_style: Style,
+) {
+    let mut spans = vec![Span::styled(prefix.to_string(), base_style)];
+    for (index, cell) in cells.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" | ", base_style.fg(theme.muted)));
+        }
+        let style = if header {
+            base_style.add_modifier(Modifier::BOLD)
+        } else {
+            base_style
+        };
+        spans.extend(inline_markdown_spans_with_style(cell, theme, style));
+    }
+    out.push(Line::from(spans));
+}
+
+fn markdown_heading_style(
+    level: usize,
+    theme: TerminalTheme,
+    base_style: Style,
+    tool_output: bool,
+) -> Style {
+    if tool_output {
+        return base_style.add_modifier(match level {
+            1 | 2 => Modifier::BOLD,
+            3 | 4 => Modifier::UNDERLINED,
+            _ => Modifier::ITALIC,
+        });
+    }
+    match level {
+        1 => Style::default()
+            .fg(theme.primary)
+            .add_modifier(Modifier::BOLD),
+        2 => Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+        3 => Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        4 => Style::default()
+            .fg(theme.secondary)
+            .add_modifier(Modifier::BOLD),
+        5 => Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::UNDERLINED),
+        _ => Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::ITALIC),
+    }
+}
+
+fn markdown_unordered_item(raw: &str) -> Option<(&str, &str)> {
+    let source_indent = &raw[..raw.len() - raw.trim_start().len()];
     let trimmed = raw.trim_start();
     trimmed
         .strip_prefix("- ")
         .or_else(|| trimmed.strip_prefix("* "))
+        .map(|item| (source_indent, item))
 }
 
-fn markdown_ordered_item(raw: &str) -> Option<(&str, &str)> {
+fn markdown_ordered_item(raw: &str) -> Option<(&str, &str, &str)> {
+    let source_indent = &raw[..raw.len() - raw.trim_start().len()];
     let trimmed = raw.trim_start();
     let dot = trimmed.find(". ")?;
     let number = &trimmed[..dot];
     if number.chars().all(|c| c.is_ascii_digit()) {
-        Some((number, &trimmed[dot + 2..]))
+        Some((source_indent, number, &trimmed[dot + 2..]))
     } else {
         None
     }
@@ -6180,6 +6379,22 @@ fn inline_markdown_spans_with_style(
     let mut rest = raw;
     let mut previous = None;
     while !rest.is_empty() {
+        if let Some(after_label) = rest.strip_prefix('[')
+            && let Some(label_end) = after_label.find("](")
+            && let Some(url_end) = after_label[label_end + 2..].find(')')
+        {
+            let label = &after_label[..label_end];
+            let url_start = label_end + 2;
+            let url = &after_label[url_start..url_start + url_end];
+            spans.extend(inline_markdown_spans_with_style(label, theme, base_style));
+            spans.push(Span::styled(
+                format!(" ({url})"),
+                base_style.fg(theme.muted),
+            ));
+            rest = &after_label[url_start + url_end + 1..];
+            previous = url.chars().next_back();
+            continue;
+        }
         if let Some(after) = rest.strip_prefix("`")
             && let Some(end) = after.find('`')
         {
@@ -6247,7 +6462,7 @@ fn inline_markdown_spans_with_style(
         let next = rest
             .char_indices()
             .skip(1)
-            .find_map(|(idx, ch)| (ch == '`' || ch == '*' || ch == '_').then_some(idx))
+            .find_map(|(idx, ch)| (ch == '`' || ch == '*' || ch == '_' || ch == '[').then_some(idx))
             .unwrap_or(rest.len());
         let (plain, tail) = rest.split_at(next);
         spans.push(Span::styled(plain.to_string(), base_style));
@@ -6407,7 +6622,7 @@ fn push_tool_outputs(
     for output in outputs {
         match output {
             ToolCallOutput::Text(text) => {
-                push_tool_markdown_lines_limited(out, text.clone(), 2, collapse_limit, theme)
+                push_tool_markdown_lines_limited(out, text.clone(), 2, width, collapse_limit, theme)
             }
             ToolCallOutput::Diff {
                 path,
@@ -7814,21 +8029,66 @@ fn draw_usage_quota_row(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let label = truncate_text_to_width(label, area.width);
-    let paragraph = Paragraph::new(label).style(Style::default().fg(state.theme.warning));
+    let paragraph = if matches!(
+        state.anvil_quota_source,
+        Some(crate::app::AnvilQuotaSource::DeepSeek)
+    ) {
+        Paragraph::new(label).wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(truncate_text_to_width(label, area.width))
+    }
+    .style(Style::default().fg(state.theme.warning));
     f.render_widget(paragraph, area);
 }
 
+fn usage_quota_row_count(state: &AppState, width: u16) -> usize {
+    let Some(label) = usage_quota_label(state) else {
+        return 0;
+    };
+    if width == 0 {
+        return 0;
+    }
+    if !matches!(
+        state.anvil_quota_source,
+        Some(crate::app::AnvilQuotaSource::DeepSeek)
+    ) {
+        return 1;
+    }
+    Paragraph::new(label)
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
+}
+
 fn usage_quota_label(state: &AppState) -> Option<String> {
-    state
-        .codex_usage
-        .as_ref()
-        .map(crate::codex_usage::CodexUsageStatus::compact_label)
+    let anvil_label = match state.anvil_quota_source {
+        Some(crate::app::AnvilQuotaSource::Bedrock) => state
+            .bedrock_credits
+            .as_ref()
+            .map(crate::bedrock_credits::BedrockCreditsStatus::compact_label),
+        Some(crate::app::AnvilQuotaSource::OpenRouter) => state
+            .openrouter_balance
+            .as_ref()
+            .map(crate::openrouter_balance::OpenRouterBalanceStatus::compact_label),
+        Some(crate::app::AnvilQuotaSource::DeepSeek) => state
+            .deepseek_balance
+            .as_ref()
+            .map(crate::deepseek_balance::DeepSeekBalanceStatus::compact_label),
+        None => None,
+    };
+
+    anvil_label
+        .or_else(|| {
+            state
+                .codex_usage
+                .as_ref()
+                .map(crate::codex_usage::CodexUsageStatus::compact_label)
+        })
         .or_else(|| {
             state
                 .claude_usage
                 .as_ref()
-                .map(crate::claude_usage::ClaudeUsageReport::compact_label)
+                .map(crate::claude_usage::ClaudeUsageStatus::compact_label)
         })
 }
 
@@ -10547,7 +10807,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::app::StatusKind;
-    use crate::claude_usage::ClaudeUsageReport;
+    use crate::claude_usage::{ClaudeUsageReport, ClaudeUsageStatus};
     use crate::event::{
         CodeAgentEvent, CodeAgentOutcome, ElicitationPrompt, InternalMessage, SessionConfigTarget,
         TerminalOutputSnapshot,
@@ -10557,10 +10817,11 @@ mod tests {
     use agent_client_protocol::schema::v1::{
         AvailableCommand, ContentBlock, ContentChunk, ElicitationFormMode, ElicitationId,
         ElicitationMode, ElicitationSchema, ElicitationSessionScope, ElicitationUrlMode,
-        EnumOption, PermissionOption, PermissionOptionKind, SessionConfigOption,
-        SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-        SessionUpdate, StopReason, StringPropertySchema, TerminalExitStatus, TextContent, ToolCall,
-        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+        EnumOption, PermissionOption, PermissionOptionKind, PlanEntry, PlanEntryPriority,
+        PlanEntryStatus, SessionConfigOption, SessionConfigOptionCategory,
+        SessionConfigSelectOption, SessionConfigValueId, SessionUpdate, StopReason,
+        StringPropertySchema, TerminalExitStatus, TextContent, ToolCall, ToolCallStatus,
+        ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::backend::{Backend, TestBackend};
@@ -10654,6 +10915,88 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn plan_rows_use_readable_status_and_priority_labels_in_every_transcript_view() {
+        let mut state = AppState::new();
+        state.transcript.push(Entry::Plan(vec![
+            PlanEntry::new(
+                "write tests",
+                PlanEntryPriority::Medium,
+                PlanEntryStatus::Pending,
+            ),
+            PlanEntry::new(
+                "render output",
+                PlanEntryPriority::High,
+                PlanEntryStatus::InProgress,
+            ),
+            PlanEntry::new(
+                "document behavior",
+                PlanEntryPriority::Low,
+                PlanEntryStatus::Completed,
+            ),
+        ]));
+
+        let expected = vec![
+            "Thor",
+            "plan",
+            "  [pending] write tests",
+            "  [running] [high] render output",
+            "  [done] [low] document behavior",
+            "",
+        ];
+        let normal = render_transcript_lines(&state, 80);
+        let full = render_full_transcript_lines(&state, 80);
+        assert_eq!(normal.iter().map(line_text).collect::<Vec<_>>(), expected);
+        assert_eq!(full.iter().map(line_text).collect::<Vec<_>>(), expected);
+        assert!(!normal.iter().any(|line| line_text(line).contains("[!]")));
+        assert!(!normal.iter().any(|line| line_text(line).contains("[*]")));
+
+        assert_eq!(normal[2].spans[1].style.fg, Some(state.theme.muted));
+        assert_eq!(normal[3].spans[1].style.fg, Some(state.theme.primary));
+        assert_eq!(normal[4].spans[1].style.fg, Some(state.theme.success));
+        assert_eq!(normal[3].spans[2].style.fg, Some(state.theme.warning));
+        assert!(
+            normal[3].spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(normal[4].spans[2].style.fg, Some(state.theme.muted));
+        assert!(
+            normal[4]
+                .spans
+                .last()
+                .expect("completed content")
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+    }
+
+    #[test]
+    fn plan_rows_wrap_without_truncating_content_at_narrow_widths() {
+        let mut state = AppState::new();
+        state.transcript.push(Entry::Plan(vec![PlanEntry::new(
+            "narrow content stays readable",
+            PlanEntryPriority::High,
+            PlanEntryStatus::InProgress,
+        )]));
+
+        let width = 18;
+        let lines = render_full_transcript_lines(&state, width);
+        let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+        let line_count = paragraph.line_count(width);
+        assert!(line_count > lines.len());
+
+        let area = Rect::new(0, 0, width, line_count as u16);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        paragraph.render(area, &mut buffer);
+        let rendered = buffer_lines(&buffer).join("\n");
+        for word in ["running", "high", "narrow", "content", "stays", "readable"] {
+            assert!(rendered.contains(word), "missing {word:?} in {rendered:?}");
+        }
     }
 
     fn buffer_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
@@ -13166,7 +13509,7 @@ mod tests {
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::UserPrompt(_), Entry::AgentThought(text)] if text == "I need to inspect this"
+            [Entry::UserPrompt(_), Entry::AgentThought(text)] if text.text == "I need to inspect this"
         ));
         assert_eq!(stable_transcript_entry_count(&state), 1);
         assert!(sink.pending_lines(&state, 80).is_empty());
@@ -13176,6 +13519,50 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>();
         assert_eq!(tail, vec!["Thor", "I need to inspect this"]);
+
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentThoughtChunk(text_chunk("implementing")),
+        )));
+        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
+            SessionUpdate::AgentMessageChunk(text_chunk("done")),
+        )));
+        assert_eq!(stable_transcript_entry_count(&state), 1);
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
+            text_chunk(" and report"),
+        )));
+        assert!(matches!(
+            &state.transcript[1],
+            Entry::AgentThought(thought)
+                if thought.text == "I need to inspect this and report" && !thought.completed
+        ));
+
+        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            text_chunk("Here is the result"),
+        )));
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        let flushed = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flushed,
+            vec![
+                "Thor",
+                "thought · 1 line",
+                "Eitri",
+                "thought · 1 line",
+                "done",
+                "",
+                "Thor",
+                "Here is the result",
+                "",
+            ]
+        );
     }
 
     #[test]
@@ -13471,10 +13858,16 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(interjection.contains("Loki"), "{interjection}");
+        assert!(interjection.is_empty(), "{interjection}");
+        let live_after_loki = inline_transcript_tail_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(live_after_loki.contains("Loki"), "{live_after_loki}");
         assert!(
-            interjection.contains("trace the fallback path too"),
-            "{interjection}"
+            live_after_loki.contains("trace the fallback path too"),
+            "{live_after_loki}"
         );
         assert!(transcript_export_markdown(&state).contains("Thor → Eitri · explore"));
     }
@@ -13504,7 +13897,10 @@ mod tests {
             .iter()
             .map(line_text)
             .collect::<Vec<_>>();
-        assert_eq!(live, vec!["Eitri", "working now"]);
+        assert_eq!(
+            live,
+            vec!["Thor", "planning the handoff", "Eitri", "working now"]
+        );
         assert!(inline_transcript_tail_row_count(&state, 80) > 0);
         assert!(
             desired_inline_height(
@@ -13528,7 +13924,13 @@ mod tests {
         state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
             outcome: CodeAgentOutcome::Completed,
         }));
-        assert!(inline_transcript_tail_lines(&state, 80).is_empty());
+        assert_eq!(
+            inline_transcript_tail_lines(&state, 80)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            vec!["Thor", "planning the handoff", "Eitri", "thought · 1 line"]
+        );
         terminal
             .draw(|frame| draw_header(frame, frame.area(), &state))
             .expect("draw restored header");
@@ -15036,28 +15438,92 @@ mod tests {
     fn thinking_is_compact_and_primary_agent_names_have_distinct_colors() {
         let mut state = AppState::new();
         let theme = state.theme;
-        state.transcript.push(Entry::AgentThought(
-            "Planning initial\n\n<!-- -->\n\ncode_agent   invocation".to_string(),
-        ));
-        state.transcript.push(Entry::CodeAgentThought(
-            "Checking the implementation".to_string(),
-        ));
+        state
+            .transcript
+            .push(Entry::AgentThought(crate::app::ThoughtEntry {
+                text: "Planning initial\n\n<!-- -->\n\ncode_agent   invocation".to_string(),
+                completed: true,
+            }));
+        state
+            .transcript
+            .push(Entry::CodeAgentThought(crate::app::ThoughtEntry {
+                text: "Checking the implementation".to_string(),
+                completed: true,
+            }));
         let rendered = render_transcript_lines(&state, 80);
         let text = rendered.iter().map(line_text).collect::<Vec<_>>();
         assert_eq!(
             text,
-            vec![
-                "Thor",
-                "Planning initial code_agent invocation",
-                "Eitri",
-                "Checking the implementation",
-            ]
+            vec!["Thor", "thought · 5 lines", "Eitri", "thought · 1 line",]
         );
         assert_eq!(rendered[0].spans[0].style.fg, Some(theme.primary));
         assert_eq!(rendered[2].spans[0].style.fg, Some(theme.code));
         for line in [&rendered[1], &rendered[3]] {
             assert_eq!(line.spans[0].style.fg, Some(theme.thought));
         }
+    }
+
+    #[test]
+    fn active_thought_uses_bounded_tail_and_completed_thought_expands() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state
+            .transcript
+            .push(Entry::AgentThought(crate::app::ThoughtEntry {
+                text: "old one\nold two\nnew one\nnew two\nnew three".to_string(),
+                completed: false,
+            }));
+
+        let active = render_transcript_lines(&state, 80);
+        let active_text = active.iter().map(line_text).collect::<Vec<_>>();
+        assert!(!active_text.iter().any(|line| line.contains("old one")));
+        assert!(!active_text.iter().any(|line| line.contains("old two")));
+        assert!(active_text.iter().any(|line| line == "new one"));
+        assert!(active_text.iter().any(|line| line == "new two"));
+        assert!(active_text.iter().any(|line| line == "new three"));
+
+        let tail = active_thought_tail(&format!(
+            "{}TAIL",
+            "x".repeat(ACTIVE_THOUGHT_TAIL_CHARS + 40)
+        ));
+        assert!(tail.starts_with('…'));
+        assert!(tail.ends_with("TAIL"));
+        assert!(tail.chars().count() <= ACTIVE_THOUGHT_TAIL_CHARS + 1);
+
+        let Entry::AgentThought(thought) = &mut state.transcript[0] else {
+            panic!("thought entry");
+        };
+        thought.text = "first line\nsecond line".to_string();
+        thought.completed = true;
+
+        let compact = render_transcript_lines(&state, 80);
+        assert_eq!(
+            compact.iter().map(line_text).collect::<Vec<_>>(),
+            vec!["Thor", "thought · 2 lines"]
+        );
+
+        state.expand_transcript_details = true;
+        let expanded = render_transcript_lines(&state, 80);
+        assert_eq!(
+            expanded.iter().map(line_text).collect::<Vec<_>>(),
+            vec!["Thor", "first line", "second line"]
+        );
+        for line in expanded.iter().skip(1) {
+            assert!(
+                line.spans
+                    .iter()
+                    .all(|span| span.style.fg == Some(theme.thought))
+            );
+        }
+
+        state.expand_transcript_details = false;
+        assert_eq!(
+            render_full_transcript_lines(&state, 80)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            vec!["Thor", "first line", "second line"]
+        );
     }
 
     #[test]
@@ -15264,6 +15730,145 @@ mod tests {
                 .any(|line| line == "│   - visible from anvil"),
             "rendered lines: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn transcript_markdown_links_tables_lists_headings_and_rules_share_reader_rendering() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state.transcript.push(Entry::AgentMessage(
+            "# Top\n###### Bottom\n[docs](https://example.test/docs) and [more](https://example.test/more)\nname | value\n--- | :---:\n**alpha** | `beta`\n  - nested bullet\n    2. nested number\n---"
+                .to_string(),
+        ));
+        state.expand_transcript_details = true;
+
+        let width = 26;
+        let normal = render_transcript_lines(&state, width);
+        let full = render_full_transcript_lines(&state, width);
+        let signature = |lines: &[Line<'static>]| {
+            lines
+                .iter()
+                .map(|line| {
+                    (
+                        line_text(line),
+                        line.spans
+                            .iter()
+                            .map(|span| (span.content.to_string(), span.style))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(signature(&normal), signature(&full));
+
+        let rendered: Vec<String> = normal.iter().map(line_text).collect();
+        assert!(
+            rendered.iter().any(|line| line
+                == "docs (https://example.test/docs) and more (https://example.test/more)")
+        );
+        assert!(rendered.iter().any(|line| line == "name | value"));
+        assert!(rendered.iter().any(|line| line == "alpha | beta"));
+        assert!(!rendered.iter().any(|line| line.contains(":---:")));
+        assert!(rendered.iter().any(|line| line == "  - nested bullet"));
+        assert!(rendered.iter().any(|line| line == "    2. nested number"));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == &"─".repeat(width as usize))
+        );
+
+        let top = normal
+            .iter()
+            .find(|line| line_text(line) == "# Top")
+            .unwrap();
+        let bottom = normal
+            .iter()
+            .find(|line| line_text(line) == "###### Bottom")
+            .unwrap();
+        assert_ne!(top.spans[0].style, bottom.spans[0].style);
+        assert_eq!(top.spans[0].style.fg, Some(theme.primary));
+        assert_eq!(bottom.spans[0].style.fg, Some(theme.muted));
+
+        let paragraph = Paragraph::new(normal).wrap(Wrap { trim: false });
+        let height = paragraph.line_count(width);
+        let area = Rect::new(0, 0, width, height as u16);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        paragraph.render(area, &mut buffer);
+        let narrow = buffer_lines(&buffer).join("");
+        for content in [
+            "docs",
+            "example.test/docs",
+            "name",
+            "value",
+            "alpha",
+            "beta",
+            "nested bullet",
+            "nested number",
+        ] {
+            assert!(
+                narrow.contains(content),
+                "narrow Markdown rendering lost {content:?}: {narrow:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_markdown_constructs_stay_desaturated_and_fit_narrow_gutter() {
+        let mut state = AppState::new();
+        let theme = state.theme;
+        state.tool_calls.insert(
+            "call-343".to_string(),
+            crate::app::ToolCallView {
+                title: "log".to_string(),
+                kind: ToolKind::Execute,
+                status: ToolCallStatus::Completed,
+                body: vec![ToolCallOutput::Text(
+                    "# heading\n[label](https://example.test/a-very-long-path)\nkey | value\n--- | ---\n**left** | *right*\n  - nested\n---"
+                        .to_string(),
+                )],
+            },
+        );
+        state
+            .transcript
+            .push(Entry::ToolCall("call-343".to_string()));
+
+        let width = 24u16;
+        let lines = render_transcript_lines(&state, width);
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        let tool_content = lines
+            .iter()
+            .filter(|line| line_text(line).starts_with(TOOL_GUTTER))
+            .flat_map(|line| line.spans.iter().skip(1))
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            tool_content.contains("label (https://example.test/a-very-long-path)"),
+            "wrapped tool rows lost link content: {rendered:?}"
+        );
+        assert!(rendered.iter().any(|line| line == "│   key | value"));
+        assert!(rendered.iter().any(|line| line == "│     - nested"));
+        for line in lines
+            .iter()
+            .filter(|line| line_text(line).starts_with(TOOL_GUTTER))
+        {
+            assert!(
+                line_text(line).width() <= width as usize,
+                "too wide: {line:?}"
+            );
+            for span in line.spans.iter().skip(1) {
+                assert!(
+                    span.style.fg == Some(theme.subtle) || span.style.fg == Some(theme.muted),
+                    "tool markdown recolored content: {line:?}"
+                );
+            }
+        }
+        let emphasis = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.as_ref() == "left")
+            .expect("bold table cell");
+        assert_eq!(emphasis.style.fg, Some(theme.subtle));
+        assert!(emphasis.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -15514,10 +16119,14 @@ mod tests {
     #[test]
     fn thought_blocks_render_dimmed_under_speaker_name() {
         let mut state = AppState::new();
+        state.expand_transcript_details = true;
         let theme = state.theme;
         state
             .transcript
-            .push(Entry::AgentThought("weighing the options".to_string()));
+            .push(Entry::AgentThought(crate::app::ThoughtEntry {
+                text: "weighing the options".to_string(),
+                completed: true,
+            }));
 
         let lines = render_transcript_lines(&state, 80);
         let row = lines
@@ -15540,10 +16149,14 @@ mod tests {
         // thought it must still read as dimmed reasoning, not like a real
         // reply heading.
         let mut state = AppState::new();
+        state.expand_transcript_details = true;
         let theme = state.theme;
         state
             .transcript
-            .push(Entry::AgentThought("# Plan\nthen do it".to_string()));
+            .push(Entry::AgentThought(crate::app::ThoughtEntry {
+                text: "# Plan\nthen do it".to_string(),
+                completed: true,
+            }));
 
         let lines = render_transcript_lines(&state, 80);
         let heading = lines
@@ -16036,14 +16649,16 @@ mod tests {
     #[test]
     fn usage_quota_row_renders_between_input_and_config_shortcuts() {
         let mut state = AppState::new();
-        state.claude_usage = Some(ClaudeUsageReport {
+        state.set_claude_usage(ClaudeUsageStatus::Available(ClaudeUsageReport {
             five_hour: Some(crate::claude_usage::ClaudeUsageWindow {
                 remaining_percent: 88,
+                reset_context: None,
             }),
             week: Some(crate::claude_usage::ClaudeUsageWindow {
                 remaining_percent: 63,
+                reset_context: None,
             }),
-        });
+        }));
         state.session_config_options = vec![SessionConfigOption::select(
             "model",
             "Model",
@@ -16067,6 +16682,265 @@ mod tests {
         let lines = buffer_lines(terminal.backend().buffer());
         assert!(lines[0].contains("Claude usage: 5H 88% left · week 63% left"));
         assert!(lines[1].contains("[F1 Model: Model 1]"));
+    }
+
+    #[test]
+    fn usage_quota_row_renders_claude_unavailable_reason() {
+        let mut state = AppState::new();
+        state.set_claude_usage(ClaudeUsageStatus::Unavailable("not signed in".to_string()));
+
+        let backend = TestBackend::new(100, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_usage_quota_row(frame, frame.area(), &state))
+            .expect("draw");
+
+        let lines = buffer_lines(terminal.backend().buffer());
+        assert!(lines[0].contains("Claude usage unavailable: not signed in"));
+    }
+
+    #[test]
+    fn usage_quota_row_renders_bedrock_available_and_unavailable() {
+        let mut state = AppState::new();
+        state.set_bedrock_credits(crate::bedrock_credits::BedrockCreditsStatus::Available(
+            crate::bedrock_credits::BedrockCreditsReport {
+                amounts: vec![crate::bedrock_credits::CreditAmount {
+                    currency: "USD".to_string(),
+                    amount: 12.5,
+                }],
+                earliest_expiration: Some("2026-12-31".to_string()),
+                as_of: "2026-07-15".to_string(),
+            },
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("Bedrock credits: USD 12.50 · expires 2026-12-31 · as of 2026-07-15")
+        );
+        let backend = TestBackend::new(100, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_usage_quota_row(frame, frame.area(), &state))
+            .expect("draw");
+        assert!(
+            buffer_lines(terminal.backend().buffer())[0].contains("Bedrock credits: USD 12.50")
+        );
+
+        state.set_bedrock_credits(crate::bedrock_credits::BedrockCreditsStatus::Unavailable(
+            "request timed out".to_string(),
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("Bedrock credits unavailable: request timed out")
+        );
+        terminal
+            .draw(|frame| draw_usage_quota_row(frame, frame.area(), &state))
+            .expect("draw");
+        assert!(
+            buffer_lines(terminal.backend().buffer())[0]
+                .contains("Bedrock credits unavailable: request timed out")
+        );
+    }
+
+    #[test]
+    fn usage_quota_row_renders_openrouter_available_zero_and_unavailable() {
+        let mut state = AppState::new();
+        state.set_openrouter_balance(
+            crate::openrouter_balance::OpenRouterBalanceStatus::Available(
+                crate::openrouter_balance::OpenRouterBalanceReport {
+                    remaining_usd: 12.5,
+                    total_credits_usd: 20.0,
+                    total_usage_usd: 7.5,
+                    as_of: "2026-07-15T18:42:00Z".to_string(),
+                },
+            ),
+        );
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("OpenRouter balance: USD 12.50 remaining · as of 2026-07-15T18:42:00Z")
+        );
+
+        state.set_openrouter_balance(
+            crate::openrouter_balance::OpenRouterBalanceStatus::Available(
+                crate::openrouter_balance::OpenRouterBalanceReport {
+                    remaining_usd: 0.0,
+                    total_credits_usd: 20.0,
+                    total_usage_usd: 20.0,
+                    as_of: "2026-07-15T18:43:00Z".to_string(),
+                },
+            ),
+        );
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("OpenRouter balance: USD 0.00 remaining · as of 2026-07-15T18:43:00Z")
+        );
+
+        state.set_openrouter_balance(
+            crate::openrouter_balance::OpenRouterBalanceStatus::Unavailable(
+                "billing credentials are unavailable".to_string(),
+            ),
+        );
+        let backend = TestBackend::new(100, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_usage_quota_row(frame, frame.area(), &state))
+            .expect("draw");
+        assert!(
+            buffer_lines(terminal.backend().buffer())[0]
+                .contains("OpenRouter balance unavailable: billing credentials are unavailable")
+        );
+    }
+
+    #[test]
+    fn usage_quota_row_renders_all_deepseek_balance_records() {
+        let mut state = AppState::new();
+        state.set_deepseek_balance(crate::deepseek_balance::DeepSeekBalanceStatus::Available(
+            crate::deepseek_balance::DeepSeekBalanceReport {
+                balances: vec![
+                    crate::deepseek_balance::DeepSeekBalance {
+                        currency: "CNY".to_string(),
+                        total_balance: "123.4500".to_string(),
+                        granted_balance: "23.0000".to_string(),
+                        topped_up_balance: "100.4500".to_string(),
+                    },
+                    crate::deepseek_balance::DeepSeekBalance {
+                        currency: "USD".to_string(),
+                        total_balance: "0.010".to_string(),
+                        granted_balance: "0.000".to_string(),
+                        topped_up_balance: "0.010".to_string(),
+                    },
+                ],
+                as_of: "2026-07-15T18:42:00Z".to_string(),
+            },
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some(
+                "DeepSeek balance: CNY total 123.4500 · granted 23.0000 · topped up 100.4500 · USD total 0.010 · granted 0.000 · topped up 0.010 · as of 2026-07-15T18:42:00Z"
+            )
+        );
+
+        let backend = TestBackend::new(50, 5);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_usage_quota_row(frame, frame.area(), &state))
+            .expect("draw");
+        let rendered = buffer_lines(terminal.backend().buffer());
+        for expected in [
+            "CNY total",
+            "123.4500",
+            "granted",
+            "23.0000",
+            "topped up",
+            "100.4500",
+            "USD total",
+            "0.010",
+            "0.000",
+            "2026-07-15T18:42:00Z",
+        ] {
+            assert!(
+                rendered.iter().any(|line| line.contains(expected)),
+                "missing intact {expected}: {rendered:?}"
+            );
+        }
+        assert!(usage_quota_row_count(&state, 50) > 1);
+
+        state.set_deepseek_balance(crate::deepseek_balance::DeepSeekBalanceStatus::Unavailable(
+            crate::deepseek_balance::DeepSeekBalanceUnavailable {
+                reason: "billing credentials are unavailable".to_string(),
+                as_of: "2026-07-15T18:43:00Z".to_string(),
+            },
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some(
+                "DeepSeek balance unavailable: billing credentials are unavailable · as of 2026-07-15T18:43:00Z"
+            )
+        );
+    }
+
+    #[test]
+    fn peer_quota_rows_remain_single_line_and_truncated() {
+        let mut state = AppState::new();
+        state.set_bedrock_credits(crate::bedrock_credits::BedrockCreditsStatus::Unavailable(
+            "request timed out".to_string(),
+        ));
+        assert_eq!(usage_quota_row_count(&state, 12), 1);
+
+        let backend = TestBackend::new(12, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_usage_quota_row(frame, frame.area(), &state))
+            .expect("draw");
+        assert_eq!(
+            buffer_lines(terminal.backend().buffer())[0],
+            truncate_text_to_width(
+                "Bedrock credits unavailable: request timed out".to_string(),
+                12
+            )
+        );
+
+        state.set_openrouter_balance(
+            crate::openrouter_balance::OpenRouterBalanceStatus::Unavailable(
+                "request timed out".to_string(),
+            ),
+        );
+        assert_eq!(usage_quota_row_count(&state, 12), 1);
+    }
+
+    #[test]
+    fn usage_quota_label_prefers_selected_anvil_provider_over_council_pollers() {
+        let mut state = AppState::new();
+        state.set_bedrock_credits(crate::bedrock_credits::BedrockCreditsStatus::Unavailable(
+            "bedrock unavailable".to_string(),
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("Bedrock credits unavailable: bedrock unavailable")
+        );
+
+        state.set_openrouter_balance(
+            crate::openrouter_balance::OpenRouterBalanceStatus::Unavailable(
+                "openrouter unavailable".to_string(),
+            ),
+        );
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("OpenRouter balance unavailable: openrouter unavailable")
+        );
+
+        state.set_bedrock_credits(crate::bedrock_credits::BedrockCreditsStatus::Unavailable(
+            "newer bedrock unavailable".to_string(),
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("Bedrock credits unavailable: newer bedrock unavailable")
+        );
+
+        state.set_codex_usage(crate::codex_usage::CodexUsageStatus::Unavailable(
+            "codex unavailable".to_string(),
+        ));
+        state.set_claude_usage(ClaudeUsageStatus::Unavailable(
+            "claude unavailable".to_string(),
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("Bedrock credits unavailable: newer bedrock unavailable")
+        );
+    }
+
+    #[test]
+    fn usage_quota_label_prefers_codex_over_claude_without_anvil_provider() {
+        let mut state = AppState::new();
+        state.set_claude_usage(ClaudeUsageStatus::Unavailable(
+            "claude unavailable".to_string(),
+        ));
+        state.set_codex_usage(crate::codex_usage::CodexUsageStatus::Unavailable(
+            "codex unavailable".to_string(),
+        ));
+        assert_eq!(
+            usage_quota_label(&state).as_deref(),
+            Some("Codex usage unavailable: codex unavailable")
+        );
     }
 
     #[test]

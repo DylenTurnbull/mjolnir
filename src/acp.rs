@@ -42,8 +42,8 @@ use crate::archive;
 use crate::code_agent;
 use crate::event::{
     ElicitationOutcome, ElicitationPrompt, LoadSessionResult, PermissionDecision, PermissionPrompt,
-    PromptImage, SessionConfigTarget, TerminalOutputSnapshot, UiCommand, UiEvent,
-    content_block_text,
+    PromptImage, SessionConfigTarget, TerminalOutputSnapshot, UiCommand, UiEvent, WorkspaceDiff,
+    WorkspaceDiffEvent, content_block_text,
 };
 use crate::paths::{WorkspaceRoots, normalize_spawn_program, path_is_under_any_root};
 use crate::{deepswe, model_resolve};
@@ -4383,13 +4383,6 @@ enum TextFileState {
 }
 
 #[derive(Debug)]
-struct WorkspaceDiff {
-    path: PathBuf,
-    old_text: Option<String>,
-    new_text: String,
-}
-
-#[derive(Debug)]
 struct TurnDiffTracker {
     roots: Vec<GitTurnDiffRoot>,
     max_text_bytes: u64,
@@ -4440,35 +4433,13 @@ impl TurnDiffTracker {
             diffs.truncate(TURN_DIFF_MAX_FILES);
         }
 
-        let title = if total == 1 {
-            "workspace changes (1 file)".to_string()
-        } else {
-            format!("workspace changes ({total} files)")
-        };
-        let mut content = diffs
-            .iter()
-            .map(|diff| {
-                ToolCallContent::Diff(
-                    Diff::new(diff.path.clone(), diff.new_text.clone())
-                        .old_text(diff.old_text.clone()),
-                )
-            })
-            .collect::<Vec<_>>();
-        if total > TURN_DIFF_MAX_FILES {
-            content.push(ToolCallContent::Content(Content::new(ContentBlock::Text(
-                TextContent::new(format!("showing first {TURN_DIFF_MAX_FILES} changed files")),
-            ))));
-        }
-        let locations = diffs
-            .iter()
-            .map(|diff| ToolCallLocation::new(diff.path.clone()))
-            .collect();
-        let tool_call = ToolCall::new(format!("mj-turn-diff-{turn_id}"), title)
-            .kind(ToolKind::Edit)
-            .status(ToolCallStatus::Completed)
-            .locations(locations)
-            .content(content);
-        let _ = ui_tx.send(UiEvent::SessionUpdate(SessionUpdate::ToolCall(tool_call)));
+        let _ = ui_tx.send(UiEvent::WorkspaceDiff(WorkspaceDiffEvent {
+            turn_id,
+            diffs,
+            total_files: total,
+            max_files: TURN_DIFF_MAX_FILES,
+            truncated: total > TURN_DIFF_MAX_FILES,
+        }));
     }
 }
 
@@ -7267,20 +7238,15 @@ mod tests {
                 .expect("timeout waiting for prompt turn")
                 .expect("channel closed");
             match ev {
-                UiEvent::SessionUpdate(SessionUpdate::ToolCall(tool_call))
-                    if tool_call.title == "workspace changes (1 file)" =>
-                {
-                    assert_eq!(tool_call.kind, ToolKind::Edit);
-                    assert_eq!(tool_call.status, ToolCallStatus::Completed);
-                    assert_eq!(tool_call.content.len(), 1);
-                    match &tool_call.content[0] {
-                        ToolCallContent::Diff(diff) => {
-                            assert_eq!(diff.path, expected_path);
-                            assert_eq!(diff.old_text.as_deref(), Some("before\n"));
-                            assert_eq!(diff.new_text, "after\n");
-                        }
-                        other => panic!("unexpected tool content: {other:?}"),
-                    }
+                UiEvent::WorkspaceDiff(diff) => {
+                    assert_eq!(diff.turn_id, 1);
+                    assert_eq!(diff.total_files, 1);
+                    assert_eq!(diff.max_files, TURN_DIFF_MAX_FILES);
+                    assert!(!diff.truncated);
+                    assert_eq!(diff.diffs.len(), 1);
+                    assert_eq!(diff.diffs[0].path, expected_path);
+                    assert_eq!(diff.diffs[0].old_text.as_deref(), Some("before\n"));
+                    assert_eq!(diff.diffs[0].new_text, "after\n");
                     saw_diff = true;
                 }
                 UiEvent::PromptDone { stop_reason, .. } => {
@@ -7298,6 +7264,43 @@ mod tests {
         cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
         let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
         agent_task.abort();
+    }
+
+    #[tokio::test]
+    async fn workspace_diff_event_caps_files_and_preserves_total() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        init_git_repo(temp.path());
+        for index in 0..=TURN_DIFF_MAX_FILES {
+            std::fs::write(temp.path().join(format!("file-{index:02}.txt")), "before\n")
+                .expect("seed file");
+        }
+        run_git(temp.path(), &["add", "."]);
+        run_git(temp.path(), &["commit", "-m", "seed"]);
+
+        let tracker =
+            TurnDiffTracker::snapshot(&[temp.path().to_path_buf()], DEFAULT_FS_TEXT_BYTES).await;
+        for index in 0..=TURN_DIFF_MAX_FILES {
+            std::fs::write(temp.path().join(format!("file-{index:02}.txt")), "after\n")
+                .expect("modify file");
+        }
+
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        tracker.emit_if_changed(&ui_tx, 42).await;
+        let event = ui_rx.recv().await.expect("workspace diff event");
+        let UiEvent::WorkspaceDiff(diff) = event else {
+            panic!("expected workspace diff event");
+        };
+
+        assert_eq!(diff.turn_id, 42);
+        assert_eq!(diff.total_files, TURN_DIFF_MAX_FILES + 1);
+        assert_eq!(diff.max_files, TURN_DIFF_MAX_FILES);
+        assert!(diff.truncated);
+        assert_eq!(diff.diffs.len(), TURN_DIFF_MAX_FILES);
+        assert!(
+            diff.diffs
+                .windows(2)
+                .all(|paths| paths[0].path < paths[1].path)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

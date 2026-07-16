@@ -884,6 +884,7 @@ impl TrackerState {
             UiEvent::SessionUpdate(update) => {
                 self.observe_session_update(update);
             }
+            UiEvent::WorkspaceDiff(_) => {}
             UiEvent::TerminalOutput(snapshot) => {
                 self.observe_terminal_output(snapshot);
             }
@@ -5233,7 +5234,7 @@ mod tests {
             resumed: false,
         });
 
-        let mut tool_call = ToolCall::new("call-1", "workspace changes (1 file)");
+        let mut tool_call = ToolCall::new("call-1", "edit src/lib.rs");
         tool_call.kind = ToolKind::Edit;
         tool_call.content = vec![ToolCallContent::Diff(
             Diff::new("src/lib.rs", "one\ntwo\nthree\n")
@@ -5270,7 +5271,7 @@ mod tests {
 
         let old_text = "a".repeat(MAX_TRANSCRIPT_DIFF_TEXT_BYTES_PER_FILE);
         let new_text = "b".repeat(MAX_TRANSCRIPT_DIFF_TEXT_BYTES_PER_FILE);
-        let mut tool_call = ToolCall::new("call-1", "workspace changes (1 file)");
+        let mut tool_call = ToolCall::new("call-1", "edit src/large.rs");
         tool_call.kind = ToolKind::Edit;
         tool_call.content = vec![ToolCallContent::Diff(
             Diff::new("src/large.rs", new_text).old_text(Some(old_text)),
