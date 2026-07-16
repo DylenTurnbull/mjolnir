@@ -216,7 +216,8 @@ Common options:
 - `--additional-directory PATH`: expose another workspace root; repeatable.
 - `-p, --print [PROMPT]`: run once; omit the value or pass `-` to read stdin.
 - `--output-format text|json|stream-json`: headless output format.
-- `--permission-mode default|acceptEdits|bypassPermissions`: headless policy.
+- `--permission-mode manual|auto|yolo`: headless policy. The former
+  `default`, `acceptEdits`, and `bypassPermissions` values remain aliases.
 - `-w, --worktree [NAME]`: create or reuse a linked worktree.
 - `--debug-file PATH`: capture Mjolnir diagnostics.
 - `--agent-stderr PATH`: capture ACP adapter stderr.

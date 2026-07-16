@@ -3772,7 +3772,7 @@ fn persist_mjconfig_selection(
                 }
                 state.record_status_message(
                     StatusKind::Info,
-                    format!("config saved — theme {theme}, spinner {style}; Council model and ACP changes apply on /new or /clear"),
+                    format!("config saved — theme {theme}, spinner {style}; Council model, permission, and ACP changes apply on /new or /clear"),
                 );
             }
             Err(e) => state.record_status_message(

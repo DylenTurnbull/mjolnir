@@ -1356,7 +1356,9 @@ impl AgentHandle {
                 return Ok(());
             }
             match ev {
-                UiEvent::SessionConfigOptions { options, targets } => {
+                UiEvent::SessionConfigOptions {
+                    options, targets, ..
+                } => {
                     self.store_config(options, targets);
                 }
                 UiEvent::PermissionRequest(p) => self.answer_permission(p),
@@ -1437,9 +1439,9 @@ impl AgentHandle {
                 }
             };
             match ev {
-                Some(UiEvent::SessionConfigOptions { options, targets }) => {
-                    self.store_config(options, targets)
-                }
+                Some(UiEvent::SessionConfigOptions {
+                    options, targets, ..
+                }) => self.store_config(options, targets),
                 Some(UiEvent::PermissionRequest(p)) => self.answer_permission(p),
                 Some(UiEvent::ElicitationRequest(e)) => {
                     let _ = e.responder.send(ElicitationOutcome::Decline);
@@ -1464,7 +1466,9 @@ impl AgentHandle {
                 }
             };
             match ev {
-                Some(UiEvent::SessionConfigOptions { options, targets }) => {
+                Some(UiEvent::SessionConfigOptions {
+                    options, targets, ..
+                }) => {
                     self.store_config(options, targets);
                     if self.model_is_current(model_value) {
                         return Ok(());
@@ -1609,9 +1613,9 @@ impl AgentHandle {
                     SessionUpdate::UsageUpdate(update) => latest_usage_update = Some(update),
                     _ => {}
                 },
-                UiEvent::SessionConfigOptions { options, targets } => {
-                    self.store_config(options, targets)
-                }
+                UiEvent::SessionConfigOptions {
+                    options, targets, ..
+                } => self.store_config(options, targets),
                 UiEvent::PermissionRequest(p) => {
                     on_event(TurnEvent::Permission {
                         prompt: Box::new(p),
@@ -4471,6 +4475,7 @@ mod tests {
             .send(UiEvent::SessionConfigOptions {
                 options: stale_options,
                 targets: stale_targets,
+                hidden_config_ids: Vec::new(),
             })
             .unwrap();
         let (confirmed_options, confirmed_targets) = model_options("opus");
@@ -4478,6 +4483,7 @@ mod tests {
             .send(UiEvent::SessionConfigOptions {
                 options: confirmed_options,
                 targets: confirmed_targets,
+                hidden_config_ids: Vec::new(),
             })
             .unwrap();
 

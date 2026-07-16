@@ -115,10 +115,10 @@ struct Cli {
 
     /// Permission handling for `--print`.
     ///
-    /// `default` rejects permission prompts so headless runs never hang.
-    /// `acceptEdits` accepts edit/delete/move prompts but rejects shell
-    /// execution. `bypassPermissions` accepts every permission prompt.
-    #[arg(long, value_enum, default_value_t = HeadlessPermissionMode::Default)]
+    /// `manual` rejects permission prompts so headless runs never hang.
+    /// `auto` accepts edit/delete/move prompts but rejects shell execution.
+    /// `yolo` accepts every permission prompt.
+    #[arg(long, value_enum, default_value_t = HeadlessPermissionMode::Manual)]
     permission_mode: HeadlessPermissionMode,
 
     /// Working directory used when opening a new session. Defaults to
@@ -324,19 +324,20 @@ impl From<HeadlessOutputFormat> for headless::OutputFormat {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum HeadlessPermissionMode {
-    Default,
-    #[value(name = "acceptEdits", alias = "accept-edits")]
-    AcceptEdits,
-    #[value(name = "bypassPermissions", alias = "bypass-permissions")]
-    BypassPermissions,
+    #[value(alias = "default")]
+    Manual,
+    #[value(alias = "acceptEdits", alias = "accept-edits")]
+    Auto,
+    #[value(alias = "bypassPermissions", alias = "bypass-permissions")]
+    Yolo,
 }
 
 impl From<HeadlessPermissionMode> for headless::PermissionMode {
     fn from(value: HeadlessPermissionMode) -> Self {
         match value {
-            HeadlessPermissionMode::Default => Self::Default,
-            HeadlessPermissionMode::AcceptEdits => Self::AcceptEdits,
-            HeadlessPermissionMode::BypassPermissions => Self::BypassPermissions,
+            HeadlessPermissionMode::Manual => Self::Manual,
+            HeadlessPermissionMode::Auto => Self::Auto,
+            HeadlessPermissionMode::Yolo => Self::Yolo,
         }
     }
 }
@@ -581,16 +582,20 @@ fn primary_session_routes(council: &council::ResolvedCouncil) -> Vec<council::Re
     routes
 }
 
-fn council_reload_message(council: &council::ResolvedCouncil) -> String {
+fn council_reload_message(
+    council: &council::ResolvedCouncil,
+    permission_mode: config::CouncilPermissionMode,
+) -> String {
     let role = |role: Option<&council::ResolvedRole>| {
         role.map(|role| format!("{} via {}", role.model.model, role.launch.source_id))
             .unwrap_or_else(|| "off".to_string())
     };
     format!(
-        "Council reloaded after /clear: Thor {}; Loki {}; Eitri {}",
+        "Council reloaded after /clear: Thor {}; Loki {}; Eitri {}; permissions {}",
         role(Some(&council.thor)),
         role(council.loki.as_ref()),
-        role(council.eitri.as_ref())
+        role(council.eitri.as_ref()),
+        permission_mode,
     )
 }
 
@@ -1250,7 +1255,10 @@ async fn run_app(
                 initial_agent = Some(council_agent.clone());
                 pending_new_session_boundary = show_new_session_boundary;
                 if session_result.reason == UiExitReason::ClearSession {
-                    pending_council_boundary = Some(council_reload_message(&council));
+                    pending_council_boundary = Some(council_reload_message(
+                        &council,
+                        cfg.council.permission_mode,
+                    ));
                 }
                 continue;
             }
@@ -1737,7 +1745,7 @@ async fn run_session(
         );
     }
     let _ = ui_event_tx.send(crate::event::UiEvent::Info(format!(
-        "Council · Thor {} · Loki {} · Eitri {} · {} launchable models",
+        "Council · Thor {} · Loki {} · Eitri {} · permissions {} · {} launchable models",
         council.thor.model.model,
         council
             .loki
@@ -1749,6 +1757,7 @@ async fn run_session(
             .as_ref()
             .map(|role| role.model.model.as_str())
             .unwrap_or("off"),
+        council_config.permission_mode,
         council.available.len(),
     )));
     for warning in &council.warnings {
@@ -1875,6 +1884,13 @@ async fn run_session(
     };
     let mut ui_event_rx = ui_event_rx;
 
+    let mut thor_env = agent.env.clone();
+    let thor_permission = council::configure_permissions(
+        council.thor.launch.kind,
+        council_config.permission_mode,
+        &mut thor_env,
+    );
+
     let runtime_cfg = acp::AcpRuntimeConfig {
         command: agent.program.clone(),
         args: agent.args.clone(),
@@ -1885,7 +1901,7 @@ async fn run_session(
             .map(|server| vec![server.advertised().clone()])
             .unwrap_or_default(),
         resume_session,
-        env: agent.env.clone(),
+        env: thor_env,
         agent_stderr: runtime_options.agent_stderr.clone(),
         fs_max_text_bytes: runtime_options.fs_max_text_bytes,
         access_mode: acp::RuntimeAccessMode::Full,
@@ -1897,6 +1913,7 @@ async fn run_session(
             model_id: council.thor.model.model.clone(),
             model_value: council.thor.model_value.clone(),
             adapter_source_id: council.thor.launch.source_id.clone(),
+            permission: thor_permission,
             council_session: Some(council_session.clone()),
         }),
         code_agent: eitri_pool.map(|eitri_pool| {
@@ -1912,6 +1929,7 @@ async fn run_session(
                 .with_implementation_handoff_counter(implementation_handoffs_this_turn.clone())
                 .with_active_implementation_workers(active_implementation_workers.clone())
                 .with_max_parallel_explores(eitri_config.max_parallel_explores)
+                .with_permission_mode(council_config.permission_mode)
                 .with_prewarm(code_agent::RunContext {
                     cwd: cwd.clone(),
                     additional_directories: runtime_options.additional_directories.clone(),
@@ -2783,8 +2801,8 @@ mod tests {
         };
 
         assert_eq!(
-            council_reload_message(&council),
-            "Council reloaded after /clear: Thor gpt-test via codex-acp; Loki claude-test via claude-acp; Eitri off"
+            council_reload_message(&council, config::CouncilPermissionMode::Auto),
+            "Council reloaded after /clear: Thor gpt-test via codex-acp; Loki claude-test via claude-acp; Eitri off; permissions Auto"
         );
     }
 
@@ -3085,38 +3103,45 @@ mod tests {
 
     #[test]
     fn parse_accepts_permission_mode_canonical_and_legacy_values() {
-        let canonical = Cli::try_parse_from(["mj", "--permission-mode", "acceptEdits"])
-            .expect("parse canonical");
+        let canonical =
+            Cli::try_parse_from(["mj", "--permission-mode", "auto"]).expect("parse canonical");
         assert!(matches!(
             canonical.permission_mode,
-            HeadlessPermissionMode::AcceptEdits
+            HeadlessPermissionMode::Auto
         ));
 
         let legacy =
-            Cli::try_parse_from(["mj", "--permission-mode", "accept-edits"]).expect("parse legacy");
+            Cli::try_parse_from(["mj", "--permission-mode", "acceptEdits"]).expect("parse legacy");
         assert!(matches!(
             legacy.permission_mode,
-            HeadlessPermissionMode::AcceptEdits
+            HeadlessPermissionMode::Auto
         ));
 
-        let canonical = Cli::try_parse_from(["mj", "--permission-mode", "bypassPermissions"])
-            .expect("parse canonical");
+        let canonical =
+            Cli::try_parse_from(["mj", "--permission-mode", "yolo"]).expect("parse canonical");
         assert!(matches!(
             canonical.permission_mode,
-            HeadlessPermissionMode::BypassPermissions
+            HeadlessPermissionMode::Yolo
         ));
 
-        let legacy = Cli::try_parse_from(["mj", "--permission-mode", "bypass-permissions"])
+        let legacy = Cli::try_parse_from(["mj", "--permission-mode", "bypassPermissions"])
             .expect("parse legacy");
         assert!(matches!(
             legacy.permission_mode,
-            HeadlessPermissionMode::BypassPermissions
+            HeadlessPermissionMode::Yolo
+        ));
+
+        let legacy =
+            Cli::try_parse_from(["mj", "--permission-mode", "default"]).expect("parse legacy");
+        assert!(matches!(
+            legacy.permission_mode,
+            HeadlessPermissionMode::Manual
         ));
     }
 
     #[test]
     fn parse_rejects_unknown_permission_mode_value() {
-        let err = Cli::try_parse_from(["mj", "--permission-mode", "auto"]).expect_err("reject");
+        let err = Cli::try_parse_from(["mj", "--permission-mode", "unsafe"]).expect_err("reject");
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
@@ -3138,7 +3163,9 @@ mod tests {
         assert!(help.contains("-w, --worktree [<WORKTREE>]"));
         assert!(help.contains("--fullscreen-tui"));
         assert!(!help.contains("--resume-session"));
-        assert!(help.contains("[possible values: default, acceptEdits, bypassPermissions]"));
+        assert!(help.contains("[possible values: manual, auto, yolo]"));
+        assert!(!help.contains("acceptEdits"));
+        assert!(!help.contains("bypassPermissions"));
         assert!(!help.contains("accept-edits"));
         assert!(!help.contains("bypass-permissions"));
     }

@@ -36,9 +36,19 @@ pub enum OutputFormat {
 
 #[derive(Debug, Clone, Copy)]
 pub enum PermissionMode {
-    Default,
-    AcceptEdits,
-    BypassPermissions,
+    Manual,
+    Auto,
+    Yolo,
+}
+
+impl From<PermissionMode> for config::CouncilPermissionMode {
+    fn from(value: PermissionMode) -> Self {
+        match value {
+            PermissionMode::Manual => Self::Manual,
+            PermissionMode::Auto => Self::Auto,
+            PermissionMode::Yolo => Self::Yolo,
+        }
+    }
 }
 
 pub struct RunConfig {
@@ -219,6 +229,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     });
     let implementation_handoffs = Arc::new(AtomicUsize::new(0));
     let active_implementation_workers = code_agent::ActiveCodeWorkers::default();
+    let mut thor_env = thor.launch.env.clone();
+    let thor_permission =
+        council::configure_permissions(thor.launch.kind, cfg.permission_mode.into(), &mut thor_env);
     let runtime_cfg = AcpRuntimeConfig {
         command: thor.launch.command.clone(),
         args: thor.launch.args.clone(),
@@ -229,7 +242,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             .map(|server| vec![server.advertised().clone()])
             .unwrap_or_default(),
         resume_session: cfg.resume_session.clone(),
-        env: thor.launch.env.clone(),
+        env: thor_env,
         agent_stderr: cfg.agent_stderr.clone(),
         fs_max_text_bytes: cfg.fs_max_text_bytes,
         access_mode: acp::RuntimeAccessMode::Full,
@@ -241,6 +254,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             model_id: thor.model.model.clone(),
             model_value: thor.model_value.clone(),
             adapter_source_id: thor.launch.source_id.clone(),
+            permission: thor_permission,
             council_session: None,
         }),
         code_agent: eitri_pool.map(|eitri_pool| {
@@ -248,6 +262,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 .with_implementation_handoff_counter(implementation_handoffs.clone())
                 .with_active_implementation_workers(active_implementation_workers.clone())
                 .with_max_parallel_explores(app_config.eitri.max_parallel_explores)
+                .with_permission_mode(cfg.permission_mode.into())
                 .with_prewarm(code_agent::RunContext {
                     cwd: cfg.cwd.clone(),
                     additional_directories: cfg.additional_directories.clone(),
@@ -732,9 +747,9 @@ fn permission_decision(
     options: &[agent_client_protocol::schema::v1::PermissionOption],
 ) -> Option<String> {
     let allow = match mode {
-        PermissionMode::Default => false,
-        PermissionMode::BypassPermissions => true,
-        PermissionMode::AcceptEdits => matches!(
+        PermissionMode::Manual => false,
+        PermissionMode::Yolo => true,
+        PermissionMode::Auto => matches!(
             tool_call.fields.kind,
             Some(ToolKind::Edit | ToolKind::Delete | ToolKind::Move)
         ),

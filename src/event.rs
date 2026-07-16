@@ -114,6 +114,9 @@ pub enum UiEvent {
     SessionConfigOptions {
         options: Vec<SessionConfigOption>,
         targets: Vec<SessionConfigTarget>,
+        /// Provider permission controls owned by the Council setting rather
+        /// than the active-session config picker.
+        hidden_config_ids: Vec<String>,
     },
     /// A background ACP adapter probe finished after startup: refreshed model
     /// choices and server inventory for the /models and /mjconfig editors.

@@ -669,6 +669,7 @@ pub struct AppState {
     pub available_commands: Vec<AvailableCommand>,
     pub session_config_options: Vec<SessionConfigOption>,
     pub session_config_targets: Vec<SessionConfigTarget>,
+    hidden_session_config_ids: HashSet<String>,
     pub prompt_images_supported: bool,
     pub session_fork_supported: bool,
     pub transcript: Vec<Entry>,
@@ -1071,6 +1072,7 @@ impl AppState {
             },
             session_config_options: Vec::new(),
             session_config_targets: Vec::new(),
+            hidden_session_config_ids: HashSet::new(),
             prompt_images_supported: false,
             session_fork_supported: false,
             transcript: Vec::new(),
@@ -2307,7 +2309,12 @@ impl AppState {
                     .insert(snapshot.terminal_id.clone(), snapshot);
                 self.apply_known_terminal_outputs();
             }
-            UiEvent::SessionConfigOptions { options, targets } => {
+            UiEvent::SessionConfigOptions {
+                options,
+                targets,
+                hidden_config_ids,
+            } => {
+                self.hidden_session_config_ids.extend(hidden_config_ids);
                 self.apply_session_config_options(options, targets);
             }
             UiEvent::CouncilUpdate { choices, inventory } => {
@@ -3009,13 +3016,16 @@ impl AppState {
             .into_iter()
             .zip(targets)
             .filter(|(option, _)| {
-                !matches!(
-                    option.category,
-                    Some(
-                        SessionConfigOptionCategory::Model
-                            | SessionConfigOptionCategory::ThoughtLevel
+                !self
+                    .hidden_session_config_ids
+                    .contains(&option.id.to_string())
+                    && !matches!(
+                        option.category,
+                        Some(
+                            SessionConfigOptionCategory::Model
+                                | SessionConfigOptionCategory::ThoughtLevel
+                        )
                     )
-                )
             })
             .unzip();
         self.session_config_targets = targets;
@@ -4867,6 +4877,31 @@ mod tests {
         assert_eq!(s.session_config_options.len(), 1);
         assert_eq!(s.current_mode.as_deref(), Some("ask"));
         assert!(s.status_line.is_none());
+    }
+
+    #[test]
+    fn council_owned_permission_option_stays_out_of_session_picker() {
+        let mut s = AppState::new();
+        let option = SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "agent",
+            vec![SessionConfigSelectOption::new("agent", "Agent")],
+        )
+        .category(Some(SessionConfigOptionCategory::Mode));
+        s.apply_event(UiEvent::SessionConfigOptions {
+            options: vec![option.clone()],
+            targets: vec![SessionConfigTarget::ConfigOption {
+                config_id: "mode".into(),
+            }],
+            hidden_config_ids: vec!["mode".to_string()],
+        });
+        assert!(s.session_config_options.is_empty());
+
+        s.apply_event(UiEvent::SessionUpdate(SessionUpdate::ConfigOptionUpdate(
+            ConfigOptionUpdate::new(vec![option]),
+        )));
+        assert!(s.session_config_options.is_empty());
     }
 
     #[test]

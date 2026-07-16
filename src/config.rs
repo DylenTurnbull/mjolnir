@@ -70,12 +70,15 @@ impl Default for Config {
 pub struct CouncilConfig {
     #[serde(default = "default_true")]
     pub auto_failover: bool,
+    #[serde(default)]
+    pub permission_mode: CouncilPermissionMode,
 }
 
 impl Default for CouncilConfig {
     fn default() -> Self {
         Self {
             auto_failover: true,
+            permission_mode: CouncilPermissionMode::default(),
         }
     }
 }
@@ -83,6 +86,33 @@ impl Default for CouncilConfig {
 impl CouncilConfig {
     fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CouncilPermissionMode {
+    Manual,
+    #[default]
+    Auto,
+    Yolo,
+}
+
+impl CouncilPermissionMode {
+    pub const ALL: [Self; 3] = [Self::Manual, Self::Auto, Self::Yolo];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "Manual",
+            Self::Auto => "Auto",
+            Self::Yolo => "YOLO",
+        }
+    }
+}
+
+impl std::fmt::Display for CouncilPermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
     }
 }
 
@@ -630,6 +660,7 @@ mod tests {
             },
             council: CouncilConfig {
                 auto_failover: false,
+                permission_mode: CouncilPermissionMode::Manual,
             },
             acp: AcpConfig {
                 servers: vec![ConfiguredAcpServer {
@@ -651,6 +682,10 @@ mod tests {
         assert_eq!(loaded.thor.model, "gpt-5-6-sol");
         assert!(!loaded.thor.discrete_review);
         assert!(!loaded.council.auto_failover);
+        assert_eq!(
+            loaded.council.permission_mode,
+            CouncilPermissionMode::Manual
+        );
         assert_eq!(loaded.acp.servers[0].id, "custom:company");
         assert_eq!(loaded.acp.servers[0].args, vec!["--stdio"]);
     }

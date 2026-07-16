@@ -95,6 +95,8 @@ pub struct RuntimeRoleConfig {
     pub model_id: String,
     pub model_value: String,
     pub adapter_source_id: String,
+    /// Provider-native permission preset applied after model selection.
+    pub permission: Option<crate::council::RuntimePermissionConfig>,
     /// Correlates Thor, Eitri, and Loki records in one interactive session.
     pub council_session: Option<String>,
 }
@@ -1930,13 +1932,19 @@ async fn drive_session(
         options: session_config_options,
         targets: session_config_targets,
     };
-    if let Some(role) = role_config.as_ref()
-        && let Err(error) =
-            apply_runtime_role_config(&conn, &session_id, &mut session_config, role).await
-    {
-        let text = format!("{} configuration failed: {error}", role.label);
-        emit_fatal(ui_tx, &fatal_emitted, text.clone());
-        return Err(anyhow::anyhow!(text));
+    if let Some(role) = role_config.as_ref() {
+        match apply_runtime_role_config(&conn, &session_id, &mut session_config, role).await {
+            Ok(warnings) => {
+                for warning in warnings {
+                    let _ = ui_tx.send(UiEvent::Warning(warning));
+                }
+            }
+            Err(error) => {
+                let text = format!("{} configuration failed: {error}", role.label);
+                emit_fatal(ui_tx, &fatal_emitted, text.clone());
+                return Err(anyhow::anyhow!(text));
+            }
+        }
     }
     // Do not require the primary agent to eagerly list Eitri's injected MCP
     // tools before the first prompt. Some ACP agents, including Anvil, accept
@@ -1977,10 +1985,16 @@ async fn drive_session(
             "Council ACP session started"
         );
     }
+    let hidden_config_ids = role_config
+        .as_ref()
+        .and_then(|role| role.permission.as_ref())
+        .map(|permission| vec![permission.config_id.clone()])
+        .unwrap_or_default();
     if !session_config.options.is_empty() {
         let _ = ui_tx.send(UiEvent::SessionConfigOptions {
             options: session_config.options.clone(),
             targets: session_config.targets.clone(),
+            hidden_config_ids: hidden_config_ids.clone(),
         });
     }
 
@@ -2042,6 +2056,7 @@ async fn drive_session(
                     target,
                     value,
                     &mut session_config,
+                    &hidden_config_ids,
                     ui_tx,
                     ui_rx,
                 )
@@ -2068,6 +2083,7 @@ async fn drive_session(
                     &mut session_id,
                     &mut session_config,
                     &session_state,
+                    &hidden_config_ids,
                     ui_tx,
                     ui_rx,
                 )
@@ -2095,6 +2111,7 @@ async fn drive_session(
                         &init_resp.auth_methods,
                         &mut session_config,
                         &session_state,
+                        &hidden_config_ids,
                         &connected_fields,
                         ui_tx,
                     )
@@ -2139,6 +2156,7 @@ async fn drive_session(
                     &mut session_config,
                     &session_state,
                     &terminals,
+                    &hidden_config_ids,
                     &connected_fields,
                     ui_tx,
                 )
@@ -2249,6 +2267,7 @@ async fn reload_active_session(
     auth_methods: &[AuthMethod],
     session_config: &mut SessionConfigCache,
     session_state: &RuntimeSessionState,
+    hidden_config_ids: &[String],
     connected_fields: &ConnectedEventFields,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> std::result::Result<(), LaunchError> {
@@ -2281,6 +2300,7 @@ async fn reload_active_session(
     let _ = ui_tx.send(UiEvent::SessionConfigOptions {
         options: session_config.options.clone(),
         targets: session_config.targets.clone(),
+        hidden_config_ids: hidden_config_ids.to_vec(),
     });
     if let Some(title) = title {
         let _ = ui_tx.send(UiEvent::SessionUpdate(SessionUpdate::SessionInfoUpdate(
@@ -2305,6 +2325,7 @@ async fn switch_existing_session(
     session_config: &mut SessionConfigCache,
     session_state: &RuntimeSessionState,
     terminals: &ManagedTerminals,
+    hidden_config_ids: &[String],
     connected_fields: &ConnectedEventFields,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> std::result::Result<SessionId, LaunchError> {
@@ -2344,6 +2365,7 @@ async fn switch_existing_session(
     let _ = ui_tx.send(UiEvent::SessionConfigOptions {
         options: session_config.options.clone(),
         targets: session_config.targets.clone(),
+        hidden_config_ids: hidden_config_ids.to_vec(),
     });
     if let Some(title) = title {
         let _ = ui_tx.send(UiEvent::SessionUpdate(SessionUpdate::SessionInfoUpdate(
@@ -2385,6 +2407,7 @@ async fn drive_fork_session(
     session_id: &mut SessionId,
     session_config: &mut SessionConfigCache,
     session_state: &RuntimeSessionState,
+    hidden_config_ids: &[String],
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
 ) -> Result<bool> {
@@ -2423,6 +2446,7 @@ async fn drive_fork_session(
                         let _ = ui_tx.send(UiEvent::SessionConfigOptions {
                             options: session_config.options.clone(),
                             targets: session_config.targets.clone(),
+                            hidden_config_ids: hidden_config_ids.to_vec(),
                         });
                         let _ = ui_tx.send(UiEvent::Info("session forked".to_string()));
                     }
@@ -4074,6 +4098,32 @@ fn session_config_option_contains_value(
     }
 }
 
+fn select_runtime_permission_value(
+    option: &SessionConfigOption,
+    permission: &crate::council::RuntimePermissionConfig,
+) -> Result<(SessionConfigValueId, bool)> {
+    let desired = SessionConfigValueId::from(permission.value.clone());
+    if session_config_option_contains_value(option, &desired) {
+        return Ok((desired, false));
+    }
+    if let Some(fallback) = permission.manual_fallback.as_ref() {
+        let fallback = SessionConfigValueId::from(fallback.clone());
+        if session_config_option_contains_value(option, &fallback) {
+            return Ok((fallback, true));
+        }
+        anyhow::bail!(
+            "permission mode '{}' and manual fallback '{}' are unavailable",
+            permission.value,
+            fallback
+        );
+    }
+    anyhow::bail!(
+        "requested {} permission mode '{}' is unavailable",
+        permission.mode,
+        permission.value
+    )
+}
+
 async fn apply_saved_session_config(
     conn: &ConnectionTo<Agent>,
     session_id: &SessionId,
@@ -4193,7 +4243,7 @@ async fn apply_runtime_role_config(
     session_id: &SessionId,
     session_config: &mut SessionConfigCache,
     role: &RuntimeRoleConfig,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let model_index = session_config
         .options
         .iter()
@@ -4224,7 +4274,47 @@ async fn apply_runtime_role_config(
         }
     }
 
-    Ok(())
+    let mut warnings = Vec::new();
+    let Some(permission) = role.permission.as_ref() else {
+        return Ok(warnings);
+    };
+    let option_index = session_config
+        .targets
+        .iter()
+        .position(|target| {
+            matches!(target, SessionConfigTarget::ConfigOption { config_id } if config_id.to_string() == permission.config_id)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "ACP adapter did not advertise permission configuration '{}'",
+                permission.config_id
+            )
+        })?;
+    let (value, used_fallback) =
+        select_runtime_permission_value(&session_config.options[option_index], permission)?;
+    if used_fallback {
+        warnings.push(format!(
+            "{} does not support Auto permissions for this model; using Manual",
+            role.label
+        ));
+    }
+    if config_option_current_value(&session_config.options[option_index]) != Some(&value) {
+        let target = session_config.targets[option_index].clone();
+        match send_config_update(conn, session_id, target.clone(), value.clone()).await? {
+            Some(options) => {
+                session_config.targets = config_option_targets(&options);
+                session_config.options = options;
+            }
+            None => set_current_config_value(
+                &mut session_config.options,
+                &session_config.targets,
+                &target,
+                &value,
+            ),
+        }
+    }
+
+    Ok(warnings)
 }
 
 fn config_option_current_value(option: &SessionConfigOption) -> Option<&SessionConfigValueId> {
@@ -4234,12 +4324,14 @@ fn config_option_current_value(option: &SessionConfigOption) -> Option<&SessionC
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive_config_update(
     conn: &ConnectionTo<Agent>,
     session_id: &SessionId,
     target: SessionConfigTarget,
     value: agent_client_protocol::schema::v1::SessionConfigValueId,
     session_config: &mut SessionConfigCache,
+    hidden_config_ids: &[String],
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
 ) -> Result<bool> {
@@ -4256,6 +4348,7 @@ async fn drive_config_update(
                         let _ = ui_tx.send(UiEvent::SessionConfigOptions {
                             options: session_config.options.clone(),
                             targets: session_config.targets.clone(),
+                            hidden_config_ids: hidden_config_ids.to_vec(),
                         });
                     }
                     Ok(None) => {
@@ -4268,6 +4361,7 @@ async fn drive_config_update(
                         let _ = ui_tx.send(UiEvent::SessionConfigOptions {
                             options: session_config.options.clone(),
                             targets: session_config.targets.clone(),
+                            hidden_config_ids: hidden_config_ids.to_vec(),
                         });
                     }
                     Err(e) => {
@@ -6002,6 +6096,7 @@ mod tests {
             model_id: "claude-sonnet-5".to_string(),
             model_value: "claude-sonnet-5".to_string(),
             adapter_source_id: "claude-acp".to_string(),
+            permission: None,
             council_session: None,
         };
         assert_eq!(
@@ -6024,12 +6119,41 @@ mod tests {
             model_id: "gpt-5-6-sol".to_string(),
             model_value: "gpt-5-6-sol".to_string(),
             adapter_source_id: "codex-acp".to_string(),
+            permission: None,
             council_session: None,
         };
         assert_eq!(
             select_role_model(&codex_model, &codex_role).map(|value| value.to_string()),
             Some("gpt-5.6-sol".to_string())
         );
+    }
+
+    #[test]
+    fn auto_permission_mode_falls_back_to_manual_but_yolo_does_not() {
+        let option = SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "default",
+            vec![SessionConfigSelectOption::new("default", "Manual")],
+        )
+        .category(SessionConfigOptionCategory::Mode);
+        let auto = crate::council::RuntimePermissionConfig {
+            config_id: "mode".to_string(),
+            value: "auto".to_string(),
+            manual_fallback: Some("default".to_string()),
+            mode: crate::config::CouncilPermissionMode::Auto,
+        };
+        let (value, fallback) = select_runtime_permission_value(&option, &auto).unwrap();
+        assert_eq!(value.to_string(), "default");
+        assert!(fallback);
+
+        let yolo = crate::council::RuntimePermissionConfig {
+            config_id: "mode".to_string(),
+            value: "bypassPermissions".to_string(),
+            manual_fallback: None,
+            mode: crate::config::CouncilPermissionMode::Yolo,
+        };
+        assert!(select_runtime_permission_value(&option, &yolo).is_err());
     }
 
     #[test]

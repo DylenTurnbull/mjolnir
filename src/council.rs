@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{StreamExt, stream};
 
-use crate::config::{AcpServerOrigin, AcpServerPolicy, Config};
+use crate::config::{AcpServerOrigin, AcpServerPolicy, Config, CouncilPermissionMode};
 use crate::deepswe::{self, Row};
 use crate::{model_resolve, probe};
 
@@ -35,6 +35,16 @@ impl AdapterKind {
             Self::Custom => "Custom",
         }
     }
+
+    pub fn from_source_id(source_id: &str) -> Option<Self> {
+        match source_id {
+            "codex-acp" => Some(Self::Codex),
+            "claude-acp" => Some(Self::Claude),
+            "anvil" => Some(Self::Anvil),
+            "opencode-acp" => Some(Self::OpenCode),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +54,61 @@ pub struct AdapterLaunch {
     pub command: PathBuf,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePermissionConfig {
+    pub config_id: String,
+    pub value: String,
+    pub manual_fallback: Option<String>,
+    pub mode: CouncilPermissionMode,
+}
+
+const OPENCODE_MANUAL_PERMISSIONS: &str = r#"{"*":"ask","read":"allow","grep":"allow","glob":"allow","list":"allow","webfetch":"allow","websearch":"allow","question":"allow","plan_enter":"allow","plan_exit":"allow","todowrite":"allow","todoread":"allow"}"#;
+const OPENCODE_YOLO_PERMISSIONS: &str = r#"{"*":"allow"}"#;
+
+pub fn configure_permissions(
+    kind: AdapterKind,
+    mode: CouncilPermissionMode,
+    env: &mut HashMap<String, String>,
+) -> Option<RuntimePermissionConfig> {
+    let (config_id, value, manual_fallback) = match (kind, mode) {
+        (AdapterKind::Codex, CouncilPermissionMode::Manual) => ("mode", "read-only", None),
+        (AdapterKind::Codex, CouncilPermissionMode::Auto) => ("mode", "agent", Some("read-only")),
+        (AdapterKind::Codex, CouncilPermissionMode::Yolo) => ("mode", "agent-full-access", None),
+        (AdapterKind::Claude, CouncilPermissionMode::Manual) => ("mode", "default", None),
+        (AdapterKind::Claude, CouncilPermissionMode::Auto) => ("mode", "auto", Some("default")),
+        (AdapterKind::Claude, CouncilPermissionMode::Yolo) => ("mode", "bypassPermissions", None),
+        (AdapterKind::Anvil, CouncilPermissionMode::Manual) => ("permission_mode", "default", None),
+        (AdapterKind::Anvil, CouncilPermissionMode::Auto) => {
+            ("permission_mode", "auto", Some("default"))
+        }
+        (AdapterKind::Anvil, CouncilPermissionMode::Yolo) => {
+            ("permission_mode", "bypassPermissions", None)
+        }
+        (AdapterKind::OpenCode, CouncilPermissionMode::Manual) => {
+            env.insert(
+                "OPENCODE_PERMISSION".to_string(),
+                OPENCODE_MANUAL_PERMISSIONS.to_string(),
+            );
+            return None;
+        }
+        (AdapterKind::OpenCode, CouncilPermissionMode::Auto) => return None,
+        (AdapterKind::OpenCode, CouncilPermissionMode::Yolo) => {
+            env.insert(
+                "OPENCODE_PERMISSION".to_string(),
+                OPENCODE_YOLO_PERMISSIONS.to_string(),
+            );
+            return None;
+        }
+        (AdapterKind::Custom, _) => return None,
+    };
+    Some(RuntimePermissionConfig {
+        config_id: config_id.to_string(),
+        value: value.to_string(),
+        manual_fallback: manual_fallback.map(str::to_string),
+        mode,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1158,6 +1223,52 @@ fn assemble_council(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_presets_map_to_provider_controls() {
+        let mut env = HashMap::new();
+        let codex =
+            configure_permissions(AdapterKind::Codex, CouncilPermissionMode::Auto, &mut env)
+                .expect("Codex preset");
+        assert_eq!(codex.config_id, "mode");
+        assert_eq!(codex.value, "agent");
+        assert_eq!(codex.manual_fallback.as_deref(), Some("read-only"));
+
+        let claude =
+            configure_permissions(AdapterKind::Claude, CouncilPermissionMode::Manual, &mut env)
+                .expect("Claude preset");
+        assert_eq!(claude.value, "default");
+
+        let anvil =
+            configure_permissions(AdapterKind::Anvil, CouncilPermissionMode::Yolo, &mut env)
+                .expect("Anvil preset");
+        assert_eq!(anvil.config_id, "permission_mode");
+        assert_eq!(anvil.value, "bypassPermissions");
+    }
+
+    #[test]
+    fn opencode_permissions_use_process_local_rules() {
+        let mut env = HashMap::from([("KEEP".to_string(), "yes".to_string())]);
+        assert!(
+            configure_permissions(
+                AdapterKind::OpenCode,
+                CouncilPermissionMode::Manual,
+                &mut env
+            )
+            .is_none()
+        );
+        let manual: serde_json::Value = serde_json::from_str(&env["OPENCODE_PERMISSION"]).unwrap();
+        assert_eq!(manual["*"], "ask");
+        assert_eq!(manual["read"], "allow");
+        assert_eq!(env["KEEP"], "yes");
+
+        assert!(
+            configure_permissions(AdapterKind::OpenCode, CouncilPermissionMode::Yolo, &mut env)
+                .is_none()
+        );
+        let yolo: serde_json::Value = serde_json::from_str(&env["OPENCODE_PERMISSION"]).unwrap();
+        assert_eq!(yolo["*"], "allow");
+    }
 
     fn option(value: &str) -> probe::ModelOption {
         probe::ModelOption {

@@ -890,8 +890,20 @@ impl TrackerState {
                 }
                 self.last_update = Some(now);
             }
-            UiEvent::SessionConfigOptions { options, targets } => {
-                self.session_config = config_option_records(options, targets);
+            UiEvent::SessionConfigOptions {
+                options,
+                targets,
+                hidden_config_ids,
+            } => {
+                self.session_config = config_option_records(options, targets)
+                    .into_iter()
+                    .filter(|option| {
+                        option
+                            .config_id
+                            .as_ref()
+                            .is_none_or(|id| !hidden_config_ids.contains(id))
+                    })
+                    .collect();
                 self.touch();
             }
             UiEvent::SessionUpdate(update) => {
@@ -2237,11 +2249,17 @@ fn start_server_agent_session(
         },
         None => None,
     };
+    let mut agent_env = agent.env.clone();
     let role_config = council.as_ref().map(|resolved| acp::RuntimeRoleConfig {
         label: "Thor".to_string(),
         model_id: resolved.thor.model.model.clone(),
         model_value: resolved.thor.model_value.clone(),
         adapter_source_id: resolved.thor.launch.source_id.clone(),
+        permission: council::configure_permissions(
+            resolved.thor.launch.kind,
+            app_config.council.permission_mode,
+            &mut agent_env,
+        ),
         council_session: None,
     });
     let implementation_handoffs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2251,6 +2269,7 @@ fn start_server_agent_session(
             .with_implementation_handoff_counter(implementation_handoffs.clone())
             .with_active_implementation_workers(active_implementation_workers.clone())
             .with_max_parallel_explores(app_config.eitri.max_parallel_explores)
+            .with_permission_mode(app_config.council.permission_mode)
             .with_prewarm(code_agent::RunContext {
                 cwd: cwd.clone(),
                 additional_directories: additional_directories.clone(),
@@ -2273,7 +2292,7 @@ fn start_server_agent_session(
             .map(|server| vec![server.advertised().clone()])
             .unwrap_or_default(),
         resume_session: None,
-        env: agent.env,
+        env: agent_env,
         agent_stderr: None,
         fs_max_text_bytes,
         access_mode: crate::acp::RuntimeAccessMode::Full,
@@ -5685,6 +5704,7 @@ mod tests {
             targets: vec![SessionConfigTarget::ConfigOption {
                 config_id: SessionConfigId::from("model"),
             }],
+            hidden_config_ids: Vec::new(),
         });
         state.observe_event(&UiEvent::TerminalOutput(TerminalOutputSnapshot {
             terminal_id: "term-1".to_string(),
@@ -6749,6 +6769,7 @@ mod tests {
             targets: vec![SessionConfigTarget::ConfigOption {
                 config_id: SessionConfigId::from("model".to_string()),
             }],
+            hidden_config_ids: Vec::new(),
         });
 
         let snapshot = tracker

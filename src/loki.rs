@@ -1978,6 +1978,7 @@ async fn connect(
             model_id: role.model.model.clone(),
             model_value: role.model_value.clone(),
             adapter_source_id: role.launch.source_id.clone(),
+            permission: None,
             council_session: Some(council_session.to_string()),
         }),
         vec![advise_server],
