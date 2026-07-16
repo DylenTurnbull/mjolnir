@@ -59,7 +59,7 @@ use clap::{Parser, ValueEnum};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -2348,7 +2348,7 @@ fn init_logging(path: Option<&std::path::Path>) -> Result<()> {
     let filter =
         EnvFilter::try_from_env("BROKK_TUI_LOG_LEVEL").unwrap_or_else(|_| EnvFilter::new("info"));
     fmt()
-        .with_writer(file)
+        .with_writer(SynchronizedFileWriter::new(file))
         .with_env_filter(filter)
         .with_ansi(false)
         .json()
@@ -2359,11 +2359,121 @@ fn init_logging(path: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
+/// A tracing writer that serializes each complete formatted event.
+///
+/// `tracing_subscriber` may write a single JSON event in multiple calls, so
+/// locking individual writes would still allow records from concurrent tasks
+/// to interleave.
+#[derive(Clone)]
+struct SynchronizedFileWriter {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl SynchronizedFileWriter {
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            file: Arc::new(Mutex::new(file)),
+        }
+    }
+}
+
+struct LockedFileWriter<'a> {
+    file: MutexGuard<'a, std::fs::File>,
+}
+
+impl Write for LockedFileWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SynchronizedFileWriter {
+    type Writer = LockedFileWriter<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LockedFileWriter {
+            file: self
+                .file
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
-    use std::io::Write;
+    use std::{
+        collections::HashSet,
+        io::Write,
+        sync::{Arc, Barrier},
+    };
+
+    #[test]
+    fn synchronized_file_writer_keeps_concurrent_json_events_intact() {
+        const THREADS: usize = 8;
+        const EVENTS_PER_THREAD: usize = 40;
+
+        let log = tempfile::NamedTempFile::new().expect("create log");
+        let writer = SynchronizedFileWriter::new(log.reopen().expect("open log"));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_ansi(false)
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+
+        for thread in 0..THREADS {
+            let dispatch = dispatch.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    barrier.wait();
+                    for event in 0..EVENTS_PER_THREAD {
+                        let marker = format!("event-{thread}-{event}");
+                        let payload = marker.repeat(4_096);
+                        tracing::info!(marker = %marker, payload = %payload, "concurrent log event");
+                    }
+                });
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("logging thread");
+        }
+        drop(dispatch);
+
+        let contents = std::fs::read_to_string(log.path()).expect("read log");
+        let records: Vec<serde_json::Value> = contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("valid JSON log record"))
+            .collect();
+        assert_eq!(records.len(), THREADS * EVENTS_PER_THREAD);
+
+        let markers: HashSet<_> = records
+            .iter()
+            .map(|record| {
+                let marker = record["marker"].as_str().expect("event marker");
+                assert_eq!(
+                    record["payload"].as_str(),
+                    Some(marker.repeat(4_096).as_str())
+                );
+                marker.to_owned()
+            })
+            .collect();
+        assert_eq!(markers.len(), THREADS * EVENTS_PER_THREAD);
+    }
 
     #[test]
     fn startup_status_is_visible_without_taking_terminal_control() {
