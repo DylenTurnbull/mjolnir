@@ -753,6 +753,12 @@ pub struct AppState {
     /// messages and tool outputs fully expanded. Inline scrollback is immutable once
     /// flushed, so this reader is how users re-read earlier output in full.
     pub transcript_viewer: bool,
+    /// Dedicated reader for the most recent native workspace-diff event.
+    /// Its selection and scroll state intentionally do not share transcript
+    /// state: workspace changes are not transcript entries.
+    pub workspace_diff_viewer: bool,
+    pub workspace_diff_selected_file: usize,
+    pub workspace_diff_scroll_offset: usize,
     pub exit_reason: Option<UiExitReason>,
     /// True once the runtime has stopped accepting commands.
     pub runtime_closed: bool,
@@ -1091,6 +1097,9 @@ impl AppState {
             scroll_offset: 0,
             expand_transcript_details: false,
             transcript_viewer: false,
+            workspace_diff_viewer: false,
+            workspace_diff_selected_file: 0,
+            workspace_diff_scroll_offset: 0,
             exit_reason: None,
             runtime_closed: false,
             code_agent_active: false,
@@ -1510,6 +1519,7 @@ impl AppState {
     /// the newest line (`scroll_offset` is reused as the top-visible line
     /// index and clamped to the last screen during draw).
     pub fn open_transcript_viewer(&mut self) {
+        self.close_workspace_diff_viewer();
         self.transcript_viewer = true;
         self.scroll_offset = usize::MAX;
     }
@@ -1518,6 +1528,45 @@ impl AppState {
     pub fn close_transcript_viewer(&mut self) {
         self.transcript_viewer = false;
         self.scroll_offset = 0;
+    }
+
+    /// Open the native workspace-diff reader. It always starts at the first
+    /// retained file and top of that file, including when there are no diffs.
+    pub fn open_workspace_diff_viewer(&mut self) {
+        self.close_transcript_viewer();
+        self.workspace_diff_viewer = true;
+        self.workspace_diff_selected_file = 0;
+        self.workspace_diff_scroll_offset = 0;
+    }
+
+    /// Close the workspace-diff reader and discard its ephemeral navigation.
+    pub fn close_workspace_diff_viewer(&mut self) {
+        self.workspace_diff_viewer = false;
+        self.workspace_diff_selected_file = 0;
+        self.workspace_diff_scroll_offset = 0;
+    }
+
+    pub fn workspace_diff_file_count(&self) -> usize {
+        self.workspace_diffs
+            .last()
+            .map_or(0, |event| event.diffs.len())
+    }
+
+    /// Move among retained files, clamping at either end. A file change resets
+    /// line scrolling so selection can never retain another file's offset.
+    pub fn select_workspace_diff_file(&mut self, next: bool) {
+        let count = self.workspace_diff_file_count();
+        if count == 0 {
+            self.workspace_diff_selected_file = 0;
+        } else if next {
+            self.workspace_diff_selected_file = self
+                .workspace_diff_selected_file
+                .saturating_add(1)
+                .min(count - 1);
+        } else {
+            self.workspace_diff_selected_file = self.workspace_diff_selected_file.saturating_sub(1);
+        }
+        self.workspace_diff_scroll_offset = 0;
     }
 
     /// Extract the text of the most recent agent message from the transcript.
@@ -2245,6 +2294,7 @@ impl AppState {
                 if self.session_id.as_deref() != Some(&session_id) {
                     self.workspace_diffs.clear();
                     self.pending_workspace_diff_total = None;
+                    self.close_workspace_diff_viewer();
                     if !self.tool_detail_overrides.is_empty() {
                         self.tool_detail_overrides.clear();
                         self.bump_transcript_revision();
@@ -2293,6 +2343,10 @@ impl AppState {
             UiEvent::WorkspaceDiff(diff) => {
                 self.pending_workspace_diff_total = Some(diff.total_files);
                 self.workspace_diffs.push(diff);
+                // A newer event replaces the display source. Keep the reader
+                // open, but make it coherent with its first retained file.
+                self.workspace_diff_selected_file = 0;
+                self.workspace_diff_scroll_offset = 0;
             }
             UiEvent::PermissionRequest(prompt) => {
                 self.finalize_thinking(EntryKind::Thought);
@@ -3864,6 +3918,73 @@ mod tests {
             resumed: false,
         });
         assert!(state.workspace_diffs.is_empty());
+    }
+
+    #[test]
+    fn workspace_diff_viewer_resets_for_session_and_newer_diff_without_transcript_mutation() {
+        let mut state = AppState::new();
+        state
+            .transcript
+            .push(Entry::UserPrompt("keep me".to_string()));
+        let transcript_len = state.transcript.len();
+        for (turn_id, path) in [(1, "one.rs"), (2, "two.rs")] {
+            state.apply_event(UiEvent::WorkspaceDiff(crate::event::WorkspaceDiffEvent {
+                turn_id,
+                diffs: vec![crate::event::WorkspaceDiff {
+                    path: PathBuf::from(path),
+                    old_text: Some("old\n".to_string()),
+                    new_text: "new\n".to_string(),
+                }],
+                total_files: 1,
+                max_files: 20,
+                truncated: false,
+            }));
+            if turn_id == 1 {
+                state.open_workspace_diff_viewer();
+                state.workspace_diff_selected_file = 9;
+                state.workspace_diff_scroll_offset = 9;
+            }
+        }
+        assert!(state.workspace_diff_viewer);
+        assert_eq!(state.workspace_diff_selected_file, 0);
+        assert_eq!(state.workspace_diff_scroll_offset, 0);
+        assert_eq!(state.workspace_diffs.last().unwrap().turn_id, 2);
+        assert_eq!(state.transcript.len(), transcript_len);
+
+        state.apply_event(UiEvent::SessionStarted {
+            session_id: "replacement".to_string(),
+            resumed: false,
+        });
+        assert!(state.workspace_diffs.is_empty());
+        assert!(!state.workspace_diff_viewer);
+        assert_eq!(state.workspace_diff_selected_file, 0);
+        assert_eq!(state.workspace_diff_scroll_offset, 0);
+    }
+
+    #[test]
+    fn workspace_diff_viewer_open_close_resets_and_excludes_transcript_reader() {
+        let mut state = AppState::new();
+        state.transcript_viewer = true;
+        state.scroll_offset = 17;
+
+        state.open_workspace_diff_viewer();
+        assert!(state.workspace_diff_viewer);
+        assert!(!state.transcript_viewer);
+        assert_eq!(state.scroll_offset, 0);
+        state.workspace_diff_selected_file = 3;
+        state.workspace_diff_scroll_offset = 12;
+
+        state.close_workspace_diff_viewer();
+        assert!(!state.workspace_diff_viewer);
+        assert_eq!(state.workspace_diff_selected_file, 0);
+        assert_eq!(state.workspace_diff_scroll_offset, 0);
+
+        state.open_workspace_diff_viewer();
+        state.open_transcript_viewer();
+        assert!(state.transcript_viewer);
+        assert!(!state.workspace_diff_viewer);
+        assert_eq!(state.workspace_diff_selected_file, 0);
+        assert_eq!(state.workspace_diff_scroll_offset, 0);
     }
 
     #[test]

@@ -120,6 +120,13 @@ fn inline_transcript_viewer_accepts_input(state: &AppState) -> bool {
     state.transcript_viewer && !state.has_pending_permission() && !state.has_pending_elicitation()
 }
 
+fn inline_reader_accepts_input(state: &AppState) -> bool {
+    inline_transcript_viewer_accepts_input(state)
+        || (state.workspace_diff_viewer
+            && !state.has_pending_permission()
+            && !state.has_pending_elicitation())
+}
+
 #[derive(Debug)]
 enum DictationEvent {
     Partial(String),
@@ -831,14 +838,14 @@ async fn ui_loop(
                             force_inline_repair = true;
                         }
                         let inline_reader_was_active =
-                            mode == UiMode::InlineChat && inline_transcript_viewer_accepts_input(&state);
+                            mode == UiMode::InlineChat && inline_reader_accepts_input(&state);
                         let request = handle_crossterm(&mut state, cmd_tx, ev, mode);
                         if mode == UiMode::InlineChat
-                            && inline_reader_was_active != inline_transcript_viewer_accepts_input(&state)
+                            && inline_reader_was_active != inline_reader_accepts_input(&state)
                         {
                             set_mouse_capture(
                                 terminal,
-                                inline_transcript_viewer_accepts_input(&state),
+                                inline_reader_accepts_input(&state),
                             )?;
                         }
                         if mode == UiMode::InlineChat
@@ -915,7 +922,7 @@ async fn ui_loop(
                 match maybe_ev {
                     Some(ev) => {
                         let inline_reader_was_active =
-                            mode == UiMode::InlineChat && inline_transcript_viewer_accepts_input(&state);
+                            mode == UiMode::InlineChat && inline_reader_accepts_input(&state);
                         let redraw_cause = ui_event_redraw_cause(&ev);
                         let force_repair_for_event =
                             should_force_inline_repair_for_ui_event(mode, &ev);
@@ -928,11 +935,11 @@ async fn ui_loop(
                         }
                         drain_queued_prompt(&mut state, cmd_tx);
                         if mode == UiMode::InlineChat
-                            && inline_reader_was_active != inline_transcript_viewer_accepts_input(&state)
+                            && inline_reader_was_active != inline_reader_accepts_input(&state)
                         {
                             set_mouse_capture(
                                 terminal,
-                                inline_transcript_viewer_accepts_input(&state),
+                                inline_reader_accepts_input(&state),
                             )?;
                         }
                         if force_repair_for_event {
@@ -1031,6 +1038,7 @@ async fn ui_loop(
         // mid-read. Entries that go stable meanwhile are flushed on close.
         if mode == UiMode::InlineChat
             && !state.transcript_viewer
+            && !state.workspace_diff_viewer
             && state.ragnarok.is_none()
             && !inline_resize_reflow.is_pending()
         {
@@ -1257,6 +1265,8 @@ fn should_force_inline_repair_for_event(mode: UiMode, state: &AppState, ev: &CtE
         && !state.has_pending_permission()
         && !state.has_pending_elicitation()
         && state.config_picker.is_none()
+        && !state.transcript_viewer
+        && !state.workspace_diff_viewer
     {
         return true;
     }
@@ -1483,7 +1493,7 @@ fn should_run_inline_resize_reflow(
     state: &AppState,
     now: Instant,
 ) -> bool {
-    reflow.is_due(now) && !state.transcript_viewer
+    reflow.is_due(now) && !state.transcript_viewer && !state.workspace_diff_viewer
 }
 
 struct InlineResizeReflowSnapshot {
@@ -1707,7 +1717,7 @@ fn inline_viewport_resize_plan(
     current_height: u16,
 ) -> Option<InlineViewportResizePlan> {
     let height = clamped_inline_height(desired_inline_height(state, size), size);
-    let reader_active = inline_transcript_viewer_accepts_input(state);
+    let reader_active = inline_reader_accepts_input(state);
     let reader_geometry_changed = reader_active
         && (current_area.width != size.width
             || current_area.height != height
@@ -1733,7 +1743,7 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
     // long histories are calm to page through. It outranks the compact
     // overlays below but yields to a pending permission prompt, which must
     // stay visible and actionable.
-    if state.transcript_viewer
+    if (state.transcript_viewer || state.workspace_diff_viewer)
         && !state.has_pending_permission()
         && !state.has_pending_elicitation()
     {
@@ -1835,6 +1845,8 @@ fn handle_crossterm(
                 || state.config_picker.is_some()
                 || state.mjconfig_menu.is_some()
                 || state.ragnarok.is_some()
+                || state.transcript_viewer
+                || state.workspace_diff_viewer
             {
                 return TerminalRequest::None;
             }
@@ -1843,7 +1855,11 @@ fn handle_crossterm(
             return TerminalRequest::None;
         }
         CtEvent::Mouse(mouse) => {
-            if mode == UiMode::InlineChat && inline_transcript_viewer_accepts_input(state) {
+            // The diff reader does not support mouse scrolling yet. In
+            // particular, do not mutate the hidden transcript's offset.
+            if state.workspace_diff_viewer {
+                return TerminalRequest::None;
+            } else if mode == UiMode::InlineChat && inline_transcript_viewer_accepts_input(state) {
                 handle_transcript_viewer_mouse(state, mouse);
             } else if mode == UiMode::FullscreenTui {
                 handle_mouse(state, mouse);
@@ -1896,9 +1912,31 @@ fn handle_crossterm(
         return TerminalRequest::None;
     }
 
+    if !state.has_pending_permission()
+        && !state.has_pending_elicitation()
+        && state.ragnarok.is_none()
+        && state.agent_picker.is_none()
+        && state.config_picker.is_none()
+        && key.modifiers == KeyModifiers::CONTROL
+        && matches!(key.code, KeyCode::Char('g' | 'G'))
+    {
+        if state.workspace_diff_viewer {
+            state.close_workspace_diff_viewer();
+        } else {
+            state.open_workspace_diff_viewer();
+        }
+        return inline_repair_request(mode);
+    }
+
     // The full-transcript reader owns the keyboard while open so scrolling
     // keys don't leak into the prompt. A pending permission prompt takes
     // precedence: it suspends the reader (drawn over it) until resolved.
+    if state.workspace_diff_viewer
+        && !state.has_pending_permission()
+        && !state.has_pending_elicitation()
+    {
+        return handle_workspace_diff_viewer_key(state, key.modifiers, key.code, mode);
+    }
     if state.transcript_viewer
         && !state.has_pending_permission()
         && !state.has_pending_elicitation()
@@ -3288,6 +3326,49 @@ fn handle_transcript_viewer_key(
         }
         KeyCode::Home => state.scroll_offset = 0,
         KeyCode::End => state.scroll_offset = usize::MAX,
+        _ => {}
+    }
+    TerminalRequest::None
+}
+
+fn handle_workspace_diff_viewer_key(
+    state: &mut AppState,
+    modifiers: KeyModifiers,
+    code: KeyCode,
+    mode: UiMode,
+) -> TerminalRequest {
+    let ctrl_g = modifiers.contains(KeyModifiers::CONTROL)
+        && !modifiers.intersects(
+            KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META,
+        )
+        && matches!(code, KeyCode::Char('g' | 'G'));
+    if matches!(code, KeyCode::Esc) || ctrl_g {
+        state.close_workspace_diff_viewer();
+        return inline_repair_request(mode);
+    }
+    match code {
+        KeyCode::Up => {
+            state.workspace_diff_scroll_offset =
+                state.workspace_diff_scroll_offset.saturating_sub(1)
+        }
+        KeyCode::Down => {
+            state.workspace_diff_scroll_offset =
+                state.workspace_diff_scroll_offset.saturating_add(1)
+        }
+        KeyCode::PageUp => {
+            state.workspace_diff_scroll_offset = state
+                .workspace_diff_scroll_offset
+                .saturating_sub(TRANSCRIPT_SCROLL_PAGE_STEP)
+        }
+        KeyCode::PageDown => {
+            state.workspace_diff_scroll_offset = state
+                .workspace_diff_scroll_offset
+                .saturating_add(TRANSCRIPT_SCROLL_PAGE_STEP)
+        }
+        KeyCode::Home => state.workspace_diff_scroll_offset = 0,
+        KeyCode::End => state.workspace_diff_scroll_offset = usize::MAX,
+        KeyCode::Char('n') if modifiers.is_empty() => state.select_workspace_diff_file(true),
+        KeyCode::Char('p') if modifiers.is_empty() => state.select_workspace_diff_file(false),
         _ => {}
     }
     TerminalRequest::None
@@ -4754,7 +4835,11 @@ fn draw(
         ])
         .split(f.area());
 
-    draw_transcript(f, chunks[0], state, transcript_scroll);
+    if state.workspace_diff_viewer {
+        draw_workspace_diff_viewer(f, chunks[0], state, false);
+    } else {
+        draw_transcript(f, chunks[0], state, transcript_scroll);
+    }
     draw_header(f, chunks[1], state);
     draw_queued_prompt_row(f, chunks[2], state);
     draw_input(f, chunks[3], state, mode);
@@ -4899,6 +4984,11 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
 
     if state.transcript_viewer {
         draw_inline_transcript_viewer(f, f.area(), state);
+        return;
+    }
+
+    if state.workspace_diff_viewer {
+        draw_workspace_diff_viewer(f, f.area(), state, true);
         return;
     }
 
@@ -5217,6 +5307,121 @@ fn draw_inline_transcript_viewer(f: &mut ratatui::Frame, area: Rect, state: &mut
             "Alt-T latest tool · Up/Down PgUp/PgDn scroll · Home/End top/bottom · Esc or Ctrl-T to close",
         )
             .style(Style::default().fg(state.theme.muted)),
+        layout[1],
+    );
+}
+
+/// Reader for the latest native workspace-diff event. Unlike tool output,
+/// this deliberately has no transcript side effects and no compact row budget.
+fn draw_workspace_diff_viewer(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    state: &mut AppState,
+    inline: bool,
+) {
+    if inline {
+        f.render_widget(Clear, area);
+    }
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+    let Some(event) = state.workspace_diffs.last() else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" workspace diff — no workspace changes ")
+            .style(Style::default().fg(state.theme.agent));
+        let inner = block.inner(layout[0]);
+        f.render_widget(block, layout[0]);
+        if inner.width > 0 && inner.height > 0 {
+            f.render_widget(
+                Paragraph::new("No workspace changes have been captured for this session.")
+                    .style(Style::default().fg(state.theme.muted)),
+                inner,
+            );
+        }
+        f.render_widget(
+            Paragraph::new("Ctrl-G/Esc close · Up/Down PgUp/PgDn Home/End scroll · n/p file")
+                .style(Style::default().fg(state.theme.muted)),
+            layout[1],
+        );
+        return;
+    };
+    let retained = event.diffs.len();
+    let selected = state
+        .workspace_diff_selected_file
+        .min(retained.saturating_sub(1));
+    state.workspace_diff_selected_file = selected;
+    let noun = if event.total_files == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    let title = if let Some(diff) = event.diffs.get(selected) {
+        let capped = event.truncated || retained < event.total_files;
+        let suffix = if capped {
+            format!(" — showing {retained} of {}", event.total_files)
+        } else {
+            String::new()
+        };
+        format!(
+            " workspace diff — {} {noun} changed — retained {}/{} {}{} ",
+            event.total_files,
+            selected + 1,
+            retained,
+            diff.path.display(),
+            suffix
+        )
+    } else if event.total_files == 0 {
+        " workspace diff — no workspace changes ".to_string()
+    } else {
+        format!(
+            " workspace diff — {} {noun} changed — no retained file ",
+            event.total_files
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().fg(state.theme.agent));
+    let inner = block.inner(layout[0]);
+    f.render_widget(block, layout[0]);
+    if let Some(diff) = event.diffs.get(selected) {
+        if inner.width > 0 && inner.height > 0 {
+            let lines = render_prepared_diff_rows(
+                &prepared_diff_rows(diff.old_text.as_deref(), &diff.new_text, usize::MAX),
+                inner.width,
+                state.theme,
+            );
+            let total = Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width);
+            let max_offset = total.saturating_sub(usize::from(inner.height));
+            state.workspace_diff_scroll_offset = state.workspace_diff_scroll_offset.min(max_offset);
+            f.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((
+                    state.workspace_diff_scroll_offset.min(u16::MAX as usize) as u16,
+                    0,
+                )),
+                inner,
+            );
+        }
+    } else if inner.width > 0 && inner.height > 0 {
+        let message = if event.total_files == 0 {
+            "No workspace changes were captured for this event."
+        } else {
+            "No retained diff is available for this event."
+        };
+        f.render_widget(
+            Paragraph::new(message).style(Style::default().fg(state.theme.muted)),
+            inner,
+        );
+    }
+    f.render_widget(
+        Paragraph::new(
+            "Ctrl-G/Esc close · Up/Down PgUp/PgDn Home/End scroll · n/p previous/next file",
+        )
+        .style(Style::default().fg(state.theme.muted)),
         layout[1],
     );
 }
@@ -6995,10 +7200,8 @@ fn push_diff_output(
     collapse_limit: Option<usize>,
     theme: TerminalTheme,
 ) {
-    let old_lines: Vec<&str> = old_text.unwrap_or("").lines().collect();
-    let new_lines: Vec<&str> = new_text.lines().collect();
     let diff_budget = collapse_limit.unwrap_or(80);
-    let rows = compact_line_diff(&old_lines, &new_lines, diff_budget);
+    let rows = prepared_diff_rows(old_text, new_text, diff_budget);
 
     let added = rows
         .iter()
@@ -7026,14 +7229,30 @@ fn push_diff_output(
     }
     out.push(Line::from(header));
 
+    out.extend(render_prepared_diff_rows(&rows, width, theme));
+}
+
+/// The shared native-diff preparation pipeline. The transcript uses its
+/// compact budget; the dedicated reader passes an unlimited budget.
+fn prepared_diff_rows(old_text: Option<&str>, new_text: &str, limit: usize) -> Vec<DiffLine> {
+    let old_lines: Vec<&str> = old_text.unwrap_or("").lines().collect();
+    let new_lines: Vec<&str> = new_text.lines().collect();
+    compact_line_diff(&old_lines, &new_lines, limit)
+}
+
+fn render_prepared_diff_rows(
+    rows: &[DiffLine],
+    width: u16,
+    theme: TerminalTheme,
+) -> Vec<Line<'static>> {
     let gutter_width = rows
         .iter()
         .filter_map(DiffLine::gutter_line)
         .max()
         .map_or(1, |number| number.to_string().len());
-    for row in &rows {
-        out.push(render_diff_row(row, gutter_width, width as usize, theme));
-    }
+    rows.iter()
+        .map(|row| render_diff_row(row, gutter_width, width as usize, theme))
+        .collect()
 }
 
 fn render_diff_row(
@@ -14703,6 +14922,347 @@ mod tests {
             UiMode::InlineChat,
         );
         assert_eq!(state.scroll_offset, 0);
+    }
+
+    fn workspace_diff_event(
+        diffs: Vec<crate::event::WorkspaceDiff>,
+        total_files: usize,
+    ) -> crate::event::WorkspaceDiffEvent {
+        crate::event::WorkspaceDiffEvent {
+            turn_id: 1,
+            diffs,
+            total_files,
+            max_files: 20,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn fullscreen_workspace_diff_viewer_owns_ctrl_g_navigation_and_prompt_input() {
+        let mut state = AppState::new();
+        state.runtime_closed = true;
+        state.workspace_diffs.push(workspace_diff_event(
+            vec![
+                crate::event::WorkspaceDiff {
+                    path: "first.rs".into(),
+                    old_text: Some("old\n".into()),
+                    new_text: "new\n".into(),
+                },
+                crate::event::WorkspaceDiff {
+                    path: "second.rs".into(),
+                    old_text: Some("before\n".into()),
+                    new_text: "after\n".into(),
+                },
+            ],
+            2,
+        ));
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert!(state.workspace_diff_viewer);
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Home));
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Down));
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::PageDown));
+        assert_eq!(
+            state.workspace_diff_scroll_offset,
+            1 + TRANSCRIPT_SCROLL_PAGE_STEP
+        );
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Up));
+        assert_eq!(
+            state.workspace_diff_scroll_offset,
+            TRANSCRIPT_SCROLL_PAGE_STEP
+        );
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::End));
+        assert_eq!(state.workspace_diff_scroll_offset, usize::MAX);
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('n')));
+        assert_eq!(state.workspace_diff_selected_file, 1);
+        assert_eq!(state.workspace_diff_scroll_offset, 0);
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('n')));
+        assert_eq!(state.workspace_diff_selected_file, 1, "next clamps at end");
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('p')));
+        assert_eq!(state.workspace_diff_selected_file, 0);
+        assert_eq!(state.workspace_diff_scroll_offset, 0);
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('p')));
+        assert_eq!(
+            state.workspace_diff_selected_file, 0,
+            "previous clamps at start"
+        );
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('x')));
+        assert!(state.input.is_empty());
+        handle_crossterm(&mut state, &cmd_tx, mouse(MouseEventKind::ScrollDown));
+        assert_eq!(
+            state.scroll_offset, 0,
+            "diff mouse input must not mutate fullscreen transcript state"
+        );
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert!(!state.workspace_diff_viewer, "Ctrl-G closes the reader");
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert!(
+            state.workspace_diff_viewer,
+            "Ctrl-G reopens after runtime closure"
+        );
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Esc));
+        assert!(!state.workspace_diff_viewer);
+        assert!(
+            state.exit_reason.is_none(),
+            "Esc closes the reader before runtime-close quit handling"
+        );
+    }
+
+    #[test]
+    fn inline_workspace_diff_viewer_handles_keys_and_ignores_mouse() {
+        let mut state = AppState::new();
+        state.workspace_diffs.push(workspace_diff_event(
+            vec![
+                crate::event::WorkspaceDiff {
+                    path: "one.rs".into(),
+                    old_text: Some("one\n".into()),
+                    new_text: "ONE\n".into(),
+                },
+                crate::event::WorkspaceDiff {
+                    path: "two.rs".into(),
+                    old_text: Some("two\n".into()),
+                    new_text: "TWO\n".into(),
+                },
+            ],
+            2,
+        ));
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        handle_inline_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert!(state.workspace_diff_viewer);
+        handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::PageUp));
+        assert_eq!(
+            state.workspace_diff_scroll_offset, 0,
+            "page up clamps at top"
+        );
+        handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::PageDown));
+        assert_eq!(
+            state.workspace_diff_scroll_offset,
+            TRANSCRIPT_SCROLL_PAGE_STEP
+        );
+        handle_inline_crossterm(&mut state, &cmd_tx, mouse(MouseEventKind::ScrollDown));
+        assert_eq!(
+            state.workspace_diff_scroll_offset,
+            TRANSCRIPT_SCROLL_PAGE_STEP
+        );
+        assert_eq!(
+            state.scroll_offset, 0,
+            "diff mouse input must not mutate transcript state"
+        );
+        handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('n')));
+        assert_eq!(state.workspace_diff_selected_file, 1);
+        assert_eq!(state.workspace_diff_scroll_offset, 0);
+        handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::Char('x')));
+        assert!(state.input.is_empty());
+        assert!(!should_force_inline_repair_for_event(
+            UiMode::InlineChat,
+            &state,
+            &CtEvent::Paste("hidden prompt text".to_string())
+        ));
+        handle_inline_crossterm(
+            &mut state,
+            &cmd_tx,
+            CtEvent::Paste("hidden prompt text".to_string()),
+        );
+        assert!(
+            state.input.is_empty(),
+            "paste must not leak into the prompt"
+        );
+        handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::Esc));
+        assert!(!state.workspace_diff_viewer);
+    }
+
+    #[test]
+    fn workspace_diff_shortcut_yields_to_existing_overlay_owners() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let ctrl_g = || key_with_modifiers(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        let mut state = AppState::new();
+
+        state.agent_picker = Some(crate::app::AgentPicker {
+            selected: 0,
+            role_indices: Vec::new(),
+            confirming: false,
+        });
+        handle_crossterm(&mut state, &cmd_tx, ctrl_g());
+        assert!(!state.workspace_diff_viewer);
+
+        state.agent_picker = None;
+        let (abort_tx, _abort_rx) = tokio::sync::watch::channel(false);
+        let (proceed_tx, _proceed_rx) = tokio::sync::watch::channel(false);
+        state.ragnarok = Some(RagnarokUi::new("task".into(), abort_tx, proceed_tx));
+        handle_crossterm(&mut state, &cmd_tx, ctrl_g());
+        assert!(!state.workspace_diff_viewer);
+    }
+
+    #[test]
+    fn workspace_diff_viewer_renders_title_navigation_and_diff_colors() {
+        let mut state = AppState::new();
+        state.workspace_diffs.push(workspace_diff_event(
+            vec![
+                crate::event::WorkspaceDiff {
+                    path: "first.rs".into(),
+                    old_text: Some("old token\n".into()),
+                    new_text: "new token\n".into(),
+                },
+                crate::event::WorkspaceDiff {
+                    path: "second.rs".into(),
+                    old_text: Some("before\n".into()),
+                    new_text: "after marker\n".into(),
+                },
+            ],
+            2,
+        ));
+        state.open_workspace_diff_viewer();
+        let backend = TestBackend::new(100, 14);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_workspace_diff_viewer(frame, frame.area(), &mut state, false))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer_lines(buffer).join("\n");
+        assert!(rendered.contains("2 files changed"), "{rendered}");
+        assert!(rendered.contains("retained 1/2 first.rs"), "{rendered}");
+        assert!(
+            rendered.contains("old token") && rendered.contains("new token"),
+            "{rendered}"
+        );
+        let mut cells = (0..buffer.area().height).flat_map(|y| {
+            (0..buffer.area().width).map(move |x| buffer.cell((x, y)).expect("cell"))
+        });
+        assert!(cells.clone().any(|cell| cell.symbol() == "-"
+            && cell.style().bg == Some(state.theme.diff_removed_bg.expect("removed background"))));
+        assert!(cells.any(|cell| cell.symbol() == "+"
+            && cell.style().bg == Some(state.theme.diff_added_bg.expect("added background"))));
+
+        state.select_workspace_diff_file(true);
+        terminal
+            .draw(|frame| draw_workspace_diff_viewer(frame, frame.area(), &mut state, false))
+            .expect("draw");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("retained 2/2 second.rs"), "{rendered}");
+        assert!(
+            rendered.contains("after marker") && !rendered.contains("new token"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn workspace_diff_viewer_explains_capped_and_empty_events_without_panicking_when_narrow() {
+        let mut state = AppState::new();
+        state
+            .workspace_diffs
+            .push(crate::event::WorkspaceDiffEvent {
+                turn_id: 1,
+                diffs: vec![crate::event::WorkspaceDiff {
+                    path: "kept.rs".into(),
+                    old_text: None,
+                    new_text: "kept content\n".into(),
+                }],
+                total_files: 4,
+                max_files: 1,
+                truncated: true,
+            });
+        state.open_workspace_diff_viewer();
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).expect("terminal");
+        terminal
+            .draw(|frame| draw_workspace_diff_viewer(frame, frame.area(), &mut state, false))
+            .expect("draw");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(
+            rendered.contains("4 files changed")
+                && rendered.contains("retained 1/1")
+                && rendered.contains("showing 1 of 4"),
+            "{rendered}"
+        );
+
+        state.workspace_diffs.push(workspace_diff_event(vec![], 3));
+        terminal
+            .draw(|frame| draw_workspace_diff_viewer(frame, frame.area(), &mut state, false))
+            .expect("draw");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(
+            rendered.contains("3 files changed")
+                && rendered.contains("No retained diff is available"),
+            "{rendered}"
+        );
+
+        state.workspace_diffs.push(workspace_diff_event(vec![], 0));
+        terminal
+            .draw(|frame| draw_workspace_diff_viewer(frame, frame.area(), &mut state, false))
+            .expect("draw");
+        assert!(
+            buffer_lines(terminal.backend().buffer())
+                .join("\n")
+                .contains("No workspace changes were captured")
+        );
+
+        let mut narrow = Terminal::new(TestBackend::new(2, 2)).expect("terminal");
+        narrow
+            .draw(|frame| draw_workspace_diff_viewer(frame, frame.area(), &mut state, false))
+            .expect("narrow draw");
+    }
+
+    #[test]
+    fn workspace_diff_viewer_uses_full_inline_height_and_fullscreen_transcript_pane() {
+        let mut state = AppState::new();
+        state.workspace_diffs.push(workspace_diff_event(
+            vec![crate::event::WorkspaceDiff {
+                path: "pane.rs".into(),
+                old_text: None,
+                new_text: "pane content\n".into(),
+            }],
+            1,
+        ));
+        state.open_workspace_diff_viewer();
+        assert_eq!(
+            desired_inline_height(
+                &state,
+                Size {
+                    width: 100,
+                    height: 40
+                }
+            ),
+            39
+        );
+        let mut inline = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+        inline
+            .draw(|frame| draw_inline_chat(frame, &mut state))
+            .expect("inline draw");
+        assert!(
+            buffer_lines(inline.backend().buffer())
+                .join("\n")
+                .contains("pane content")
+        );
+
+        let mut fullscreen = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        let mut scroll = TranscriptScrollState::default();
+        fullscreen
+            .draw(|frame| draw(frame, &mut state, &mut scroll, UiMode::FullscreenTui))
+            .expect("fullscreen draw");
+        let rendered = buffer_lines(fullscreen.backend().buffer()).join("\n");
+        assert!(
+            rendered.contains("pane content") && rendered.contains("Ctrl-G/Esc close"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("mj") || rendered.contains("You"),
+            "fullscreen retains its non-transcript chrome: {rendered}"
+        );
     }
 
     #[test]
