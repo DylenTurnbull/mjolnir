@@ -5483,9 +5483,15 @@ fn draw_workspace_diff_viewer(
     if inline {
         f.render_widget(Clear, area);
     }
+    let footer = "Ctrl-G/Esc close · Up/Down PgUp/PgDn Home/End scroll · n/p previous/next file";
+    let footer_height = Paragraph::new(footer)
+        .wrap(Wrap { trim: false })
+        .line_count(area.width)
+        .max(1)
+        .min(usize::from(u16::MAX)) as u16;
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([Constraint::Min(1), Constraint::Length(footer_height)])
         .split(area);
     let Some(event) = state.workspace_diffs.last() else {
         let block = Block::default()
@@ -5502,8 +5508,9 @@ fn draw_workspace_diff_viewer(
             );
         }
         f.render_widget(
-            Paragraph::new("Ctrl-G/Esc close · Up/Down PgUp/PgDn Home/End scroll · n/p file")
-                .style(Style::default().fg(state.theme.muted)),
+            Paragraph::new(footer)
+                .style(Style::default().fg(state.theme.muted))
+                .wrap(Wrap { trim: false }),
             layout[1],
         );
         return;
@@ -5549,9 +5556,8 @@ fn draw_workspace_diff_viewer(
     f.render_widget(block, layout[0]);
     if let Some(diff) = event.diffs.get(selected) {
         if inner.width > 0 && inner.height > 0 {
-            let lines = render_prepared_diff_rows(
+            let lines = render_prepared_diff_rows_full(
                 &prepared_diff_rows(diff.old_text.as_deref(), &diff.new_text, usize::MAX),
-                inner.width,
                 state.theme,
             );
             let total = Paragraph::new(lines.clone())
@@ -5579,10 +5585,9 @@ fn draw_workspace_diff_viewer(
         );
     }
     f.render_widget(
-        Paragraph::new(
-            "Ctrl-G/Esc close · Up/Down PgUp/PgDn Home/End scroll · n/p previous/next file",
-        )
-        .style(Style::default().fg(state.theme.muted)),
+        Paragraph::new(footer)
+            .style(Style::default().fg(state.theme.muted))
+            .wrap(Wrap { trim: false }),
         layout[1],
     );
 }
@@ -7421,6 +7426,67 @@ fn render_prepared_diff_rows(
     rows.iter()
         .map(|row| render_diff_row(row, gutter_width, width as usize, theme))
         .collect()
+}
+
+/// Dedicated diff readers wrap complete rows in their `Paragraph`; unlike the
+/// compact transcript renderer, they must never discard the tail of a line.
+fn render_prepared_diff_rows_full(rows: &[DiffLine], theme: TerminalTheme) -> Vec<Line<'static>> {
+    let gutter_width = rows
+        .iter()
+        .filter_map(DiffLine::gutter_line)
+        .max()
+        .map_or(1, |number| number.to_string().len());
+    rows.iter()
+        .map(|row| render_diff_row_full(row, gutter_width, theme))
+        .collect()
+}
+
+fn render_diff_row_full(
+    row: &DiffLine,
+    gutter_width: usize,
+    theme: TerminalTheme,
+) -> Line<'static> {
+    if row.kind == DiffLineKind::Omitted {
+        return Line::from(Span::styled(
+            format!("  {:>gutter_width$} ··· {}", "", row.text()),
+            Style::default().fg(theme.muted),
+        ));
+    }
+    let (marker, accent, row_bg, emph_bg) = match row.kind {
+        DiffLineKind::Added => (
+            "+",
+            theme.diff_added,
+            theme.diff_added_bg,
+            theme.diff_added_emph_bg,
+        ),
+        DiffLineKind::Removed => (
+            "-",
+            theme.diff_removed,
+            theme.diff_removed_bg,
+            theme.diff_removed_emph_bg,
+        ),
+        _ => (" ", theme.diff_context, None, None),
+    };
+    let number = row
+        .gutter_line()
+        .map_or_else(String::new, |number| number.to_string());
+    let prefix = format!("  {number:>gutter_width$} {marker} ");
+    let mut spans = vec![Span::styled(
+        prefix,
+        match row_bg {
+            Some(bg) => Style::default().fg(accent).bg(bg),
+            None => Style::default().fg(accent),
+        },
+    )];
+    spans.extend(row.segments.iter().map(|segment| {
+        let style = match (row_bg, segment.emphasized.then_some(emph_bg).flatten()) {
+            (None, _) => Style::default().fg(accent),
+            (Some(bg), None) => Style::default().fg(theme.text).bg(bg),
+            (Some(_), Some(emph)) => Style::default().fg(theme.text).bg(emph),
+        };
+        Span::styled(segment.text.clone(), style)
+    }));
+    Line::from(spans)
 }
 
 fn render_diff_row(
@@ -15570,6 +15636,41 @@ mod tests {
         narrow
             .draw(|frame| draw_workspace_diff_viewer(frame, frame.area(), &mut state, false))
             .expect("narrow draw");
+    }
+
+    #[test]
+    fn workspace_diff_viewer_wraps_long_lines_and_complete_footer_when_narrow() {
+        let long_line =
+            "release-build-long-diff-line-that-must-remain-readable-through-the-final-token";
+        let mut state = AppState::new();
+        state.workspace_diffs.push(workspace_diff_event(
+            vec![crate::event::WorkspaceDiff {
+                path: "long.txt".into(),
+                old_text: None,
+                new_text: format!("{long_line}\n"),
+            }],
+            1,
+        ));
+        state.open_workspace_diff_viewer();
+
+        let mut terminal = Terminal::new(TestBackend::new(68, 20)).expect("terminal");
+        terminal
+            .draw(|frame| draw_workspace_diff_viewer(frame, frame.area(), &mut state, false))
+            .expect("draw");
+        let rendered = buffer_lines(terminal.backend().buffer());
+        let joined = rendered.join("");
+        let body_text = rendered
+            .iter()
+            .map(|line| line.trim_matches(['│', ' ']))
+            .collect::<String>();
+
+        assert!(body_text.contains(long_line), "rendered: {rendered:?}");
+        assert!(!joined.contains("..."), "rendered: {rendered:?}");
+        assert!(joined.contains("n/p"), "rendered: {rendered:?}");
+        assert!(
+            joined.contains("previous/next file"),
+            "rendered: {rendered:?}"
+        );
     }
 
     #[test]
