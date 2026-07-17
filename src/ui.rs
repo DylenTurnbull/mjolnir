@@ -980,6 +980,7 @@ async fn ui_loop(
                                 }
                                 let main = main_state.as_mut().expect("checked main state");
                                 main.apply_event(main_event);
+                                finalize_startup_prompt(main);
                                 drain_hidden_main_prompt(main, cmd_tx);
                                 pending_redraw.mark_interactive();
                                 continue;
@@ -996,6 +997,7 @@ async fn ui_loop(
                             && state.session_id.is_none()
                             && matches!(&ev, UiEvent::Fatal(_));
                         state.apply_event(ev);
+                        finalize_startup_prompt(&mut state);
                         if failed_side_start {
                             state.side_exit_requested = true;
                         }
@@ -3861,6 +3863,24 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
     if state.session_id.is_none() {
+        if state.has_startup_prompt() {
+            state.announce_waiting_for_primary();
+            return;
+        }
+
+        let prompt = QueuedPrompt {
+            text: text.clone(),
+            images: images.clone(),
+            display_text: prompt_display_text(&text, images.len()),
+        };
+        if cmd_tx.send(UiCommand::SendPrompt { text, images }).is_err() {
+            state.record_status_message(
+                StatusKind::Warning,
+                "the ACP runtime closed before the startup prompt could be queued",
+            );
+            return;
+        }
+        debug_assert!(state.stage_startup_prompt(prompt));
         state.announce_waiting_for_primary();
         return;
     }
@@ -4357,6 +4377,43 @@ fn drain_queued_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCo
         text: queued.text,
         images: queued.images,
     });
+}
+
+/// Commit the prompt already queued on the runtime channel once the primary
+/// ACP session is ready. The editor remains recoverable if startup fails. If
+/// the user edited the retained draft meanwhile, preserve those edits as the
+/// next prompt instead of erasing them.
+fn finalize_startup_prompt(state: &mut AppState) {
+    if state.runtime_closed || state.session_id.is_none() {
+        return;
+    }
+    let Some(prompt) = state.take_startup_prompt() else {
+        return;
+    };
+
+    let current_text = input_text_with_attachments(&state.input, &state.attachments)
+        .trim()
+        .to_string();
+    let input_len = input_char_count(&state.input);
+    let mut ordered_images: Vec<&PastedImageAttachment> = state.image_attachments.iter().collect();
+    ordered_images.sort_by_key(|attachment| (attachment.position.min(input_len), attachment.id));
+    let current_images: Vec<PromptImage> = ordered_images
+        .into_iter()
+        .map(|attachment| PromptImage {
+            data_base64: attachment.data_base64.clone(),
+            mime_type: attachment.mime_type.clone(),
+            width: attachment.width,
+            height: attachment.height,
+        })
+        .collect();
+    if current_text == prompt.text && current_images == prompt.images {
+        state.input.clear();
+        clear_attachments(state);
+        state.input_cursor = 0;
+        state.scroll_input_to_bottom();
+    }
+
+    state.record_user_prompt(prompt.display_text);
 }
 
 /// Truncate the display text to a short single-line preview for the
@@ -19878,7 +19935,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_preserves_text_and_images_when_session_is_not_ready() {
+    fn startup_submission_queues_once_and_commits_on_session_readiness() {
         let mut state = AppState::new();
         state.set_primary_acp_name("Codex");
         state
@@ -19888,14 +19945,78 @@ mod tests {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
 
         submit_prompt(&mut state, &cmd_tx);
+        submit_prompt(&mut state, &cmd_tx);
 
-        assert!(cmd_rx.try_recv().is_err());
+        let queued = cmd_rx.try_recv().expect("startup prompt queued");
+        match queued {
+            UiCommand::SendPrompt { text, images } => {
+                assert_eq!(text, "describe this");
+                assert_eq!(images.len(), 1);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "second Enter must not duplicate"
+        );
+        assert!(state.has_startup_prompt());
         assert_eq!(state.input, "describe this");
         assert_eq!(state.image_attachments.len(), 1);
-        let status = state.status_line.expect("status");
+        let status = state.status_line.as_ref().expect("status");
         assert_eq!(status.kind, StatusKind::Info);
         assert_eq!(status.text, "session is still starting");
         assert!(state.transcript.is_empty());
+
+        state.apply_event(UiEvent::Connected {
+            agent_name: Some("slow Codex".into()),
+            agent_version: None,
+            prompt_images_supported: true,
+            session_fork_supported: false,
+            side_session_supported: false,
+            side_session_unsupported_reason: None,
+        });
+        finalize_startup_prompt(&mut state);
+        assert_eq!(state.input, "describe this", "Connected is not ready");
+        assert!(state.has_startup_prompt());
+
+        state.apply_event(UiEvent::SessionStarted {
+            session_id: "slow-session".into(),
+            resumed: false,
+        });
+        finalize_startup_prompt(&mut state);
+
+        assert!(!state.has_startup_prompt());
+        assert!(state.input.is_empty());
+        assert!(state.image_attachments.is_empty());
+        assert!(state.is_streaming());
+        assert!(matches!(
+            state.transcript.last(),
+            Some(Entry::UserPrompt(text)) if text == "describe this\n[image]"
+        ));
+        finalize_startup_prompt(&mut state);
+        assert!(cmd_rx.try_recv().is_err(), "readiness must not resend");
+    }
+
+    #[test]
+    fn startup_failure_preserves_the_submitted_editor_draft() {
+        let mut state = AppState::new();
+        state.input = "recover this prompt".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(UiCommand::SendPrompt { text, .. }) if text == "recover this prompt"
+        ));
+
+        state.apply_event(UiEvent::Fatal("startup failed".to_string()));
+        finalize_startup_prompt(&mut state);
+
+        assert_eq!(state.input, "recover this prompt");
+        assert!(state.has_startup_prompt());
+        assert!(state.runtime_closed);
+        assert_eq!(state.connection_state(), ConnectionState::Fatal);
+        assert!(cmd_rx.try_recv().is_err());
     }
 
     #[test]

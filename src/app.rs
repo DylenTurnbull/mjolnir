@@ -887,6 +887,10 @@ pub struct AppState {
     /// flight. They stay out of the transcript until the runtime actually
     /// sends them, then drain oldest-first.
     queued_prompts: VecDeque<QueuedPrompt>,
+    /// The one prompt accepted while the primary ACP session is still
+    /// starting. Its command is already queued for the runtime, but the
+    /// editor stays intact until session readiness (or startup failure).
+    startup_prompt: Option<QueuedPrompt>,
 }
 
 /// A prompt staged behind the currently streaming turn. The runtime takes
@@ -1202,6 +1206,7 @@ impl AppState {
             ragnarok_models: Vec::new(),
             clipboard_lease: None,
             queued_prompts: VecDeque::new(),
+            startup_prompt: None,
             pending_workspace_diff_total: None,
         }
     }
@@ -1460,6 +1465,25 @@ impl AppState {
     /// none is staged.
     pub fn take_queued_prompt(&mut self) -> Option<QueuedPrompt> {
         self.queued_prompts.pop_front()
+    }
+
+    /// Remember the single command queued while the primary session starts.
+    /// Returns `false` when an earlier Enter already staged the same startup
+    /// slot, preventing duplicate runtime commands.
+    pub fn stage_startup_prompt(&mut self, prompt: QueuedPrompt) -> bool {
+        if self.startup_prompt.is_some() {
+            return false;
+        }
+        self.startup_prompt = Some(prompt);
+        true
+    }
+
+    pub fn has_startup_prompt(&self) -> bool {
+        self.startup_prompt.is_some()
+    }
+
+    pub fn take_startup_prompt(&mut self) -> Option<QueuedPrompt> {
+        self.startup_prompt.take()
     }
 
     /// Return a copy of the prompt history for persistence.
