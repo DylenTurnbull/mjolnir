@@ -47,8 +47,9 @@ Mjolnir discovers these built-in routes automatically:
 
 - Existing Codex credentials enable OpenAI models through `codex-acp`.
 - Existing Claude credentials enable Anthropic models through `claude-agent-acp`.
-- Pinned Anvil `0.22.0` is a managed pseudo-builtin and enables its exposed models.
-- `opencode` on `PATH` enables OpenCode through `opencode acp`.
+- Existing Kimi Code credentials enable Moonshot models through the official
+  Kimi ACP server, which Mjolnir installs from the ACP registry when needed.
+- Pinned Anvil `0.23.0` is a managed pseudo-builtin and enables its exposed models.
 
 Council adapters must advertise ACP HTTP MCP support because Thor invokes
 Eitri through Mjolnir's embedded `code_agent` and `explore_agent` MCP tools.
@@ -95,12 +96,18 @@ Pareto frontier at the current Sonnet High quality floor, but may reuse a model
 when no distinct qualifying choice exists. Set `model = "disabled"` under
 `[loki]` or `[eitri]` to turn that role off.
 
-Use `/mjconfig` to configure Council models, ACP servers, review policy, and
-appearance. `/models` opens the same editor directly on the Council tab. Model
-and ACP server changes apply to the next session. The ACP Servers tab explains
-why each built-in route was detected and shows its launch command. Its inline
-registry browser installs explicitly selected servers; binary distributions are
-owned under Mjolnir's platform data directory. Configure automatic Thor review with the
+Use `/mjconfig` to configure Council models, accounts, ACP servers, review
+policy, and appearance. `/models` opens the same editor directly on the Council
+tab. Model and ACP server changes apply to the next session. The ACP Servers tab
+can sign in to OpenAI, Anthropic, and Kimi through their official CLIs. OpenAI
+credentials also enable Anvil's Codex routes, while Kimi credentials enable both
+Kimi Code and Anvil's Kimi routes. Mjolnir requires an installed `codex` or
+`claude` CLI for those vendors; it can install the official Kimi CLI itself.
+
+Only available native servers are listed. Choose `+ Add server` to browse the
+ACP registry or enter a custom command. Managed servers show their managed
+version without repeating their internal install path. Registry binary
+distributions are owned under Mjolnir's platform data directory. Configure automatic Thor review with the
 `Thor review` switch in `/mjconfig`. Use `/review` to choose a findings-only review of the
 most recent change-producing turn, all uncommitted changes, or `HEAD`; direct forms are
 `/review recent`, `/review uncommitted`, and `/review head`.

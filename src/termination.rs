@@ -6,7 +6,7 @@
 //! convention (SIGINT 130, SIGHUP 129, SIGTERM 143); Windows uses 1.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
@@ -17,6 +17,26 @@ use tokio::signal::windows::{CtrlBreak, CtrlC};
 enum SignalAction {
     Graceful,
     Force,
+}
+
+static SUPPRESSED_INTERRUPTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Keeps a foreground child process's Ctrl-C from also terminating Mjolnir.
+///
+/// The child remains in the terminal's foreground process group and receives
+/// the signal normally; only Mjolnir's process-wide graceful shutdown is
+/// suspended until the guard is dropped.
+pub struct SuppressInterruptGuard;
+
+pub fn suppress_interrupts() -> SuppressInterruptGuard {
+    SUPPRESSED_INTERRUPTS.fetch_add(1, Ordering::AcqRel);
+    SuppressInterruptGuard
+}
+
+impl Drop for SuppressInterruptGuard {
+    fn drop(&mut self) {
+        SUPPRESSED_INTERRUPTS.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Pure, testable signal transition. The side effect for `Force` belongs to
@@ -72,6 +92,14 @@ impl Coordinator {
     }
 
     fn received_signal(&self, signal: i32) {
+        #[cfg(unix)]
+        if signal == libc::SIGINT && SUPPRESSED_INTERRUPTS.load(Ordering::Acquire) > 0 {
+            return;
+        }
+        #[cfg(windows)]
+        if signal == 0 && SUPPRESSED_INTERRUPTS.load(Ordering::Acquire) > 0 {
+            return;
+        }
         match next_signal_action(&self.signals_seen) {
             SignalAction::Graceful => self.token.cancel(),
             SignalAction::Force => std::process::exit(exit_code(signal)),
@@ -83,7 +111,7 @@ impl Coordinator {
         loop {
             tokio::select! {
                 _ = ctrl_c.recv() => self.received_signal(0),
-                _ = ctrl_break.recv() => self.received_signal(0),
+                _ = ctrl_break.recv() => self.received_signal(1),
             }
         }
     }
@@ -118,6 +146,16 @@ mod tests {
         let signals_seen = AtomicU8::new(0);
         assert_eq!(next_signal_action(&signals_seen), SignalAction::Graceful);
         assert_eq!(next_signal_action(&signals_seen), SignalAction::Force);
+    }
+
+    #[test]
+    fn interrupt_suppression_is_scoped() {
+        assert_eq!(SUPPRESSED_INTERRUPTS.load(Ordering::Acquire), 0);
+        {
+            let _guard = suppress_interrupts();
+            assert_eq!(SUPPRESSED_INTERRUPTS.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(SUPPRESSED_INTERRUPTS.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

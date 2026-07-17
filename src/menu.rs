@@ -51,6 +51,28 @@ pub fn select_inline(
     options: &[MenuOption],
     initial: usize,
 ) -> Result<Option<usize>> {
+    select_inline_impl(question, footer, options, initial, true)
+}
+
+/// Like [`select_inline`], but Esc returns `None` instead of choosing the
+/// initial option. Use this for actions where starting the default has side
+/// effects, such as launching an OAuth flow.
+pub fn select_inline_cancelable(
+    question: &str,
+    footer: &str,
+    options: &[MenuOption],
+    initial: usize,
+) -> Result<Option<usize>> {
+    select_inline_impl(question, footer, options, initial, false)
+}
+
+fn select_inline_impl(
+    question: &str,
+    footer: &str,
+    options: &[MenuOption],
+    initial: usize,
+    cancel_uses_initial: bool,
+) -> Result<Option<usize>> {
     if options.is_empty() || initial >= options.len() {
         bail!("select_inline needs options and a valid initial index");
     }
@@ -74,7 +96,7 @@ pub fn select_inline(
     );
     let _ = out.flush();
 
-    result.map(Some)
+    result.map(|selection| selection.or_else(|| cancel_uses_initial.then_some(initial)))
 }
 
 fn run_menu(
@@ -83,7 +105,7 @@ fn run_menu(
     footer: &str,
     options: &[MenuOption],
     initial: usize,
-) -> Result<usize> {
+) -> Result<Option<usize>> {
     let mut selected = initial;
     let mut width = terminal::size().map(|(w, _)| w).unwrap_or(80);
     draw(out, question, footer, options, selected, width, false)?;
@@ -94,8 +116,8 @@ fn run_menu(
                 match key_outcome(key.code, key.modifiers, selected, options) {
                     KeyOutcome::Ignored => continue,
                     KeyOutcome::Select(i) => selected = i,
-                    KeyOutcome::Choose(i) => return Ok(i),
-                    KeyOutcome::Cancel => return Ok(initial),
+                    KeyOutcome::Choose(i) => return Ok(Some(i)),
+                    KeyOutcome::Cancel => return Ok(None),
                 }
             }
             Event::Resize(w, _) => width = w,

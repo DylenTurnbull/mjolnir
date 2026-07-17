@@ -111,6 +111,7 @@ enum TerminalRequest {
     StopDictation,
     ForceInlineRepair,
     CopyText(String),
+    Authenticate(crate::auth::AuthVendor),
 }
 
 fn terminal_request_forces_inline_repair(request: &TerminalRequest) -> bool {
@@ -880,7 +881,9 @@ async fn ui_loop(
                             request,
                             &dictation_tx,
                             &mut dictation_cancel_tx,
-                        )?;
+                            mode,
+                        )
+                        .await?;
                         if let Some(task) = state.take_ragnarok_launch() {
                             start_ragnarok(&mut state, task, ragnarok_tx.clone());
                             force_soft_inline_repair = mode == UiMode::InlineChat;
@@ -2381,12 +2384,13 @@ fn handle_transcript_viewer_mouse(state: &mut AppState, mouse: MouseEvent) {
     }
 }
 
-fn apply_terminal_request(
+async fn apply_terminal_request(
     terminal: &mut Terminal<TrackedBackend<Stdout>>,
     state: &mut AppState,
     request: TerminalRequest,
     dictation_tx: &mpsc::UnboundedSender<DictationEvent>,
     dictation_cancel_tx: &mut Option<std_mpsc::Sender<()>>,
+    mode: UiMode,
 ) -> Result<()> {
     match request {
         TerminalRequest::None => Ok(()),
@@ -2412,6 +2416,20 @@ fn apply_terminal_request(
         TerminalRequest::ForceInlineRepair => Ok(()),
         TerminalRequest::CopyText(text) => {
             copy_text_to_clipboard(state, &text, Some("URL"));
+            Ok(())
+        }
+        TerminalRequest::Authenticate(vendor) => {
+            restore_terminal_for_auth(terminal, mode)?;
+            let login = crate::auth::run_login(vendor).await;
+            let resumed = resume_terminal_after_auth(terminal, mode);
+            let notice = match (login, resumed) {
+                (Ok(message), Ok(())) => message,
+                (Err(error), Ok(())) => format!("Sign-in failed: {error:#}"),
+                (_, Err(error)) => return Err(error.context("restore UI after sign-in")),
+            };
+            if let Some(menu) = state.mjconfig_menu.as_mut() {
+                menu.editor.refresh_after_auth(notice);
+            }
             Ok(())
         }
     }
@@ -3853,6 +3871,31 @@ fn handle_mjconfig_menu_key(
             }
             inline_repair_request(mode)
         }
+        SettingsAction::Authenticate(vendor) => {
+            if state.is_busy() || state.has_pending_permission() || state.has_pending_elicitation()
+            {
+                if let Some(menu) = state.mjconfig_menu.as_mut() {
+                    menu.editor.notice =
+                        Some("Wait for the current turn or prompt before signing in".to_string());
+                }
+                TerminalRequest::None
+            } else if matches!(
+                vendor,
+                crate::auth::AuthVendor::OpenAi | crate::auth::AuthVendor::Anthropic
+            ) && crate::auth::executable(vendor).is_none()
+            {
+                if let Some(menu) = state.mjconfig_menu.as_mut() {
+                    menu.editor.notice = Some(format!(
+                        "{} CLI is not installed; run `{}`",
+                        vendor.label(),
+                        crate::auth::install_hint(vendor)
+                    ));
+                }
+                TerminalRequest::None
+            } else {
+                TerminalRequest::Authenticate(vendor)
+            }
+        }
         SettingsAction::None | SettingsAction::Changed => TerminalRequest::None,
     }
 }
@@ -4908,6 +4951,51 @@ pub fn restore_inline_chat_terminal(terminal: &mut Terminal<TrackedBackend<Stdou
     terminal_modes?;
     raw_mode?;
     cursor?;
+    Ok(())
+}
+
+pub(crate) fn restore_terminal_for_auth(
+    terminal: &mut Terminal<TrackedBackend<Stdout>>,
+    mode: UiMode,
+) -> Result<()> {
+    match mode {
+        UiMode::InlineChat => restore_inline_chat_terminal(terminal),
+        UiMode::FullscreenTui => restore_fullscreen_terminal(terminal),
+    }
+}
+
+pub(crate) fn resume_terminal_after_auth(
+    terminal: &mut Terminal<TrackedBackend<Stdout>>,
+    mode: UiMode,
+) -> Result<()> {
+    enable_raw_mode().context("enable raw mode after sign-in")?;
+    let modes = match mode {
+        UiMode::InlineChat => execute!(terminal.backend_mut(), EnableBracketedPaste),
+        UiMode::FullscreenTui => execute!(
+            terminal.backend_mut(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ),
+    };
+    if let Err(error) = modes {
+        let _ = disable_raw_mode();
+        return Err(error).context("restore terminal modes after sign-in");
+    }
+    match terminal.autoresize() {
+        Ok(()) => {}
+        Err(error) if is_cursor_position_timeout_io(&error) => {
+            trace_inline_cursor_position_timeout("post-sign-in autoresize", &error);
+        }
+        Err(error) => return Err(error).context("resize terminal after sign-in"),
+    }
+    match terminal.clear() {
+        Ok(()) => {}
+        Err(error) if is_cursor_position_timeout_io(&error) => {
+            trace_inline_cursor_position_timeout("post-sign-in clear", &error);
+        }
+        Err(error) => return Err(error).context("clear terminal after sign-in"),
+    }
     Ok(())
 }
 
@@ -13716,6 +13804,7 @@ mod tests {
 
         // ACP Servers tab: toggle Codex off.
         state.mjconfig_menu_key(KeyCode::Tab);
+        state.mjconfig_menu.as_mut().expect("menu").editor.selected = 4;
         handle_mjconfig_menu_key(
             &mut state,
             &cmd_tx,

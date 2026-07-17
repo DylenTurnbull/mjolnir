@@ -340,7 +340,7 @@ impl Config {
     }
 
     pub fn set_acp_server_policy(&mut self, id: &str, policy: AcpServerPolicy) -> bool {
-        if matches!(id, "codex-acp" | "claude-acp" | "anvil" | "opencode-acp") {
+        if matches!(id, "codex-acp" | "claude-acp" | "kimi" | "anvil") {
             if policy == AcpServerPolicy::Auto {
                 self.acp.policies.remove(id);
             } else {

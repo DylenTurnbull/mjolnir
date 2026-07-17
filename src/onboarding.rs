@@ -61,8 +61,32 @@ pub async fn run(
                 let Some(event) = event else {
                     return Ok(Outcome::Cancel);
                 };
-                if let Some(outcome) = handle_event(&mut editor, event.context("settings event")?) {
-                    return Ok(outcome);
+                if let Some(action) = handle_event(&mut editor, event.context("settings event")?) {
+                    match action {
+                        SettingsAction::Save => return Ok(Outcome::Accept(Box::new(editor.config.clone()))),
+                        SettingsAction::Cancel => {
+                            editor.cancel_background();
+                            return Ok(Outcome::Cancel);
+                        }
+                        SettingsAction::Authenticate(vendor) => {
+                            if matches!(vendor, crate::auth::AuthVendor::OpenAi | crate::auth::AuthVendor::Anthropic)
+                                && crate::auth::executable(vendor).is_none()
+                            {
+                                editor.notice = Some(format!(
+                                    "{} CLI is not installed; run `{}`",
+                                    vendor.label(),
+                                    crate::auth::install_hint(vendor)
+                                ));
+                            } else {
+                                crate::ui::restore_terminal_for_auth(terminal, crate::ui::UiMode::FullscreenTui)?;
+                                let login = crate::auth::run_login(vendor).await;
+                                crate::ui::resume_terminal_after_auth(terminal, crate::ui::UiMode::FullscreenTui)?;
+                                let notice = login.unwrap_or_else(|error| format!("Sign-in failed: {error:#}"));
+                                editor.refresh_after_auth(notice);
+                            }
+                        }
+                        SettingsAction::None | SettingsAction::Changed => {}
+                    }
                 }
             }
             _ = tick.tick() => editor.poll_background(),
@@ -73,7 +97,7 @@ pub async fn run(
     }
 }
 
-fn handle_event(editor: &mut SettingsEditor, event: CtEvent) -> Option<Outcome> {
+fn handle_event(editor: &mut SettingsEditor, event: CtEvent) -> Option<SettingsAction> {
     let CtEvent::Key(key) = event else {
         return None;
     };
@@ -82,16 +106,9 @@ fn handle_event(editor: &mut SettingsEditor, event: CtEvent) -> Option<Outcome> 
     }
     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
         editor.cancel_background();
-        return Some(Outcome::Cancel);
+        return Some(SettingsAction::Cancel);
     }
-    match editor.handle_key(key.code) {
-        SettingsAction::Save => Some(Outcome::Accept(Box::new(editor.config.clone()))),
-        SettingsAction::Cancel => {
-            editor.cancel_background();
-            Some(Outcome::Cancel)
-        }
-        SettingsAction::None | SettingsAction::Changed => None,
-    }
+    Some(editor.handle_key(key.code))
 }
 
 #[cfg(test)]

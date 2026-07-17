@@ -8,6 +8,7 @@ mod acp;
 mod anvil;
 mod app;
 mod archive;
+mod auth;
 mod bedrock_credits;
 mod claude_usage;
 mod clipboard;
@@ -22,6 +23,7 @@ mod deepswe;
 mod event;
 mod headless;
 mod install;
+mod kimi;
 mod labels;
 mod loki;
 mod menu;
@@ -1232,6 +1234,12 @@ async fn run_app(
         initial_agent.as_ref(),
     );
     let mut cfg = Config::load(&config_path)?;
+    if auth::detect(auth::AuthVendor::Kimi).available()
+        && cfg.acp.policy("kimi") != config::AcpServerPolicy::Disabled
+        && !cfg.acp.servers.iter().any(|server| server.id == "kimi")
+    {
+        kimi::start_background_install();
+    }
     let mut council_updates = None;
     let mut pending_probe_servers = Vec::new();
     let mut council = if first_startup {

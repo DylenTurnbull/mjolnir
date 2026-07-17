@@ -20,8 +20,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 pub enum AdapterKind {
     Codex,
     Claude,
+    Kimi,
     Anvil,
-    OpenCode,
     Custom,
 }
 
@@ -30,8 +30,8 @@ impl AdapterKind {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude Code",
+            Self::Kimi => "Kimi Code",
             Self::Anvil => "Anvil",
-            Self::OpenCode => "OpenCode",
             Self::Custom => "Custom",
         }
     }
@@ -40,8 +40,8 @@ impl AdapterKind {
         match source_id {
             "codex-acp" => Some(Self::Codex),
             "claude-acp" => Some(Self::Claude),
+            "kimi" => Some(Self::Kimi),
             "anvil" => Some(Self::Anvil),
-            "opencode-acp" => Some(Self::OpenCode),
             _ => None,
         }
     }
@@ -64,13 +64,10 @@ pub struct RuntimePermissionConfig {
     pub mode: CouncilPermissionMode,
 }
 
-const OPENCODE_MANUAL_PERMISSIONS: &str = r#"{"*":"ask","read":"allow","grep":"allow","glob":"allow","list":"allow","webfetch":"allow","websearch":"allow","question":"allow","plan_enter":"allow","plan_exit":"allow","todowrite":"allow","todoread":"allow"}"#;
-const OPENCODE_YOLO_PERMISSIONS: &str = r#"{"*":"allow"}"#;
-
 pub fn configure_permissions(
     kind: AdapterKind,
     mode: CouncilPermissionMode,
-    env: &mut HashMap<String, String>,
+    _env: &mut HashMap<String, String>,
 ) -> Option<RuntimePermissionConfig> {
     let (config_id, value, manual_fallback) = match (kind, mode) {
         (AdapterKind::Codex, CouncilPermissionMode::Manual) => ("mode", "read-only", None),
@@ -79,27 +76,13 @@ pub fn configure_permissions(
         (AdapterKind::Claude, CouncilPermissionMode::Manual) => ("mode", "default", None),
         (AdapterKind::Claude, CouncilPermissionMode::Auto) => ("mode", "auto", Some("default")),
         (AdapterKind::Claude, CouncilPermissionMode::Yolo) => ("mode", "bypassPermissions", None),
+        (AdapterKind::Kimi, _) => return None,
         (AdapterKind::Anvil, CouncilPermissionMode::Manual) => ("permission_mode", "default", None),
         (AdapterKind::Anvil, CouncilPermissionMode::Auto) => {
             ("permission_mode", "auto", Some("default"))
         }
         (AdapterKind::Anvil, CouncilPermissionMode::Yolo) => {
             ("permission_mode", "bypassPermissions", None)
-        }
-        (AdapterKind::OpenCode, CouncilPermissionMode::Manual) => {
-            env.insert(
-                "OPENCODE_PERMISSION".to_string(),
-                OPENCODE_MANUAL_PERMISSIONS.to_string(),
-            );
-            return None;
-        }
-        (AdapterKind::OpenCode, CouncilPermissionMode::Auto) => return None,
-        (AdapterKind::OpenCode, CouncilPermissionMode::Yolo) => {
-            env.insert(
-                "OPENCODE_PERMISSION".to_string(),
-                OPENCODE_YOLO_PERMISSIONS.to_string(),
-            );
-            return None;
         }
         (AdapterKind::Custom, _) => return None,
     };
@@ -211,8 +194,9 @@ pub struct ModelChoice {
 pub struct Availability {
     pub codex_credentials: bool,
     pub claude_credentials: bool,
+    pub kimi_credentials: bool,
+    pub kimi: Option<PathBuf>,
     pub anvil: Option<PathBuf>,
-    pub opencode: Option<PathBuf>,
 }
 
 impl Availability {
@@ -220,8 +204,9 @@ impl Availability {
         Self {
             codex_credentials: codex_credentials_available(),
             claude_credentials: claude_credentials_available(),
+            kimi_credentials: kimi_credentials_available(),
+            kimi: crate::kimi::detect().path,
             anvil: crate::anvil::detect().path,
-            opencode: find_on_path("opencode"),
         }
     }
 
@@ -229,10 +214,9 @@ impl Availability {
         match adapter_kind(model) {
             AdapterKind::Codex if !self.codex_credentials => Some("Codex credentials not found"),
             AdapterKind::Claude if !self.claude_credentials => Some("Claude credentials not found"),
+            AdapterKind::Kimi if !self.kimi_credentials => Some("Kimi credentials not found"),
+            AdapterKind::Kimi if self.kimi.is_none() => Some("Kimi Code is not installed"),
             AdapterKind::Anvil if self.anvil.is_none() => Some("managed Anvil is not ready"),
-            AdapterKind::OpenCode if self.opencode.is_none() => {
-                Some("opencode executable not found on PATH")
-            }
             _ => None,
         }
     }
@@ -264,41 +248,15 @@ fn credential_file_evidence(path: &Path, pointers: &[&str]) -> Option<String> {
 }
 
 fn codex_credentials_available() -> bool {
-    if nonempty_env(&["CODEX_API_KEY", "OPENAI_API_KEY"]) {
-        return true;
-    }
-    let root = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")));
-    root.is_some_and(|root| {
-        credential_file_has_any(
-            &root.join("auth.json"),
-            &[
-                "/OPENAI_API_KEY",
-                "/tokens/access_token",
-                "/tokens/refresh_token",
-            ],
-        )
-    })
+    crate::auth::detect(crate::auth::AuthVendor::OpenAi).available()
 }
 
 fn claude_credentials_available() -> bool {
-    if nonempty_env(&[
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-    ]) {
-        return true;
-    }
-    let root = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")));
-    root.is_some_and(|root| {
-        credential_file_has_any(
-            &root.join(".credentials.json"),
-            &["/claudeAiOauth/accessToken", "/claudeAiOauth/refreshToken"],
-        )
-    })
+    crate::auth::detect(crate::auth::AuthVendor::Anthropic).available()
+}
+
+fn kimi_credentials_available() -> bool {
+    crate::auth::detect(crate::auth::AuthVendor::Kimi).available()
 }
 
 fn codex_detection() -> Option<String> {
@@ -339,28 +297,11 @@ fn claude_detection() -> Option<String> {
     )
 }
 
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for directory in std::env::split_paths(&path) {
-        let candidate = directory.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        {
-            let exe = directory.join(format!("{name}.exe"));
-            if exe.is_file() {
-                return Some(exe);
-            }
-        }
-    }
-    None
-}
-
 fn adapter_kind(model: &str) -> AdapterKind {
     match deepswe::model_provider(model) {
         "openai" => AdapterKind::Codex,
         "anthropic" => AdapterKind::Claude,
+        "moonshotai" => AdapterKind::Kimi,
         _ => AdapterKind::Anvil,
     }
 }
@@ -369,7 +310,8 @@ fn adapter_accepts_model(kind: AdapterKind, model: &str) -> bool {
     match kind {
         AdapterKind::Codex => deepswe::model_provider(model) == "openai",
         AdapterKind::Claude => deepswe::model_provider(model) == "anthropic",
-        AdapterKind::Anvil | AdapterKind::OpenCode | AdapterKind::Custom => true,
+        AdapterKind::Kimi => deepswe::model_provider(model) == "moonshotai",
+        AdapterKind::Anvil | AdapterKind::Custom => true,
     }
 }
 
@@ -395,18 +337,21 @@ fn launch_for(kind: AdapterKind) -> AdapterLaunch {
             ],
             env: HashMap::new(),
         },
+        AdapterKind::Kimi => {
+            let detection = crate::kimi::detect();
+            AdapterLaunch {
+                kind,
+                source_id: "kimi".to_string(),
+                command: detection.path.unwrap_or_else(|| PathBuf::from("kimi")),
+                args: detection.args,
+                env: detection.env,
+            }
+        }
         AdapterKind::Anvil => AdapterLaunch {
             kind,
             source_id: "anvil".to_string(),
             command: PathBuf::from("anvil"),
             args: Vec::new(),
-            env: HashMap::new(),
-        },
-        AdapterKind::OpenCode => AdapterLaunch {
-            kind,
-            source_id: "opencode-acp".to_string(),
-            command: PathBuf::from("opencode"),
-            args: vec!["acp".to_string()],
             env: HashMap::new(),
         },
         AdapterKind::Custom => unreachable!("custom launches come from configuration"),
@@ -416,6 +361,7 @@ fn launch_for(kind: AdapterKind) -> AdapterLaunch {
 pub fn discover_inventory(config: &Config) -> AcpInventory {
     let availability = Availability::detect();
     let anvil = crate::anvil::detect();
+    let kimi = crate::kimi::detect();
     let detections = [
         (
             AdapterKind::Codex,
@@ -428,17 +374,15 @@ pub fn discover_inventory(config: &Config) -> AcpInventory {
             "Claude credentials not found".to_string(),
         ),
         (
+            AdapterKind::Kimi,
+            (availability.kimi_credentials && availability.kimi.is_some())
+                .then(|| kimi.evidence.clone()),
+            kimi.evidence.clone(),
+        ),
+        (
             AdapterKind::Anvil,
             availability.anvil.as_ref().map(|_| anvil.evidence.clone()),
             anvil.evidence.clone(),
-        ),
-        (
-            AdapterKind::OpenCode,
-            availability
-                .opencode
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            "opencode executable not found on PATH".to_string(),
         ),
     ];
     let mut servers = detections
@@ -458,7 +402,8 @@ pub fn discover_inventory(config: &Config) -> AcpInventory {
                 launch,
                 model_count: 0,
                 error: None,
-                installing: kind == AdapterKind::Anvil && anvil.installing,
+                installing: (kind == AdapterKind::Anvil && anvil.installing)
+                    || (kind == AdapterKind::Kimi && kimi.installing),
                 origin: None,
             }
         })
@@ -503,6 +448,19 @@ pub fn discover_inventory(config: &Config) -> AcpInventory {
             server.launch.command = path;
         }
     }
+    if let Some(server) = servers.iter_mut().find(|server| server.id == "kimi") {
+        server.error = kimi.error;
+        if let Some(path) = availability.kimi {
+            server.launch.command = path;
+        }
+    }
+    servers.retain(|server| {
+        server.detected
+            || server.installing
+            || server.error.is_some()
+            || server.origin.is_some()
+            || server.id == "anvil"
+    });
     AcpInventory { servers }
 }
 
@@ -711,19 +669,21 @@ fn credentialed_provider_capabilities(
     launch: &AdapterLaunch,
     rows: &[Row],
 ) -> Option<probe::AdapterCapabilities> {
-    matches!(launch.kind, AdapterKind::Codex | AdapterKind::Claude).then(|| {
-        probe::AdapterCapabilities {
-            http_mcp: true,
-            models: rows
-                .iter()
-                .filter(|row| adapter_accepts_model(launch.kind, &row.model))
-                .map(|row| probe::ModelOption {
-                    value: row.model.clone(),
-                    name: row.model.clone(),
-                    description: None,
-                })
-                .collect(),
-        }
+    matches!(
+        launch.kind,
+        AdapterKind::Codex | AdapterKind::Claude | AdapterKind::Kimi
+    )
+    .then(|| probe::AdapterCapabilities {
+        http_mcp: true,
+        models: rows
+            .iter()
+            .filter(|row| adapter_accepts_model(launch.kind, &row.model))
+            .map(|row| probe::ModelOption {
+                value: row.model.clone(),
+                name: row.model.clone(),
+                description: None,
+            })
+            .collect(),
     })
 }
 
@@ -884,20 +844,20 @@ fn unavailable_reason(
             availability.claude_credentials
                 || config.acp.policy("claude-acp") == AcpServerPolicy::Enabled
         }
+        AdapterKind::Kimi => {
+            (availability.kimi_credentials && availability.kimi.is_some())
+                || config.acp.policy("kimi") == AcpServerPolicy::Enabled
+        }
         AdapterKind::Anvil => {
             availability.anvil.is_some() || config.acp.policy("anvil") == AcpServerPolicy::Enabled
-        }
-        AdapterKind::OpenCode => {
-            availability.opencode.is_some()
-                || config.acp.policy("opencode-acp") == AcpServerPolicy::Enabled
         }
         AdapterKind::Custom => false,
     };
     let native_enabled = match native {
         AdapterKind::Codex => config.acp.policy("codex-acp") != AcpServerPolicy::Disabled,
         AdapterKind::Claude => config.acp.policy("claude-acp") != AcpServerPolicy::Disabled,
+        AdapterKind::Kimi => config.acp.policy("kimi") != AcpServerPolicy::Disabled,
         AdapterKind::Anvil => config.acp.policy("anvil") != AcpServerPolicy::Disabled,
-        AdapterKind::OpenCode => config.acp.policy("opencode-acp") != AcpServerPolicy::Disabled,
         AdapterKind::Custom => true,
     };
     if !native_enabled {
@@ -916,16 +876,6 @@ fn unavailable_reason(
             |reason| format!("anvil: {reason}"),
         ));
     }
-    if config.acp.policy("opencode-acp") != AcpServerPolicy::Disabled {
-        if availability.opencode.is_some() {
-            reasons.push(adapter_errors.get("opencode-acp").map_or_else(
-                || "opencode-acp did not advertise this model".to_string(),
-                |reason| format!("opencode-acp: {reason}"),
-            ));
-        } else {
-            reasons.push("opencode executable not found on PATH".to_string());
-        }
-    }
     reasons.sort();
     reasons.dedup();
     reasons.join("; ")
@@ -942,6 +892,14 @@ pub async fn resolve_waiting_for_installs(config: &Config, cwd: &Path) -> Result
         crate::anvil::wait_until_ready()
             .await
             .context("install managed Anvil")?;
+    }
+    if config.acp.policy("kimi") != AcpServerPolicy::Disabled
+        && kimi_credentials_available()
+        && crate::kimi::detect().path.is_none()
+    {
+        crate::kimi::wait_until_ready()
+            .await
+            .context("install managed Kimi Code")?;
     }
     resolve_inner(config, cwd).await
 }
@@ -1246,30 +1204,6 @@ mod tests {
         assert_eq!(anvil.value, "bypassPermissions");
     }
 
-    #[test]
-    fn opencode_permissions_use_process_local_rules() {
-        let mut env = HashMap::from([("KEEP".to_string(), "yes".to_string())]);
-        assert!(
-            configure_permissions(
-                AdapterKind::OpenCode,
-                CouncilPermissionMode::Manual,
-                &mut env
-            )
-            .is_none()
-        );
-        let manual: serde_json::Value = serde_json::from_str(&env["OPENCODE_PERMISSION"]).unwrap();
-        assert_eq!(manual["*"], "ask");
-        assert_eq!(manual["read"], "allow");
-        assert_eq!(env["KEEP"], "yes");
-
-        assert!(
-            configure_permissions(AdapterKind::OpenCode, CouncilPermissionMode::Yolo, &mut env)
-                .is_none()
-        );
-        let yolo: serde_json::Value = serde_json::from_str(&env["OPENCODE_PERMISSION"]).unwrap();
-        assert_eq!(yolo["*"], "allow");
-    }
-
     fn option(value: &str) -> probe::ModelOption {
         probe::ModelOption {
             value: value.to_string(),
@@ -1371,13 +1305,20 @@ mod tests {
     fn adapter_display_names_match_the_primary_acp_products() {
         assert_eq!(AdapterKind::Codex.display_name(), "Codex");
         assert_eq!(AdapterKind::Claude.display_name(), "Claude Code");
+        assert_eq!(AdapterKind::Kimi.display_name(), "Kimi Code");
         assert_eq!(AdapterKind::Anvil.display_name(), "Anvil");
     }
 
     #[test]
     fn opencode_normalizes_provider_and_openrouter_model_values() {
         let row = role_at("claude-opus-4-8", 0.5, 4.0).model;
-        let launch = launch_for(AdapterKind::OpenCode);
+        let launch = AdapterLaunch {
+            kind: AdapterKind::Custom,
+            source_id: "opencode".to_string(),
+            command: PathBuf::from("opencode"),
+            args: vec!["acp".to_string()],
+            env: HashMap::new(),
+        };
         assert!(option_matches(
             &launch,
             &option("anthropic/claude-opus-4-8"),
@@ -1446,7 +1387,7 @@ mod tests {
     #[test]
     fn auto_misses_are_inventory_state_not_probe_errors() {
         let mut config = Config::default();
-        for id in ["codex-acp", "claude-acp", "anvil", "opencode-acp"] {
+        for id in ["codex-acp", "claude-acp", "kimi", "anvil"] {
             config.set_acp_server_policy(id, AcpServerPolicy::Disabled);
         }
         let inventory = discover_inventory(&config);
@@ -1459,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn route_precedence_is_custom_then_native_then_anvil_then_opencode() {
+    fn route_precedence_is_custom_then_native_then_anvil() {
         let rows = vec![
             role_at("gpt-5-5", 0.6, 5.0).model,
             role_at("claude-opus-4-8", 0.5, 4.0).model,
@@ -1491,11 +1432,6 @@ mod tests {
                             "google/gemini-3-1-pro-preview",
                         ],
                     ),
-                ),
-                (
-                    4,
-                    launch_for(AdapterKind::OpenCode),
-                    capabilities(true, &["openrouter/google/gemini-3-1-pro-preview"]),
                 ),
             ],
         );
@@ -1595,8 +1531,9 @@ mod tests {
         let availability = Availability {
             codex_credentials: false,
             claude_credentials: false,
+            kimi_credentials: false,
+            kimi: None,
             anvil: None,
-            opencode: None,
         };
         assert_eq!(
             availability.missing_reason("gpt-5-6-sol"),
@@ -1619,8 +1556,9 @@ mod tests {
         let availability = Availability {
             codex_credentials: false,
             claude_credentials: false,
+            kimi_credentials: false,
+            kimi: None,
             anvil: None,
-            opencode: None,
         };
         let error = explicit("Thor", "gpt-5-6-sol", &rows, &[])
             .expect_err("must reject unavailable explicit model");

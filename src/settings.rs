@@ -50,6 +50,7 @@ impl SettingsTab {
 pub enum SettingsAction {
     None,
     Changed,
+    Authenticate(crate::auth::AuthVendor),
     Save,
     Cancel,
 }
@@ -142,9 +143,9 @@ impl SettingsEditor {
                 AcpView::Servers
                     if code == KeyCode::Char('r')
                         && self
-                            .inventory
-                            .servers
-                            .get(self.selected)
+                            .selected
+                            .checked_sub(4)
+                            .and_then(|index| self.inventory.servers.get(index))
                             .is_some_and(|server| {
                                 server.id == "anvil" && server.error.is_some()
                             }) =>
@@ -157,10 +158,10 @@ impl SettingsEditor {
         }
         match code {
             KeyCode::Esc => SettingsAction::Cancel,
-            KeyCode::Enter
-                if self.tab == SettingsTab::AcpServers
-                    && self.selected == self.inventory.servers.len() =>
-            {
+            KeyCode::Enter if self.tab == SettingsTab::AcpServers && self.selected < 3 => {
+                SettingsAction::Authenticate(crate::auth::AuthVendor::ALL[self.selected])
+            }
+            KeyCode::Enter if self.tab == SettingsTab::AcpServers && self.selected == 3 => {
                 self.open_catalog();
                 SettingsAction::None
             }
@@ -202,7 +203,7 @@ impl SettingsEditor {
     fn row_count(&self) -> usize {
         match self.tab {
             SettingsTab::Council => 7,
-            SettingsTab::AcpServers => self.inventory.servers.len() + 1,
+            SettingsTab::AcpServers => self.inventory.servers.len() + 4,
             SettingsTab::Appearance => 2,
         }
     }
@@ -232,7 +233,10 @@ impl SettingsEditor {
                 self.config.council.permission_mode = choices[next];
             }
             SettingsTab::AcpServers => {
-                let Some(server) = self.inventory.servers.get(self.selected) else {
+                let Some(index) = self.selected.checked_sub(4) else {
+                    return SettingsAction::None;
+                };
+                let Some(server) = self.inventory.servers.get(index) else {
                     return SettingsAction::None;
                 };
                 let id = server.id.clone();
@@ -289,7 +293,10 @@ impl SettingsEditor {
                 self.config.council.auto_failover = !self.config.council.auto_failover;
             }
             SettingsTab::AcpServers => {
-                let Some(server) = self.inventory.servers.get(self.selected) else {
+                let Some(index) = self.selected.checked_sub(4) else {
+                    return SettingsAction::None;
+                };
+                let Some(server) = self.inventory.servers.get(index) else {
                     return SettingsAction::None;
                 };
                 let id = server.id.clone();
@@ -489,6 +496,11 @@ impl SettingsEditor {
         self.inventory = refreshed;
     }
 
+    pub(crate) fn refresh_after_auth(&mut self, notice: String) {
+        self.inventory = crate::council::discover_inventory(&self.config);
+        self.notice = Some(notice);
+    }
+
     fn filtered_agents(&self) -> Vec<&Agent> {
         let RegistryState::Ready(registry) = &self.registry else {
             return Vec::new();
@@ -559,14 +571,14 @@ impl SettingsEditor {
             }
             KeyCode::Enter => {
                 let agents = self.filtered_agents();
-                if self.selected == agents.len() {
+                if self.selected == 0 {
                     self.acp_view = AcpView::Custom {
                         name: String::new(),
                         command: String::new(),
                         field: 0,
                     };
                     self.selected = 0;
-                } else if let Some(agent) = agents.get(self.selected).cloned().cloned() {
+                } else if let Some(agent) = agents.get(self.selected - 1).cloned().cloned() {
                     self.select_registry_agent(agent);
                 }
             }
@@ -665,7 +677,7 @@ impl SettingsEditor {
         self.config.acp.servers.push(server);
         self.inventory = crate::council::discover_inventory(&self.config);
         self.acp_view = AcpView::Servers;
-        self.selected = self.inventory.servers.len().saturating_sub(1);
+        self.selected = self.inventory.servers.len().saturating_sub(1) + 4;
         self.notice = None;
     }
 
@@ -802,6 +814,12 @@ pub fn draw_settings_panel(
         AcpView::Catalog { .. } if editor.installing.is_some() => "Esc cancel install view",
         AcpView::Catalog { .. } => "Type filter · ↑/↓ select · Enter add · Esc back",
         AcpView::Custom { .. } => "Tab field · Enter add · Esc back",
+        AcpView::Servers if editor.tab == SettingsTab::AcpServers && editor.selected < 3 => {
+            "Enter sign in · ↑/↓ select · Tab view · Esc cancel"
+        }
+        AcpView::Servers if editor.tab == SettingsTab::AcpServers && editor.selected == 3 => {
+            "Enter add server · ↑/↓ select · Tab view · Esc cancel"
+        }
         AcpView::Servers => {
             "Tab view · ↑/↓ select · ←/→ change · Space toggle · Enter save · Esc cancel"
         }
@@ -947,18 +965,41 @@ fn draw_servers(
         }
         AcpView::Servers => {}
     }
-    let mut lines = vec![
-        Line::styled(
-            "Auto-detected and explicitly configured ACP servers.",
-            Style::default().fg(theme.muted),
-        ),
-        Line::raw(""),
-    ];
-    let rows_available = area.height.saturating_sub(4) as usize / 2;
-    let start = editor
-        .selected
-        .saturating_sub(rows_available.saturating_sub(1));
-    let mut previous_section = None;
+    let mut lines = vec![Line::styled(
+        "Accounts",
+        Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for (index, vendor) in crate::auth::AuthVendor::ALL.into_iter().enumerate() {
+        let credentials = crate::auth::detect(vendor);
+        lines.push(selected_line(
+            editor.selected == index,
+            format!(
+                "{:<18} {} · enables {}",
+                vendor.label(),
+                credentials.status(),
+                vendor.enables()
+            ),
+            theme,
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(selected_line(
+        editor.selected == 3,
+        "+ Add server".to_string(),
+        theme,
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Servers",
+        Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let rows_available = area.height.saturating_sub(lines.len() as u16) as usize / 2;
+    let selected_server = editor.selected.saturating_sub(4);
+    let start = selected_server.saturating_sub(rows_available.saturating_sub(1));
     for (index, server) in editor
         .inventory
         .servers
@@ -967,20 +1008,6 @@ fn draw_servers(
         .skip(start)
         .take(rows_available)
     {
-        let section = if server.origin.is_some() {
-            "Configured"
-        } else {
-            "Built-in / autodetected"
-        };
-        if previous_section != Some(section) {
-            lines.push(Line::styled(
-                section,
-                Style::default()
-                    .fg(theme.muted)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            previous_section = Some(section);
-        }
         let status = if server.installing {
             "installing".to_string()
         } else if server.policy == AcpServerPolicy::Disabled {
@@ -993,15 +1020,13 @@ fn draw_servers(
                 server.model_count,
                 if server.model_count == 1 { "" } else { "s" }
             )
-        } else if server.selected && !server.detected {
-            "explicitly enabled; starts on /new or /clear".to_string()
         } else if server.detected {
-            "detected".to_string()
+            "ready".to_string()
         } else {
-            "not detected".to_string()
+            "not ready".to_string()
         };
         lines.push(selected_line(
-            editor.selected == index,
+            editor.selected == index + 4,
             format!(
                 "[{}] {:<16} {status}",
                 if server.installing {
@@ -1015,22 +1040,20 @@ fn draw_servers(
             ),
             theme,
         ));
+        let detail = if server.id == "anvil" {
+            server.evidence.clone()
+        } else {
+            let args = server.launch.args.join(" ");
+            let command = if args.is_empty() {
+                server.launch.command.display().to_string()
+            } else {
+                format!("{} {args}", server.launch.command.display())
+            };
+            format!("{} · {command}", server.evidence)
+        };
         lines.push(Line::styled(
-            format!(
-                "      {} · {} {}",
-                server.evidence,
-                server.launch.command.display(),
-                server.launch.args.join(" ")
-            ),
+            format!("      {detail}"),
             Style::default().fg(theme.muted),
-        ));
-    }
-    let add_index = editor.inventory.servers.len();
-    if add_index >= start && lines.len() + 1 < area.height as usize {
-        lines.push(selected_line(
-            editor.selected == add_index,
-            "+ Add server".to_string(),
-            theme,
         ));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
@@ -1103,8 +1126,7 @@ fn draw_catalog(
         }
         RegistryState::Ready(_) => {
             let agents = editor.filtered_agents();
-            let count = agents.len() + 1;
-            if let Some(agent) = agents.get(editor.selected) {
+            if let Some(agent) = editor.selected.checked_sub(1).and_then(|i| agents.get(i)) {
                 let platform = crate::registry::current_platform();
                 let kind = agent.preferred_kind(&platform);
                 let (command, download) = match kind {
@@ -1145,24 +1167,26 @@ fn draw_catalog(
                 lines.push(Line::styled(command, Style::default().fg(theme.muted)));
                 lines.push(Line::raw(""));
             }
+            lines.push(selected_line(
+                editor.selected == 0,
+                "Custom command...".to_string(),
+                theme,
+            ));
             let visible = area.height.saturating_sub(lines.len() as u16) as usize;
             let start = editor.selected.saturating_sub(visible.saturating_sub(1));
-            for (index, agent) in agents.iter().enumerate().skip(start).take(visible) {
+            for (index, agent) in agents
+                .iter()
+                .enumerate()
+                .skip(start.saturating_sub(1))
+                .take(visible)
+            {
                 let kind = agent
                     .preferred_kind(&crate::registry::current_platform())
                     .map(DistributionKind::label)
                     .unwrap_or("unsupported");
                 lines.push(selected_line(
-                    editor.selected == index,
+                    editor.selected == index + 1,
                     format!("{:<24} {kind} · {}", agent.name, agent.description),
-                    theme,
-                ));
-            }
-            let custom_index = count - 1;
-            if custom_index >= start && lines.len() < area.height as usize {
-                lines.push(selected_line(
-                    editor.selected == custom_index,
-                    "Custom command...".to_string(),
                     theme,
                 ));
             }
@@ -1253,6 +1277,13 @@ mod tests {
         assert!(!editor.config.thor.discrete_review);
         editor.handle_key(KeyCode::Tab);
         assert_eq!(editor.tab, SettingsTab::AcpServers);
+        editor.selected = editor
+            .inventory
+            .servers
+            .iter()
+            .position(|server| server.id == "codex-acp")
+            .expect("codex")
+            + 4;
         assert_eq!(
             editor.handle_key(KeyCode::Char(' ')),
             SettingsAction::Changed
@@ -1330,26 +1361,24 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_auto_server_can_be_explicitly_enabled() {
+    fn auto_server_can_be_explicitly_enabled() {
         let mut editor = SettingsEditor::new(Config::default(), Vec::new(), None);
         editor.tab = SettingsTab::AcpServers;
-        editor.selected = editor
+        let server_index = editor
             .inventory
             .servers
             .iter()
-            .position(|server| server.id == "opencode-acp")
-            .expect("opencode");
-        editor.inventory.servers[editor.selected].detected = false;
-        editor.inventory.servers[editor.selected].policy = AcpServerPolicy::Auto;
+            .position(|server| server.id == "anvil")
+            .expect("anvil");
+        editor.selected = server_index + 4;
+        editor.inventory.servers[server_index].detected = false;
+        editor.inventory.servers[server_index].policy = AcpServerPolicy::Auto;
 
         assert_eq!(
             editor.handle_key(KeyCode::Char(' ')),
             SettingsAction::Changed
         );
-        assert_eq!(
-            editor.config.acp.policy("opencode-acp"),
-            AcpServerPolicy::Enabled
-        );
+        assert_eq!(editor.config.acp.policy("anvil"), AcpServerPolicy::Enabled);
     }
 
     #[test]
@@ -1364,7 +1393,7 @@ mod tests {
             filter: String::new(),
         };
         editor.registry = RegistryState::Ready(registry);
-        editor.selected = 0;
+        editor.selected = 1;
 
         editor.handle_key(KeyCode::Enter);
 
@@ -1378,5 +1407,21 @@ mod tests {
         assert_eq!(server.command, PathBuf::from("npx"));
         assert_eq!(server.args, vec!["-y", "@google/gemini-cli", "--acp"]);
         assert_eq!(server.policy, AcpServerPolicy::Enabled);
+    }
+
+    #[test]
+    fn accounts_and_add_server_are_direct_actions() {
+        let mut editor = SettingsEditor::new(Config::default(), Vec::new(), None);
+        editor.tab = SettingsTab::AcpServers;
+
+        editor.selected = 2;
+        assert_eq!(
+            editor.handle_key(KeyCode::Enter),
+            SettingsAction::Authenticate(crate::auth::AuthVendor::Kimi)
+        );
+
+        editor.selected = 3;
+        assert_eq!(editor.handle_key(KeyCode::Enter), SettingsAction::None);
+        assert!(matches!(editor.acp_view, AcpView::Catalog { .. }));
     }
 }

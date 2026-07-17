@@ -126,7 +126,7 @@ impl Gate {
                     }
                 }
             }
-            AdapterKind::Anvil | AdapterKind::OpenCode | AdapterKind::Custom => Check::Unavailable,
+            AdapterKind::Kimi | AdapterKind::Anvil | AdapterKind::Custom => Check::Unavailable,
         };
         self.cache.lock().await.insert(
             key,

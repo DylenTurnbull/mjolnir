@@ -118,6 +118,29 @@ pub fn store(path: &Path, key: &str, command: &Path, capabilities: &AdapterCapab
     }
 }
 
+/// Remove one adapter's cached capabilities after shared credentials change.
+pub fn remove(path: &Path, key: &str) {
+    let mut file = read(path);
+    if file.entries.remove(key).is_none() {
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(serialized) = serde_json::to_vec_pretty(&file) else {
+        return;
+    };
+    let Ok(mut temp) = tempfile::NamedTempFile::new_in(parent) else {
+        return;
+    };
+    if std::io::Write::write_all(temp.as_file_mut(), &serialized).is_ok() {
+        let _ = temp.persist(path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +203,20 @@ mod tests {
 
         store(&cache, "custom:npx", &command, &capabilities("m1"));
         assert!(load(&cache, "custom:npx", &command, CACHE_TTL).is_some());
+    }
+
+    #[test]
+    fn removing_one_entry_preserves_the_others() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path().join("probes.json");
+        let command = dir.path().join("agent");
+        std::fs::write(&command, b"binary").expect("command");
+
+        store(&cache, "codex-acp", &command, &capabilities("gpt"));
+        store(&cache, "anvil", &command, &capabilities("kimi"));
+        remove(&cache, "codex-acp");
+
+        assert!(load(&cache, "codex-acp", &command, CACHE_TTL).is_none());
+        assert!(load(&cache, "anvil", &command, CACHE_TTL).is_some());
     }
 }

@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use crate::install::Progress;
 use crate::registry::BinaryTarget;
 
-pub const VERSION: &str = "0.22.0";
+pub const VERSION: &str = "0.23.0";
 
 static CLI_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 static INSTALL_STATE: LazyLock<Mutex<InstallState>> =
@@ -57,7 +57,7 @@ pub fn detect() -> Detection {
     }
     if let Some(path) = managed_path().filter(|path| path.is_file()) {
         return Detection {
-            evidence: format!("managed Anvil {VERSION} at {}", path.display()),
+            evidence: format!("managed Anvil {VERSION}"),
             path: Some(path),
             installing: false,
             error: None,
@@ -101,7 +101,7 @@ pub fn detect() -> Detection {
             }
         }
         InstallState::Ready(path) => Detection {
-            evidence: format!("managed Anvil {VERSION} at {}", path.display()),
+            evidence: format!("managed Anvil {VERSION}"),
             path: Some(path),
             installing: false,
             error: None,
@@ -305,8 +305,8 @@ mod tests {
     #[test]
     fn pinned_target_uses_the_anvil_release() {
         if let Some(target) = release_target() {
-            assert!(target.archive.contains("/anvil/releases/download/v0.22.0/"));
-            assert!(target.cmd.contains("brokk-anvil-v0.22.0"));
+            assert!(target.archive.contains("/anvil/releases/download/v0.23.0/"));
+            assert!(target.cmd.contains("brokk-anvil-v0.23.0"));
         }
     }
 }
