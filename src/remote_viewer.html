@@ -123,11 +123,14 @@
         --scrollbar-thumb: #2a2d2f;
 
         /* transcript kind hues: rails, labels, glyphs only — never washes */
-        --user: #5fa8cf;
+        --user: #FFD166;
         --agent: #4fae84;
         --thought: #c79a4b;
         --tool: #9a8cc9;
         --system: #6f7375;
+        --thor: #78c5ff;
+        --loki: #6edb78;
+        --eitri: #9a8cc9;
 
         /* type */
         --font-display: "Staatliches", "Arial Narrow", Impact, sans-serif;
@@ -194,11 +197,14 @@
         --overlay-shadow: rgb(61 54 43 / 0.2);
         --scrollbar-thumb: #c8beb0;
 
-        --user: #176b96;
+        --user: #7A4B00;
         --agent: #14754f;
         --thought: #88600e;
         --tool: #6c58a0;
         --system: #777c7f;
+        --thor: #0066b3;
+        --loki: #197a32;
+        --eitri: #6c58a0;
       }
 
       * {
@@ -1305,6 +1311,9 @@
         &[data-kind="agent"] { --kind-color: var(--agent); }
         &[data-kind="thought"] { --kind-color: var(--thought); }
         &[data-kind="tool"] { --kind-color: var(--tool); }
+        &[data-actor="thor"] { --kind-color: var(--thor); }
+        &[data-actor="loki"] { --kind-color: var(--loki); }
+        &[data-actor="eitri"] { --kind-color: var(--eitri); }
       }
 
       @keyframes entry-in {
@@ -4622,7 +4631,11 @@
       function createEntryRefs(entry) {
         const el = cloneTemplate(entryTpl);
         const kind = entryKind(entry);
+        const actor = typeof entry.actor === "string" ? entry.actor.toLowerCase() : "";
         el.dataset.kind = kind;
+        if (actor === "thor" || actor === "loki" || actor === "eitri") {
+          el.dataset.actor = actor;
+        }
         el.querySelector(".entry-kind").textContent = entryLabel(kind, entry.actor);
         setTimestamp(el.querySelector(".entry-time"), entry.timestamp || "");
         const refs = {
