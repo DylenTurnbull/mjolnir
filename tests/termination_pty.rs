@@ -179,6 +179,16 @@ fn sigterm_restores_real_pty_terminal() {
     let after = termios(slave.as_raw_fd());
     assert_eq!(after.c_iflag, before.c_iflag, "restore input flags");
     assert_eq!(after.c_oflag, before.c_oflag, "restore output flags");
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin may surface this kernel-managed pending-input flag after restoration.
+        assert_eq!(
+            after.c_lflag & !libc::PENDIN,
+            before.c_lflag & !libc::PENDIN,
+            "restore local flags"
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(after.c_lflag, before.c_lflag, "restore local flags");
 
     let output = String::from_utf8_lossy(&output);
