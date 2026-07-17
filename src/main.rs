@@ -1057,7 +1057,7 @@ struct ActiveSideRuntime {
 
 fn isolated_side_runtime_config(
     agent: &SelectedAgent,
-    session_id: String,
+    resume_session: Option<String>,
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
     agent_stderr: Option<PathBuf>,
@@ -1069,7 +1069,7 @@ fn isolated_side_runtime_config(
         cwd,
         additional_directories,
         mcp_servers: Vec::new(),
-        resume_session: Some(session_id),
+        resume_session,
         env: agent.env.clone(),
         agent_stderr,
         fs_max_text_bytes,
@@ -2129,8 +2129,8 @@ async fn run_session(
                     });
                     continue;
                 }
-                let child_session_id = match response.await {
-                    Ok(Ok(session_id)) => session_id,
+                let source = match response.await {
+                    Ok(Ok(source)) => source,
                     Ok(Err(message)) => {
                         let _ = side_ui_event_tx.send(UiEvent::SideStartFailed { message });
                         continue;
@@ -2143,12 +2143,14 @@ async fn run_session(
                         continue;
                     }
                 };
+                let fork_source = source.has_history;
+                let resume_session = fork_source.then_some(source.session_id);
 
                 let (side_event_tx, mut side_event_rx) = mpsc::unbounded_channel();
                 let (side_cmd_tx, side_cmd_rx) = mpsc::unbounded_channel();
                 let side_cfg = isolated_side_runtime_config(
                     &side_agent,
-                    child_session_id.clone(),
+                    resume_session,
                     side_cwd.clone(),
                     side_additional_directories.clone(),
                     side_agent_stderr.clone(),
@@ -2158,20 +2160,36 @@ async fn run_session(
                     let _ = acp::run(side_cfg, side_event_tx, side_cmd_rx).await;
                 });
                 let forwarded_events = side_ui_event_tx.clone();
+                let (child_ready_tx, child_ready_rx) = tokio::sync::oneshot::channel();
+                let expected_session_starts = if fork_source { 2 } else { 1 };
                 let event_task = tokio::spawn(async move {
+                    let mut child_ready_tx = Some(child_ready_tx);
+                    let mut session_starts = 0_u8;
                     let mut started = false;
                     while let Some(event) = side_event_rx.recv().await {
-                        if matches!(event, UiEvent::SessionStarted { .. }) {
-                            started = true;
-                        }
-                        if !started
-                            && matches!(
-                                event,
-                                UiEvent::SessionUpdate(_)
-                                    | UiEvent::SessionConfigOptions { .. }
-                                    | UiEvent::TerminalOutput(_)
-                            )
-                        {
+                        if let UiEvent::SessionStarted { session_id, .. } = &event {
+                            session_starts = session_starts.saturating_add(1);
+                            if session_starts < expected_session_starts {
+                                continue;
+                            }
+                            if session_starts == expected_session_starts {
+                                started = true;
+                                if let Some(tx) = child_ready_tx.take() {
+                                    let _ = tx.send(Ok(session_id.clone()));
+                                }
+                            }
+                        } else if !started {
+                            let failure = match &event {
+                                UiEvent::SessionForkFailed { message }
+                                | UiEvent::Fatal(message) => Some(message.clone()),
+                                _ => None,
+                            };
+                            if let Some(message) = failure {
+                                if let Some(tx) = child_ready_tx.take() {
+                                    let _ = tx.send(Err(message));
+                                }
+                                break;
+                            }
                             continue;
                         }
                         if forwarded_events
@@ -2182,6 +2200,40 @@ async fn run_session(
                         }
                     }
                 });
+                if fork_source && side_cmd_tx.send(UiCommand::ForkSession).is_err() {
+                    runtime_task.abort();
+                    event_task.abort();
+                    let _ = side_ui_event_tx.send(UiEvent::SideStartFailed {
+                        message: "the side ACP runtime closed before forking".to_string(),
+                    });
+                    continue;
+                }
+                let child_session_id =
+                    match tokio::time::timeout(Duration::from_secs(15), child_ready_rx).await {
+                        Ok(Ok(Ok(session_id))) => session_id,
+                        Ok(Ok(Err(message))) => {
+                            let _ = side_cmd_tx.send(UiCommand::Shutdown);
+                            event_task.abort();
+                            let _ = side_ui_event_tx.send(UiEvent::SideStartFailed { message });
+                            continue;
+                        }
+                        Ok(Err(_)) => {
+                            let _ = side_cmd_tx.send(UiCommand::Shutdown);
+                            event_task.abort();
+                            let _ = side_ui_event_tx.send(UiEvent::SideStartFailed {
+                                message: "the side ACP runtime dropped its fork result".to_string(),
+                            });
+                            continue;
+                        }
+                        Err(_) => {
+                            let _ = side_cmd_tx.send(UiCommand::Shutdown);
+                            event_task.abort();
+                            let _ = side_ui_event_tx.send(UiEvent::SideStartFailed {
+                                message: "side session fork timed out".to_string(),
+                            });
+                            continue;
+                        }
+                    };
                 side_runtime = Some(ActiveSideRuntime {
                     session_id: child_session_id,
                     commands: side_cmd_tx,
@@ -2851,7 +2903,7 @@ mod tests {
         };
         let cfg = isolated_side_runtime_config(
             &agent,
-            "child-session".to_string(),
+            Some("child-session".to_string()),
             PathBuf::from("/workspace"),
             vec![PathBuf::from("/extra")],
             None,

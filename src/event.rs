@@ -315,6 +315,12 @@ pub enum AgentCommandOutcome {
     Failed(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SideSessionSource {
+    pub session_id: String,
+    pub has_history: bool,
+}
+
 /// Commands flowing from the UI task into the ACP runtime.
 #[derive(Debug)]
 pub enum UiCommand {
@@ -341,9 +347,10 @@ pub enum UiCommand {
     },
     /// Fork the current ACP session and continue in the forked session.
     ForkSession,
-    /// Fork without replacing the runtime's active main session.
+    /// Return the active main session that an isolated side runtime should
+    /// resume and fork on its own connection when it has persisted history.
     ForkSideSession {
-        responder: oneshot::Sender<Result<String, String>>,
+        responder: oneshot::Sender<Result<SideSessionSource, String>>,
     },
     /// Enter an isolated side conversation, optionally sending an initial prompt.
     StartSide,

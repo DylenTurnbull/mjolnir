@@ -42,8 +42,9 @@ use crate::archive;
 use crate::code_agent;
 use crate::event::{
     AgentCommandOutcome, CompactTrigger, ElicitationOutcome, ElicitationPrompt, LoadSessionResult,
-    PermissionDecision, PermissionPrompt, PromptImage, SessionConfigTarget, TerminalOutputSnapshot,
-    UiCommand, UiEvent, WorkspaceDiff, WorkspaceDiffEvent, content_block_text,
+    PermissionDecision, PermissionPrompt, PromptImage, SessionConfigTarget, SideSessionSource,
+    TerminalOutputSnapshot, UiCommand, UiEvent, WorkspaceDiff, WorkspaceDiffEvent,
+    content_block_text,
 };
 use crate::paths::{WorkspaceRoots, normalize_spawn_program, path_is_under_any_root};
 use crate::{deepswe, model_resolve};
@@ -104,7 +105,6 @@ pub struct RuntimeRoleConfig {
 }
 
 const MAX_LOGGED_UPDATE_BYTES: usize = 4096;
-const SIDE_FORK_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn bounded_log_text(mut text: String) -> String {
     if text.len() <= MAX_LOGGED_UPDATE_BYTES {
@@ -2036,6 +2036,7 @@ async fn drive_session(
     workspace_roots.push(cwd.clone());
     workspace_roots.extend(additional_directories.iter().cloned());
     let mut next_turn_diff_id = 1_u64;
+    let mut session_has_history = resumed;
 
     while let Some(cmd) = ui_rx.recv().await {
         match cmd {
@@ -2063,7 +2064,7 @@ async fn drive_session(
                 session_state.clear_permissions_cancelled(&session_id).await;
                 let prompt = prompt_content_blocks(text, images, side_prompt_policy);
                 let req = PromptRequest::new(session_id.clone(), prompt);
-                if !drive_prompt_turn(
+                let keep_running = drive_prompt_turn(
                     &conn,
                     &session_id,
                     req,
@@ -2076,9 +2077,11 @@ async fn drive_session(
                         turn_id: next_turn_diff_id,
                     },
                     &code_agent_controller,
+                    session_has_history,
                 )
-                .await?
-                {
+                .await?;
+                session_has_history = true;
+                if !keep_running {
                     break;
                 }
                 next_turn_diff_id = next_turn_diff_id.saturating_add(1);
@@ -2132,8 +2135,10 @@ async fn drive_session(
                 {
                     Err(reason)
                 } else {
-                    fork_side_session(&conn, &session_id, cwd.clone(), &additional_directories)
-                        .await
+                    Ok(SideSessionSource {
+                        session_id: session_id.to_string(),
+                        has_history: session_has_history,
+                    })
                 };
                 let _ = responder.send(result);
             }
@@ -2165,6 +2170,7 @@ async fn drive_session(
                         Ok(()) => {
                             let _ = responder.send(LoadSessionResult::Switched);
                             context_usage.reset_for_session();
+                            session_has_history = true;
                         }
                         Err(launch_err) => {
                             let _ = responder.send(LoadSessionResult::Fallback {
@@ -2210,6 +2216,7 @@ async fn drive_session(
                     Ok(switched_session_id) => {
                         session_id = switched_session_id;
                         context_usage.reset_for_session();
+                        session_has_history = true;
                         let _ = responder.send(LoadSessionResult::Switched);
                     }
                     Err(launch_err) => {
@@ -2573,24 +2580,6 @@ async fn fork_session(
     let config = session_config_from_parts(resp.config_options, resp.modes)
         .map(|(options, targets)| SessionConfigCache { options, targets });
     Ok((resp.session_id, config))
-}
-
-async fn fork_side_session(
-    conn: &ConnectionTo<Agent>,
-    session_id: &SessionId,
-    cwd: PathBuf,
-    additional_directories: &[PathBuf],
-) -> std::result::Result<String, String> {
-    match tokio::time::timeout(
-        SIDE_FORK_TIMEOUT,
-        fork_session(conn, session_id, cwd, additional_directories, &[]),
-    )
-    .await
-    {
-        Ok(Ok((child_id, _))) => Ok(child_id.to_string()),
-        Ok(Err(error)) => Err(format!("side session fork failed: {error}")),
-        Err(_) => Err("side session fork timed out".to_string()),
-    }
 }
 
 /// How a spawned agent relates to the controlling terminal.
@@ -4555,6 +4544,7 @@ async fn drive_prompt_turn(
     session_state: &RuntimeSessionState,
     diff_config: PromptTurnDiffConfig<'_>,
     code_agent_controller: &code_agent::Controller,
+    side_source_has_history: bool,
 ) -> Result<bool> {
     let turn_diff_tracker =
         TurnDiffTracker::snapshot(diff_config.workspace_roots, diff_config.max_text_bytes).await;
@@ -4626,14 +4616,10 @@ async fn drive_prompt_turn(
                         ));
                     }
                     Some(UiCommand::ForkSideSession { responder }) => {
-                        let result = fork_side_session(
-                            conn,
-                            session_id,
-                            diff_config.workspace_roots[0].clone(),
-                            &diff_config.workspace_roots[1..],
-                        )
-                        .await;
-                        let _ = responder.send(result);
+                        let _ = responder.send(Ok(SideSessionSource {
+                            session_id: session_id.to_string(),
+                            has_history: side_source_has_history,
+                        }));
                     }
                     Some(UiCommand::LoadSession { responder, .. }) => {
                         let _ = responder.send(LoadSessionResult::Fallback {
@@ -7930,7 +7916,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn side_fork_keeps_main_session_active_and_forwards_main_events() {
+    async fn side_source_keeps_main_session_active_and_forwards_main_events() {
         let root = tempfile::tempdir().expect("root");
         let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
         let (cr, cw) = split(client_side);
@@ -7955,30 +7941,62 @@ mod tests {
         assert_eq!(
             response
                 .await
-                .expect("side fork response")
-                .expect("side fork"),
-            "forked-session"
+                .expect("side source response")
+                .expect("side source"),
+            SideSessionSource {
+                session_id: "test-session".to_string(),
+                has_history: false,
+            }
         );
+
+        cmd_tx
+            .send(UiCommand::SendPrompt {
+                text: "main remains active".to_string(),
+                images: Vec::new(),
+            })
+            .expect("main prompt after side source");
 
         let event = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let event = ui_rx.recv().await.expect("event channel");
                 match event {
                     UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(chunk))
-                        if content_block_text(&chunk.content) == "stale parent update" =>
+                        if content_block_text(&chunk.content) == "ack" =>
                     {
                         break "main update";
-                    }
-                    UiEvent::SessionStarted { session_id, .. } => {
-                        assert_ne!(session_id, "forked-session");
                     }
                     _ => {}
                 }
             }
         })
         .await
-        .expect("main event after side fork");
+        .expect("main event after side source");
         assert_eq!(event, "main update");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(ui_rx.recv().await, Some(UiEvent::PromptDone { .. })) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("main prompt completion after side source");
+
+        let (responder, response) = oneshot::channel();
+        cmd_tx
+            .send(UiCommand::ForkSideSession { responder })
+            .expect("request side source after prompt");
+        assert_eq!(
+            response
+                .await
+                .expect("side source response after prompt")
+                .expect("side source after prompt"),
+            SideSessionSource {
+                session_id: "test-session".to_string(),
+                has_history: true,
+            }
+        );
 
         cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
         client_task
