@@ -315,6 +315,13 @@ pub enum AgentCommandOutcome {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewTarget {
+    Recent,
+    Uncommitted,
+    Head,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SideSessionSource {
     pub session_id: String,
@@ -336,6 +343,8 @@ pub enum UiCommand {
     },
     /// Change Thor's discrete review policy without replacing its ACP session.
     SetThorReviewPolicy { enabled: bool },
+    /// Run one Mjolnir-owned findings-only review while Thor is idle.
+    RunReview { target: ReviewTarget },
     /// Compact Thor and the persistent Loki session where each role advertises
     /// the exact portable command.
     CompactCouncil,

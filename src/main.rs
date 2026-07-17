@@ -2051,6 +2051,7 @@ async fn run_session(
             implementation_handoffs: implementation_handoffs_this_turn.clone(),
             active_implementation_workers: active_implementation_workers.clone(),
             discrete_review: thor_config.discrete_review,
+            review_root: cwd.clone(),
             log_context: Some(council_orchestrator::LogContext {
                 council_session: council_session.clone(),
                 model: council.thor.model.model.clone(),
@@ -2271,6 +2272,10 @@ async fn run_session(
             cmd_tracker.observe_command(&command);
             if let UiCommand::SetThorReviewPolicy { enabled } = &command {
                 cmd_orchestrator.set_review_enabled(*enabled);
+                continue;
+            }
+            if let UiCommand::RunReview { target } = command {
+                cmd_orchestrator.request_review(target);
                 continue;
             }
             if matches!(command, UiCommand::CompactCouncil) {

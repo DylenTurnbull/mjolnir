@@ -25,8 +25,8 @@ use agent_client_protocol::schema::v1::{
 
 use crate::event::{
     CodeAgentEvent, CodeAgentOutcome, ElicitationOutcome, ElicitationPrompt, InternalMessage,
-    LokiActivity, PermissionDecision, PermissionPrompt, PromptImage, SessionConfigTarget,
-    TerminalOutputSnapshot, UiEvent, content_block_text,
+    LokiActivity, PermissionDecision, PermissionPrompt, PromptImage, ReviewTarget,
+    SessionConfigTarget, TerminalOutputSnapshot, UiEvent, content_block_text,
 };
 use crate::palette::TerminalTheme;
 use crate::ragnarok;
@@ -55,7 +55,7 @@ const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
 const BUILTIN_MODELS_COMMAND: &str = "models";
 const BUILTIN_COUNCIL_COMMAND: &str = "council";
-const BUILTIN_REVIEWS_COMMAND: &str = "reviews";
+const BUILTIN_REVIEW_COMMAND: &str = "review";
 const BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
 
@@ -117,10 +117,10 @@ fn builtin_council_command() -> AvailableCommand {
     )
 }
 
-fn builtin_reviews_command() -> AvailableCommand {
+fn builtin_review_command() -> AvailableCommand {
     AvailableCommand::new(
-        BUILTIN_REVIEWS_COMMAND,
-        "show or change Thor review (usage: /reviews [thor on|off])",
+        BUILTIN_REVIEW_COMMAND,
+        "review recent, uncommitted, or HEAD changes",
     )
 }
 
@@ -147,7 +147,7 @@ fn install_builtin_commands(
             && command.name != BUILTIN_MJCONFIG_COMMAND
             && command.name != BUILTIN_MODELS_COMMAND
             && command.name != BUILTIN_COUNCIL_COMMAND
-            && command.name != BUILTIN_REVIEWS_COMMAND
+            && command.name != BUILTIN_REVIEW_COMMAND
             && command.name != BUILTIN_RAGNAROK_COMMAND
     });
     if include_fork {
@@ -158,7 +158,7 @@ fn install_builtin_commands(
     }
     commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_mjconfig_command());
-    commands.insert(0, builtin_reviews_command());
+    commands.insert(0, builtin_review_command());
     commands.insert(0, builtin_council_command());
     commands.insert(0, builtin_models_command());
     commands.insert(0, builtin_export_command());
@@ -180,7 +180,7 @@ fn install_side_builtin_commands(commands: &mut Vec<AvailableCommand>) {
             BUILTIN_MJCONFIG_COMMAND,
             BUILTIN_MODELS_COMMAND,
             BUILTIN_COUNCIL_COMMAND,
-            BUILTIN_REVIEWS_COMMAND,
+            BUILTIN_REVIEW_COMMAND,
             BUILTIN_RAGNAROK_COMMAND,
         ]
         .contains(&command.name.as_str())
@@ -789,6 +789,7 @@ pub struct AppState {
     elicitation_queue: VecDeque<PendingElicitation>,
     pub agent_picker: Option<AgentPicker>,
     pub config_picker: Option<ConfigPicker>,
+    pub review_picker: Option<ReviewPicker>,
     /// Scroll offset measured in rendered lines from the bottom of the
     /// transcript. `0` keeps the view pinned to the newest line.
     pub scroll_offset: usize,
@@ -1076,6 +1077,11 @@ pub struct ConfigPicker {
     pub filtered_indices: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ReviewPicker {
+    pub selected: usize,
+}
+
 /// Autocomplete popover for slash-commands.
 ///
 /// `matches` holds indices into `AppState.available_commands` so the
@@ -1149,6 +1155,7 @@ impl AppState {
             elicitation_queue: VecDeque::new(),
             agent_picker: None,
             config_picker: None,
+            review_picker: None,
             scroll_offset: 0,
             expand_transcript_details: false,
             transcript_viewer: false,
@@ -1388,6 +1395,26 @@ impl AppState {
         }
     }
 
+    pub fn open_review_picker(&mut self) {
+        self.review_picker = Some(ReviewPicker::default());
+    }
+
+    pub fn review_picker_move(&mut self, delta: i32) {
+        let Some(picker) = self.review_picker.as_mut() else {
+            return;
+        };
+        picker.selected = (picker.selected as i32 + delta).rem_euclid(3) as usize;
+    }
+
+    pub fn review_picker_accept(&mut self) -> Option<ReviewTarget> {
+        let selected = self.review_picker.take()?.selected;
+        Some(match selected {
+            0 => ReviewTarget::Recent,
+            1 => ReviewTarget::Uncommitted,
+            _ => ReviewTarget::Head,
+        })
+    }
+
     /// Close the menu, keeping its live appearance preview.
     pub fn mjconfig_menu_accept(&mut self) -> Option<crate::config::Config> {
         self.mjconfig_menu.take().map(|menu| menu.editor.config)
@@ -1401,31 +1428,6 @@ impl AppState {
             self.set_theme(menu.orig_theme);
             self.set_spinner_style(menu.orig_spinner);
         }
-    }
-
-    pub fn review_summary(&self) -> String {
-        format!(
-            "Council reviews · Thor discrete {}",
-            on_off(self.thor_review_enabled)
-        )
-    }
-
-    pub fn set_review_policy(&mut self, role: &str, enabled: bool) -> Result<(), String> {
-        let path = self
-            .config_path
-            .as_deref()
-            .ok_or_else(|| "config path is unavailable".to_string())?;
-        let mut config =
-            crate::config::Config::load(path).map_err(|error| format!("load config: {error:#}"))?;
-        if !role.eq_ignore_ascii_case("thor") {
-            return Err("review role must be thor".to_string());
-        }
-        config.thor.discrete_review = enabled;
-        self.thor_review_enabled = enabled;
-        config
-            .save(path)
-            .map_err(|error| format!("save config: {error:#}"))?;
-        Ok(())
     }
 
     /// Stage a prompt to fire when the current turn completes.
@@ -2420,8 +2422,11 @@ impl AppState {
                 // turn after the user's turn already completed. Re-enter the
                 // streaming state so submissions queue behind it instead of
                 // racing the in-flight prompt.
-                if message.kind == crate::event::InternalMessageKind::Interjection
-                    && self.connection_state == ConnectionState::Ready
+                if matches!(
+                    message.kind,
+                    crate::event::InternalMessageKind::Interjection
+                        | crate::event::InternalMessageKind::DiscreteReview
+                ) && self.connection_state == ConnectionState::Ready
                 {
                     self.set_connection_state(ConnectionState::Streaming);
                     self.turn_started_at = Some(Instant::now());
@@ -3167,10 +3172,6 @@ fn move_wrapped(selected: &mut usize, delta: i32, len: usize) {
     if len > 0 {
         *selected = (*selected as i32 + delta).rem_euclid(len as i32) as usize;
     }
-}
-
-fn on_off(enabled: bool) -> &'static str {
-    if enabled { "on" } else { "off" }
 }
 
 fn config_option_targets(options: &[SessionConfigOption]) -> Vec<SessionConfigTarget> {
@@ -6744,7 +6745,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "compact", "load", "export", "models", "council", "reviews",
+                "new", "clear", "compact", "load", "export", "models", "council", "review",
                 "mjconfig", "ragnarok"
             ]
         );
@@ -6774,7 +6775,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "compact", "load", "export", "models", "council", "reviews",
+                "new", "clear", "compact", "load", "export", "models", "council", "review",
                 "mjconfig", "ragnarok", "fork"
             ]
         );
@@ -6817,7 +6818,7 @@ mod tests {
                 "export",
                 "models",
                 "council",
-                "reviews",
+                "review",
                 "mjconfig",
                 "ragnarok",
                 "fork",
@@ -6880,7 +6881,7 @@ mod tests {
                 "export",
                 "models",
                 "council",
-                "reviews",
+                "review",
                 "mjconfig",
                 "ragnarok",
                 "review_pr"

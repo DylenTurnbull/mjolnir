@@ -53,8 +53,8 @@ use crate::clipboard::{
 };
 use crate::config;
 use crate::event::{
-    LokiActivity, LokiIdentity, PermissionDecision, PermissionPrompt, PromptImage, UiCommand,
-    UiEvent,
+    LokiActivity, LokiIdentity, PermissionDecision, PermissionPrompt, PromptImage, ReviewTarget,
+    UiCommand, UiEvent,
 };
 use crate::notifications::TerminalNotificationBackend;
 use crate::palette::TerminalTheme;
@@ -1897,6 +1897,8 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
         usize::from(INLINE_MJCONFIG_HEIGHT)
     } else if let Some(picker) = state.agent_picker.as_ref() {
         picker.role_indices.len().saturating_add(4)
+    } else if state.review_picker.is_some() {
+        6
     } else if let Some(pending) = state.pending_permission() {
         permission_view_lines(
             pending,
@@ -2153,6 +2155,10 @@ fn handle_crossterm(
 
     if state.agent_picker.is_some() {
         return handle_agent_picker_key(state, key.modifiers, key.code, mode);
+    }
+
+    if state.review_picker.is_some() {
+        return handle_review_picker_key(state, cmd_tx, key.modifiers, key.code, mode);
     }
 
     if state.config_picker.is_some() {
@@ -3692,27 +3698,36 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && (text == "/reviews" || text.starts_with("/reviews ")) {
+    if images.is_empty()
+        && let Some(rest) = text.strip_prefix("/review")
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
         state.scroll_input_to_bottom();
-        let args = text["/reviews".len()..]
-            .split_whitespace()
-            .collect::<Vec<_>>();
-        match args.as_slice() {
-            [] => state.record_status_message(StatusKind::Info, state.review_summary()),
-            [role, value] if matches!(*value, "on" | "off") => {
-                let enabled = *value == "on";
-                match state.set_review_policy(role, enabled) {
-                    Ok(()) => {
-                        let _ = cmd_tx.send(UiCommand::SetThorReviewPolicy { enabled });
-                        state.record_status_message(StatusKind::Info, state.review_summary());
-                    }
-                    Err(message) => state.record_status_message(StatusKind::Warning, message),
-                }
-            }
-            _ => state.record_status_message(StatusKind::Warning, "usage: /reviews [thor on|off]"),
+        if state.is_side {
+            state.record_status_message(
+                StatusKind::Warning,
+                "manual review is unavailable in side conversations",
+            );
+        } else if state.runtime_closed || state.session_id.is_none() {
+            state.record_status_message(StatusKind::Warning, "Thor is unavailable");
+        } else if state.is_busy() {
+            state.record_status_message(
+                StatusKind::Warning,
+                "manual review is only available while Thor is idle",
+            );
+        } else if rest.trim().is_empty() {
+            state.open_review_picker();
+        } else if let Some(target) = parse_review_target(rest.trim()) {
+            state.record_status_message(StatusKind::Info, "preparing manual review…");
+            let _ = cmd_tx.send(UiCommand::RunReview { target });
+        } else {
+            state.record_status_message(
+                StatusKind::Warning,
+                "usage: /review [recent|uncommitted|head]",
+            );
         }
         return;
     }
@@ -3872,6 +3887,15 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
 
     state.record_user_prompt(display_text);
     let _ = cmd_tx.send(UiCommand::SendPrompt { text, images });
+}
+
+fn parse_review_target(value: &str) -> Option<ReviewTarget> {
+    match value.to_ascii_lowercase().as_str() {
+        "recent" => Some(ReviewTarget::Recent),
+        "uncommitted" => Some(ReviewTarget::Uncommitted),
+        "head" => Some(ReviewTarget::Head),
+        _ => None,
+    }
 }
 
 fn handle_mjconfig_menu_key(
@@ -4680,6 +4704,35 @@ fn handle_config_picker_key(
     }
 }
 
+fn handle_review_picker_key(
+    state: &mut AppState,
+    cmd_tx: &mpsc::UnboundedSender<UiCommand>,
+    modifiers: KeyModifiers,
+    code: KeyCode,
+    mode: UiMode,
+) -> TerminalRequest {
+    match picker_key_action(modifiers, code) {
+        PickerKeyAction::Cancel => {
+            state.review_picker = None;
+            inline_repair_request(mode)
+        }
+        PickerKeyAction::Accept => {
+            if let Some(target) = state.review_picker_accept() {
+                state.record_status_message(StatusKind::Info, "preparing manual review…");
+                let _ = cmd_tx.send(UiCommand::RunReview { target });
+                inline_repair_request(mode)
+            } else {
+                TerminalRequest::None
+            }
+        }
+        PickerKeyAction::Move(delta) => {
+            state.review_picker_move(delta);
+            TerminalRequest::None
+        }
+        PickerKeyAction::Other => TerminalRequest::None,
+    }
+}
+
 fn open_config_value_picker_for_shortcut(
     state: &mut AppState,
     modifiers: KeyModifiers,
@@ -5019,6 +5072,10 @@ fn draw(
         draw_agent_picker_modal(f, f.area(), state);
     }
 
+    if state.review_picker.is_some() {
+        draw_review_picker_modal(f, f.area(), state);
+    }
+
     if state.config_picker.is_some() {
         draw_config_value_picker_modal(f, f.area(), state);
     }
@@ -5130,6 +5187,11 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
 
     if state.agent_picker.is_some() {
         draw_inline_agent_picker(f, f.area(), state);
+        return;
+    }
+
+    if state.review_picker.is_some() {
+        draw_inline_review_picker(f, f.area(), state);
         return;
     }
 
@@ -9757,6 +9819,95 @@ fn centered_modal_rect(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+fn review_picker_lines(state: &AppState) -> Vec<Line<'static>> {
+    let selected = state
+        .review_picker
+        .as_ref()
+        .map_or(0, |picker| picker.selected);
+    [
+        ("Most recent changes", "retained change-producing user turn"),
+        ("All uncommitted changes", "staged, unstaged, and untracked"),
+        ("HEAD", "changes introduced by the current commit"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (name, description))| {
+        let marker = if index == selected { "› " } else { "  " };
+        let style = if index == selected {
+            Style::default()
+                .fg(state.theme.primary)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(state.theme.text)
+        };
+        Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(name, style),
+            Span::styled(
+                format!(" — {description}"),
+                Style::default().fg(state.theme.muted),
+            ),
+        ])
+    })
+    .collect()
+}
+
+fn draw_review_picker_modal(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    let width = area.width.saturating_sub(8).min(72);
+    let height = 7.min(area.height.saturating_sub(2));
+    if width < 24 || height < 6 {
+        return;
+    }
+    let rect = centered_modal_rect(area, width, height);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Review target ")
+        .style(Style::default().fg(state.theme.primary));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+    f.render_widget(Paragraph::new(review_picker_lines(state)), layout[0]);
+    f.render_widget(
+        Paragraph::new("Up/Down choose | Enter review | Esc cancel")
+            .style(Style::default().fg(state.theme.muted)),
+        layout[1],
+    );
+}
+
+fn draw_inline_review_picker(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    f.render_widget(Clear, area);
+    let content = inline_content_rect(area);
+    if content.width == 0 || content.height < 5 {
+        return;
+    }
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(content);
+    f.render_widget(
+        Paragraph::new("Review target").style(
+            Style::default()
+                .fg(state.theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        layout[0],
+    );
+    f.render_widget(Paragraph::new(review_picker_lines(state)), layout[1]);
+    f.render_widget(
+        Paragraph::new("Up/Down choose | Enter review | Esc cancel")
+            .style(Style::default().fg(state.theme.muted)),
+        layout[2],
+    );
+}
+
 fn draw_agent_picker_modal(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let Some(picker) = state.agent_picker.as_ref() else {
         return;
@@ -13591,6 +13742,46 @@ mod tests {
 
         assert!(state.input.is_empty());
         assert!(matches!(cmd_rx.try_recv(), Ok(UiCommand::CompactCouncil)));
+    }
+
+    #[test]
+    fn slash_review_opens_picker_and_direct_target_routes_locally() {
+        let mut state = ready_state_with_session();
+        state.input = "/review".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+        assert!(state.review_picker.is_some());
+        assert!(cmd_rx.try_recv().is_err());
+
+        state.review_picker = None;
+        state.input = "/review uncommitted".to_string();
+        submit_prompt(&mut state, &cmd_tx);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(UiCommand::RunReview {
+                target: ReviewTarget::Uncommitted
+            })
+        ));
+    }
+
+    #[test]
+    fn slash_review_rejects_busy_turn_without_queueing() {
+        let mut state = ready_state_with_session();
+        state.record_user_prompt("active".to_string());
+        state.input = "/review recent".to_string();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        assert!(cmd_rx.try_recv().is_err());
+        assert_eq!(state.queued_prompt_count(), 0);
+        assert!(
+            state
+                .status_line
+                .as_ref()
+                .is_some_and(|status| status.text.contains("only available while Thor is idle"))
+        );
     }
 
     #[test]

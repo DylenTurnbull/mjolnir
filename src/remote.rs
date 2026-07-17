@@ -88,6 +88,7 @@ const REMOTE_BUILTIN_LOAD_COMMAND: &str = "load";
 const REMOTE_BUILTIN_FORK_COMMAND: &str = "fork";
 const REMOTE_BUILTIN_EXPORT_COMMAND: &str = "export";
 const REMOTE_BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
+const REMOTE_BUILTIN_REVIEW_COMMAND: &str = "review";
 const REMOTE_BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 /// Default lifetime of a viewer session cookie, in days. Long enough that an
 /// installed phone PWA stays signed in across app evictions for weeks, short
@@ -218,6 +219,12 @@ fn remote_builtin_command_records(include_fork: bool) -> Vec<CommandRecord> {
             None,
             "mjolnir",
         ),
+        command_record(
+            REMOTE_BUILTIN_REVIEW_COMMAND,
+            "review selected changes without modifying them",
+            Some("recent|uncommitted|head".to_string()),
+            "mjolnir",
+        ),
     ];
     if include_fork {
         commands.push(command_record(
@@ -241,6 +248,7 @@ fn is_remote_reserved_command(name: &str) -> bool {
             | REMOTE_BUILTIN_FORK_COMMAND
             | REMOTE_BUILTIN_EXPORT_COMMAND
             | REMOTE_BUILTIN_MJCONFIG_COMMAND
+            | REMOTE_BUILTIN_REVIEW_COMMAND
             | REMOTE_BUILTIN_RAGNAROK_COMMAND
     )
 }
@@ -504,13 +512,30 @@ enum RemoteQueuedPromptAction {
     SendPrompt(String),
     ForkSession,
     RejectUnsupportedFork,
+    RunReview(crate::event::ReviewTarget),
+    RejectInvalidReview,
 }
 
 fn remote_queued_prompt_action(
     text: String,
     session_fork_supported: bool,
 ) -> RemoteQueuedPromptAction {
-    if text.trim() != "/fork" {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix("/review")
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        let target = match rest.trim().to_ascii_lowercase().as_str() {
+            "recent" => Some(crate::event::ReviewTarget::Recent),
+            "uncommitted" => Some(crate::event::ReviewTarget::Uncommitted),
+            "head" => Some(crate::event::ReviewTarget::Head),
+            _ => None,
+        };
+        return target.map_or(
+            RemoteQueuedPromptAction::RejectInvalidReview,
+            RemoteQueuedPromptAction::RunReview,
+        );
+    }
+    if trimmed != "/fork" {
         return RemoteQueuedPromptAction::SendPrompt(text);
     }
     if session_fork_supported {
@@ -1897,6 +1922,20 @@ impl RemoteSessionTracker {
                                     guard.push_system_notice(message);
                                 }
                             }
+                            RemoteQueuedPromptAction::RunReview(target) => {
+                                if command_tx.send(UiCommand::RunReview { target }).is_err() {
+                                    break;
+                                }
+                            }
+                            RemoteQueuedPromptAction::RejectInvalidReview => {
+                                let message = "usage: /review recent|uncommitted|head".to_string();
+                                if let Some(ui_event_tx) = ui_event_tx.as_ref() {
+                                    let _ = ui_event_tx.send(UiEvent::Warning(message.clone()));
+                                }
+                                if let Ok(mut guard) = state.lock() {
+                                    guard.push_system_notice(message);
+                                }
+                            }
                             RemoteQueuedPromptAction::SendPrompt(text) => {
                                 let command = UiCommand::SendPrompt {
                                     text,
@@ -2322,6 +2361,7 @@ fn start_server_agent_session(
             implementation_handoffs: implementation_handoffs.clone(),
             active_implementation_workers: active_implementation_workers.clone(),
             discrete_review: app_config.thor.discrete_review,
+            review_root: provenance_cwd.clone(),
             log_context,
         },
     );
@@ -2350,6 +2390,10 @@ fn start_server_agent_session(
             tokio::spawn(async move {
                 let mut local_epoch = 0_u64;
                 while let Some(command) = server_cmd_rx.recv().await {
+                    if let UiCommand::RunReview { target } = command {
+                        thor_orchestrator.request_review(target);
+                        continue;
+                    }
                     if matches!(command, UiCommand::CompactCouncil)
                         || matches!(&command, UiCommand::SendPrompt { text, images } if text == "/compact" && images.is_empty())
                     {
@@ -3404,17 +3448,37 @@ async fn queue_prompt(
             "prompt text must not be empty".to_string(),
         ));
     }
+    let review = match remote_queued_prompt_action(request.text.clone(), false) {
+        RemoteQueuedPromptAction::RunReview(_) => true,
+        RemoteQueuedPromptAction::RejectInvalidReview => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "usage: /review recent|uncommitted|head".to_string(),
+            ));
+        }
+        _ => false,
+    };
     let db_path = Arc::clone(&state.db_path);
-    tokio::task::spawn_blocking(move || {
+    let queued = tokio::task::spawn_blocking(move || -> Result<bool> {
+        if review && session_prompt_in_flight(db_path.as_ref().as_path(), &request.session_id)? {
+            return Ok(false);
+        }
         queue_prompt_record(
             db_path.as_ref().as_path(),
             &request.session_id,
             &request.text,
-        )
+        )?;
+        Ok(true)
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
+    if !queued {
+        return Err((
+            StatusCode::CONFLICT,
+            "manual review is only available while Thor is idle".to_string(),
+        ));
+    }
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -4384,6 +4448,19 @@ fn queue_prompt_record(db_path: &Path, session_id: &str, text: &str) -> Result<(
     .context("touch session prompt recency")?;
     tx.commit().context("commit queued-prompt transaction")?;
     Ok(())
+}
+
+fn session_prompt_in_flight(db_path: &Path, session_id: &str) -> Result<bool> {
+    init_db(db_path)?;
+    let conn = open_db(db_path)?;
+    Ok(conn
+        .query_row(
+            "select prompt_in_flight from sessions where session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some_and(|value| value != 0))
 }
 
 fn claim_queued_prompt_record(db_path: &Path, session_id: &str) -> Result<Option<QueuedPrompt>> {
@@ -6278,6 +6355,18 @@ mod tests {
             remote_queued_prompt_action("hello".to_string(), true),
             RemoteQueuedPromptAction::SendPrompt("hello".to_string())
         );
+        assert_eq!(
+            remote_queued_prompt_action("/review recent".to_string(), true),
+            RemoteQueuedPromptAction::RunReview(crate::event::ReviewTarget::Recent)
+        );
+        assert_eq!(
+            remote_queued_prompt_action("/review head".to_string(), true),
+            RemoteQueuedPromptAction::RunReview(crate::event::ReviewTarget::Head)
+        );
+        assert_eq!(
+            remote_queued_prompt_action("/review".to_string(), true),
+            RemoteQueuedPromptAction::RejectInvalidReview
+        );
     }
 
     #[tokio::test]
@@ -6834,13 +6923,13 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["new", "compact", "export", "mjconfig", "fork", "review"]
+            vec!["new", "compact", "export", "mjconfig", "review", "fork"]
         );
         assert_eq!(snapshot.available_commands[0].source, "mjolnir");
-        assert_eq!(snapshot.available_commands[5].source, "agent");
+        assert_eq!(snapshot.available_commands[4].source, "mjolnir");
         assert_eq!(
-            snapshot.available_commands[5].input_hint.as_deref(),
-            Some("scope")
+            snapshot.available_commands[4].input_hint.as_deref(),
+            Some("recent|uncommitted|head")
         );
     }
 
@@ -6886,7 +6975,7 @@ mod tests {
             .collect();
         assert_eq!(
             same_session_names,
-            vec!["new", "compact", "export", "mjconfig", "fork"]
+            vec!["new", "compact", "export", "mjconfig", "review", "fork"]
         );
 
         state.observe_event(&UiEvent::SessionUpdate(
@@ -6907,7 +6996,7 @@ mod tests {
             .collect();
         assert_eq!(
             new_session_names,
-            vec!["new", "compact", "export", "mjconfig", "fork"]
+            vec!["new", "compact", "export", "mjconfig", "review", "fork"]
         );
     }
 

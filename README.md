@@ -100,8 +100,10 @@ appearance. `/models` opens the same editor directly on the Council tab. Model
 and ACP server changes apply to the next session. The ACP Servers tab explains
 why each built-in route was detected and shows its launch command. Its inline
 registry browser installs explicitly selected servers; binary distributions are
-owned under Mjolnir's platform data directory. Use `/reviews`, `/reviews thor on|off` to
-inspect or change Thor's discrete review policy.
+owned under Mjolnir's platform data directory. Configure automatic Thor review with the
+`Thor review` switch in `/mjconfig`. Use `/review` to choose a findings-only review of the
+most recent change-producing turn, all uncommitted changes, or `HEAD`; direct forms are
+`/review recent`, `/review uncommitted`, and `/review head`.
 
 The config schema is versioned. A missing or incompatible `version` starts from
 fresh defaults instead of attempting field-by-field migration.

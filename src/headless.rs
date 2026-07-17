@@ -292,6 +292,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             implementation_handoffs: implementation_handoffs.clone(),
             active_implementation_workers: active_implementation_workers.clone(),
             discrete_review: app_config.thor.discrete_review,
+            review_root: cfg.cwd.clone(),
             log_context: Some(crate::council_orchestrator::LogContext {
                 council_session: format!("headless-{}", std::process::id()),
                 model: thor.model.model.clone(),

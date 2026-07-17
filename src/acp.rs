@@ -2226,7 +2226,7 @@ async fn drive_session(
                     }
                 }
             }
-            UiCommand::SetThorReviewPolicy { .. } => {}
+            UiCommand::SetThorReviewPolicy { .. } | UiCommand::RunReview { .. } => {}
             UiCommand::CompactCouncil => {
                 let _ = ui_tx.send(UiEvent::Warning(
                     "Council compact command bypassed its coordinator".to_string(),
@@ -2545,7 +2545,7 @@ async fn drive_fork_session(
                         });
                     }
                     Some(UiCommand::CancelPrompt) => {}
-                    Some(UiCommand::SetThorReviewPolicy { .. }) => {}
+                    Some(UiCommand::SetThorReviewPolicy { .. } | UiCommand::RunReview { .. }) => {}
                     Some(UiCommand::CompactCouncil) => {}
                     Some(UiCommand::RunAdvertisedCommand { responder, .. }) => {
                         let _ = responder.send(AgentCommandOutcome::Failed(
@@ -4467,7 +4467,7 @@ async fn drive_config_update(
                         });
                     }
                     Some(UiCommand::CancelPrompt) => {}
-                    Some(UiCommand::SetThorReviewPolicy { .. }) => {}
+                    Some(UiCommand::SetThorReviewPolicy { .. } | UiCommand::RunReview { .. }) => {}
                     Some(UiCommand::CompactCouncil) => {}
                     Some(UiCommand::RunAdvertisedCommand { responder, .. }) => {
                         let _ = responder.send(AgentCommandOutcome::Failed(
@@ -4626,7 +4626,7 @@ async fn drive_prompt_turn(
                             message: "prompt already in flight".to_string(),
                         });
                     }
-                    Some(UiCommand::SetThorReviewPolicy { .. }) => {}
+                    Some(UiCommand::SetThorReviewPolicy { .. } | UiCommand::RunReview { .. }) => {}
                     Some(UiCommand::CompactCouncil) => {}
                     Some(UiCommand::RunAdvertisedCommand { responder, .. }) => {
                         let _ = responder.send(AgentCommandOutcome::Failed(

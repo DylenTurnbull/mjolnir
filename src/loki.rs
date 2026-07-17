@@ -637,6 +637,7 @@ pub struct Checkpoint {
 #[derive(Default)]
 pub struct BoundaryTracker {
     trajectory: String,
+    review_trajectory: String,
     final_message: String,
     segment: String,
     lane: Option<SegmentLane>,
@@ -685,7 +686,7 @@ impl BoundaryTracker {
             }
             this.segment.push_str(text);
         };
-        let boundary: Option<(String, Vec<String>)> = match event {
+        let boundary: Option<(String, String, Vec<String>)> = match event {
             UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(chunk)) => {
                 let text = crate::event::content_block_text(&chunk.content);
                 append(self, SegmentLane::Message, &text);
@@ -725,8 +726,10 @@ impl BoundaryTracker {
                 (complete && !terminal_backed && !is_pull_advice(call)).then(|| {
                     self.final_message.clear();
                     let activity = tool_activity(call);
+                    let previous = flush(self);
                     (
-                        join_agent_boundary(flush(self), render_tool_delta(call)),
+                        join_agent_boundary(previous.clone(), render_tool_delta(call)),
+                        join_agent_boundary(previous, render_review_tool_delta(call)),
                         vec![activity],
                     )
                 })
@@ -744,23 +747,26 @@ impl BoundaryTracker {
                         .or_insert_with(|| ToolCall::new(id.clone(), "tool"));
                     tool.update(update.fields.clone());
                     (completed && !tool_has_terminal(tool) && !is_pull_advice(tool))
-                        .then(|| render_tool_delta(tool))
+                        .then(|| (render_tool_delta(tool), render_review_tool_delta(tool)))
                 };
-                rendered.map(|rendered| {
+                rendered.map(|(rendered, review_rendered)| {
                     self.final_message.clear();
                     let activity = self
                         .tools
                         .get(&id)
                         .map_or_else(|| "tool".to_string(), tool_activity);
-                    (join_agent_boundary(flush(self), rendered), vec![activity])
+                    let previous = flush(self);
+                    (
+                        join_agent_boundary(previous.clone(), rendered),
+                        join_agent_boundary(previous, review_rendered),
+                        vec![activity],
+                    )
                 })
             }
             UiEvent::SessionUpdate(SessionUpdate::Plan(plan)) => {
                 self.final_message.clear();
-                Some((
-                    join_boundary(flush(self), format!("plan update:\n{plan:?}")),
-                    vec!["plan update".to_string()],
-                ))
+                let text = join_boundary(flush(self), format!("plan update:\n{plan:?}"));
+                Some((text.clone(), text, vec!["plan update".to_string()]))
             }
             UiEvent::TerminalOutput(snapshot) if snapshot.exit_status.is_some() => {
                 let terminal = self
@@ -771,13 +777,11 @@ impl BoundaryTracker {
                         activity: "terminal".to_string(),
                         head: "→ terminal()".to_string(),
                     });
-                Some((
-                    join_agent_boundary(
-                        flush(self),
-                        render_terminal_result(&terminal.head, snapshot),
-                    ),
-                    vec![terminal.activity],
-                ))
+                let text = join_agent_boundary(
+                    flush(self),
+                    render_terminal_result(&terminal.head, snapshot),
+                );
+                Some((text.clone(), text, vec![terminal.activity]))
             }
             UiEvent::PromptDone { stop_reason, .. } => {
                 use agent_client_protocol::schema::v1::StopReason;
@@ -788,15 +792,17 @@ impl BoundaryTracker {
                 (!matches!(stop_reason, StopReason::Cancelled))
                     .then(|| flush(self))
                     .flatten()
-                    .map(|segment| (segment, vec!["final response".to_string()]))
+                    .map(|segment| (segment.clone(), segment, vec!["final response".to_string()]))
             }
             UiEvent::PromptFailed { .. } => None,
             _ => None,
         };
-        boundary.map(|(text, activities)| {
+        boundary.map(|(text, review_text, activities)| {
             self.next_step += 1;
             self.trajectory.push_str(&text);
             self.trajectory.push('\n');
+            self.review_trajectory.push_str(&review_text);
+            self.review_trajectory.push('\n');
             Checkpoint {
                 step: self.next_step,
                 text,
@@ -805,8 +811,13 @@ impl BoundaryTracker {
         })
     }
 
+    #[cfg(test)]
     pub fn trajectory(&self) -> String {
         self.trajectory.clone()
+    }
+
+    pub fn review_trajectory(&self) -> String {
+        self.review_trajectory.clone()
     }
 
     pub fn final_message(&self) -> String {
@@ -835,6 +846,17 @@ fn is_pull_advice(tool: &agent_client_protocol::schema::v1::ToolCall) -> bool {
 }
 
 fn render_tool_delta(tool: &agent_client_protocol::schema::v1::ToolCall) -> String {
+    render_tool_delta_with_diffs(tool, true)
+}
+
+fn render_review_tool_delta(tool: &agent_client_protocol::schema::v1::ToolCall) -> String {
+    render_tool_delta_with_diffs(tool, false)
+}
+
+fn render_tool_delta_with_diffs(
+    tool: &agent_client_protocol::schema::v1::ToolCall,
+    include_diffs: bool,
+) -> String {
     use agent_client_protocol::schema::v1::{ToolCallContent, ToolCallStatus};
     let output = tool_output_text(tool);
     let lines = line_count(&output);
@@ -859,12 +881,14 @@ fn render_tool_delta(tool: &agent_client_protocol::schema::v1::ToolCall) -> Stri
         text.push_str(" — ");
         text.push_str(&one_line(first.trim(), 120));
     }
-    for content in &tool.content {
-        if let ToolCallContent::Diff(diff) = content {
-            let diff = unified_diff(diff);
-            if !diff.trim().is_empty() {
-                text.push('\n');
-                text.push_str(&fence_diff(&diff));
+    if include_diffs {
+        for content in &tool.content {
+            if let ToolCallContent::Diff(diff) = content {
+                let diff = unified_diff(diff);
+                if !diff.trim().is_empty() {
+                    text.push('\n');
+                    text.push_str(&fence_diff(&diff));
+                }
             }
         }
     }
@@ -2528,6 +2552,21 @@ mod tests {
         assert!(!projected.contains("far-start"));
         assert!(!projected.contains("far-end"));
         assert!(projected.ends_with("```"));
+
+        let review_projected = render_review_tool_delta(&tool);
+        assert_eq!(review_projected, "→ edit(src/lib.rs) ⇒ ok · 0 lines");
+
+        let mut tracker = BoundaryTracker::default();
+        tracker
+            .observe(&UiEvent::SessionUpdate(SessionUpdate::ToolCall(tool)))
+            .expect("edit checkpoint");
+        assert!(tracker.trajectory().contains("```diff"));
+        assert!(!tracker.review_trajectory().contains("```diff"));
+        assert!(
+            tracker
+                .review_trajectory()
+                .contains("→ edit(src/lib.rs) ⇒ ok")
+        );
     }
 
     #[test]
