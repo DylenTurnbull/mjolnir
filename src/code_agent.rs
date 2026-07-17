@@ -63,7 +63,7 @@ A code_agent call that reports an active run ID is healthy and still running: ca
 Every Eitri call starts a brand-new ACP process and session. Eitri has no conversation context and no memory of the user's request or any earlier Eitri call, including an immediately preceding call. Apply this policy throughout this ACP session while handling each current user request; do not acknowledge or summarize the policy.
 </mj-code-agent-policy>"#;
 
-const CODE_PREAMBLE: &str = "You are Eitri, the implementation agent. This is a fresh ACP process and session. You have no memory of the user conversation or of any earlier Eitri call, including an immediately preceding call. Treat the standalone instructions below and the current workspace as your only task context. Loki is Mjolnir's one persistent read-only observer shared with Thor; never create, summon, or substitute another Loki process or session. Use pull_advice at good semantic stopping points, never on two consecutive semantic steps and at least once every eight semantic steps. Automatic Loki receipts already drain the named queues.\n\n";
+const CODE_PREAMBLE: &str = "You are Eitri, the implementation agent. This is a fresh ACP process and session. You have no memory of the user conversation or of any earlier Eitri call, including an immediately preceding call. Treat the standalone instructions below and the current workspace as your only task context. Loki is Mjolnir's one persistent read-only observer shared with Thor; never create, summon, or substitute another Loki process or session. Use pull_advice at good semantic stopping points, never on two consecutive semantic steps and at least once every eight semantic steps. Always pull after failed validation before retrying, and before finalizing when at least one semantic step has elapsed since the last pull or automatic receipt. Automatic Loki receipts already drain the named queues.\n\n";
 const EXPLORE_PREAMBLE: &str = r#"You are Eitri, a fast read-only codebase scout. This is a fresh ACP process and session with no memory of the user conversation or any earlier Eitri call. Your delegation may occur at any point in Thor's ongoing work, so treat the supplied current state and completed work as authoritative context rather than assuming the task is just beginning. Return compressed context that Thor can use directly.
 
 READ-ONLY EXPLORATION: Never create, modify, delete, move, or copy files. Never install dependencies, change configuration, create commits, or run commands that modify system or workspace state. Do not create a report file. Do not run builds, tests, formatters, linters, package managers, or git status; inspect their definitions or source instead when relevant.
@@ -2960,6 +2960,9 @@ mod tests {
                 .standalone_prompt("fix it")
                 .contains("pull_advice")
         );
+        let prompt = EitriPurpose::Code.standalone_prompt("fix it");
+        assert!(prompt.contains("after failed validation before retrying"));
+        assert!(prompt.contains("before finalizing"));
     }
 
     #[tokio::test]

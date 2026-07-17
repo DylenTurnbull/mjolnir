@@ -474,7 +474,7 @@ impl PullMcpHandler {
 
     #[tool(
         name = "pull_advice",
-        description = "Drain Loki advice at a good stopping point. Avoid redundant pulls at consecutive semantic steps and do not let more than eight semantic steps pass without pulling. Automatic Council delivery receipts already drain the named queues, so do not immediately pull again after one."
+        description = "Drain Loki advice at a good stopping point. Pull after failed validation before retrying, and before finalizing when a semantic step has elapsed since the last pull or automatic receipt. Avoid redundant pulls at consecutive semantic steps and do not let more than eight semantic steps pass without pulling. Automatic Council delivery receipts already drain the named queues, so do not immediately pull again after one."
     )]
     async fn pull_advice(&self) -> std::result::Result<CallToolResult, McpError> {
         let outcome = self.reviewer.pull_manual(self.consumer).await;
@@ -1243,6 +1243,8 @@ pub struct Handle {
     eitri_invocations: Arc<AtomicU64>,
     thor_steps: Arc<AtomicU64>,
     eitri_steps: Arc<AtomicU64>,
+    thor_cadence_steps: Arc<AtomicU64>,
+    eitri_cadence_steps: Arc<AtomicU64>,
     pending_thor: Arc<AtomicU64>,
     pending_eitri: Arc<AtomicU64>,
     last_thor_pull: Arc<AtomicU64>,
@@ -1281,6 +1283,8 @@ impl Handle {
             eitri_invocations: Arc::new(AtomicU64::new(1)),
             thor_steps: Arc::new(AtomicU64::new(1)),
             eitri_steps: Arc::new(AtomicU64::new(1)),
+            thor_cadence_steps: Arc::new(AtomicU64::new(0)),
+            eitri_cadence_steps: Arc::new(AtomicU64::new(0)),
             pending_thor: pending_thor.clone(),
             pending_eitri: pending_eitri.clone(),
             last_thor_pull: Arc::new(AtomicU64::new(u64::MAX)),
@@ -1345,8 +1349,8 @@ impl Handle {
 
     pub async fn pull_manual(&self, consumer: Consumer) -> PullOutcome {
         let current = match consumer {
-            Consumer::Thor => self.thor_steps.load(Ordering::Relaxed).saturating_sub(1),
-            Consumer::Eitri => self.eitri_steps.load(Ordering::Relaxed).saturating_sub(1),
+            Consumer::Thor => self.thor_cadence_steps.load(Ordering::Relaxed),
+            Consumer::Eitri => self.eitri_cadence_steps.load(Ordering::Relaxed),
         };
         let last = match consumer {
             Consumer::Thor => self.last_thor_pull.swap(current, Ordering::Relaxed),
@@ -1527,6 +1531,12 @@ impl Handle {
                 self.eitri_steps.fetch_add(1, Ordering::Relaxed)
             }
         };
+        if checkpoint_counts_toward_pull_cadence(&checkpoint) {
+            match target {
+                Target::Thor => self.thor_cadence_steps.fetch_add(1, Ordering::Relaxed),
+                Target::Eitri => self.eitri_cadence_steps.fetch_add(1, Ordering::Relaxed),
+            };
+        }
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
         let _ = self.requests.send(Request::Review {
             id,
@@ -1546,6 +1556,13 @@ impl Handle {
         }
         let _ = tokio::time::timeout(Duration::from_secs(5), finished.changed()).await;
     }
+}
+
+fn checkpoint_counts_toward_pull_cadence(checkpoint: &Checkpoint) -> bool {
+    checkpoint
+        .activities
+        .iter()
+        .any(|activity| activity != "Guardian Review")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2103,6 +2120,8 @@ mod tests {
                 eitri_invocations: Arc::new(AtomicU64::new(1)),
                 thor_steps: Arc::new(AtomicU64::new(1)),
                 eitri_steps: Arc::new(AtomicU64::new(1)),
+                thor_cadence_steps: Arc::new(AtomicU64::new(0)),
+                eitri_cadence_steps: Arc::new(AtomicU64::new(0)),
                 pending_thor: Arc::new(AtomicU64::new(0)),
                 pending_eitri: Arc::new(AtomicU64::new(0)),
                 last_thor_pull: Arc::new(AtomicU64::new(u64::MAX)),
@@ -2293,6 +2312,48 @@ mod tests {
                 (Target::Eitri, 2),
             ]
         );
+    }
+
+    #[test]
+    fn guardian_review_is_reviewable_without_advancing_pull_cadence() {
+        let (handle, mut requests) = test_handle(1);
+        let checkpoint = |activity: &str| Checkpoint {
+            step: 99,
+            text: activity.to_string(),
+            activities: vec![activity.to_string()],
+        };
+
+        for activity in [
+            "Guardian Review",
+            "Editing files",
+            "Guardian Review",
+            "cargo test",
+            "Guardian Review",
+            "Editing files",
+            "Guardian Review",
+            "cargo test",
+            "Guardian Review",
+            "git status",
+        ] {
+            handle.observe(1, Target::Eitri, Some(1), checkpoint(activity));
+        }
+
+        let activities = (0..10)
+            .map(|_| match requests.try_recv().expect("review") {
+                Request::Review { checkpoint, .. } => checkpoint.activities[0].clone(),
+                _ => panic!("expected review"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(activities.len(), 10);
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|activity| activity.as_str() == "Guardian Review")
+                .count(),
+            5
+        );
+        assert_eq!(handle.eitri_steps.load(Ordering::Relaxed), 11);
+        assert_eq!(handle.eitri_cadence_steps.load(Ordering::Relaxed), 5);
     }
 
     #[test]
