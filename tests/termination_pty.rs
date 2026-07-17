@@ -114,8 +114,8 @@ fn sigterm_restores_real_pty_terminal() {
                 &mut master_fd,
                 &mut slave_fd,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &window_size,
+                std::ptr::null_mut(),
+                &window_size as *const libc::winsize as *mut libc::winsize,
             )
         },
         0,
@@ -212,8 +212,8 @@ fn repeated_sigterm_forces_real_pty_child_exit() {
                 &mut master_fd,
                 &mut slave_fd,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &window_size,
+                std::ptr::null_mut(),
+                &window_size as *const libc::winsize as *mut libc::winsize,
             )
         },
         0,
