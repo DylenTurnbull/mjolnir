@@ -757,19 +757,6 @@ fn drain_hidden_main_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender
     }
 }
 
-/// Slow inline repair cadence. Regular draws are diffed against ratatui's
-/// previous buffer, so they cannot repair terminal emulator damage that
-/// happens while the tab is backgrounded. This heartbeat clears only the
-/// inline viewport and forces a full redraw at a human-scale interval.
-const INLINE_REPAIR_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Permission prompts are safety-critical, but repeated repair attempts
-/// after the prompt has already opened do more harm than good. Give the
-/// terminal a few early chances to repair damage, then stop.
-const INLINE_PERMISSION_REPAIR_INTERVAL: Duration = Duration::from_secs(1);
-const INLINE_PERMISSION_REPAIR_WINDOW: Duration = Duration::from_secs(2);
-const INLINE_PERMISSION_REPAIR_ATTEMPTS: usize = 3;
-
 /// Maximum number of lines we render from each tool-output entry when
 /// transcript details are collapsed. Picked to keep the head of long
 /// stdout / diff dumps visible without flushing the surrounding
@@ -845,7 +832,6 @@ async fn ui_loop(
     let initial_rendered = draw_terminal_frame(terminal, &mut state, &mut transcript_scroll, mode)?;
     let mut pending_redraw = PendingRedraw::from_failed_initial_draw(initial_rendered);
     let mut last_draw = Instant::now();
-    let mut last_inline_repair = Instant::now();
     let mut force_inline_repair = false;
     let mut force_soft_inline_repair = false;
 
@@ -1041,10 +1027,8 @@ async fn ui_loop(
                                     &mut transcript_scroll,
                                     InlineRepairMode::Hard,
                                 );
-                                let now = Instant::now();
-                                last_inline_repair = now;
                                 if repaired {
-                                    last_draw = now;
+                                    last_draw = Instant::now();
                                     force_inline_repair = false;
                                 }
                             }
@@ -1130,10 +1114,8 @@ async fn ui_loop(
                 &mut transcript_scroll,
                 InlineRepairMode::Hard,
             );
-            let now = Instant::now();
-            last_inline_repair = now;
             if repaired {
-                last_draw = now;
+                last_draw = Instant::now();
                 pending_redraw.clear();
             } else {
                 pending_redraw.mark_interactive();
@@ -1197,10 +1179,8 @@ async fn ui_loop(
                 &mut transcript_scroll,
                 InlineRepairMode::Soft,
             );
-            let now = Instant::now();
-            last_inline_repair = now;
             if repaired {
-                last_draw = now;
+                last_draw = Instant::now();
                 pending_redraw.clear();
             } else {
                 pending_redraw.mark_interactive();
@@ -1208,12 +1188,7 @@ async fn ui_loop(
         }
 
         if !inline_resize_reflow.is_pending()
-            && should_attempt_inline_repair(
-                force_inline_repair,
-                mode,
-                &state,
-                last_inline_repair.elapsed(),
-            )
+            && should_attempt_inline_repair(force_inline_repair, mode)
         {
             force_inline_repair = false;
             sync_inline_terminal_height(terminal, &state, &mut inline_height)?;
@@ -1223,10 +1198,8 @@ async fn ui_loop(
                 &mut transcript_scroll,
                 InlineRepairMode::Hard,
             );
-            let now = Instant::now();
-            last_inline_repair = now;
             if repaired {
-                last_draw = now;
+                last_draw = Instant::now();
                 pending_redraw.clear();
             } else {
                 pending_redraw.mark_interactive();
@@ -1422,64 +1395,8 @@ fn should_attempt_inline_repair_before_flush(
         && (state.has_pending_permission() || state.has_pending_elicitation())
 }
 
-fn should_attempt_inline_repair(
-    force_inline_repair: bool,
-    mode: UiMode,
-    state: &AppState,
-    last_inline_repair_elapsed: Duration,
-) -> bool {
-    if force_inline_repair {
-        debug_assert_eq!(mode, UiMode::InlineChat);
-        return true;
-    }
-
-    // Permission and elicitation modals already get an immediate forced
-    // repair when they open, when focus returns, on resize, and when the
-    // user accepts or cancels. Avoid a background heartbeat while the modal
-    // merely stays open: the regular diff-based redraw path updates
-    // selection changes without full-screen flashing.
-    if state.has_pending_permission() || state.has_pending_elicitation() {
-        return false;
-    }
-
-    should_repair_inline_view(mode, state)
-        && last_inline_repair_elapsed >= inline_repair_interval(state)
-        && permission_repair_budget_allows_attempt(state)
-}
-
-fn permission_repair_budget_allows_attempt(state: &AppState) -> bool {
-    let Some(pending) = state.pending_permission() else {
-        return true;
-    };
-
-    pending.repair_attempts < INLINE_PERMISSION_REPAIR_ATTEMPTS
-        && pending.opened_at.elapsed() <= INLINE_PERMISSION_REPAIR_WINDOW
-}
-
-fn inline_repair_interval(state: &AppState) -> Duration {
-    if state.has_pending_permission() || state.has_pending_elicitation() {
-        INLINE_PERMISSION_REPAIR_INTERVAL
-    } else {
-        INLINE_REPAIR_INTERVAL
-    }
-}
-
-fn inline_repair_heartbeat_active(state: &AppState) -> bool {
-    state.voice_input_active
-        || state.help_overlay
-        || state.has_pending_permission()
-        || state.has_pending_elicitation()
-        || state.agent_picker.is_some()
-        || state.config_picker.is_some()
-        || state.mjconfig_menu.is_some()
-        || matches!(
-            state.connection_state(),
-            ConnectionState::Launching | ConnectionState::Initializing
-        )
-}
-
-fn should_repair_inline_view(mode: UiMode, state: &AppState) -> bool {
-    mode == UiMode::InlineChat && inline_repair_heartbeat_active(state)
+fn should_attempt_inline_repair(force_inline_repair: bool, mode: UiMode) -> bool {
+    mode == UiMode::InlineChat && force_inline_repair
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1494,10 +1411,6 @@ fn repair_inline_viewport(
     transcript_scroll: &mut TranscriptScrollState,
     mode: InlineRepairMode,
 ) -> bool {
-    if let Some(pending) = state.pending_permission_mut() {
-        pending.repair_attempts = pending.repair_attempts.saturating_add(1);
-    }
-
     match terminal.autoresize() {
         Ok(()) => {}
         Err(e) if is_cursor_position_timeout_io(&e) => {
@@ -12305,8 +12218,6 @@ mod tests {
             },
             selected,
             scroll_offset: None,
-            opened_at: Instant::now(),
-            repair_attempts: 0,
             code_agent: false,
         }
     }
@@ -12779,7 +12690,6 @@ mod tests {
             FRAME_BUDGET
         );
         assert_eq!(SPINNER_FRAME_BUDGET, Duration::from_millis(250));
-        assert!(!should_repair_inline_view(UiMode::InlineChat, &state));
     }
 
     #[test]
@@ -12832,12 +12742,10 @@ mod tests {
         assert!(should_show_spinner(&state));
         assert!(timer_driven_live_redraw(UiMode::InlineChat, &state));
         assert!(timer_driven_live_redraw(UiMode::FullscreenTui, &state));
-        assert!(!should_repair_inline_view(UiMode::InlineChat, &state));
 
         state.set_connection_state(ConnectionState::Cancelling);
         assert!(timer_driven_live_redraw(UiMode::InlineChat, &state));
         assert!(timer_driven_live_redraw(UiMode::FullscreenTui, &state));
-        assert!(!should_repair_inline_view(UiMode::InlineChat, &state));
     }
 
     #[test]
@@ -12878,7 +12786,13 @@ mod tests {
     }
 
     #[test]
-    fn mjconfig_animation_uses_spinner_cadence_but_keys_stay_interactive() {
+    fn mjconfig_animation_uses_diff_redraws_but_keys_stay_interactive() {
+        let mut state = AppState::new();
+        state.open_mjconfig_menu();
+
+        assert!(state.mjconfig_menu.is_some());
+        assert!(timer_driven_live_redraw(UiMode::InlineChat, &state));
+        assert!(!should_attempt_inline_repair(false, UiMode::InlineChat));
         assert_ne!(MJCONFIG_FRAME_BUDGET, FRAME_BUDGET);
         assert_eq!(MJCONFIG_FRAME_BUDGET, SPINNER_FRAME_BUDGET);
         assert_eq!(
@@ -12901,16 +12815,14 @@ mod tests {
     }
 
     #[test]
-    fn streaming_uses_timer_redraws_but_not_inline_repair_during_streaming() {
+    fn streaming_uses_timer_redraws_at_the_expected_budget() {
         let mut state = AppState::new();
 
         state.set_connection_state(ConnectionState::Launching);
         assert!(needs_live_redraw(&state));
-        assert!(should_repair_inline_view(UiMode::InlineChat, &state));
 
         state.set_connection_state(ConnectionState::Initializing);
         assert!(needs_live_redraw(&state));
-        assert!(should_repair_inline_view(UiMode::InlineChat, &state));
 
         state.set_connection_state(ConnectionState::Streaming);
         assert!(state.is_streaming());
@@ -12933,48 +12845,12 @@ mod tests {
         );
         assert!(needs_live_redraw(&state));
         assert!(timer_driven_live_redraw(UiMode::InlineChat, &state));
-        assert!(!should_repair_inline_view(UiMode::InlineChat, &state));
 
         state.set_connection_state(ConnectionState::Cancelling);
         assert!(state.is_streaming());
         assert!(should_show_spinner(&state));
         assert!(needs_live_redraw(&state));
         assert!(timer_driven_live_redraw(UiMode::InlineChat, &state));
-        assert!(!should_repair_inline_view(UiMode::InlineChat, &state));
-    }
-
-    #[test]
-    fn inline_repair_is_limited_to_live_inline_states() {
-        let mut state = AppState::new();
-
-        state.set_connection_state(ConnectionState::Launching);
-        assert!(should_repair_inline_view(UiMode::InlineChat, &state));
-
-        state.set_connection_state(ConnectionState::Streaming);
-        assert!(!should_repair_inline_view(UiMode::InlineChat, &state));
-        assert!(!should_repair_inline_view(UiMode::FullscreenTui, &state));
-
-        state.set_connection_state(ConnectionState::Ready);
-        assert!(!should_repair_inline_view(UiMode::InlineChat, &state));
-
-        state.set_connection_state(ConnectionState::Cancelling);
-        assert!(!should_repair_inline_view(UiMode::InlineChat, &state));
-    }
-
-    #[test]
-    fn inline_permission_prompt_keeps_repair_active_until_resolved() {
-        let pending =
-            permission_pending_with_options("run shell command", &["Allow once", "Reject"], 0);
-        let mut state = AppState::new();
-        state.set_connection_state(ConnectionState::Ready);
-        state.apply_event(UiEvent::PermissionRequest(pending.prompt));
-
-        assert!(state.has_pending_permission());
-        assert!(should_repair_inline_view(UiMode::InlineChat, &state));
-        assert!(!should_repair_inline_view(UiMode::FullscreenTui, &state));
-
-        let _ = state.take_pending_permission();
-        assert!(!should_repair_inline_view(UiMode::InlineChat, &state));
     }
 
     #[test]
@@ -12982,7 +12858,6 @@ mod tests {
         let mut state = AppState::new();
         state.set_connection_state(ConnectionState::Ready);
 
-        assert!(!should_repair_inline_view(UiMode::InlineChat, &state));
         assert!(should_force_inline_repair_for_event(
             UiMode::InlineChat,
             &state,
@@ -13094,22 +12969,10 @@ mod tests {
     }
 
     #[test]
-    fn forced_inline_repair_bypasses_live_redraw_gate_once() {
-        let mut state = AppState::new();
-        state.set_connection_state(ConnectionState::Ready);
-
-        assert!(should_attempt_inline_repair(
-            true,
-            UiMode::InlineChat,
-            &state,
-            Duration::ZERO
-        ));
-        assert!(!should_attempt_inline_repair(
-            false,
-            UiMode::InlineChat,
-            &state,
-            Duration::ZERO
-        ));
+    fn inline_repairs_require_an_explicit_inline_request() {
+        assert!(should_attempt_inline_repair(true, UiMode::InlineChat));
+        assert!(!should_attempt_inline_repair(false, UiMode::InlineChat));
+        assert!(!should_attempt_inline_repair(true, UiMode::FullscreenTui));
     }
 
     #[test]
@@ -13155,62 +13018,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_permission_uses_limited_inline_repair_budget() {
-        let pending =
-            permission_pending_with_options("run shell command", &["Allow once", "Reject"], 0);
-        let mut state = AppState::new();
-        state.set_connection_state(ConnectionState::Ready);
-
-        assert_eq!(inline_repair_interval(&state), INLINE_REPAIR_INTERVAL);
-        assert!(permission_repair_budget_allows_attempt(&state));
-
-        state.apply_event(UiEvent::PermissionRequest(pending.prompt));
-
-        assert_eq!(
-            inline_repair_interval(&state),
-            INLINE_PERMISSION_REPAIR_INTERVAL
-        );
-        assert!(permission_repair_budget_allows_attempt(&state));
-        assert!(!should_attempt_inline_repair(
-            false,
-            UiMode::InlineChat,
-            &state,
-            INLINE_PERMISSION_REPAIR_INTERVAL
-        ));
-        assert!(!should_attempt_inline_repair(
-            false,
-            UiMode::InlineChat,
-            &state,
-            INLINE_PERMISSION_REPAIR_INTERVAL.saturating_mul(10)
-        ));
-        assert!(should_attempt_inline_repair(
-            true,
-            UiMode::InlineChat,
-            &state,
-            Duration::ZERO
-        ));
-
-        if let Some(permission) = state.pending_permission_mut() {
-            permission.repair_attempts = INLINE_PERMISSION_REPAIR_ATTEMPTS;
-        }
-        assert!(!permission_repair_budget_allows_attempt(&state));
-        assert!(!should_attempt_inline_repair(
-            false,
-            UiMode::InlineChat,
-            &state,
-            INLINE_PERMISSION_REPAIR_INTERVAL
-        ));
-
-        if let Some(permission) = state.pending_permission_mut() {
-            permission.repair_attempts = 0;
-            permission.opened_at =
-                Instant::now() - INLINE_PERMISSION_REPAIR_WINDOW - Duration::from_millis(1);
-        }
-        assert!(!permission_repair_budget_allows_attempt(&state));
-    }
-
-    #[test]
-    fn streaming_inline_help_overlay_keeps_repair_active_after_f10() {
+    fn streaming_inline_help_overlay_renders_after_f10() {
         let mut state = AppState::new();
         state.record_user_prompt("hello".to_string());
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
@@ -13219,8 +13027,6 @@ mod tests {
 
         assert!(state.is_streaming());
         assert!(state.help_overlay);
-        assert!(should_repair_inline_view(UiMode::InlineChat, &state));
-        assert!(!should_repair_inline_view(UiMode::FullscreenTui, &state));
 
         let desired = desired_inline_height(
             &state,
@@ -13302,7 +13108,6 @@ mod tests {
             state.status_line.is_none(),
             "help overlay should keep unrelated shortcuts from mutating status"
         );
-        assert!(should_repair_inline_view(UiMode::InlineChat, &state));
         assert_eq!(
             desired_inline_height(
                 &state,

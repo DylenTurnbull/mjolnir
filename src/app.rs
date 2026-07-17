@@ -912,8 +912,6 @@ pub struct PendingPermission {
     pub prompt: PermissionPrompt,
     pub selected: usize,
     pub scroll_offset: Option<usize>,
-    pub opened_at: Instant,
-    pub repair_attempts: usize,
     pub code_agent: bool,
 }
 
@@ -2484,8 +2482,6 @@ impl AppState {
                     prompt,
                     selected: 0,
                     scroll_offset: None,
-                    opened_at: Instant::now(),
-                    repair_attempts: 0,
                     code_agent: false,
                 });
                 self.update_autocomplete();
@@ -2662,8 +2658,6 @@ impl AppState {
                     prompt,
                     selected: 0,
                     scroll_offset: None,
-                    opened_at: Instant::now(),
-                    repair_attempts: 0,
                     code_agent: true,
                 });
                 self.update_autocomplete();
