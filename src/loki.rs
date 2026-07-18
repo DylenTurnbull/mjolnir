@@ -44,9 +44,7 @@ use tokio_util::sync::CancellationToken;
 use crate::acp::{RuntimeAccessMode, RuntimeRoleConfig};
 use crate::council::ResolvedRole;
 use crate::council_usage::{Record, Role};
-use crate::event::{
-    AgentCommandOutcome, CompactTrigger, CouncilRole, LokiActivity, LokiIdentity, UiEvent,
-};
+use crate::event::{AgentCommandOutcome, CompactTrigger, LokiActivity, LokiIdentity, UiEvent};
 use crate::ragnarok::{AgentHandle, Launch, TurnEvent};
 
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -1837,10 +1835,6 @@ async fn worker(
             advice.finish(id).await;
             continue;
         };
-        let _ = ui_tx.send(UiEvent::CouncilPhase {
-            role: CouncilRole::Loki,
-            active: true,
-        });
         let mut context = Vec::new();
         for span in &spans {
             if let Some(value) = pending_context.remove(&(span.target, span.invocation)) {
@@ -1884,10 +1878,6 @@ async fn worker(
             }
         }
         let accepted = advice.finish(id).await;
-        let _ = ui_tx.send(UiEvent::CouncilPhase {
-            role: CouncilRole::Loki,
-            active: false,
-        });
         if let Err(error) = result {
             let quota_failure = role_pool.observe_failure(&role).await;
             if !quota_failure && !*abort_rx.borrow() {

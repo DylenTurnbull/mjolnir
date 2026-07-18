@@ -468,7 +468,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             UiEvent::ClaudeUsage(_) | UiEvent::CodexUsage(_) => {}
             UiEvent::CouncilUsage(record) => council_usage.observe(record),
             UiEvent::CouncilRoleChanged { .. } => {}
-            UiEvent::CouncilPhase { .. } => {}
             // Headless runs never receive remote decisions (no UI event
             // channel is registered with the tracker).
             UiEvent::RemotePermissionDecision { .. } => {}

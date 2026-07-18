@@ -1031,7 +1031,6 @@ impl TrackerState {
                 self.touch();
             }
             UiEvent::CouncilRoleChanged { .. } => {}
-            UiEvent::CouncilPhase { .. } => {}
             UiEvent::CancelPendingPermissions => {
                 self.pending_permissions.clear();
                 self.touch();

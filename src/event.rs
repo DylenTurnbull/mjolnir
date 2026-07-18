@@ -63,24 +63,6 @@ pub enum LokiActivity {
     },
 }
 
-/// A Council member the busy indicator can attribute current work to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CouncilRole {
-    Thor,
-    Loki,
-    Eitri,
-}
-
-impl CouncilRole {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Thor => "Thor",
-            Self::Loki => "Loki",
-            Self::Eitri => "Eitri",
-        }
-    }
-}
-
 /// A council coordination prompt shown as ordinary transcript prose while
 /// retaining its complete text for expansion and export.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,10 +137,6 @@ pub enum UiEvent {
     InternalMessage(InternalMessage),
     /// Completed prompt usage attributed to one Council role.
     CouncilUsage(crate::council_usage::Record),
-    /// A Council role started or finished a work phase. Emitted only where
-    /// begin/end edges are reliable (currently Loki reviews); drives the
-    /// busy-indicator attribution in the status row.
-    CouncilPhase { role: CouncilRole, active: bool },
     /// A background Council role moved to a fallback model for this session.
     CouncilRoleChanged {
         role: crate::council_usage::Role,

@@ -24,8 +24,8 @@ use agent_client_protocol::schema::v1::{
 };
 
 use crate::event::{
-    CodeAgentEvent, CodeAgentOutcome, CouncilRole, ElicitationOutcome, ElicitationPrompt,
-    InternalMessage, LokiActivity, PermissionDecision, PermissionPrompt, PromptImage, ReviewTarget,
+    CodeAgentEvent, CodeAgentOutcome, ElicitationOutcome, ElicitationPrompt, InternalMessage,
+    LokiActivity, PermissionDecision, PermissionPrompt, PromptImage, ReviewTarget,
     SessionConfigTarget, TerminalOutputSnapshot, UiEvent, content_block_text,
 };
 use crate::palette::TerminalTheme;
@@ -817,9 +817,6 @@ pub struct AppState {
     pub code_agent_label: Option<String>,
     /// Number of read-only Eitri scouts currently running in the background.
     pub active_explorations: usize,
-    /// Council role currently in a tracked work phase (set by
-    /// `UiEvent::CouncilPhase`). `None` attributes busy time to Thor.
-    pub active_council_role: Option<CouncilRole>,
     exploration_entries: HashMap<u64, usize>,
     pub council_usage: crate::council_usage::Snapshot,
     /// Transient status line with severity.
@@ -1092,15 +1089,11 @@ pub struct ReviewPicker {
 /// `matches` holds indices into `AppState.available_commands` so the
 /// popup keeps pointing at the right command even if the agent pushes a
 /// new `AvailableCommandsUpdate` (we just recompute the list).
-///
-/// `prefix` is the lowercased slug the matches were filtered with; the
-/// renderer bolds the matching leading characters of each command name.
 #[derive(Debug, Default)]
 pub struct Autocomplete {
     pub visible: bool,
     pub selected: usize,
     pub matches: Vec<usize>,
-    pub prefix: String,
 }
 
 impl AppState {
@@ -1176,7 +1169,6 @@ impl AppState {
             code_agent_active: false,
             code_agent_label: None,
             active_explorations: 0,
-            active_council_role: None,
             exploration_entries: HashMap::new(),
             council_usage: crate::council_usage::Snapshot::default(),
             status_line: None,
@@ -2120,9 +2112,6 @@ impl AppState {
         self.set_connection_state(ConnectionState::Streaming);
         self.turn_started_at = Some(Instant::now());
         self.last_turn_elapsed = None;
-        // A new user turn re-attributes the busy indicator; any Loki review
-        // still finishing the previous turn reports its own end event.
-        self.active_council_role = None;
         self.input_cursor = 0;
         self.scroll_offset = 0;
         // Sending the prompt clears the input; tear down any open
@@ -2308,14 +2297,14 @@ impl AppState {
             .and_then(|&i| self.available_commands.get(i))
             .map(|c| c.name.clone());
 
-        let prefix_matches: Vec<usize> = self
+        let prefix: Vec<usize> = self
             .available_commands
             .iter()
             .enumerate()
             .filter(|(_, c)| c.name.to_lowercase().starts_with(&query))
             .map(|(i, _)| i)
             .collect();
-        let matches = if prefix_matches.is_empty() {
+        let matches = if prefix.is_empty() {
             self.available_commands
                 .iter()
                 .enumerate()
@@ -2323,7 +2312,7 @@ impl AppState {
                 .map(|(i, _)| i)
                 .collect()
         } else {
-            prefix_matches
+            prefix
         };
 
         // Keep the user's selection on the same command if it survived
@@ -2340,7 +2329,6 @@ impl AppState {
             visible: !matches.is_empty(),
             selected,
             matches,
-            prefix: query,
         };
     }
 
@@ -2475,15 +2463,6 @@ impl AppState {
                 crate::council_usage::Role::Loki => self.active_council_models.loki = model,
                 crate::council_usage::Role::Eitri => self.active_council_models.eitri = model,
             },
-            UiEvent::CouncilPhase { role, active } => {
-                if active {
-                    self.active_council_role = Some(role);
-                } else if self.active_council_role == Some(role) {
-                    // Clear only a matching phase so an overlapping role's
-                    // stale `active: false` cannot clobber the current one.
-                    self.active_council_role = None;
-                }
-            }
             UiEvent::WorkspaceDiff(diff) => {
                 self.pending_workspace_diff_total = Some(diff.total_files);
                 self.workspace_diffs.push(diff);
@@ -5385,51 +5364,6 @@ mod tests {
         });
         assert_eq!(s.connection_state, ConnectionState::Ready);
         assert!(!s.is_streaming());
-    }
-
-    #[test]
-    fn council_phase_sets_and_clears_the_active_role() {
-        let mut s = AppState::new();
-        assert_eq!(s.active_council_role, None);
-
-        s.apply_event(UiEvent::CouncilPhase {
-            role: CouncilRole::Loki,
-            active: true,
-        });
-        assert_eq!(s.active_council_role, Some(CouncilRole::Loki));
-
-        s.apply_event(UiEvent::CouncilPhase {
-            role: CouncilRole::Loki,
-            active: false,
-        });
-        assert_eq!(s.active_council_role, None);
-    }
-
-    #[test]
-    fn council_phase_clear_ignores_a_non_matching_role() {
-        let mut s = AppState::new();
-        s.apply_event(UiEvent::CouncilPhase {
-            role: CouncilRole::Loki,
-            active: true,
-        });
-
-        s.apply_event(UiEvent::CouncilPhase {
-            role: CouncilRole::Thor,
-            active: false,
-        });
-        assert_eq!(s.active_council_role, Some(CouncilRole::Loki));
-    }
-
-    #[test]
-    fn record_user_prompt_resets_the_active_council_role() {
-        let mut s = AppState::new();
-        s.apply_event(UiEvent::CouncilPhase {
-            role: CouncilRole::Loki,
-            active: true,
-        });
-
-        s.record_user_prompt("hi".to_string());
-        assert_eq!(s.active_council_role, None);
     }
 
     #[test]
