@@ -1998,6 +1998,7 @@ async fn run(
                     | UiEvent::CodexUsage(_)
                     | UiEvent::CouncilUsage(_)
                     | UiEvent::CouncilRoleChanged { .. }
+                    | UiEvent::CouncilPhase { .. }
                     | UiEvent::RemotePermissionDecision { .. }
                     | UiEvent::LokiActivity(_)
                     | UiEvent::InternalMessage(_) => {}

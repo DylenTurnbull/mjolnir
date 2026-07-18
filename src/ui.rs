@@ -16,7 +16,7 @@ use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
-    AvailableCommandInput, SessionConfigOption, StopReason, ToolCallStatus,
+    AvailableCommand, AvailableCommandInput, SessionConfigOption, StopReason, ToolCallStatus,
 };
 use anyhow::{Context, Result};
 use crossterm::cursor::MoveTo;
@@ -53,8 +53,8 @@ use crate::clipboard::{
 };
 use crate::config;
 use crate::event::{
-    LokiActivity, LokiIdentity, PermissionDecision, PermissionPrompt, PromptImage, ReviewTarget,
-    UiCommand, UiEvent,
+    CouncilRole, LokiActivity, LokiIdentity, PermissionDecision, PermissionPrompt, PromptImage,
+    ReviewTarget, UiCommand, UiEvent,
 };
 use crate::notifications::TerminalNotificationBackend;
 use crate::palette::TerminalTheme;
@@ -729,6 +729,7 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::CodexUsage(_)
         | UiEvent::CouncilUsage(_)
         | UiEvent::CouncilRoleChanged { .. }
+        | UiEvent::CouncilPhase { .. }
         | UiEvent::PromptFailed { .. }
         | UiEvent::SessionForkFailed { .. }
         | UiEvent::RemotePermissionDecision { .. }
@@ -3216,20 +3217,6 @@ fn finish_dictation(state: &mut AppState, result: std::result::Result<String, St
     }
 }
 
-fn dictation_prompt_title(state: &AppState) -> String {
-    if let Some(level) = state.voice_input_level {
-        return format!(" 🎙 {} Ctrl-R stop ", voice_level_meter(Some(level)));
-    }
-
-    let message = state
-        .status_line
-        .as_ref()
-        .filter(|status| status.kind == StatusKind::Info)
-        .map(|status| status.text.as_str())
-        .unwrap_or("preparing voice input...");
-    format!(" 🎙 {message} Ctrl-R stop ")
-}
-
 fn normalize_paste(text: &str) -> String {
     let mut normalized = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -5042,11 +5029,11 @@ fn is_cursor_position_timeout_message(message: &str) -> bool {
         || (message.contains("cursor position") && message.contains("normal duration"))
 }
 
-/// Minimum input box height: three text rows between top and bottom borders.
-const MIN_INPUT_HEIGHT: u16 = 5;
-/// Maximum input box height so the transcript stays usable even when
+/// Minimum input surface height: one padding row above three text rows.
+const MIN_INPUT_HEIGHT: u16 = 4;
+/// Maximum input surface height so the transcript stays usable even when
 /// the user pastes or drafts a long multi-line prompt.
-const MAX_INPUT_HEIGHT: u16 = 16;
+const MAX_INPUT_HEIGHT: u16 = 15;
 
 fn draw(
     f: &mut ratatui::Frame,
@@ -5087,10 +5074,10 @@ fn draw(
     let has_config_options = !state.selectable_config_options().is_empty();
     let usage_quota_rows = usage_quota_row_count(state, f.area().width) as u16;
 
-    // Dynamic input height: borders (2) + chip rows + text lines, clamped.
+    // Dynamic input height: padding row (1) + chip rows + text lines, clamped.
     let chip_rows = attachment_count(state);
     let input_lines = 1 + state.input.chars().filter(|c| *c == '\n').count();
-    let input_height = (chip_rows + input_lines + 2) as u16;
+    let input_height = (chip_rows + input_lines + 1) as u16;
     let input_height = input_height.clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT);
 
     let queued_row = queued_prompt_row_count(state);
@@ -5102,6 +5089,7 @@ fn draw(
             Constraint::Length(1),
             Constraint::Length(queued_row),
             Constraint::Length(input_height),
+            Constraint::Length(1),
             Constraint::Length(usage_quota_rows),
             Constraint::Length(if has_config_options { 1 } else { 0 }),
         ])
@@ -5115,15 +5103,16 @@ fn draw(
     draw_header(f, chunks[1], state);
     draw_queued_prompt_row(f, chunks[2], state);
     draw_input(f, chunks[3], state, mode);
-    draw_usage_quota_row(f, chunks[4], state);
-    draw_config_shortcuts_row(f, chunks[5], state);
+    draw_status_row(f, chunks[4], state, mode);
+    draw_usage_quota_row(f, chunks[5], state);
+    draw_config_shortcuts_row(f, chunks[6], state);
 
     // Autocomplete sits above the input box (so it doesn't collide with
     // the cursor) and is rendered last among the input-area widgets so
     // it overlays the transcript pane. The permission modal trumps it
     // and renders on top.
     if state.autocomplete.visible {
-        draw_autocomplete_popover(f, chunks[1], state);
+        draw_autocomplete_popover(f, chunks[3], state, AutocompleteAnchor::AboveInput);
     }
 
     if state.agent_picker.is_some() {
@@ -5285,6 +5274,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
             Constraint::Length(1),
             Constraint::Length(queued_row),
             Constraint::Min(MIN_INPUT_HEIGHT),
+            Constraint::Length(1),
             Constraint::Length(usage_quota_rows),
             Constraint::Length(if has_config_options { 1 } else { 0 }),
         ])
@@ -5294,14 +5284,15 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
     draw_header(f, chunks[1], state);
     draw_queued_prompt_row(f, chunks[2], state);
     draw_input(f, chunks[3], state, UiMode::InlineChat);
-    draw_usage_quota_row(f, chunks[4], state);
-    draw_config_shortcuts_row(f, chunks[5], state);
+    draw_status_row(f, chunks[4], state, UiMode::InlineChat);
+    draw_usage_quota_row(f, chunks[5], state);
+    draw_config_shortcuts_row(f, chunks[6], state);
 
     if state.autocomplete.visible
         && !state.has_pending_permission()
         && !state.has_pending_elicitation()
     {
-        draw_inline_autocomplete_popover(f, f.area(), state);
+        draw_autocomplete_popover(f, f.area(), state, AutocompleteAnchor::TopOfArea);
     }
 
     if state.help_overlay {
@@ -5750,20 +5741,6 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         spans.push(Span::styled(
             agent_label.to_string(),
             Style::default().fg(state.theme.primary),
-        ));
-        spans.push(Span::raw("   "));
-    }
-    if let Some(notice) = state.side_main_notice.as_deref() {
-        spans.push(Span::styled(
-            notice.to_string(),
-            Style::default().fg(state.theme.warning),
-        ));
-        spans.push(Span::raw("   "));
-    }
-    if state.active_explorations > 0 {
-        spans.push(Span::styled(
-            format!("explore ×{}", state.active_explorations),
-            Style::default().fg(state.theme.tool),
         ));
         spans.push(Span::raw("   "));
     }
@@ -8551,61 +8528,318 @@ fn prompt_activity_ornament(state: &AppState) -> &'static str {
     }
 }
 
-fn prompt_title_label(state: &AppState) -> String {
-    let ornament = prompt_activity_ornament(state);
+/// Which left-side content the status row below the input shows, in
+/// priority order: a pending prompt for the user beats dictation, which
+/// beats an active turn, which beats the idle council roster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusRowMode {
+    NeedsInput,
+    Dictation,
+    Busy,
+    Idle,
+}
+
+fn status_row_mode(state: &AppState) -> StatusRowMode {
+    if state.has_pending_permission() || state.has_pending_elicitation() {
+        StatusRowMode::NeedsInput
+    } else if state.voice_input_active {
+        StatusRowMode::Dictation
+    } else if should_show_spinner(state) {
+        StatusRowMode::Busy
+    } else {
+        StatusRowMode::Idle
+    }
+}
+
+fn council_role_color(role: CouncilRole, theme: &TerminalTheme) -> Color {
+    match role {
+        CouncilRole::Thor => theme.primary,
+        CouncilRole::Loki => theme.warning,
+        CouncilRole::Eitri => theme.tool,
+    }
+}
+
+/// Idle-mode left side: the council roster. Role names and separators are
+/// muted, model names default fg; an unresolved `auto` model stays dim. The
+/// role currently in a work phase keeps its role color instead. Background
+/// Eitri scouts are appended as ` · Eitri exploring ×N` after the roster.
+fn council_roster_spans(
+    models: &config::ModelsConfig,
+    theme: &TerminalTheme,
+    active: Option<CouncilRole>,
+    active_explorations: usize,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (role, model) in [
+        (CouncilRole::Thor, &models.thor),
+        (CouncilRole::Loki, &models.loki),
+        (CouncilRole::Eitri, &models.eitri),
+    ] {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", Style::default().fg(theme.muted)));
+        }
+        let role_color = if active == Some(role) {
+            council_role_color(role, theme)
+        } else {
+            theme.muted
+        };
+        spans.push(Span::styled(role.name(), Style::default().fg(role_color)));
+        spans.push(Span::raw(" "));
+        let model_style = if model == "auto" {
+            Style::default().fg(theme.muted)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(model.clone(), model_style));
+    }
+    if active_explorations > 0 {
+        spans.push(Span::styled(" · ", Style::default().fg(theme.muted)));
+        spans.push(Span::styled(
+            CouncilRole::Eitri.name(),
+            Style::default().fg(council_role_color(CouncilRole::Eitri, theme)),
+        ));
+        spans.push(Span::raw(format!(" exploring ×{active_explorations}")));
+    }
+    spans
+}
+
+/// Dictation-mode left side: the live microphone meter (or setup status
+/// while the microphone warms up) plus the stop shortcut.
+fn dictation_status_spans(state: &AppState, theme: &TerminalTheme) -> Vec<Span<'static>> {
+    let body = if let Some(level) = state.voice_input_level {
+        format!("🎙 {}", voice_level_meter(Some(level)))
+    } else {
+        let message = state
+            .status_line
+            .as_ref()
+            .filter(|status| status.kind == StatusKind::Info)
+            .map(|status| status.text.as_str())
+            .unwrap_or("preparing voice input...");
+        format!("🎙 {message}")
+    };
+    vec![
+        Span::raw(body),
+        Span::raw(" "),
+        Span::raw("Ctrl-R"),
+        Span::styled(" stop", Style::default().fg(theme.muted)),
+    ]
+}
+
+/// Busy-mode left side: the Thor anchor — spinner ornament and `Thor
+/// working <elapsed>`, since every busy connection state and the turn clock
+/// belong to Thor's turn — followed by ` · Role verb` fragments for
+/// concurrent Loki reviews and Eitri scouts (role name in the role's
+/// color), then the queued/cancel affordances (keys default fg, labels
+/// muted).
+fn busy_status_spans(state: &AppState, theme: &TerminalTheme) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::styled(
+            prompt_activity_ornament(state),
+            Style::default().fg(theme.primary),
+        ),
+        Span::raw(" "),
+        Span::styled(CouncilRole::Thor.name(), Style::default().fg(theme.primary)),
+        Span::raw(" working"),
+    ];
     if let Some(elapsed) = turn_elapsed_value_label(state) {
-        format!("{ornament} {elapsed}")
-    } else {
-        ornament.to_string()
+        spans.push(Span::raw(format!(" {elapsed}")));
     }
-}
-
-fn idle_prompt_title(
-    state: &AppState,
-    voice_input_supported: bool,
-    text_selection_hint: &str,
-) -> String {
-    let label = prompt_title_label(state);
-    if voice_input_supported {
-        format!(
-            " {label} (Enter send | {PROMPT_NEWLINE_HINT} newline | 🎙 Ctrl-R voice | F10 help | Ctrl-C quit{text_selection_hint}) "
-        )
-    } else {
-        format!(
-            " {label} (Enter send | {PROMPT_NEWLINE_HINT} newline | F10 help | Ctrl-C quit{text_selection_hint}) "
-        )
+    if state.active_council_role == Some(CouncilRole::Loki) {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(
+            CouncilRole::Loki.name(),
+            Style::default().fg(council_role_color(CouncilRole::Loki, theme)),
+        ));
+        spans.push(Span::raw(" reviewing"));
     }
-}
-
-fn busy_prompt_title(state: &AppState) -> Option<String> {
+    if state.active_explorations > 0 {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(
+            CouncilRole::Eitri.name(),
+            Style::default().fg(council_role_color(CouncilRole::Eitri, theme)),
+        ));
+        spans.push(Span::raw(format!(
+            " exploring ×{}",
+            state.active_explorations
+        )));
+    }
     let queued = state.queued_prompt_count();
-    let label = prompt_title_label(state);
     // Matched exhaustively (no `_` arm) on purpose: this and
     // turn_elapsed_value_label must both be revisited when a variant is added,
     // and the missing-arm compile error is what forces that.
-    let hint = match state.connection_state() {
+    match state.connection_state() {
         ConnectionState::Streaming | ConnectionState::Cancelling => {
             if queued > 0 {
-                format!("{queued} queued | Enter queue next | Ctrl-C/Esc cancel current")
-            } else {
-                "Enter queue next | Ctrl-C/Esc cancel current".to_string()
+                spans.push(Span::raw(format!(" · {queued} queued")));
             }
+            spans.push(Span::raw(" · "));
+            spans.push(Span::raw("Enter"));
+            spans.push(Span::styled(
+                " queue next",
+                Style::default().fg(theme.muted),
+            ));
+            spans.push(Span::raw(" · "));
+            spans.push(Span::raw("Esc"));
+            spans.push(Span::styled(" cancel", Style::default().fg(theme.muted)));
         }
         ConnectionState::Forking => {
             if queued > 0 {
-                format!("{queued} queued | Enter queue next")
-            } else {
-                "Enter queue next".to_string()
+                spans.push(Span::raw(format!(" · {queued} queued")));
             }
+            spans.push(Span::raw(" · "));
+            spans.push(Span::raw("Enter"));
+            spans.push(Span::styled(
+                " queue next",
+                Style::default().fg(theme.muted),
+            ));
         }
         ConnectionState::Launching
         | ConnectionState::Initializing
         | ConnectionState::Ready
         | ConnectionState::Closed
-        | ConnectionState::Fatal => return None,
-    };
+        | ConnectionState::Fatal => {}
+    }
+    spans
+}
 
-    Some(format!(" {label} ({hint}) "))
+/// Right-side key hints, widest variant first: the voice shortcut is the
+/// first thing dropped when the row gets narrow. While text selection is
+/// active the hints collapse to the resume-wheel shortcut.
+fn status_row_right_hints(
+    mode: UiMode,
+    text_selection_mode: bool,
+    voice_supported: bool,
+) -> Vec<String> {
+    if mode == UiMode::FullscreenTui && text_selection_mode {
+        return vec!["F12 resume wheel".to_string()];
+    }
+    let base = match mode {
+        UiMode::FullscreenTui => "F10 help · Ctrl-C quit · F12 select text",
+        UiMode::InlineChat => "F10 help · Ctrl-C quit",
+    };
+    if voice_supported {
+        vec![format!("{base} · 🎙 Ctrl-R voice"), base.to_string()]
+    } else {
+        vec![base.to_string()]
+    }
+}
+
+/// Rows narrower than this hide the right-side key hints entirely.
+const STATUS_ROW_HINT_MIN_WIDTH: u16 = 60;
+
+/// Gap kept between the left content and the right-side hint.
+const STATUS_ROW_HINT_GAP: usize = 2;
+
+/// Columns reserved for the left content when deciding whether a hint
+/// fits; the hint wins collisions and the left side truncates instead.
+const STATUS_ROW_MIN_LEFT_WIDTH: usize = 20;
+
+/// Lay out one status row: pick the first right-hint candidate that fits
+/// and truncate the left side with an ellipsis if it would collide. Never
+/// wraps; hints vanish below the minimum width.
+fn status_row_layout(
+    left: Vec<Span<'static>>,
+    hint_candidates: &[String],
+    width: u16,
+) -> (Vec<Span<'static>>, Option<String>) {
+    let hint = if width >= STATUS_ROW_HINT_MIN_WIDTH {
+        hint_candidates.iter().find(|hint| {
+            hint.width() + STATUS_ROW_HINT_GAP + STATUS_ROW_MIN_LEFT_WIDTH <= usize::from(width)
+        })
+    } else {
+        None
+    };
+    let budget = match hint {
+        Some(hint) => usize::from(width).saturating_sub(hint.width() + STATUS_ROW_HINT_GAP),
+        None => usize::from(width),
+    };
+    (truncate_spans_to_width(left, budget), hint.cloned())
+}
+
+/// Truncate styled spans to a display-width budget, appending an ellipsis
+/// when content was dropped. Span styles are preserved.
+fn truncate_spans_to_width(spans: Vec<Span<'static>>, budget: usize) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(|span| span.content.width()).sum();
+    if total <= budget {
+        return spans;
+    }
+    if budget == 0 {
+        return Vec::new();
+    }
+    // Reserve one column for the ellipsis.
+    let limit = budget - 1;
+    let mut out = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        let span_width = span.content.width();
+        if used + span_width <= limit {
+            used += span_width;
+            out.push(span);
+            continue;
+        }
+        let mut text = String::new();
+        let mut text_width = 0;
+        for ch in span.content.chars() {
+            let ch_width = ch.width().unwrap_or(0);
+            if text_width + ch_width > limit - used {
+                break;
+            }
+            text.push(ch);
+            text_width += ch_width;
+        }
+        if !text.is_empty() {
+            out.push(Span::styled(text, span.style));
+        }
+        break;
+    }
+    out.push(Span::raw("…"));
+    out
+}
+
+fn draw_status_row(f: &mut ratatui::Frame, area: Rect, state: &AppState, mode: UiMode) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let theme = state.theme;
+    let mut left = match status_row_mode(state) {
+        StatusRowMode::NeedsInput => vec![Span::styled(
+            "⚑ Thor needs input",
+            Style::default().fg(theme.warning),
+        )],
+        StatusRowMode::Dictation => dictation_status_spans(state, &theme),
+        StatusRowMode::Busy => busy_status_spans(state, &theme),
+        StatusRowMode::Idle => council_roster_spans(
+            &state.active_council_models,
+            &theme,
+            state.active_council_role,
+            state.active_explorations,
+        ),
+    };
+    // A side-by-side Main agent's lifecycle is surfaced nowhere else, so it
+    // rides along at the tail of every mode's left content and truncates
+    // with it.
+    if let Some(notice) = &state.side_main_notice {
+        left.push(Span::styled(" · ", Style::default().fg(theme.muted)));
+        left.push(Span::styled(
+            notice.clone(),
+            Style::default().fg(theme.warning),
+        ));
+    }
+    let hint_candidates =
+        status_row_right_hints(mode, state.text_selection_mode, voice_input_supported());
+    let (left, hint) = status_row_layout(left, &hint_candidates, area.width);
+    f.render_widget(Paragraph::new(Line::from(left)), area);
+    if let Some(hint) = hint {
+        let hint_width = hint.width() as u16;
+        let hint_area = Rect::new(area.x + area.width - hint_width, area.y, hint_width, 1);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(theme.muted),
+            ))),
+            hint_area,
+        );
+    }
 }
 
 fn queued_prompt_row_count(state: &AppState) -> u16 {
@@ -8619,9 +8853,9 @@ fn queued_prompt_row_count(state: &AppState) -> u16 {
 }
 
 /// Render queued prompts directly above the input box. Visible only while
-/// prompts are waiting behind the active turn. Styled as distinct chips so
+/// prompts are waiting behind the active turn. Styled as plain dim lines so
 /// they read as "waiting to send", never as messages already in the
-/// transcript.
+/// transcript; the next-up line uses the warning color.
 fn draw_queued_prompt_row(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     if area.height == 0 {
         return;
@@ -8646,14 +8880,11 @@ fn draw_queued_prompt_row(f: &mut ratatui::Frame, area: Rect, state: &AppState) 
             );
             Line::from(Span::styled(
                 label,
-                Style::default()
-                    .fg(state.theme.selection_fg)
-                    .bg(if idx == 0 {
-                        state.theme.warning
-                    } else {
-                        state.theme.permission
-                    })
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(if idx == 0 {
+                    state.theme.warning
+                } else {
+                    state.theme.muted
+                }),
             ))
         })
         .collect::<Vec<_>>();
@@ -8667,45 +8898,35 @@ fn draw_queued_prompt_row(f: &mut ratatui::Frame, area: Rect, state: &AppState) 
     f.render_widget(chip, area);
 }
 
-fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &AppState, mode: UiMode) {
-    let text_selection_hint = match mode {
-        UiMode::InlineChat => String::new(),
-        UiMode::FullscreenTui => {
-            if state.text_selection_mode {
-                " | F12 resume wheel".to_string()
-            } else {
-                " | F12 select text".to_string()
-            }
-        }
-    };
-    let title = if state.runtime_closed {
-        " runtime closed (/clear same agent | /new picker | Ctrl-C quit) ".to_string()
-    } else if let Some(title) = busy_prompt_title(state) {
-        title
-    } else if state.voice_input_active {
-        dictation_prompt_title(state)
+/// Placeholder for an empty composer; the runtime-closed hint takes the
+/// same slot so the recovery commands stay discoverable without a border
+/// title. Returns `None` once there is content to show instead.
+fn input_placeholder(state: &AppState) -> Option<&'static str> {
+    if !state.input.is_empty() || attachment_count(state) > 0 {
+        return None;
+    }
+    if state.runtime_closed {
+        Some("runtime closed (/clear same agent | /new picker | Ctrl-C quit)")
     } else {
-        idle_prompt_title(state, voice_input_supported(), &text_selection_hint)
-    };
+        Some("Ask the Council anything…")
+    }
+}
+
+fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &AppState, mode: UiMode) {
     let style = if state.runtime_closed {
         Style::default().fg(state.theme.muted)
     } else {
         Style::default()
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
 
-    // Build lines with attachment chips interleaved with input text.
-    let mut lines: Vec<Line> = Vec::new();
+    // Borderless tinted surface; ANSI themes leave the default background.
+    if let Some(bg) = state.theme.input_bg {
+        f.render_widget(Block::default().style(Style::default().bg(bg)), area);
+    }
 
-    f.render_widget(block, area);
-
-    let inner = Rect::new(
-        area.x.saturating_add(1),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    );
-    if inner.width == 0 || inner.height == 0 {
+    let inner = area;
+    // Need at least the padding row plus one content row.
+    if inner.width == 0 || inner.height < 2 {
         return;
     }
     let side_padding = PROMPT_SIDE_PADDING.min(inner.width / 4);
@@ -8715,24 +8936,19 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &AppState, mode: UiMode
         .width
         .saturating_sub(side_padding * 2 + PROMPT_PREFIX_WIDTH)
         .max(1);
-    let inner_h = inner.height as usize;
+    // Content starts one calm padding row below the top of the surface.
+    let inner_h = inner.height.saturating_sub(1).max(1) as usize;
     let total_visual_rows = input_row_count_with_attachments(state, content_width as usize);
     let visible_rows = total_visual_rows.max(1).min(inner_h);
-    let top_padding = if total_visual_rows < inner_h {
-        ((inner_h - total_visual_rows) / 2) as u16
-    } else {
-        0
-    };
     let content_area = Rect::new(
         inner.x + side_padding + PROMPT_PREFIX_WIDTH,
-        inner.y + top_padding,
+        inner.y + 1,
         content_width,
         visible_rows as u16,
     );
 
-    // Add input rows after the content width is known so cursor
-    // placement and rendering use the same wrap boundaries.
-    lines.extend(input_lines_with_attachments(state, content_width as usize));
+    // Build lines with attachment chips interleaved with input text.
+    let lines = input_lines_with_attachments(state, content_width as usize);
 
     let scroll = if total_visual_rows > visible_rows {
         let cursor_row =
@@ -8745,6 +8961,13 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &AppState, mode: UiMode
 
     let paragraph = Paragraph::new(lines).style(style).scroll((scroll, 0));
     f.render_widget(paragraph, content_area);
+
+    if let Some(placeholder) = input_placeholder(state) {
+        f.render_widget(
+            Paragraph::new(placeholder).style(Style::default().fg(state.theme.muted)),
+            Rect::new(content_area.x, content_area.y, content_width, 1),
+        );
+    }
 
     // Draw the ">" prompt prefix in the gutter to the left of the input text.
     let gutter_area = Rect::new(
@@ -10143,39 +10366,54 @@ fn draw_config_value_picker_modal(f: &mut ratatui::Frame, area: Rect, state: &Ap
     f.render_widget(footer, layout[3]);
 }
 
-/// Slash-command autocomplete popover. Anchored to the top edge of the
-/// input box and grows upward into the transcript pane so it never
-/// covers the user's cursor. Width matches the input box; height caps
-/// at 8 visible rows + 2 borders.
-fn draw_autocomplete_popover(f: &mut ratatui::Frame, input_area: Rect, state: &AppState) {
+/// Where the autocomplete popover anchors.
+enum AutocompleteAnchor {
+    /// Bottom edge sits directly above the given rect (the input box),
+    /// growing upward into the transcript pane.
+    AboveInput,
+    /// Overlays from the top of the given rect (inline mode).
+    TopOfArea,
+}
+
+/// Slash-command autocomplete popover. Height caps at 8 visible rows and
+/// shrinks when the available space is short so the highlighted item
+/// stays visible.
+fn draw_autocomplete_popover(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    state: &AppState,
+    anchor: AutocompleteAnchor,
+) {
     let max_visible_rows = 8u16;
     let desired_rows = (state.autocomplete.matches.len() as u16).min(max_visible_rows);
     if desired_rows == 0 {
         return;
     }
-    // Place the popover so its bottom border sits just above the input
-    // box. If the transcript pane is short, shrink the number of rows
-    // to keep the highlighted item visible.
-    let height = (desired_rows + 2).min(input_area.y);
-    if height < 3 {
-        return;
-    }
-    let visible_rows = (height - 2) as usize;
-    let rect = Rect::new(
-        input_area.x,
-        input_area.y - height,
-        input_area.width,
-        height,
-    );
+    let rect = match anchor {
+        AutocompleteAnchor::AboveInput => {
+            let height = desired_rows.min(area.y);
+            if height == 0 {
+                return;
+            }
+            Rect::new(area.x, area.y - height, area.width, height)
+        }
+        AutocompleteAnchor::TopOfArea => {
+            // Leave the bottom row to the input line beneath the overlay.
+            let height = desired_rows.min(area.height.saturating_sub(1));
+            if height == 0 {
+                return;
+            }
+            Rect::new(area.x, area.y, area.width, height)
+        }
+    };
 
     f.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" commands (Tab/Enter accept, Esc cancel) ")
-        .style(Style::default().fg(state.theme.primary));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
+    // Float the popover on the same surface as the composer below it.
+    if let Some(bg) = state.theme.input_bg {
+        f.render_widget(Block::default().style(Style::default().bg(bg)), rect);
+    }
 
+    let visible_rows = usize::from(rect.height);
     let total = state.autocomplete.matches.len();
     let selected = state.autocomplete.selected;
     let range = centered_visible_range(total, selected, visible_rows);
@@ -10185,83 +10423,91 @@ fn draw_autocomplete_popover(f: &mut ratatui::Frame, input_area: Rect, state: &A
         .iter()
         .enumerate()
         .map(|(offset, &cmd_idx)| {
-            let absolute = start + offset;
             let cmd = &state.available_commands[cmd_idx];
-            let marker = if absolute == selected { ">" } else { " " };
-            let hint = cmd
-                .input
-                .as_ref()
-                .map(|i| match i {
-                    AvailableCommandInput::Unstructured(u) => format!(" <{}>", u.hint),
-                    _ => String::new(),
-                })
-                .unwrap_or_default();
-            let mut line = format!("{marker} /{}{hint}", cmd.name);
-            // Append a trimmed description on the same row.
-            let description = cmd.description.trim();
-            if !description.is_empty() {
-                line.push_str("  -- ");
-                line.push_str(description);
-            }
-            truncate_line(line, inner.width, absolute == selected, state.theme)
+            ListItem::new(autocomplete_row(
+                cmd,
+                &state.autocomplete.prefix,
+                start + offset == selected,
+                rect.width,
+                &state.theme,
+            ))
         })
         .collect();
-
-    let list = List::new(items);
-    f.render_widget(list, inner);
+    f.render_widget(List::new(items), rect);
 }
 
-fn draw_inline_autocomplete_popover(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
-    let max_visible_rows = 8u16;
-    let desired_rows = (state.autocomplete.matches.len() as u16).min(max_visible_rows);
-    if desired_rows == 0 || area.height < 4 {
-        return;
+/// One autocomplete row: `/name <hint>` with the typed prefix bolded,
+/// then the trimmed description in muted. The selected row is primary +
+/// bold without a background fill.
+fn autocomplete_row(
+    cmd: &AvailableCommand,
+    prefix: &str,
+    selected: bool,
+    width: u16,
+    theme: &TerminalTheme,
+) -> Line<'static> {
+    let base = if selected {
+        Style::default()
+            .fg(theme.primary)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let mut spans = vec![Span::styled("/", base)];
+
+    // Bold only a true leading-prefix match of the command name.
+    let prefix_chars = if !prefix.is_empty() && cmd.name.to_lowercase().starts_with(prefix) {
+        prefix.chars().count()
+    } else {
+        0
+    };
+    let split = cmd
+        .name
+        .char_indices()
+        .nth(prefix_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(cmd.name.len());
+    let (matched, rest) = cmd.name.split_at(split);
+    if !matched.is_empty() {
+        spans.push(Span::styled(
+            matched.to_string(),
+            base.add_modifier(Modifier::BOLD),
+        ));
     }
-    let height = (desired_rows + 2).min(area.height.saturating_sub(1));
-    if height < 3 {
-        return;
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), base));
     }
-    let rect = Rect::new(area.x, area.y, area.width, height);
 
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" commands (Tab/Enter accept, Esc cancel) ")
-        .style(Style::default().fg(state.theme.primary));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
+    if let Some(input) = cmd.input.as_ref()
+        && let AvailableCommandInput::Unstructured(u) = input
+    {
+        spans.push(Span::styled(format!(" <{}>", u.hint), base));
+    }
 
-    let visible_rows = usize::from(inner.height);
-    let total = state.autocomplete.matches.len();
-    let selected = state.autocomplete.selected;
-    let range = centered_visible_range(total, selected, visible_rows);
-    let start = range.start;
+    let description = cmd.description.trim();
+    if !description.is_empty() {
+        spans.push(Span::styled(
+            format!("  {description}"),
+            Style::default().fg(theme.muted),
+        ));
+    }
 
-    let items: Vec<ListItem> = state.autocomplete.matches[range]
-        .iter()
-        .enumerate()
-        .map(|(offset, &cmd_idx)| {
-            let absolute = start + offset;
-            let cmd = &state.available_commands[cmd_idx];
-            let marker = if absolute == selected { ">" } else { " " };
-            let hint = cmd
-                .input
-                .as_ref()
-                .map(|i| match i {
-                    AvailableCommandInput::Unstructured(u) => format!(" <{}>", u.hint),
-                    _ => String::new(),
-                })
-                .unwrap_or_default();
-            let mut line = format!("{marker} /{}{hint}", cmd.name);
-            let description = cmd.description.trim();
-            if !description.is_empty() {
-                line.push_str("  -- ");
-                line.push_str(description);
-            }
-            truncate_line(line, inner.width, marker == ">", state.theme)
-        })
-        .collect();
-    f.render_widget(List::new(items), inner);
+    truncate_row_spans(spans, width)
+}
+
+/// Truncate spans to `width` display columns, preserving styles.
+fn truncate_row_spans(spans: Vec<Span<'static>>, width: u16) -> Line<'static> {
+    let mut remaining = usize::from(width);
+    let mut out = Vec::new();
+    for span in spans {
+        if remaining == 0 {
+            break;
+        }
+        let text = truncate_text_to_width(span.content.into_owned(), remaining as u16);
+        remaining = remaining.saturating_sub(text.width());
+        out.push(Span::styled(text, span.style));
+    }
+    Line::from(out)
 }
 
 fn truncate_line(
@@ -16481,34 +16727,28 @@ mod tests {
     }
 
     #[test]
-    fn input_title_includes_text_selection_shortcut() {
+    fn status_row_shows_text_selection_shortcut_in_fullscreen() {
         let mut state = AppState::new();
         state.set_connection_state(ConnectionState::Ready);
-        let backend = TestBackend::new(180, 5);
+        let backend = TestBackend::new(180, 1);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
         terminal
-            .draw(|frame| draw_input(frame, frame.area(), &state, UiMode::FullscreenTui))
+            .draw(|frame| draw_status_row(frame, frame.area(), &state, UiMode::FullscreenTui))
             .expect("draw");
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(
-            rendered.contains("············ (Enter send"),
-            "rendered:\n{rendered}"
-        );
+        assert!(rendered.contains("Thor auto"), "rendered:\n{rendered}");
+        assert!(rendered.contains("F10 help"), "rendered:\n{rendered}");
         assert!(rendered.contains("Ctrl-C quit"), "rendered:\n{rendered}");
         assert!(
             rendered.contains("F12 select text"),
             "rendered:\n{rendered}"
         );
-        assert!(!rendered.contains("prompt"), "rendered:\n{rendered}");
-        assert!(!rendered.contains("ready"), "rendered:\n{rendered}");
-        assert!(!rendered.contains("streaming"), "rendered:\n{rendered}");
-        assert!(!rendered.contains("elapsed"), "rendered:\n{rendered}");
 
         state.text_selection_mode = true;
         terminal
-            .draw(|frame| draw_input(frame, frame.area(), &state, UiMode::FullscreenTui))
+            .draw(|frame| draw_status_row(frame, frame.area(), &state, UiMode::FullscreenTui))
             .expect("draw");
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -16516,10 +16756,28 @@ mod tests {
             rendered.contains("F12 resume wheel"),
             "rendered:\n{rendered}"
         );
+        assert!(!rendered.contains("F10 help"), "rendered:\n{rendered}");
     }
 
     #[test]
-    fn inline_input_title_omits_text_selection_shortcut() {
+    fn inline_status_row_omits_text_selection_shortcut() {
+        let mut state = AppState::new();
+        state.set_connection_state(ConnectionState::Ready);
+        let backend = TestBackend::new(140, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_status_row(frame, frame.area(), &state, UiMode::InlineChat))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Ctrl-C quit"), "rendered:\n{rendered}");
+        assert!(rendered.contains("F10 help"), "rendered:\n{rendered}");
+        assert!(!rendered.contains("F12"), "rendered:\n{rendered}");
+    }
+
+    #[test]
+    fn empty_input_shows_placeholder_without_hints() {
         let mut state = AppState::new();
         state.set_connection_state(ConnectionState::Ready);
         let backend = TestBackend::new(140, 5);
@@ -16531,16 +16789,16 @@ mod tests {
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(
-            rendered.contains("············ (Enter send"),
+            rendered.contains("Ask the Council anything…"),
             "rendered:\n{rendered}"
         );
-        assert!(rendered.contains("Ctrl-C quit"), "rendered:\n{rendered}");
-        assert!(rendered.contains("F10 help"), "rendered:\n{rendered}");
-        assert!(!rendered.contains("F12"), "rendered:\n{rendered}");
-        assert!(!rendered.contains("prompt"), "rendered:\n{rendered}");
-        assert!(!rendered.contains("ready"), "rendered:\n{rendered}");
-        assert!(!rendered.contains("streaming"), "rendered:\n{rendered}");
-        assert!(!rendered.contains("elapsed"), "rendered:\n{rendered}");
+        assert!(!rendered.contains("············"), "rendered:\n{rendered}");
+        assert!(!rendered.contains("Enter send"), "rendered:\n{rendered}");
+        assert!(!rendered.contains("F10 help"), "rendered:\n{rendered}");
+        assert!(!rendered.contains("Ctrl-C quit"), "rendered:\n{rendered}");
+        // The borderless surface must not draw box-drawing characters.
+        assert!(!rendered.contains('─'), "rendered:\n{rendered}");
+        assert!(!rendered.contains('│'), "rendered:\n{rendered}");
 
         state.record_user_prompt("hello".to_string());
         state.apply_event(UiEvent::PromptDone {
@@ -16553,23 +16811,66 @@ mod tests {
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(
-            rendered.contains("············ 0s (Enter send"),
+            rendered.contains("Ask the Council anything…"),
             "rendered:\n{rendered}"
         );
-        assert!(!rendered.contains("prompt"), "rendered:\n{rendered}");
-        assert!(!rendered.contains("ready"), "rendered:\n{rendered}");
-        assert!(!rendered.contains("streaming"), "rendered:\n{rendered}");
-        assert!(!rendered.contains("elapsed"), "rendered:\n{rendered}");
+        assert!(!rendered.contains("Enter send"), "rendered:\n{rendered}");
     }
 
     #[test]
-    fn busy_input_title_uses_activity_ornament_without_status_words() {
+    fn input_placeholder_visibility_rule() {
         let mut state = AppState::new();
-        let backend = TestBackend::new(120, 5);
+        assert_eq!(input_placeholder(&state), Some("Ask the Council anything…"));
+
+        state.input = "typed".to_string();
+        assert_eq!(input_placeholder(&state), None);
+
+        state.input.clear();
+        state.attachments.push(PastedAttachment {
+            id: 1,
+            position: 0,
+            content: "pasted".to_string(),
+        });
+        assert_eq!(input_placeholder(&state), None);
+
+        state.attachments.clear();
+        state.runtime_closed = true;
+        assert_eq!(
+            input_placeholder(&state),
+            Some("runtime closed (/clear same agent | /new picker | Ctrl-C quit)")
+        );
+
+        state.input = "/clear".to_string();
+        assert_eq!(input_placeholder(&state), None);
+    }
+
+    #[test]
+    fn runtime_closed_shows_hint_as_placeholder() {
+        let mut state = AppState::new();
+        state.set_connection_state(ConnectionState::Ready);
+        state.runtime_closed = true;
+        let backend = TestBackend::new(140, 5);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
         terminal
             .draw(|frame| draw_input(frame, frame.area(), &state, UiMode::InlineChat))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(
+            rendered.contains("runtime closed (/clear same agent | /new picker | Ctrl-C quit)"),
+            "rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn busy_status_row_uses_activity_ornament_without_status_words() {
+        let mut state = AppState::new();
+        let backend = TestBackend::new(120, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_status_row(frame, frame.area(), &state, UiMode::InlineChat))
             .expect("draw");
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -16579,12 +16880,11 @@ mod tests {
         );
         assert!(rendered.contains("0s"), "rendered:\n{rendered}");
         assert!(!rendered.contains("launching"), "rendered:\n{rendered}");
-        assert!(!rendered.contains("prompt ("), "rendered:\n{rendered}");
         assert!(!rendered.contains("elapsed"), "rendered:\n{rendered}");
 
         state.record_user_prompt("hello".to_string());
         terminal
-            .draw(|frame| draw_input(frame, frame.area(), &state, UiMode::InlineChat))
+            .draw(|frame| draw_status_row(frame, frame.area(), &state, UiMode::InlineChat))
             .expect("draw");
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -16593,12 +16893,8 @@ mod tests {
             "rendered:\n{rendered}"
         );
         assert!(rendered.contains("0s"), "rendered:\n{rendered}");
-        assert!(
-            rendered.contains("Ctrl-C/Esc cancel current"),
-            "rendered:\n{rendered}"
-        );
+        assert!(rendered.contains("Esc cancel"), "rendered:\n{rendered}");
         assert!(!rendered.contains("streaming"), "rendered:\n{rendered}");
-        assert!(!rendered.contains("prompt ("), "rendered:\n{rendered}");
         assert!(!rendered.contains("elapsed"), "rendered:\n{rendered}");
     }
 
@@ -16628,38 +16924,40 @@ mod tests {
     }
 
     #[test]
-    fn busy_prompt_title_preserves_cancelling_forking_and_queue_affordances() {
+    fn busy_status_row_preserves_cancelling_forking_and_queue_affordances() {
+        let theme = TerminalThemeKind::Dark.palette();
+        let text = |state: &AppState| -> String {
+            busy_status_spans(state, &theme)
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
         let mut state = AppState::new();
 
         state.set_connection_state(ConnectionState::Cancelling);
-        let cancelling = busy_prompt_title(&state).expect("cancelling title");
+        let cancelling = text(&state);
         assert!(contains_prompt_activity_frame(&cancelling), "{cancelling}");
         assert!(cancelling.contains("Enter queue next"), "{cancelling}");
-        assert!(
-            cancelling.contains("Ctrl-C/Esc cancel current"),
-            "{cancelling}"
-        );
+        assert!(cancelling.contains("Esc cancel"), "{cancelling}");
         assert!(!cancelling.contains("cancelling"), "{cancelling}");
         assert!(!cancelling.contains("streaming"), "{cancelling}");
-        assert!(!cancelling.contains("prompt"), "{cancelling}");
 
         state.push_queued_prompt(QueuedPrompt {
             text: "next".to_string(),
             images: Vec::new(),
             display_text: "next".to_string(),
         });
-        let queued = busy_prompt_title(&state).expect("queued title");
+        let queued = text(&state);
         assert!(queued.contains("1 queued"), "{queued}");
-        assert!(queued.contains("Ctrl-C/Esc cancel current"), "{queued}");
+        assert!(queued.contains("Esc cancel"), "{queued}");
 
         state.set_connection_state(ConnectionState::Forking);
-        let forking = busy_prompt_title(&state).expect("forking title");
+        let forking = text(&state);
         assert!(contains_prompt_activity_frame(&forking), "{forking}");
         assert!(forking.contains("1 queued"), "{forking}");
         assert!(forking.contains("Enter queue next"), "{forking}");
-        assert!(!forking.contains("Ctrl-C/Esc cancel current"), "{forking}");
+        assert!(!forking.contains("Esc cancel"), "{forking}");
         assert!(!forking.contains("forking"), "{forking}");
-        assert!(!forking.contains("prompt"), "{forking}");
     }
 
     #[test]
@@ -16693,6 +16991,288 @@ mod tests {
             rendered.contains(&mjolnir_version_label()),
             "rendered:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn status_row_mode_prioritizes_needs_input_over_dictation_busy_and_idle() {
+        let mut state = AppState::new();
+        state.set_connection_state(ConnectionState::Ready);
+        assert_eq!(status_row_mode(&state), StatusRowMode::Idle);
+
+        state.set_connection_state(ConnectionState::Streaming);
+        assert_eq!(status_row_mode(&state), StatusRowMode::Busy);
+
+        state.voice_input_active = true;
+        assert_eq!(status_row_mode(&state), StatusRowMode::Dictation);
+
+        let permission = permission_pending_with_options("run cmd", &["Allow", "Reject"], 0);
+        state.apply_event(UiEvent::PermissionRequest(permission.prompt));
+        assert_eq!(status_row_mode(&state), StatusRowMode::NeedsInput);
+    }
+
+    #[test]
+    fn council_roster_spans_mute_roles_and_dim_auto_models() {
+        let theme = TerminalThemeKind::Dark.palette();
+        let models = config::ModelsConfig {
+            thor: "claude-opus".to_string(),
+            loki: "auto".to_string(),
+            eitri: "gpt-5".to_string(),
+        };
+
+        let spans = council_roster_spans(&models, &theme, None, 0);
+
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "Thor claude-opus · Loki auto · Eitri gpt-5");
+        let fg_of = |content: &str| {
+            spans
+                .iter()
+                .find(|span| span.content == content)
+                .map(|span| span.style.fg)
+        };
+        assert_eq!(fg_of("Thor"), Some(Some(theme.muted)));
+        assert_eq!(fg_of("Loki"), Some(Some(theme.muted)));
+        assert_eq!(fg_of("Eitri"), Some(Some(theme.muted)));
+        assert_eq!(fg_of(" · "), Some(Some(theme.muted)));
+        assert_eq!(fg_of("claude-opus"), Some(None));
+        assert_eq!(fg_of("gpt-5"), Some(None));
+        assert_eq!(fg_of("auto"), Some(Some(theme.muted)));
+    }
+
+    #[test]
+    fn council_roster_spans_highlight_the_active_role_in_its_color() {
+        let theme = TerminalThemeKind::Dark.palette();
+        let models = config::ModelsConfig {
+            thor: "claude-opus".to_string(),
+            loki: "auto".to_string(),
+            eitri: "gpt-5".to_string(),
+        };
+
+        let spans = council_roster_spans(&models, &theme, Some(CouncilRole::Loki), 0);
+
+        let fg_of = |content: &str| {
+            spans
+                .iter()
+                .find(|span| span.content == content)
+                .map(|span| span.style.fg)
+        };
+        assert_eq!(fg_of("Loki"), Some(Some(theme.warning)));
+        assert_eq!(fg_of("Thor"), Some(Some(theme.muted)));
+        assert_eq!(fg_of("Eitri"), Some(Some(theme.muted)));
+    }
+
+    #[test]
+    fn busy_status_spans_anchor_thor_and_list_secondary_role_activity() {
+        let theme = TerminalThemeKind::Dark.palette();
+        let fg_of = |spans: &[Span<'static>], content: &str| {
+            spans
+                .iter()
+                .find(|span| span.content == content)
+                .map(|span| span.style.fg)
+        };
+        let text_of = |spans: &[Span<'static>]| {
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let mut state = AppState::new();
+        state.record_user_prompt("hello".to_string());
+
+        // Thor is always the anchor: spinner stays primary and the turn
+        // elapsed attaches to Thor's `working`.
+        let spans = busy_status_spans(&state, &theme);
+        let text = text_of(&spans);
+        assert!(text.contains("Thor working"), "{text}");
+        assert_eq!(fg_of(&spans, "Thor"), Some(Some(theme.primary)));
+        assert_eq!(spans[0].style.fg, Some(theme.primary), "spinner ornament");
+        let working_idx = spans
+            .iter()
+            .position(|span| span.content == " working")
+            .expect("working span");
+        assert!(
+            spans[working_idx + 1].content.starts_with(' '),
+            "elapsed directly follows working: {:?}",
+            spans[working_idx + 1].content
+        );
+
+        // A Loki review is a secondary fragment; Thor stays the anchor.
+        state.active_council_role = Some(CouncilRole::Loki);
+        let spans = busy_status_spans(&state, &theme);
+        let text = text_of(&spans);
+        assert!(text.contains("Thor working"), "{text}");
+        assert!(text.contains("· Loki reviewing"), "{text}");
+        assert_eq!(fg_of(&spans, "Thor"), Some(Some(theme.primary)));
+        assert_eq!(fg_of(&spans, "Loki"), Some(Some(theme.warning)));
+        assert_eq!(spans[0].style.fg, Some(theme.primary), "spinner ornament");
+
+        // Eitri scouts append after Loki; both fragments may coexist.
+        state.active_explorations = 2;
+        let spans = busy_status_spans(&state, &theme);
+        let text = text_of(&spans);
+        assert!(text.contains("Thor working"), "{text}");
+        assert!(text.contains("· Loki reviewing"), "{text}");
+        assert!(text.contains("· Eitri exploring ×2"), "{text}");
+        assert!(
+            text.find("Loki").expect("Loki") < text.find("Eitri").expect("Eitri"),
+            "Loki fragment precedes Eitri: {text}"
+        );
+        assert_eq!(fg_of(&spans, "Eitri"), Some(Some(theme.tool)));
+        assert_eq!(spans[0].style.fg, Some(theme.primary), "spinner ornament");
+
+        // Some(Thor)/Some(Eitri) emit no fragment: Thor is the anchor and
+        // Eitri is covered by the exploration count.
+        state.active_council_role = Some(CouncilRole::Thor);
+        let text = text_of(&busy_status_spans(&state, &theme));
+        assert_eq!(text.matches("Thor").count(), 1, "{text}");
+
+        state.active_council_role = Some(CouncilRole::Eitri);
+        let text = text_of(&busy_status_spans(&state, &theme));
+        assert_eq!(text.matches("Eitri").count(), 1, "{text}");
+        assert!(!text.contains("Eitri reviewing"), "{text}");
+    }
+
+    #[test]
+    fn busy_status_row_renders_thor_anchor_and_loki_fragment() {
+        let mut state = AppState::new();
+        state.record_user_prompt("hello".to_string());
+        state.active_council_role = Some(CouncilRole::Loki);
+        let backend = TestBackend::new(120, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_status_row(frame, frame.area(), &state, UiMode::InlineChat))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Thor working"), "rendered:\n{rendered}");
+        assert!(rendered.contains("Loki reviewing"), "rendered:\n{rendered}");
+        assert!(rendered.contains("Esc cancel"), "rendered:\n{rendered}");
+    }
+
+    #[test]
+    fn status_row_renders_side_main_notice_in_warning_after_mode_content() {
+        let theme = TerminalThemeKind::Dark.palette();
+        let mut state = AppState::new();
+        state.set_connection_state(ConnectionState::Ready);
+        state.side_main_notice = Some("Main running".to_string());
+        let backend = TestBackend::new(120, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_status_row(frame, frame.area(), &state, UiMode::InlineChat))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer_lines(buffer).join("\n");
+        assert!(
+            rendered.contains("Eitri auto · Main running"),
+            "notice follows the idle roster, rendered:\n{rendered}"
+        );
+        let mut cells = (0..buffer.area().height).flat_map(|y| {
+            (0..buffer.area().width).map(move |x| buffer.cell((x, y)).expect("cell"))
+        });
+        let notice_cell = cells
+            .find(|cell| cell.symbol() == "M")
+            .expect("notice cell");
+        assert_eq!(notice_cell.fg, theme.warning);
+    }
+
+    #[test]
+    fn council_roster_spans_surface_background_eitri_scouts() {
+        let theme = TerminalThemeKind::Dark.palette();
+        let models = config::ModelsConfig {
+            thor: "claude-opus".to_string(),
+            loki: "auto".to_string(),
+            eitri: "gpt-5".to_string(),
+        };
+
+        let spans = council_roster_spans(&models, &theme, None, 2);
+
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(
+            text,
+            "Thor claude-opus · Loki auto · Eitri gpt-5 · Eitri exploring ×2"
+        );
+        let tail: Vec<&Span> = spans[spans.len() - 3..].iter().collect();
+        assert_eq!(tail[0].style.fg, Some(theme.muted), "separator");
+        assert_eq!(tail[1].content, "Eitri");
+        assert_eq!(tail[1].style.fg, Some(theme.tool));
+        assert_eq!(tail[2].content, " exploring ×2");
+        assert_eq!(tail[2].style.fg, None, "verb keeps default fg");
+    }
+
+    #[test]
+    fn status_row_right_hints_prefer_voice_variant_then_base() {
+        let hints = status_row_right_hints(UiMode::InlineChat, false, true);
+        assert_eq!(hints.len(), 2);
+        assert!(hints[0].contains("🎙 Ctrl-R voice"), "{}", hints[0]);
+        assert!(!hints[1].contains("🎙 Ctrl-R voice"), "{}", hints[1]);
+
+        let hints = status_row_right_hints(UiMode::FullscreenTui, false, false);
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("F12 select text"), "{}", hints[0]);
+        assert!(!hints[0].contains("🎙 Ctrl-R voice"), "{}", hints[0]);
+
+        // Text selection collapses the hints to the resume-wheel shortcut.
+        let hints = status_row_right_hints(UiMode::FullscreenTui, true, true);
+        assert_eq!(hints, vec!["F12 resume wheel".to_string()]);
+    }
+
+    #[test]
+    fn status_row_layout_drops_voice_hint_first_then_all_hints() {
+        let hints = status_row_right_hints(UiMode::InlineChat, false, true);
+        let left = || vec![Span::raw("Thor auto · Loki auto · Eitri auto")];
+        let full_width = ((hints[0].width() + STATUS_ROW_HINT_GAP + STATUS_ROW_MIN_LEFT_WIDTH)
+            as u16)
+            .max(STATUS_ROW_HINT_MIN_WIDTH);
+
+        // Wide enough for everything: the voice variant wins.
+        let (_, hint) = status_row_layout(left(), &hints, full_width);
+        assert_eq!(hint.as_deref(), Some(hints[0].as_str()));
+
+        // Narrower: the voice suffix is dropped before the rest.
+        let (_, hint) = status_row_layout(left(), &hints, full_width - 1);
+        assert_eq!(hint.as_deref(), Some(hints[1].as_str()));
+
+        // Below the minimum width the hints vanish entirely.
+        let (_, hint) = status_row_layout(left(), &hints, STATUS_ROW_HINT_MIN_WIDTH - 1);
+        assert_eq!(hint, None);
+    }
+
+    #[test]
+    fn status_row_layout_truncates_left_side_with_ellipsis() {
+        let hints = status_row_right_hints(UiMode::InlineChat, false, false);
+        let long_left = || vec![Span::raw("x".repeat(80))];
+        let text_of = |spans: &[Span]| {
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+
+        // No hint fits: the left side fills the row minus the ellipsis.
+        let width = STATUS_ROW_HINT_MIN_WIDTH - 1;
+        let (truncated, hint) = status_row_layout(long_left(), &hints, width);
+        assert_eq!(hint, None);
+        let text = text_of(&truncated);
+        assert!(text.ends_with('…'), "{text}");
+        assert_eq!(text.width(), usize::from(width));
+
+        // A visible hint shrinks the left budget accordingly.
+        let width = 70;
+        let (truncated, hint) = status_row_layout(long_left(), &hints, width);
+        let hint = hint.expect("hint should fit");
+        let text = text_of(&truncated);
+        assert!(text.ends_with('…'), "{text}");
+        assert_eq!(
+            text.width(),
+            usize::from(width) - hint.width() - STATUS_ROW_HINT_GAP
+        );
+
+        // Short content is passed through untouched.
+        let short = vec![Span::raw("Thor auto")];
+        let (untouched, _) = status_row_layout(short, &hints, width);
+        assert_eq!(text_of(&untouched), "Thor auto");
     }
 
     #[test]
@@ -18995,13 +19575,16 @@ mod tests {
     }
 
     #[test]
-    fn android_prompt_title_hides_voice_shortcut() {
-        let mut state = AppState::new();
-        state.set_connection_state(ConnectionState::Ready);
-        let title = idle_prompt_title(&state, false, "");
-
-        assert!(!title.contains("Ctrl-R"));
-        assert!(!title.contains("voice"));
+    fn android_status_row_hint_hides_voice_shortcut() {
+        for mode in [UiMode::FullscreenTui, UiMode::InlineChat] {
+            for text_selection_mode in [false, true] {
+                let hints = status_row_right_hints(mode, text_selection_mode, false);
+                for hint in &hints {
+                    assert!(!hint.contains("Ctrl-R"), "{hint}");
+                    assert!(!hint.contains("voice"), "{hint}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -19111,7 +19694,8 @@ mod tests {
     }
 
     #[test]
-    fn dictation_prompt_title_shows_setup_status_before_microphone_levels() {
+    fn dictation_status_row_shows_setup_status_before_microphone_levels() {
+        let theme = TerminalThemeKind::Dark.palette();
         let mut state = AppState::new();
         state.voice_input_active = true;
         state.voice_input_level = None;
@@ -19119,23 +19703,30 @@ mod tests {
             "downloading voice model (one-time): 42% of 464 MB",
         ));
 
-        let title = dictation_prompt_title(&state);
+        let text: String = dictation_status_spans(&state, &theme)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
 
-        assert!(title.contains("downloading voice model (one-time): 42% of 464 MB"));
-        assert!(title.contains("Ctrl-R stop"));
+        assert!(text.contains("downloading voice model (one-time): 42% of 464 MB"));
+        assert!(text.contains("Ctrl-R stop"));
     }
 
     #[test]
-    fn dictation_prompt_title_switches_to_meter_after_microphone_levels_arrive() {
+    fn dictation_status_row_switches_to_meter_after_microphone_levels_arrive() {
+        let theme = TerminalThemeKind::Dark.palette();
         let mut state = AppState::new();
         state.voice_input_active = true;
         state.voice_input_level = Some(0.35);
         state.status_line = Some(StatusMessage::info("listening..."));
 
-        let title = dictation_prompt_title(&state);
+        let text: String = dictation_status_spans(&state, &theme)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
 
-        assert!(title.contains("[||||......]"));
-        assert!(!title.contains("listening..."));
+        assert!(text.contains("[||||......]"));
+        assert!(!text.contains("listening..."));
     }
 
     #[tokio::test]
@@ -19340,7 +19931,7 @@ mod tests {
         state.input = "hello abcdef".to_string();
         state.input_cursor = state.input.chars().count();
 
-        let mut terminal = Terminal::new(TestBackend::new(16, 6)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(14, 6)).expect("terminal");
         terminal
             .draw(|frame| draw_input(frame, frame.area(), &state, UiMode::FullscreenTui))
             .expect("draw");
@@ -19358,7 +19949,7 @@ mod tests {
         );
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(10, 3));
+            .assert_cursor_position(Position::new(9, 2));
     }
 
     #[test]
@@ -20995,5 +21586,81 @@ mod tests {
         assert!(!preview.contains('\n'));
         assert!(!preview.contains('\r'));
         assert!(preview.starts_with("line one"));
+    }
+
+    fn autocomplete_test_theme() -> TerminalTheme {
+        TerminalThemeKind::default().palette()
+    }
+
+    #[test]
+    fn autocomplete_row_renders_trimmed_description_muted() {
+        let theme = autocomplete_test_theme();
+        let cmd = AvailableCommand::new("plan", "  draft a plan  ");
+        let line = super::autocomplete_row(&cmd, "", false, 80, &theme);
+        let description = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("draft a plan"))
+            .expect("description span");
+        assert_eq!(description.style.fg, Some(theme.muted));
+        assert_eq!(description.content.as_ref(), "  draft a plan");
+    }
+
+    #[test]
+    fn autocomplete_row_selected_is_primary_bold_without_bg() {
+        let theme = autocomplete_test_theme();
+        let cmd = AvailableCommand::new("plan", "draft a plan");
+        let line = super::autocomplete_row(&cmd, "", true, 80, &theme);
+        let name = line
+            .spans
+            .iter()
+            .find(|s| s.content == "plan")
+            .expect("name span");
+        assert_eq!(name.style.fg, Some(theme.primary));
+        assert!(name.style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            line.spans.iter().all(|s| s.style.bg.is_none()),
+            "selected row must not paint a background"
+        );
+    }
+
+    #[test]
+    fn autocomplete_row_bolds_only_true_prefix_match() {
+        let theme = autocomplete_test_theme();
+        let cmd = AvailableCommand::new("create_plan", "draft a plan");
+
+        let line = super::autocomplete_row(&cmd, "cre", false, 80, &theme);
+        let matched = line
+            .spans
+            .iter()
+            .find(|s| s.content == "cre")
+            .expect("prefix span");
+        assert!(matched.style.add_modifier.contains(Modifier::BOLD));
+        let rest = line
+            .spans
+            .iter()
+            .find(|s| s.content == "ate_plan")
+            .expect("rest span");
+        assert!(!rest.style.add_modifier.contains(Modifier::BOLD));
+
+        // A substring-only match is not a prefix: nothing is bolded.
+        let line = super::autocomplete_row(&cmd, "plan", false, 80, &theme);
+        assert!(
+            line.spans
+                .iter()
+                .all(|s| !s.style.add_modifier.contains(Modifier::BOLD)),
+            "non-prefix query must not bold any span"
+        );
+    }
+
+    #[test]
+    fn autocomplete_row_truncates_to_width() {
+        let theme = autocomplete_test_theme();
+        let cmd = AvailableCommand::new(
+            "create_plan",
+            "a very long description that will not fit the popover",
+        );
+        let line = super::autocomplete_row(&cmd, "", false, 12, &theme);
+        assert!(line.width() <= 12);
     }
 }

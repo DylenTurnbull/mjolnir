@@ -34,6 +34,10 @@ pub struct TerminalTheme {
     pub diff_removed_bg: Option<Color>,
     pub diff_added_emph_bg: Option<Color>,
     pub diff_removed_emph_bg: Option<Color>,
+    /// Background fill for the input composer surface. `None` leaves the
+    /// terminal default background, which the ANSI palettes need because
+    /// subtle background tints cannot be expressed in 16 colors.
+    pub input_bg: Option<Color>,
     pub permission: Color,
 }
 
@@ -68,6 +72,9 @@ impl TerminalThemeKind {
                 diff_removed_bg: Some(Color::Rgb(255, 235, 233)),
                 diff_added_emph_bg: Some(Color::Rgb(171, 242, 189)),
                 diff_removed_emph_bg: Some(Color::Rgb(255, 197, 194)),
+                // ~4% black over a white terminal background; sits just
+                // below the light diff row fills in intensity.
+                input_bg: Some(Color::Rgb(245, 245, 245)),
                 permission: Color::Rgb(154, 103, 0),
             },
             Self::Dark => TerminalTheme {
@@ -98,6 +105,9 @@ impl TerminalThemeKind {
                 diff_removed_bg: Some(Color::Rgb(70, 22, 22)),
                 diff_added_emph_bg: Some(Color::Rgb(24, 100, 48)),
                 diff_removed_emph_bg: Some(Color::Rgb(130, 35, 35)),
+                // ~12% white over a black terminal background; a neutral
+                // lift matching the tone of the dark diff row fills.
+                input_bg: Some(Color::Rgb(31, 31, 31)),
                 permission: Color::Yellow,
             },
             Self::AnsiLight => TerminalTheme {
@@ -128,6 +138,7 @@ impl TerminalThemeKind {
                 diff_removed_bg: None,
                 diff_added_emph_bg: None,
                 diff_removed_emph_bg: None,
+                input_bg: None,
                 permission: Color::Yellow,
             },
             Self::AnsiDark => TerminalTheme {
@@ -158,6 +169,7 @@ impl TerminalThemeKind {
                 diff_removed_bg: None,
                 diff_added_emph_bg: None,
                 diff_removed_emph_bg: None,
+                input_bg: None,
                 permission: Color::Yellow,
             },
         }
@@ -193,6 +205,8 @@ mod tests {
                     | Color::Cyan
                     | Color::White
             )));
+            // Subtle background tints cannot be expressed in 16 colors.
+            assert!(palette.input_bg.is_none());
         }
     }
 
@@ -202,6 +216,7 @@ mod tests {
             let palette = kind.palette();
             assert_ne!(palette.selection_fg, palette.selection_bg);
             assert_ne!(palette.text, palette.muted);
+            assert!(palette.input_bg.is_some());
         }
     }
 }
