@@ -3065,8 +3065,8 @@ mod tests {
         };
 
         assert_eq!(
-            council_reload_message(&council, config::CouncilPermissionMode::Auto),
-            "Council reloaded after /clear: Thor gpt-test via codex-acp; Loki claude-test via claude-acp; Eitri off; permissions Auto"
+            council_reload_message(&council),
+            "Council reloaded after /clear: Thor gpt-test via codex-acp; Loki claude-test via claude-acp; Eitri off"
         );
     }
 

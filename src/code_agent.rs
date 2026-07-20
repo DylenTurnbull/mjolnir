@@ -2981,7 +2981,7 @@ mod tests {
             implementation_handoff_counter: None,
             active_implementation_workers: ActiveCodeWorkers::default(),
             max_parallel_explores: 1,
-            permission_mode: crate::config::CouncilPermissionMode::Auto,
+            headless_permission_mode: Some(crate::config::CouncilPermissionMode::Auto),
             role_pool: None,
             warm: Arc::default(),
         };
@@ -3029,7 +3029,7 @@ mod tests {
             implementation_handoff_counter: None,
             active_implementation_workers: ActiveCodeWorkers::default(),
             max_parallel_explores: 1,
-            permission_mode: crate::config::CouncilPermissionMode::Auto,
+            headless_permission_mode: Some(crate::config::CouncilPermissionMode::Auto),
             role_pool: None,
             warm: Arc::default(),
         };

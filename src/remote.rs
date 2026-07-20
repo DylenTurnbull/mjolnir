@@ -5549,7 +5549,10 @@ mod tests {
     fn server_remote_permission_decision_rejects_unknown_option() {
         let (prompt, mut rx) = permission_prompt("call-a");
         let mut pending = std::collections::HashMap::new();
-        pending.insert("call-a".to_string(), prompt);
+        pending.insert(
+            "call-a".to_string(),
+            RemotePendingApproval::Permission(prompt),
+        );
 
         handle_server_remote_event(
             UiEvent::RemotePermissionDecision {
@@ -5570,7 +5573,10 @@ mod tests {
     fn server_remote_permission_decision_resolves_known_option() {
         let (prompt, mut rx) = permission_prompt("call-a");
         let mut pending = std::collections::HashMap::new();
-        pending.insert("call-a".to_string(), prompt);
+        pending.insert(
+            "call-a".to_string(),
+            RemotePendingApproval::Permission(prompt),
+        );
 
         handle_server_remote_event(
             UiEvent::RemotePermissionDecision {
@@ -6144,6 +6150,7 @@ mod tests {
                 Some("scope".to_string()),
                 "agent",
             )],
+            native_mode: None,
         };
 
         upsert_session_record(&db_path, &session).expect("insert");
@@ -6347,6 +6354,7 @@ mod tests {
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
             available_commands: Vec::new(),
+            native_mode: None,
         };
         let disconnected = SessionRecord {
             session_id: "sess-disconnected".to_string(),
@@ -6857,6 +6865,7 @@ mod tests {
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
             available_commands: Vec::new(),
+            native_mode: None,
         }
     }
 
@@ -7492,6 +7501,7 @@ mod tests {
             pending_permissions: vec![pending.clone()],
             session_config: Vec::new(),
             available_commands: Vec::new(),
+            native_mode: None,
         };
 
         upsert_session_record(&db_path, &session).expect("insert");
@@ -8139,6 +8149,7 @@ mod tests {
     fn test_state() -> ServerState {
         ServerState {
             db_path: Arc::new(PathBuf::from("unused.sqlite3")),
+            native_modes: Arc::new(Mutex::new(HashMap::new())),
             token: Arc::new("integration-token".to_string()),
             viewer_code: Arc::new("123456".to_string()),
             cookie_key: Arc::new("test-cookie-signing-key".to_string()),
@@ -8572,6 +8583,7 @@ mod tests {
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
             available_commands: Vec::new(),
+            native_mode: None,
         };
 
         // Without the bearer token the write is rejected.
