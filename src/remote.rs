@@ -1,17 +1,18 @@
 //! Simple remote-control server and local session registration.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::io::IsTerminal;
 use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
-    AvailableCommand, AvailableCommandInput, ContentBlock, Diff, PermissionOptionKind,
-    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    AvailableCommand, AvailableCommandInput, ContentBlock, Diff, ElicitationContentValue,
+    ElicitationMode, ElicitationPropertySchema, PermissionOptionKind, SessionConfigId,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOptions, SessionConfigValueId, SessionUpdate, ToolCallContent,
     ToolCallStatus, ToolCallUpdateFields, ToolKind,
 };
@@ -49,8 +50,8 @@ use tracing::{debug, warn};
 use crate::acp::{self, AcpRuntimeConfig};
 use crate::config::{self, SelectedAgent};
 use crate::event::{
-    PermissionDecision, PermissionPrompt, SessionConfigTarget, TerminalOutputSnapshot, UiCommand,
-    UiEvent,
+    ElicitationOutcome, ElicitationPrompt, PermissionDecision, PermissionPrompt,
+    SessionConfigTarget, TerminalOutputSnapshot, UiCommand, UiEvent,
 };
 use crate::{code_agent, council, loki};
 
@@ -76,6 +77,13 @@ const QUEUED_PROMPT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// in a live session's memory. A live session claims within seconds, so an
 /// old unclaimed decision is unambiguously dead.
 const PERMISSION_DECISION_TTL: Duration = Duration::from_secs(60 * 60);
+const NATIVE_MCP_APPROVAL_PROPERTY: &str = "persist";
+const NATIVE_MCP_APPROVAL_CHOICES: [(&str, &str, &str); 3] = [
+    ("once", "Allow once", "allow_once"),
+    ("session", "Allow for session", "allow_session"),
+    ("always", "Allow always", "allow_always"),
+];
+
 /// Stop requests are meaningful only for the currently active prompt turn.
 /// Keep them long enough for a live session's poller to claim, but prune old
 /// rows aggressively so they cannot affect a later turn.
@@ -153,11 +161,13 @@ pub struct SessionRecord {
     /// Permission prompts currently waiting for an answer in this session.
     #[serde(default)]
     pub pending_permissions: Vec<PendingPermissionRecord>,
-    /// Session configuration options (model, mode, thought level, ...) the
-    /// agent currently advertises, published so the remote viewer can show
-    /// the active value and queue a change.
+    /// Editable session configuration options the agent currently advertises.
     #[serde(default)]
     pub session_config: Vec<SessionConfigOptionRecord>,
+    /// The native Codex Mode currently advertised by this live Thor session.
+    /// It is intentionally status-only: Mjolnir never changes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_mode: Option<NativeModeRecord>,
     /// Slash commands available in the web composer. This includes agent
     /// commands from ACP plus the subset of Mjolnir-local commands that have a
     /// web equivalent.
@@ -292,11 +302,11 @@ fn available_command_input_hint(input: Option<&AvailableCommandInput>) -> Option
 
 /// A session configuration option projected for the remote viewer. Carries
 /// enough to render a selector and to reconstruct the [`SessionConfigTarget`]
-/// a queued change should drive.
+/// an editable queued change should drive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionConfigOptionRecord {
-    /// Which ACP method a change drives: `config_option`, `legacy_model`, or
-    /// `legacy_mode`. Paired with `config_id` it round-trips back into a
+    /// Which ACP method a change drives: `config_option` or `legacy_model`.
+    /// Paired with `config_id` it round-trips back into a
     /// `SessionConfigTarget` when a viewer change is claimed.
     pub target_kind: String,
     /// Set only for `config_option` targets; the agent-assigned option id.
@@ -320,6 +330,13 @@ pub struct SessionConfigChoiceRecord {
     pub description: Option<String>,
 }
 
+/// Read-only native Codex Mode status projected from the current ACP session
+/// configuration advertisement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeModeRecord {
+    pub label: String,
+}
+
 /// Project the parallel `options`/`targets` vectors the runtime emits into
 /// viewer-friendly records. Only `Select` options are representable; any other
 /// kind is skipped so the viewer never shows a control it cannot drive.
@@ -331,10 +348,14 @@ fn config_option_records(
         .iter()
         .zip(targets.iter())
         .filter_map(|(option, target)| {
+            if matches!(target, SessionConfigTarget::LegacyMode) {
+                return None;
+            }
             if matches!(
                 option.category,
                 Some(
-                    agent_client_protocol::schema::v1::SessionConfigOptionCategory::Model
+                    agent_client_protocol::schema::v1::SessionConfigOptionCategory::Mode
+                        | agent_client_protocol::schema::v1::SessionConfigOptionCategory::Model
                         | agent_client_protocol::schema::v1::SessionConfigOptionCategory::ThoughtLevel
                 )
             ) {
@@ -355,6 +376,27 @@ fn config_option_records(
             })
         })
         .collect()
+}
+
+fn native_mode_record(options: &[SessionConfigOption]) -> Option<NativeModeRecord> {
+    options.iter().find_map(|option| {
+        if !matches!(option.category, Some(SessionConfigOptionCategory::Mode)) {
+            return None;
+        }
+        let SessionConfigKind::Select(select) = &option.kind else {
+            return None;
+        };
+        let current_value = select.current_value.to_string();
+        if current_value.is_empty() {
+            return None;
+        }
+        let label = select_choice_records(&select.options)
+            .into_iter()
+            .find(|choice| choice.value == current_value)
+            .map(|choice| choice.label)
+            .unwrap_or(current_value);
+        Some(NativeModeRecord { label })
+    })
 }
 
 fn select_choice_records(options: &SessionConfigSelectOptions) -> Vec<SessionConfigChoiceRecord> {
@@ -418,7 +460,6 @@ fn config_target_from_parts(
             config_id: SessionConfigId::from(id.to_string()),
         }),
         "legacy_model" => Some(SessionConfigTarget::LegacyModel),
-        "legacy_mode" => Some(SessionConfigTarget::LegacyMode),
         _ => None,
     }
 }
@@ -672,6 +713,7 @@ pub struct RemoteSessionTracker {
     publish_signal: Arc<tokio::sync::Notify>,
     queue_poller: Arc<Mutex<Option<JoinHandle<()>>>>,
     connector: Arc<Mutex<Option<JoinHandle<()>>>>,
+    next_mcp_elicitation_id: Arc<AtomicU64>,
     /// False when no UI event channel exists (headless): remote permission
     /// decisions could never be applied, so pending permissions must not
     /// be advertised to viewers at all.
@@ -699,6 +741,7 @@ struct TrackerState {
     exploration_entries: HashMap<u64, usize>,
     pending_permissions: Vec<PendingPermissionRecord>,
     session_config: Vec<SessionConfigOptionRecord>,
+    native_mode: Option<NativeModeRecord>,
     available_commands: Vec<CommandRecord>,
     session_fork_supported: bool,
     sessions_to_disconnect: Vec<String>,
@@ -734,6 +777,9 @@ struct ServerListenConfig {
 #[derive(Debug, Clone)]
 struct ServerState {
     db_path: Arc<PathBuf>,
+    /// Live-only native Codex Mode status. It intentionally never enters the
+    /// session database or any saved session configuration.
+    native_modes: Arc<Mutex<HashMap<String, NativeModeRecord>>>,
     token: Arc<String>,
     viewer_code: Arc<String>,
     /// HMAC key that signs viewer session cookies. Cookies are stateless: each
@@ -849,6 +895,7 @@ impl TrackerState {
             exploration_entries: HashMap::new(),
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
+            native_mode: None,
             available_commands: remote_builtin_command_records(false),
             session_fork_supported: false,
             sessions_to_disconnect: Vec::new(),
@@ -876,6 +923,7 @@ impl TrackerState {
         self.exploration_entries.clear();
         self.pending_permissions.clear();
         self.session_config.clear();
+        self.native_mode = None;
         self.available_commands = available_command_records(&[], self.session_fork_supported);
     }
 
@@ -911,6 +959,7 @@ impl TrackerState {
                     self.prompt_turn_started_at = None;
                     self.pending_permissions.clear();
                     self.session_config.clear();
+                    self.native_mode = None;
                     self.available_commands =
                         available_command_records(&[], self.session_fork_supported);
                 }
@@ -921,6 +970,7 @@ impl TrackerState {
                 targets,
                 hidden_config_ids,
             } => {
+                self.native_mode = native_mode_record(options);
                 self.session_config = config_option_records(options, targets)
                     .into_iter()
                     .filter(|option| {
@@ -1286,6 +1336,7 @@ impl TrackerState {
             prompt_in_flight: self.prompt_in_flight && self.prompt_turn_started_at.is_some(),
             pending_permissions: self.pending_permissions.clone(),
             session_config: self.session_config.clone(),
+            native_mode: self.native_mode.clone(),
             available_commands: self.available_commands.clone(),
         })
     }
@@ -1371,6 +1422,7 @@ impl RemoteSessionTracker {
             publish_signal: Arc::new(tokio::sync::Notify::new()),
             queue_poller: Arc::new(Mutex::new(None)),
             connector: Arc::new(Mutex::new(None)),
+            next_mcp_elicitation_id: Arc::new(AtomicU64::new(1)),
             publish_permissions: ui_event_tx.is_some(),
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
@@ -1394,6 +1446,7 @@ impl RemoteSessionTracker {
             publish_signal: Arc::new(tokio::sync::Notify::new()),
             queue_poller: Arc::new(Mutex::new(None)),
             connector: Arc::new(Mutex::new(None)),
+            next_mcp_elicitation_id: Arc::new(AtomicU64::new(1)),
             publish_permissions: true,
             shutting_down: Arc::new(AtomicBool::new(false)),
         }
@@ -1470,6 +1523,72 @@ impl RemoteSessionTracker {
             options,
             responder: wrapped_tx,
         }
+    }
+
+    /// Only Codex's native MCP approval form for the two injected
+    /// servers is safe to expose remotely. All other elicitations are handled
+    /// locally or explicitly declined by the server session loop.
+    fn track_mcp_tool_approval(
+        &self,
+        prompt: ElicitationPrompt,
+    ) -> Option<(String, ElicitationPrompt)> {
+        if !is_native_injected_mcp_approval(&prompt) {
+            return None;
+        }
+
+        let request_id = format!(
+            "mcp-elicitation:{}",
+            self.next_mcp_elicitation_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let record = PendingPermissionRecord {
+            request_id: request_id.clone(),
+            title: prompt.message.clone(),
+            options: NATIVE_MCP_APPROVAL_CHOICES
+                .into_iter()
+                .map(|(option_id, label, kind)| PermissionOptionRecord {
+                    option_id: option_id.to_string(),
+                    label: label.to_string(),
+                    kind: kind.to_string(),
+                })
+                .chain(std::iter::once(PermissionOptionRecord {
+                    option_id: "decline".to_string(),
+                    label: "Decline".to_string(),
+                    kind: "reject_once".to_string(),
+                }))
+                .collect(),
+            requested_at: now_rfc3339(),
+        };
+        if let Ok(mut state) = self.state.lock() {
+            state.push_pending_permission(record);
+        }
+        self.request_flush();
+
+        let ElicitationPrompt {
+            message,
+            mode,
+            responder,
+        } = prompt;
+        let (wrapped_tx, wrapped_rx) = tokio::sync::oneshot::channel();
+        let tracker = self.clone();
+        let tracked_id = request_id.clone();
+        tokio::spawn(async move {
+            let decision = wrapped_rx.await;
+            if let Ok(mut state) = tracker.state.lock() {
+                state.remove_pending_permission(&tracked_id);
+            }
+            if let Ok(decision) = decision {
+                let _ = responder.send(decision);
+            }
+            tracker.request_flush();
+        });
+        Some((
+            request_id,
+            ElicitationPrompt {
+                message,
+                mode,
+                responder: wrapped_tx,
+            },
+        ))
     }
 
     pub fn observe_command(&self, command: &UiCommand) {
@@ -1555,7 +1674,11 @@ impl RemoteSessionTracker {
             return;
         };
         let (snapshot, mut sessions_to_disconnect) = match self.state.lock() {
-            Ok(mut state) => (state.snapshot(), state.take_sessions_to_disconnect()),
+            Ok(mut state) => {
+                state.pending_permissions.clear();
+                state.touch();
+                (state.snapshot(), state.take_sessions_to_disconnect())
+            }
             Err(_) => (None, Vec::new()),
         };
         let session_id = snapshot
@@ -2289,17 +2412,12 @@ fn start_server_agent_session(
         },
         None => None,
     };
-    let mut agent_env = agent.env.clone();
     let role_config = council.as_ref().map(|resolved| acp::RuntimeRoleConfig {
         label: "Thor".to_string(),
         model_id: resolved.thor.model.model.clone(),
         model_value: resolved.thor.model_value.clone(),
         adapter_source_id: resolved.thor.launch.source_id.clone(),
-        permission: council::configure_permissions(
-            resolved.thor.launch.kind,
-            app_config.council.permission_mode,
-            &mut agent_env,
-        ),
+        permission: None,
         council_session: None,
     });
     let implementation_handoffs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2309,7 +2427,6 @@ fn start_server_agent_session(
             .with_implementation_handoff_counter(implementation_handoffs.clone())
             .with_active_implementation_workers(active_implementation_workers.clone())
             .with_max_parallel_explores(app_config.eitri.max_parallel_explores)
-            .with_permission_mode(app_config.council.permission_mode)
             .with_prewarm(code_agent::RunContext {
                 cwd: cwd.clone(),
                 additional_directories: additional_directories.clone(),
@@ -2332,7 +2449,7 @@ fn start_server_agent_session(
             .map(|server| vec![server.advertised().clone()])
             .unwrap_or_default(),
         resume_session: None,
-        env: agent_env,
+        env: agent.env,
         agent_stderr: None,
         fs_max_text_bytes,
         access_mode: crate::acp::RuntimeAccessMode::Full,
@@ -2514,7 +2631,7 @@ impl ServerAgentSession {
 fn handle_server_agent_event(
     event: UiEvent,
     tracker: &RemoteSessionTracker,
-    pending_permissions: &mut std::collections::HashMap<String, PermissionPrompt>,
+    pending_permissions: &mut HashMap<String, RemotePendingApproval>,
 ) {
     if let UiEvent::CodeAgent(code_event) = event {
         match code_event {
@@ -2533,7 +2650,10 @@ fn handle_server_agent_event(
                 let event = tracker.intercept_event(UiEvent::PermissionRequest(prompt));
                 tracker.observe_event(&event);
                 if let UiEvent::PermissionRequest(prompt) = event {
-                    pending_permissions.insert(prompt.tool_call.tool_call_id.to_string(), prompt);
+                    pending_permissions.insert(
+                        prompt.tool_call.tool_call_id.to_string(),
+                        RemotePendingApproval::Permission(prompt),
+                    );
                 }
             }
             crate::event::CodeAgentEvent::SessionUpdate(update) => {
@@ -2555,16 +2675,89 @@ fn handle_server_agent_event(
         }
         return;
     }
+    if let UiEvent::ElicitationRequest(prompt) = event {
+        if is_native_injected_mcp_approval(&prompt) {
+            let Some((request_id, prompt)) = tracker.track_mcp_tool_approval(prompt) else {
+                return;
+            };
+            pending_permissions.insert(request_id, RemotePendingApproval::Elicitation(prompt));
+        } else {
+            let _ = prompt.responder.send(ElicitationOutcome::Decline);
+        }
+        return;
+    }
     let event = tracker.intercept_event(event);
     tracker.observe_event(&event);
     match event {
         UiEvent::PermissionRequest(prompt) => {
-            pending_permissions.insert(prompt.tool_call.tool_call_id.to_string(), prompt);
+            pending_permissions.insert(
+                prompt.tool_call.tool_call_id.to_string(),
+                RemotePendingApproval::Permission(prompt),
+            );
         }
-        UiEvent::PromptDone { .. } | UiEvent::PromptFailed { .. } | UiEvent::Fatal(_) => {
+        UiEvent::SessionStarted { .. }
+        | UiEvent::CancelPendingPermissions
+        | UiEvent::PromptDone { .. }
+        | UiEvent::PromptFailed { .. }
+        | UiEvent::Fatal(_) => {
             pending_permissions.clear();
         }
         _ => {}
+    }
+}
+
+enum RemotePendingApproval {
+    Permission(PermissionPrompt),
+    Elicitation(ElicitationPrompt),
+}
+
+/// Keep the recognition deliberately narrow: only Codex's native approval
+/// form for the two injected servers and their approved tool names may cross
+/// the remote boundary.
+fn is_native_injected_mcp_approval(prompt: &ElicitationPrompt) -> bool {
+    let ElicitationMode::Form(form) = &prompt.mode else {
+        return false;
+    };
+    let schema = &form.requested_schema;
+    let Some(ElicitationPropertySchema::String(approval)) =
+        schema.properties.get(NATIVE_MCP_APPROVAL_PROPERTY)
+    else {
+        return false;
+    };
+    let matches_native_schema = schema.properties.len() == 1
+        && schema.required.as_ref().is_some_and(|required| {
+            required.len() == 1 && required[0] == NATIVE_MCP_APPROVAL_PROPERTY
+        })
+        && approval.enum_values.is_none()
+        && approval.one_of.as_ref().is_some_and(|options| {
+            options.len() == NATIVE_MCP_APPROVAL_CHOICES.len()
+                && options
+                    .iter()
+                    .zip(NATIVE_MCP_APPROVAL_CHOICES)
+                    .all(|(option, (value, _, _))| option.value == value)
+        });
+    if !matches_native_schema {
+        return false;
+    }
+    let message = prompt.message.to_ascii_lowercase();
+    message.contains("mcp")
+        && ((message.contains("mj-loki-pull") && message.contains("pull_advice"))
+            || (message.contains("mj-code-agent") && message.contains("explore_agent")))
+}
+
+fn native_mcp_approval_outcome(option_id: &str) -> Option<ElicitationOutcome> {
+    if NATIVE_MCP_APPROVAL_CHOICES
+        .iter()
+        .any(|(value, _, _)| *value == option_id)
+    {
+        Some(ElicitationOutcome::Accept(BTreeMap::from([(
+            NATIVE_MCP_APPROVAL_PROPERTY.to_string(),
+            ElicitationContentValue::String(option_id.to_string()),
+        )])))
+    } else if option_id == "decline" {
+        Some(ElicitationOutcome::Decline)
+    } else {
+        None
     }
 }
 
@@ -2586,28 +2779,43 @@ fn namespace_remote_terminals(content: &mut [ToolCallContent], prefix: Option<&s
 
 fn handle_server_remote_event(
     event: UiEvent,
-    pending_permissions: &mut std::collections::HashMap<String, PermissionPrompt>,
+    pending_permissions: &mut HashMap<String, RemotePendingApproval>,
 ) {
     if let UiEvent::RemotePermissionDecision {
         request_id,
         option_id,
     } = event
     {
-        let valid_option = pending_permissions.get(&request_id).is_some_and(|prompt| {
-            prompt
-                .options
-                .iter()
-                .any(|option| option.option_id.to_string() == option_id)
-        });
+        let valid_option =
+            pending_permissions
+                .get(&request_id)
+                .is_some_and(|prompt| match prompt {
+                    RemotePendingApproval::Permission(prompt) => prompt
+                        .options
+                        .iter()
+                        .any(|option| option.option_id.to_string() == option_id),
+                    RemotePendingApproval::Elicitation(_) => {
+                        native_mcp_approval_outcome(&option_id).is_some()
+                    }
+                });
         if !valid_option {
             return;
         }
         let Some(prompt) = pending_permissions.remove(&request_id) else {
             return;
         };
-        let _ = prompt
-            .responder
-            .send(PermissionDecision::Selected(option_id));
+        match prompt {
+            RemotePendingApproval::Permission(prompt) => {
+                let _ = prompt
+                    .responder
+                    .send(PermissionDecision::Selected(option_id));
+            }
+            RemotePendingApproval::Elicitation(prompt) => {
+                if let Some(outcome) = native_mcp_approval_outcome(&option_id) {
+                    let _ = prompt.responder.send(outcome);
+                }
+            }
+        }
     }
 }
 
@@ -2856,6 +3064,7 @@ struct RouterConfig {
 fn build_router(config: RouterConfig) -> Router {
     let state = ServerState {
         db_path: Arc::new(config.db_path),
+        native_modes: Arc::new(Mutex::new(HashMap::new())),
         token: Arc::new(config.token),
         viewer_code: Arc::new(config.viewer_code),
         cookie_key: Arc::new(config.cookie_key),
@@ -3307,6 +3516,13 @@ async fn upsert_session(
     State(state): State<ServerState>,
     Json(session): Json<SessionRecord>,
 ) -> std::result::Result<StatusCode, (StatusCode, String)> {
+    if let Ok(mut native_modes) = state.native_modes.lock() {
+        if let Some(mode) = session.native_mode.clone() {
+            native_modes.insert(session.session_id.clone(), mode);
+        } else {
+            native_modes.remove(&session.session_id);
+        }
+    }
     let db_path = Arc::clone(&state.db_path);
     tokio::task::spawn_blocking(move || {
         upsert_session_record(db_path.as_ref().as_path(), &session)
@@ -3322,12 +3538,16 @@ async fn disconnect_session(
     AxumPath(session_id): AxumPath<String>,
 ) -> std::result::Result<StatusCode, (StatusCode, String)> {
     let db_path = Arc::clone(&state.db_path);
+    let db_session_id = session_id.clone();
     tokio::task::spawn_blocking(move || {
-        disconnect_session_record(db_path.as_ref().as_path(), &session_id)
+        disconnect_session_record(db_path.as_ref().as_path(), &db_session_id)
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
+    if let Ok(mut native_modes) = state.native_modes.lock() {
+        native_modes.remove(&session_id);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3335,11 +3555,12 @@ async fn list_sessions(
     State(state): State<ServerState>,
 ) -> std::result::Result<Json<Vec<SessionRecord>>, (StatusCode, String)> {
     let db_path = Arc::clone(&state.db_path);
-    let sessions =
+    let mut sessions =
         tokio::task::spawn_blocking(move || load_session_records(db_path.as_ref().as_path()))
             .await
             .map_err(internal_error)?
             .map_err(internal_error)?;
+    apply_live_native_modes(&mut sessions, &state.native_modes);
     Ok(Json(sessions))
 }
 
@@ -3348,13 +3569,26 @@ async fn list_live_sessions(
 ) -> std::result::Result<Json<Vec<SessionRecord>>, (StatusCode, String)> {
     let db_path = Arc::clone(&state.db_path);
     let cutoff = connected_session_cutoff_rfc3339();
-    let sessions = tokio::task::spawn_blocking(move || {
+    let mut sessions = tokio::task::spawn_blocking(move || {
         load_connected_session_records(db_path.as_ref().as_path(), &cutoff)
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
+    apply_live_native_modes(&mut sessions, &state.native_modes);
     Ok(Json(sessions))
+}
+
+fn apply_live_native_modes(
+    sessions: &mut [SessionRecord],
+    native_modes: &Mutex<HashMap<String, NativeModeRecord>>,
+) {
+    let Ok(native_modes) = native_modes.lock() else {
+        return;
+    };
+    for session in sessions {
+        session.native_mode = native_modes.get(&session.session_id).cloned();
+    }
 }
 
 async fn browse_filesystem(
@@ -3628,6 +3862,27 @@ async fn queue_config_change(
         return Err((StatusCode::BAD_REQUEST, "invalid config target".to_string()));
     }
     let db_path = Arc::clone(&state.db_path);
+    let validation_db_path = Arc::clone(&db_path);
+    let session_id = request.session_id.clone();
+    let target_kind = request.target_kind.clone();
+    let config_id = request.config_id.clone();
+    let editable = tokio::task::spawn_blocking(move || {
+        is_currently_editable_config_target(
+            validation_db_path.as_ref().as_path(),
+            &session_id,
+            &target_kind,
+            config_id.as_deref(),
+        )
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+    if !editable {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "config target is not currently editable for this session".to_string(),
+        ));
+    }
     tokio::task::spawn_blocking(move || {
         queue_config_change_record(
             db_path.as_ref().as_path(),
@@ -4364,6 +4619,7 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         prompt_in_flight: prompt_in_flight != 0,
         pending_permissions,
         session_config,
+        native_mode: None,
         available_commands,
     })
 }
@@ -4698,6 +4954,32 @@ fn queue_config_change_record(
     )
     .context("insert config change")?;
     Ok(())
+}
+
+fn is_currently_editable_config_target(
+    db_path: &Path,
+    session_id: &str,
+    target_kind: &str,
+    config_id: Option<&str>,
+) -> Result<bool> {
+    init_db(db_path)?;
+    let conn = open_db(db_path)?;
+    let session_config_json = conn
+        .query_row(
+            "select session_config_json from sessions where session_id = ?1 and connected = 1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("load current remote session config")?;
+    let Some(session_config_json) = session_config_json else {
+        return Ok(false);
+    };
+    let options: Vec<SessionConfigOptionRecord> =
+        serde_json::from_str(&session_config_json).unwrap_or_default();
+    Ok(options.iter().any(|option| {
+        option.target_kind == target_kind && option.config_id.as_deref() == config_id
+    }))
 }
 
 fn claim_config_change_record(

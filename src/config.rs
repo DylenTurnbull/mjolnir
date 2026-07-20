@@ -71,6 +71,8 @@ pub struct CouncilConfig {
     #[serde(default = "default_true")]
     pub auto_failover: bool,
     #[serde(default)]
+    /// Compatibility-only value for older in-memory callers. Interactive and
+    /// remote Council sessions inherit the ACP harness permission policy.
     pub permission_mode: CouncilPermissionMode,
 }
 
@@ -98,21 +100,13 @@ pub enum CouncilPermissionMode {
     Yolo,
 }
 
-impl CouncilPermissionMode {
-    pub const ALL: [Self; 3] = [Self::Manual, Self::Auto, Self::Yolo];
-
-    pub fn label(self) -> &'static str {
-        match self {
+impl std::fmt::Display for CouncilPermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
             Self::Manual => "Manual",
             Self::Auto => "Auto",
             Self::Yolo => "YOLO",
-        }
-    }
-}
-
-impl std::fmt::Display for CouncilPermissionMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.label())
+        })
     }
 }
 

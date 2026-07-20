@@ -148,7 +148,7 @@ pub struct Config {
     pub implementation_handoff_counter: Option<Arc<AtomicUsize>>,
     pub active_implementation_workers: ActiveCodeWorkers,
     pub max_parallel_explores: usize,
-    permission_mode: crate::config::CouncilPermissionMode,
+    headless_permission_mode: Option<crate::config::CouncilPermissionMode>,
     role_pool: Option<crate::quota::RolePool>,
     warm: Arc<WarmPool>,
 }
@@ -212,7 +212,7 @@ impl Config {
             implementation_handoff_counter: None,
             active_implementation_workers: ActiveCodeWorkers::default(),
             max_parallel_explores: 6,
-            permission_mode: crate::config::CouncilPermissionMode::default(),
+            headless_permission_mode: None,
             role_pool: Some(role_pool),
             warm: Arc::default(),
         }
@@ -233,8 +233,11 @@ impl Config {
         self
     }
 
-    pub fn with_permission_mode(mut self, mode: crate::config::CouncilPermissionMode) -> Self {
-        self.permission_mode = mode;
+    pub fn with_headless_permission_mode(
+        mut self,
+        mode: crate::config::CouncilPermissionMode,
+    ) -> Self {
+        self.headless_permission_mode = Some(mode);
         self
     }
 
@@ -294,8 +297,8 @@ impl Config {
             .as_ref()
             .map(|role| {
                 format!(
-                    "{}\0{}\0{}",
-                    role.adapter_source_id, role.model_id, self.permission_mode
+                    "{}\0{}\0{:?}",
+                    role.adapter_source_id, role.model_id, self.headless_permission_mode
                 )
             })
             .unwrap_or_else(|| self.display_label.clone())
@@ -736,11 +739,11 @@ fn spawn_eitri_runtime(
     let mut env = config.env.clone();
     let mut role_config = config.role_config.clone();
     if purpose.marks_implementation_delegation()
+        && let Some(mode) = config.headless_permission_mode
         && let Some(role) = role_config.as_mut()
         && let Some(kind) = crate::council::AdapterKind::from_source_id(&role.adapter_source_id)
     {
-        role.permission =
-            crate::council::configure_permissions(kind, config.permission_mode, &mut env);
+        role.permission = crate::council::configure_permissions(kind, mode, &mut env);
     }
     let runtime_config = AcpRuntimeConfig {
         command: config.command.clone(),
