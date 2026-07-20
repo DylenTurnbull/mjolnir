@@ -5408,20 +5408,20 @@
         summary.className = "config-native-mode-summary";
         const name = document.createElement("span");
         name.className = "config-native-mode-name";
-        name.textContent = "Codex session mode:";
+        name.textContent = "Native session mode:";
         const value = document.createElement("span");
         value.className = "config-native-mode-value";
         value.textContent = session.native_mode?.label || "unavailable";
         const help = document.createElement("details");
         help.className = "config-native-mode-help";
         const helpTrigger = document.createElement("summary");
-        helpTrigger.setAttribute("aria-label", "About Codex session mode");
-        helpTrigger.title = "About Codex session mode";
+        helpTrigger.setAttribute("aria-label", "About native session mode");
+        helpTrigger.title = "About native session mode";
         helpTrigger.textContent = "?";
         const detail = document.createElement("div");
         detail.className = "config-native-mode-detail";
         detail.textContent =
-          "Managed by the native Codex session configuration. Applies to the current Thor session only. This does not alter Loki or Eitri Explore read-only restrictions.";
+          "Managed by the active ACP harness's native session configuration. This is a live, read-only status for the current Thor session and grants no mutation authority. It does not alter Loki or Eitri Explore read-only restrictions.";
         help.append(helpTrigger, detail);
         summary.append(name, " ", value, " ", help);
         root.append(summary);
