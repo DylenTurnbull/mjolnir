@@ -1276,32 +1276,12 @@ mod tests {
     #[test]
     fn council_quota_failover_can_be_disabled() {
         let mut editor = SettingsEditor::new(Config::default(), Vec::new(), None);
-        editor.selected = 6;
+        editor.selected = 5;
         assert_eq!(
             editor.handle_key(KeyCode::Char(' ')),
             SettingsAction::Changed
         );
         assert!(!editor.config.council.auto_failover);
-    }
-
-    #[test]
-    fn council_permission_mode_cycles() {
-        let mut editor = SettingsEditor::new(Config::default(), Vec::new(), None);
-        editor.selected = 5;
-        assert_eq!(
-            editor.config.council.permission_mode,
-            crate::config::CouncilPermissionMode::Auto
-        );
-        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
-        assert_eq!(
-            editor.config.council.permission_mode,
-            crate::config::CouncilPermissionMode::Yolo
-        );
-        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
-        assert_eq!(
-            editor.config.council.permission_mode,
-            crate::config::CouncilPermissionMode::Manual
-        );
     }
 
     #[test]

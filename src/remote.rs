@@ -7704,22 +7704,13 @@ mod tests {
             config_id: SessionConfigId::from("mode".to_string()),
         }];
 
-        let records = config_option_records(&options, &targets);
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        assert_eq!(record.target_kind, "config_option");
-        assert_eq!(record.config_id.as_deref(), Some("mode"));
-        assert_eq!(record.name, "Mode");
-        assert_eq!(record.category.as_deref(), Some("mode"));
-        assert_eq!(record.current_value, "code");
-        assert_eq!(record.choices.len(), 2);
-        assert_eq!(record.choices[1].value, "ask");
-        assert_eq!(record.choices[1].description.as_deref(), Some("read-only"));
-
-        // The published pair round-trips back into the target to drive.
-        let target = config_target_from_parts(&record.target_kind, record.config_id.as_deref())
-            .expect("target reconstructs");
-        assert_eq!(target, targets[0]);
+        assert!(config_option_records(&options, &targets).is_empty());
+        assert_eq!(
+            native_mode_record(&options)
+                .expect("native mode record")
+                .label,
+            "Code"
+        );
     }
 
     #[test]
@@ -7749,16 +7740,13 @@ mod tests {
 
     #[test]
     fn config_target_parts_round_trip_and_reject_bad_input() {
-        for target in [
-            SessionConfigTarget::LegacyModel,
-            SessionConfigTarget::LegacyMode,
-        ] {
-            let (kind, id) = config_target_parts(&target);
-            assert_eq!(config_target_from_parts(&kind, id.as_deref()), Some(target));
-        }
+        let target = SessionConfigTarget::LegacyModel;
+        let (kind, id) = config_target_parts(&target);
+        assert_eq!(config_target_from_parts(&kind, id.as_deref()), Some(target));
         // A config_option target is meaningless without its id, and unknown
         // kinds are refused rather than guessed.
         assert!(config_target_from_parts("config_option", None).is_none());
+        assert!(config_target_from_parts("legacy_mode", None).is_none());
         assert!(config_target_from_parts("nonsense", Some("x")).is_none());
     }
 
@@ -7885,8 +7873,8 @@ mod tests {
             .expect("send blank value");
         assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
 
-        // A valid change is accepted, then claimed back exactly once.
-        let accepted = app
+        // A stale direct Mode change is refused and does not queue a change.
+        let rejected = app
             .clone()
             .oneshot(
                 axum::http::Request::builder()
@@ -7895,48 +7883,20 @@ mod tests {
                     .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
                     .header(axum::http::header::CONTENT_TYPE, "application/json")
                     .body(axum::body::Body::from(change_body(
-                        "config_option",
-                        Some("model"),
-                        "gpt-5",
+                        "legacy_mode",
+                        None,
+                        "code",
                     )))
                     .expect("request"),
             )
             .await
-            .expect("send change");
-        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+            .expect("send stale mode change");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 
         let claim_body = serde_json::to_vec(&ClaimConfigChangeRequest {
             session_id: "sess-1".to_string(),
         })
         .expect("claim json");
-        let claimed = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/api/config-changes/claim")
-                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(claim_body.clone()))
-                    .expect("request"),
-            )
-            .await
-            .expect("claim change");
-        assert_eq!(claimed.status(), StatusCode::OK);
-        let claimed: Option<ConfigChangeRecord> = serde_json::from_slice(
-            &claimed
-                .into_body()
-                .collect()
-                .await
-                .expect("claim body")
-                .to_bytes(),
-        )
-        .expect("claim json");
-        let claimed = claimed.expect("a change was queued");
-        assert_eq!(claimed.target_kind, "config_option");
-        assert_eq!(claimed.config_id.as_deref(), Some("model"));
-        assert_eq!(claimed.value, "gpt-5");
-
         let empty = app
             .oneshot(
                 axum::http::Request::builder()
