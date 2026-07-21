@@ -262,7 +262,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 .with_implementation_handoff_counter(implementation_handoffs.clone())
                 .with_active_implementation_workers(active_implementation_workers.clone())
                 .with_max_parallel_explores(app_config.eitri.max_parallel_explores)
-                .with_permission_mode(cfg.permission_mode.into())
+                .with_headless_permission_mode(cfg.permission_mode.into())
                 .with_prewarm(code_agent::RunContext {
                     cwd: cfg.cwd.clone(),
                     additional_directories: cfg.additional_directories.clone(),

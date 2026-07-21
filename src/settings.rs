@@ -202,7 +202,7 @@ impl SettingsEditor {
 
     fn row_count(&self) -> usize {
         match self.tab {
-            SettingsTab::Council => 7,
+            SettingsTab::Council => 6,
             SettingsTab::AcpServers => self.inventory.servers.len() + 4,
             SettingsTab::Appearance => 2,
         }
@@ -222,15 +222,6 @@ impl SettingsEditor {
                 self.config.eitri.max_parallel_explores =
                     (self.config.eitri.max_parallel_explores as i32 + delta).rem_euclid(17)
                         as usize;
-            }
-            SettingsTab::Council if self.selected == 5 => {
-                let choices = crate::config::CouncilPermissionMode::ALL;
-                let current = choices
-                    .iter()
-                    .position(|mode| *mode == self.config.council.permission_mode)
-                    .unwrap_or(0);
-                let next = (current as i32 + delta).rem_euclid(choices.len() as i32) as usize;
-                self.config.council.permission_mode = choices[next];
             }
             SettingsTab::AcpServers => {
                 let Some(index) = self.selected.checked_sub(4) else {
@@ -289,7 +280,7 @@ impl SettingsEditor {
             SettingsTab::Council if self.selected == 3 => {
                 self.config.thor.discrete_review = !self.config.thor.discrete_review;
             }
-            SettingsTab::Council if self.selected == 6 => {
+            SettingsTab::Council if self.selected == 5 => {
                 self.config.council.auto_failover = !self.config.council.auto_failover;
             }
             SettingsTab::AcpServers => {
@@ -911,25 +902,13 @@ fn draw_council(
     lines.push(selected_line(
         editor.selected == 5,
         format!(
-            "Permissions       < {} >",
-            editor.config.council.permission_mode
-        ),
-        theme,
-    ));
-    lines.push(Line::from(Span::styled(
-        "         Manual asks; Auto uses provider guardrails; YOLO bypasses checks",
-        Style::default().fg(theme.muted),
-    )));
-    lines.push(selected_line(
-        editor.selected == 6,
-        format!(
             "Automatic quota failover [{}]",
             on_off(editor.config.council.auto_failover)
         ),
         theme,
     ));
     lines.push(Line::from(Span::styled(
-        "         quota and permission changes reload with /new or /clear",
+        "         quota changes reload with /new or /clear",
         Style::default().fg(theme.muted),
     )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
@@ -1297,32 +1276,12 @@ mod tests {
     #[test]
     fn council_quota_failover_can_be_disabled() {
         let mut editor = SettingsEditor::new(Config::default(), Vec::new(), None);
-        editor.selected = 6;
+        editor.selected = 5;
         assert_eq!(
             editor.handle_key(KeyCode::Char(' ')),
             SettingsAction::Changed
         );
         assert!(!editor.config.council.auto_failover);
-    }
-
-    #[test]
-    fn council_permission_mode_cycles() {
-        let mut editor = SettingsEditor::new(Config::default(), Vec::new(), None);
-        editor.selected = 5;
-        assert_eq!(
-            editor.config.council.permission_mode,
-            crate::config::CouncilPermissionMode::Auto
-        );
-        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
-        assert_eq!(
-            editor.config.council.permission_mode,
-            crate::config::CouncilPermissionMode::Yolo
-        );
-        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
-        assert_eq!(
-            editor.config.council.permission_mode,
-            crate::config::CouncilPermissionMode::Manual
-        );
     }
 
     #[test]

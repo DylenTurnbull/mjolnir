@@ -584,20 +584,16 @@ fn primary_session_routes(council: &council::ResolvedCouncil) -> Vec<council::Re
     routes
 }
 
-fn council_reload_message(
-    council: &council::ResolvedCouncil,
-    permission_mode: config::CouncilPermissionMode,
-) -> String {
+fn council_reload_message(council: &council::ResolvedCouncil) -> String {
     let role = |role: Option<&council::ResolvedRole>| {
         role.map(|role| format!("{} via {}", role.model.model, role.launch.source_id))
             .unwrap_or_else(|| "off".to_string())
     };
     format!(
-        "Council reloaded after /clear: Thor {}; Loki {}; Eitri {}; permissions {}",
+        "Council reloaded after /clear: Thor {}; Loki {}; Eitri {}",
         role(Some(&council.thor)),
         role(council.loki.as_ref()),
         role(council.eitri.as_ref()),
-        permission_mode,
     )
 }
 
@@ -1333,10 +1329,7 @@ async fn run_app(
                 initial_agent = Some(council_agent.clone());
                 pending_new_session_boundary = show_new_session_boundary;
                 if session_result.reason == UiExitReason::ClearSession {
-                    pending_council_boundary = Some(council_reload_message(
-                        &council,
-                        cfg.council.permission_mode,
-                    ));
+                    pending_council_boundary = Some(council_reload_message(&council));
                 }
                 continue;
             }
@@ -1823,7 +1816,7 @@ async fn run_session(
         );
     }
     let _ = ui_event_tx.send(crate::event::UiEvent::Info(format!(
-        "Council · Thor {} · Loki {} · Eitri {} · permissions {} · {} launchable models",
+        "Council · Thor {} · Loki {} · Eitri {} · {} launchable models",
         council.thor.model.model,
         council
             .loki
@@ -1835,7 +1828,6 @@ async fn run_session(
             .as_ref()
             .map(|role| role.model.model.as_str())
             .unwrap_or("off"),
-        council_config.permission_mode,
         council.available.len(),
     )));
     for warning in &council.warnings {
@@ -1962,13 +1954,6 @@ async fn run_session(
     };
     let mut ui_event_rx = ui_event_rx;
 
-    let mut thor_env = agent.env.clone();
-    let thor_permission = council::configure_permissions(
-        council.thor.launch.kind,
-        council_config.permission_mode,
-        &mut thor_env,
-    );
-
     let runtime_cfg = acp::AcpRuntimeConfig {
         command: agent.program.clone(),
         args: agent.args.clone(),
@@ -1979,7 +1964,7 @@ async fn run_session(
             .map(|server| vec![server.advertised().clone()])
             .unwrap_or_default(),
         resume_session,
-        env: thor_env,
+        env: agent.env.clone(),
         agent_stderr: runtime_options.agent_stderr.clone(),
         fs_max_text_bytes: runtime_options.fs_max_text_bytes,
         access_mode: acp::RuntimeAccessMode::Full,
@@ -1991,7 +1976,7 @@ async fn run_session(
             model_id: council.thor.model.model.clone(),
             model_value: council.thor.model_value.clone(),
             adapter_source_id: council.thor.launch.source_id.clone(),
-            permission: thor_permission,
+            permission: None,
             council_session: Some(council_session.clone()),
         }),
         code_agent: eitri_pool.map(|eitri_pool| {
@@ -2007,7 +1992,6 @@ async fn run_session(
                 .with_implementation_handoff_counter(implementation_handoffs_this_turn.clone())
                 .with_active_implementation_workers(active_implementation_workers.clone())
                 .with_max_parallel_explores(eitri_config.max_parallel_explores)
-                .with_permission_mode(council_config.permission_mode)
                 .with_prewarm(code_agent::RunContext {
                     cwd: cwd.clone(),
                     additional_directories: runtime_options.additional_directories.clone(),
@@ -3081,8 +3065,8 @@ mod tests {
         };
 
         assert_eq!(
-            council_reload_message(&council, config::CouncilPermissionMode::Auto),
-            "Council reloaded after /clear: Thor gpt-test via codex-acp; Loki claude-test via claude-acp; Eitri off; permissions Auto"
+            council_reload_message(&council),
+            "Council reloaded after /clear: Thor gpt-test via codex-acp; Loki claude-test via claude-acp; Eitri off"
         );
     }
 
