@@ -2043,50 +2043,6 @@
         text-transform: uppercase;
       }
 
-      .config-native-mode-help {
-        position: relative;
-        display: inline-block;
-      }
-
-      .config-native-mode-help > summary {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 16px;
-        height: 16px;
-        border: 1px solid var(--dim);
-        border-radius: 50%;
-        color: var(--dim);
-        cursor: pointer;
-        font: 700 10px/1 var(--font-mono);
-        list-style: none;
-      }
-
-      .config-native-mode-help > summary::-webkit-details-marker {
-        display: none;
-      }
-
-      .config-native-mode-help[open] > summary,
-      .config-native-mode-help > summary:hover {
-        color: var(--text-control);
-        border-color: currentColor;
-      }
-
-      .config-native-mode-detail {
-        position: absolute;
-        z-index: 31;
-        left: 0;
-        bottom: calc(100% + 8px);
-        width: min(300px, calc(100vw - 48px));
-        padding: 9px 10px;
-        border: 1px solid var(--border);
-        border-radius: 6px;
-        background: var(--panel);
-        box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
-        color: var(--dim);
-        font: 400 10px/1.4 var(--font-mono);
-      }
-
       .config-combo {
         position: relative;
         min-width: 0;
@@ -5412,18 +5368,9 @@
         const value = document.createElement("span");
         value.className = "config-native-mode-value";
         value.textContent = session.native_mode?.label || "unavailable";
-        const help = document.createElement("details");
-        help.className = "config-native-mode-help";
-        const helpTrigger = document.createElement("summary");
-        helpTrigger.setAttribute("aria-label", "About native session mode");
-        helpTrigger.title = "About native session mode";
-        helpTrigger.textContent = "?";
-        const detail = document.createElement("div");
-        detail.className = "config-native-mode-detail";
-        detail.textContent =
-          "Managed by the active ACP harness's native session configuration. This is a live, read-only status for the current Thor session and grants no mutation authority. It does not alter Loki or Eitri Explore read-only restrictions.";
-        help.append(helpTrigger, detail);
-        summary.append(name, " ", value, " ", help);
+        value.title =
+          "Current mode reported by the active ACP harness.";
+        summary.append(name, " ", value);
         root.append(summary);
         return root;
       }
