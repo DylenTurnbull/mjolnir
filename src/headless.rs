@@ -429,6 +429,15 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 stop_reason: reason,
                 usage: prompt_usage,
             } => {
+                // Headless has no further turn boundary after this point --
+                // the process is about to shut down and abort Loki's
+                // reviewer. Give any Thor advice already routed but never
+                // delivered (no ordinary boundary fired in time) one last
+                // chance before treating this completion as terminal. Bounded
+                // to at most one extra turn per prompt by the orchestrator.
+                if thor_orchestrator.drain_advice_before_shutdown().await {
+                    continue;
+                }
                 stop_reason = Some(reason);
                 usage = prompt_usage;
                 saw_terminal_event = true;

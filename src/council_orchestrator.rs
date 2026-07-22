@@ -46,6 +46,24 @@ pub struct Handle {
     reviewer: Option<loki::Handle>,
     events: mpsc::UnboundedSender<UiEvent>,
     review_requests: mpsc::UnboundedSender<ReviewTarget>,
+    log_context: Option<LogContext>,
+    /// Set once a `drain_advice_before_shutdown` call has actually dispatched
+    /// a drain turn for the current prompt, so a session never drains twice
+    /// (in particular, advice generated *by* the drain turn itself waits for
+    /// an ordinary boundary rather than triggering another drain). Reset in
+    /// `begin_turn`.
+    ///
+    /// Kept even though the now-blocking rendezvous at the ordinary
+    /// turn-boundary (see `pull_advice`) makes the scenario this guards
+    /// against much rarer: that rendezvous already waits out everything in
+    /// flight before a drain turn's own `PromptDone` reaches this function
+    /// again, so the drain turn's own advice is now usually already
+    /// delivered by the time this would fire a second time. It remains
+    /// cheap, deliberate defense-in-depth against a pathological repeat
+    /// drain (e.g. two consecutive `loki::RENDEZVOUS_TIMEOUT`s), not
+    /// something this design leans on for correctness the way the old
+    /// async-only pull did.
+    drain_used: Arc<AtomicBool>,
 }
 
 impl Handle {
@@ -55,6 +73,56 @@ impl Handle {
             task,
             snapshot: Some(snapshot),
         };
+        self.drain_used.store(false, Ordering::Release);
+    }
+
+    /// Headless and remote sessions have no further turn boundary after
+    /// Thor's final `PromptDone` -- the process is about to exit. Call this
+    /// once, right before treating that completion as terminal, as the last
+    /// injection-point rendezvous: it waits (bounded, see
+    /// `loki::Handle::rendezvous`) for Loki to finish everything in flight
+    /// or still sitting unprocessed in the worker's request channel, to give
+    /// advice one last chance to reach Thor before the process exits. In the
+    /// ordinary case the ordinary turn-boundary rendezvous in `spawn`'s event
+    /// loop already caught everything before this `PromptDone` was even
+    /// emitted, so this is mainly a backstop for the rare case where that
+    /// rendezvous itself hit `loki::RENDEZVOUS_TIMEOUT` and Loki kept working
+    /// past it. Reuses the same "interjection" fresh-turn mechanism the
+    /// idle-time late-advice watch below uses, so a drained note reads
+    /// identically to an ordinary late-arriving one.
+    ///
+    /// Returns `true` when a drain turn was actually dispatched via
+    /// `runtime_commands`; the caller must then keep processing events for
+    /// that turn's own `PromptDone` instead of shutting down immediately.
+    /// Returns `false` (a no-op) when there is no reviewer, the queue holds
+    /// nothing but stale-trivial (empty/whitespace) notes, or a drain turn
+    /// was already dispatched once for this prompt.
+    pub async fn drain_advice_before_shutdown(&self) -> bool {
+        let Some(reviewer) = self.reviewer.as_ref() else {
+            return false;
+        };
+        if !advice_drain_should_fire(&self.drain_used) {
+            return false;
+        }
+        let epoch = self.turn.lock().await.epoch;
+        let outcome = reviewer.rendezvous(loki::Consumer::Thor).await;
+        if !advice_drain_has_material_notes(&outcome) {
+            return false;
+        }
+        let advice = loki::format_pull_outcome(&outcome, epoch, loki::Consumer::Thor);
+        log_advice_drain(self.log_context.as_ref(), &advice, outcome.advice.len());
+        emit_internal(
+            &self.events,
+            "Loki",
+            "Thor",
+            InternalMessageKind::Interjection,
+            &advice,
+        );
+        let _ = self.runtime_commands.send(UiCommand::SendPrompt {
+            text: loki_interjection_prompt(&advice),
+            images: Vec::new(),
+        });
+        true
     }
 
     pub fn set_review_enabled(&self, enabled: bool) {
@@ -152,6 +220,8 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
         reviewer: config.reviewer.clone(),
         events: events_tx.clone(),
         review_requests,
+        log_context: config.log_context.clone(),
+        drain_used: Arc::new(AtomicBool::new(false)),
     };
     let task = tokio::spawn(async move {
         let mut active_worker_updates = config.active_implementation_workers.subscribe();
@@ -244,6 +314,18 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                         }
                     }
                 }
+                // Late-advice safety net: Thor is idle (between turns) and
+                // Loki just posted a fresh note. The ordinary turn-boundary
+                // rendezvous below (see the `pulled = pull_advice(...)` call
+                // near the end of this loop) now waits, bounded by
+                // `loki::RENDEZVOUS_TIMEOUT`, for everything in flight before
+                // Thor goes idle, so in the common case there is nothing
+                // left for this branch to catch by the time `idle_epoch` is
+                // set. It still matters for the residual case: a review
+                // still running past that timeout, which posts here once it
+                // finally finishes. Left on the plain `pull` deliberately --
+                // it only needs the round already relevant to it, not a full
+                // rendezvous.
                 advice_posted = async {
                     match advice_watch.as_mut() {
                         Some(watch) => watch.changed().await.ok(),
@@ -371,6 +453,11 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                 idle_epoch = Some(active.epoch);
                 continue;
             }
+            // Turn-boundary injection point: wait (bounded by
+            // `loki::RENDEZVOUS_TIMEOUT`) for everything already in flight
+            // or still sitting unprocessed in the worker's request channel
+            // to finish, and deliver it all as one digest before Thor's
+            // completion is allowed to proceed. See `loki::Handle::rendezvous`.
             let pulled = pull_advice(config.reviewer.as_ref(), active.epoch).await;
             let handoffs = config.implementation_handoffs.load(Ordering::Acquire);
             let review = review_enabled.load(Ordering::Acquire);
@@ -454,12 +541,15 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
     }
 }
 
+/// The turn-boundary rendezvous: blocks (bounded) until Loki has finished
+/// everything already in flight or still sitting unprocessed in its
+/// request channel. See `loki::Handle::rendezvous`.
 async fn pull_advice(
     reviewer: Option<&loki::Handle>,
     epoch: u64,
 ) -> Option<(loki::PullOutcome, String)> {
     let reviewer = reviewer?;
-    let outcome = reviewer.pull(loki::Consumer::Thor).await;
+    let outcome = reviewer.rendezvous(loki::Consumer::Thor).await;
     let receipt = loki::format_pull_outcome(&outcome, epoch, loki::Consumer::Thor);
     Some((outcome, receipt))
 }
@@ -476,6 +566,22 @@ fn log_advice(context: Option<&LogContext>, advice: &str, delivery: &str) {
             delivery,
             advice,
             "Thor received Loki advice"
+        );
+    }
+}
+
+fn log_advice_drain(context: Option<&LogContext>, advice: &str, note_count: usize) {
+    if let Some(context) = context {
+        tracing::info!(
+            event = "advice_drain",
+            council_session = %context.council_session,
+            god = "Thor",
+            source = "Loki",
+            model = %context.model,
+            adapter = %context.adapter,
+            note_count,
+            advice,
+            "Undelivered Loki advice drained before the session ended"
         );
     }
 }
@@ -500,6 +606,24 @@ fn loki_interjection_prompt(advice: &str) -> String {
     format!(
         "<advisory source=\"Loki\" timing=\"post-turn; may be superseded by later work\">\n{advice}\n</advisory>\n\nLoki finished reviewing after your previous answer was already delivered. Re-open that completed work only as needed to verify whether this feedback still applies. If a material issue remains, address it and explain the correction; otherwise briefly say the completed work already covers it."
     )
+}
+
+/// Check-and-set gate for `Handle::drain_advice_before_shutdown`: `true` the
+/// first time it is called after a `begin_turn` reset, `false` on every call
+/// after that (including from advice the drain turn itself generates), so a
+/// session drains undelivered advice at most once per user prompt.
+fn advice_drain_should_fire(drain_used: &AtomicBool) -> bool {
+    !drain_used.swap(true, Ordering::AcqRel)
+}
+
+/// A drained pull is worth spending an extra Thor turn on only if it carries
+/// at least one note with real (non-whitespace) text. Overflow-only outcomes
+/// (drops with no surviving notes) and an empty pull are not material.
+fn advice_drain_has_material_notes(outcome: &loki::PullOutcome) -> bool {
+    outcome
+        .advice
+        .iter()
+        .any(|item| !item.note.trim().is_empty())
 }
 
 fn should_start_discrete_review(
@@ -624,6 +748,59 @@ mod tests {
     }
 
     #[test]
+    fn advice_drain_fires_once_per_prompt_and_not_on_the_drain_turn_itself() {
+        let drain_used = AtomicBool::new(false);
+        assert!(
+            advice_drain_should_fire(&drain_used),
+            "queued notes waiting at turn end must fire the first time"
+        );
+        assert!(
+            !advice_drain_should_fire(&drain_used),
+            "a second call for the same prompt -- e.g. from advice the drain \
+             turn itself generated -- must not fire another drain"
+        );
+        // A new prompt (`begin_turn`) rearms the gate.
+        drain_used.store(false, Ordering::Release);
+        assert!(
+            advice_drain_should_fire(&drain_used),
+            "the next prompt must be able to drain again"
+        );
+    }
+
+    #[test]
+    fn advice_drain_skips_stale_trivial_notes_but_fires_for_real_ones() {
+        let span = |ordinal| loki::ReviewedSpan::for_test(loki::Target::Thor, ordinal);
+        let blank_only = loki::PullOutcome {
+            advice: vec![
+                loki::Advice::for_test(1, 1, loki::Target::Thor, "   ", span(1)),
+                loki::Advice::for_test(2, 1, loki::Target::Thor, "", span(2)),
+            ],
+            dropped: 0,
+            waited: false,
+        };
+        assert!(
+            !advice_drain_has_material_notes(&blank_only),
+            "whitespace-only queued notes must not trigger a drain turn"
+        );
+
+        let empty = loki::PullOutcome::default();
+        assert!(!advice_drain_has_material_notes(&empty));
+
+        let mixed = loki::PullOutcome {
+            advice: vec![
+                loki::Advice::for_test(1, 1, loki::Target::Thor, "   ", span(1)),
+                loki::Advice::for_test(2, 1, loki::Target::Thor, "fix the race", span(2)),
+            ],
+            dropped: 0,
+            waited: false,
+        };
+        assert!(
+            advice_drain_has_material_notes(&mixed),
+            "one real note among stale-trivial ones must still fire"
+        );
+    }
+
+    #[test]
     fn asynchronous_advice_prompts_warn_that_feedback_may_be_superseded() {
         let advice = "turn 3, Thor step 2: verify the fallback";
         assert!(loki_advice_prompt(advice).contains("may be superseded"));
@@ -710,5 +887,31 @@ mod tests {
 
         drop(runtime_tx);
         running.task.await.expect("orchestrator task");
+    }
+
+    #[tokio::test]
+    async fn drain_before_shutdown_is_a_noop_without_a_reviewer() {
+        let (_runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let running = spawn(
+            runtime_rx,
+            Config {
+                reviewer: None,
+                runtime_commands: command_tx,
+                implementation_handoffs: Arc::new(AtomicUsize::new(1)),
+                active_implementation_workers: ActiveCodeWorkers::default(),
+                discrete_review: false,
+                review_root: PathBuf::from("."),
+                log_context: None,
+            },
+        );
+        // A session without a reviewer configured has no advice to drain,
+        // and must never dispatch a phantom turn while shutting down.
+        assert!(!running.handle.drain_advice_before_shutdown().await);
+        running
+            .handle
+            .begin_turn(1, "task".to_string(), WorkspaceSnapshot::capture(&[]).await)
+            .await;
+        assert!(!running.handle.drain_advice_before_shutdown().await);
     }
 }

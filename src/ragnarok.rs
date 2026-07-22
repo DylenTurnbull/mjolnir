@@ -73,6 +73,11 @@ const CONFIG_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Defense in depth: how many times one turn re-sends a prompt the runtime
 /// rejected with "config update already in flight" (250ms apart).
 const PROMPT_RESEND_LIMIT: usize = 20;
+/// Hard ceiling on an advertised session command (e.g. Loki's `/compact`).
+/// This does not race the per-turn abort watch (see `run_advertised_command`
+/// doc comment), so this timeout is the only thing standing between a hung
+/// agent and a permanently wedged worker loop.
+const ADVERTISED_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Straggler judgment never begins before this much combat time has passed…
 const STRAGGLER_MIN_ELAPSED: Duration = Duration::from_secs(4 * 60);
@@ -1180,10 +1185,35 @@ pub(crate) struct AgentHandle {
 }
 
 impl AgentHandle {
+    /// Run an advertised session command (currently only Loki's `/compact`)
+    /// and wait for its outcome.
+    ///
+    /// This deliberately does **not** race `self.abort`: `abort` means "the
+    /// target turn ended, stop reviewing" (see `Handle::cancel_turn` in
+    /// `loki.rs`, fired on `UiCommand::CancelPrompt`), which is a review-work
+    /// cancellation signal. Compaction is session maintenance, not review
+    /// work, and must survive a turn ending mid-compact -- racing abort here
+    /// previously made a perfectly healthy compact report as
+    /// `Failed("agent command aborted")` whenever the user's turn happened to
+    /// finish while the command was in flight. The underlying ACP runtime
+    /// loop (`acp::run`) never receives `abort` at all and always drives the
+    /// command to completion once dispatched, so the fix is confined to not
+    /// giving up early here. A generous hard timeout still bounds how long a
+    /// hung agent can wedge the worker.
     pub(crate) async fn run_advertised_command(
         &mut self,
         name: &str,
         trigger: CompactTrigger,
+    ) -> AgentCommandOutcome {
+        self.run_advertised_command_with_timeout(name, trigger, ADVERTISED_COMMAND_TIMEOUT)
+            .await
+    }
+
+    async fn run_advertised_command_with_timeout(
+        &mut self,
+        name: &str,
+        trigger: CompactTrigger,
+        timeout: Duration,
     ) -> AgentCommandOutcome {
         let (responder, response) = tokio::sync::oneshot::channel();
         if self
@@ -1197,13 +1227,11 @@ impl AgentHandle {
         {
             return AgentCommandOutcome::Failed("agent runtime closed".to_string());
         }
-        tokio::select! {
-            result = response => result.unwrap_or_else(|_| {
+        match tokio::time::timeout(timeout, response).await {
+            Ok(result) => result.unwrap_or_else(|_| {
                 AgentCommandOutcome::Failed("agent command response was dropped".to_string())
             }),
-            _ = wait_abort(self.abort.clone()) => {
-                AgentCommandOutcome::Failed("agent command aborted".to_string())
-            }
+            Err(_) => AgentCommandOutcome::Failed("agent command timed out".to_string()),
         }
     }
 
@@ -4391,6 +4419,71 @@ mod tests {
 
         handle.dismiss().await;
         assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn run_advertised_command_survives_abort_firing_mid_flight() {
+        let TestRig {
+            mut handle,
+            mut cmd_rx,
+            _abort_tx: abort_tx,
+            ..
+        } = test_rig();
+
+        let run = tokio::spawn(async move {
+            handle
+                .run_advertised_command("compact", CompactTrigger::Loki128k)
+                .await
+        });
+
+        let UiCommand::RunAdvertisedCommand { responder, .. } = cmd_rx
+            .recv()
+            .await
+            .expect("compact command dispatched to the runtime")
+        else {
+            panic!("expected RunAdvertisedCommand");
+        };
+
+        // Fire the abort watch (as `Handle::cancel_turn` does on
+        // `UiCommand::CancelPrompt`) *before* the agent-side response
+        // lands. A pre-fix implementation raced this against the response
+        // future and would report a spurious "agent command aborted"
+        // failure here even though the underlying command kept running and
+        // eventually succeeded.
+        let _ = abort_tx.send(true);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = responder.send(AgentCommandOutcome::Completed);
+
+        let outcome = run.await.expect("run_advertised_command task");
+        assert_eq!(outcome, AgentCommandOutcome::Completed);
+    }
+
+    #[tokio::test]
+    async fn run_advertised_command_times_out_when_the_runtime_never_answers() {
+        let TestRig {
+            mut handle,
+            mut cmd_rx,
+            ..
+        } = test_rig();
+
+        let run = tokio::spawn(async move {
+            handle
+                .run_advertised_command_with_timeout(
+                    "compact",
+                    CompactTrigger::Loki128k,
+                    Duration::from_millis(20),
+                )
+                .await
+        });
+
+        // Receive the request but never respond, leaving the runtime "hung".
+        let _received = cmd_rx.recv().await.expect("compact command dispatched");
+
+        let outcome = run.await.expect("run_advertised_command task");
+        assert!(
+            matches!(&outcome, AgentCommandOutcome::Failed(message) if message.contains("timed out")),
+            "expected a timeout failure, got {outcome:?}"
+        );
     }
 
     fn model_options(current: &str) -> (Vec<SessionConfigOption>, Vec<SessionConfigTarget>) {

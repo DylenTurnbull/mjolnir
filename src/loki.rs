@@ -1,8 +1,16 @@
 //! Persistent read-only council advisor. Thor and Eitri stream hidden transcript
 //! deltas into one long-lived Loki ACP session; Loki reviews them asynchronously
-//! at his own pace. Advice accumulates in a queue and is pulled by the
+//! at his own pace, dispatching whatever checkpoints have accumulated as soon
+//! as the worker is free -- there is no group-size gate, so a busy worker
+//! naturally coalesces whatever arrived while it was occupied into its next
+//! review round. Advice accumulates in a queue and is pulled by the
 //! orchestrators at natural turn boundaries. Loki never interrupts a running
-//! target; a pull may wait briefly for the one review already in flight.
+//! target; a plain `pull`/`pull_manual` may wait briefly for the one review
+//! already in flight. At an injection point (a Thor turn boundary, or the
+//! pre-shutdown drain) `Handle::rendezvous` instead waits -- bounded by
+//! `RENDEZVOUS_TIMEOUT` -- for every review already in flight or still
+//! sitting unprocessed in the worker's request channel to finish, and
+//! returns it all as one digest.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -53,16 +61,41 @@ const MCP_SERVER_NAME: &str = "mj-loki-advisor";
 const PULL_MCP_SERVER_NAME: &str = "mj-loki-pull";
 const ADVICE_QUEUE_CAPACITY: usize = 10;
 const PULL_WAIT: Duration = Duration::from_secs(10);
-const LOKI_COMPACT_THRESHOLD: u64 = 128_000;
+/// Hard ceiling on `Handle::rendezvous`'s wait for Loki to finish every
+/// review already in flight or still sitting unprocessed in the worker's
+/// request channel at an injection point (turn boundaries, the pre-shutdown
+/// advice drain). Mirrors `ragnarok::ADVERTISED_COMMAND_TIMEOUT`'s role as
+/// the last line of defense between a hung Loki review and a permanently
+/// blocked Thor: on timeout the rendezvous logs a warning and returns
+/// whatever advice is already queued instead of hanging.
+const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(120);
+/// Loki's session context, in tokens, above which we request an automatic
+/// `/compact`. DeepSeek's server-side prompt cache evicts our retained
+/// prefix under memory pressure on roughly 1 in 11 requests; when that
+/// happens the *entire* retained context re-bills as a cache miss, which
+/// dominates Loki's cost on long runs. Keeping the retained context small
+/// caps the size of that re-bill, so we compact far earlier than any real
+/// model context limit rather than waiting for something close to it.
+/// (Anvil's own `/compact` has no minimum-context skip floor -- see the
+/// investigation notes on `run_advertised_command` -- so there is no larger
+/// floor this needs to clear.)
+const LOKI_COMPACT_THRESHOLD: u64 = 32_000;
 
 #[derive(Debug)]
 struct CompactThreshold {
     armed: bool,
+    /// Epoch (Loki turn) of the last retry-after-failure rearm, so a
+    /// persistently broken compact path gets one extra attempt per turn
+    /// instead of hammering the agent on every review round.
+    retried_epoch: Option<u64>,
 }
 
 impl Default for CompactThreshold {
     fn default() -> Self {
-        Self { armed: true }
+        Self {
+            armed: true,
+            retried_epoch: None,
+        }
     }
 }
 
@@ -73,6 +106,21 @@ impl CompactThreshold {
             return false;
         }
         std::mem::replace(&mut self.armed, false)
+    }
+
+    /// Re-arm after an automatic compact came back `Failed` or `Skipped`, so
+    /// the next completed review round's `observe` call retries rather than
+    /// leaving the threshold permanently disarmed. Returns whether a fresh
+    /// retry was granted; `false` means this epoch already used its one
+    /// retry and must wait for the next turn (or a genuine usage dip) before
+    /// trying again.
+    fn rearm_for_retry(&mut self, epoch: u64) -> bool {
+        if self.retried_epoch == Some(epoch) {
+            return false;
+        }
+        self.retried_epoch = Some(epoch);
+        self.armed = true;
+        true
     }
 }
 
@@ -120,6 +168,17 @@ pub struct ReviewedSpan {
 }
 
 impl ReviewedSpan {
+    #[cfg(test)]
+    pub(crate) fn for_test(target: Target, ordinal: u64) -> Self {
+        Self {
+            target,
+            invocation: None,
+            first_step: ordinal,
+            last_step: ordinal,
+            activities: vec!["test".to_string()],
+        }
+    }
+
     fn marker(&self) -> String {
         let actor = match self.invocation {
             Some(invocation) => format!("{} #{invocation}", self.target.label()),
@@ -141,9 +200,32 @@ pub struct Advice {
     pub target: Target,
     pub note: String,
     pub span: ReviewedSpan,
+    /// Set when a later `advise` submission for the same (god, ordinal) step
+    /// replaced this note's text in place while it was still queued (see
+    /// `AdviceSlot::accept`), rather than being appended as a new entry.
+    /// Rendered as "(updated)" in the advice ledger.
+    pub updated: bool,
 }
 
 impl Advice {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        id: u64,
+        epoch: u64,
+        target: Target,
+        note: &str,
+        span: ReviewedSpan,
+    ) -> Self {
+        Self {
+            id,
+            epoch,
+            target,
+            note: note.to_string(),
+            span,
+            updated: false,
+        }
+    }
+
     fn deferred_text(&self, current_epoch: u64) -> String {
         let provenance = if self.epoch == current_epoch {
             format!("[reviewed {}]", self.span.marker())
@@ -162,7 +244,42 @@ struct AdviceState {
     dropped_eitri: u64,
     thor_cutoff: u64,
     next_advice_id: u64,
-    seen: HashSet<StepRef>,
+    /// Every (epoch, step) reviewed in any batch this session, keyed to the
+    /// epoch it was reviewed in, with the span data needed to render it.
+    /// Lets `AdviceSlot::accept` validate a step reference against the whole
+    /// epoch's reviewed history, not just the current review batch, so Loki
+    /// can re-raise an unresolved issue keyed to an older step (see
+    /// `AdviceSlot::begin`). Never cleared -- entries from a prior epoch
+    /// simply stop matching once the active epoch moves on.
+    reviewed_spans: HashMap<(u64, StepRef), ReviewedSpan>,
+    /// Notes actually handed to their target since the last time a review
+    /// prompt drained this log (see `take_ledger_snapshot`). Recorded in
+    /// `drain_for`, the single choke point every delivery path -- automatic
+    /// turn-boundary pulls and the manual `pull_advice` tool -- goes through.
+    delivered_log: Vec<DeliveredEntry>,
+    /// Advise-tool submissions the acceptance gate rejected since the last
+    /// ledger drain, so Loki keeps a persistent record of a diagnosis that
+    /// would otherwise be silently lost. Recorded in `AdviceSlot::accept`.
+    rejected_log: Vec<RejectedEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct DeliveredEntry {
+    id: u64,
+    target: Target,
+    note: String,
+}
+
+#[derive(Debug, Clone)]
+struct RejectedEntry {
+    /// Which review batch the rejected submission was attempted against, for
+    /// correlation with the `review_id` tracing field; "no active review"
+    /// when the submission arrived outside any review turn.
+    context: String,
+    reason: &'static str,
+    /// Truncated at render time; kept untruncated here so later truncation
+    /// changes do not need to touch the recording site.
+    text: String,
 }
 
 type SharedAdviceState = Arc<std::sync::Mutex<AdviceState>>;
@@ -189,6 +306,21 @@ struct AdviceSlot {
 
 impl AdviceSlot {
     async fn begin(&self, id: u64, epoch: u64, spans: Vec<ReviewedSpan>) {
+        {
+            let mut state = self.state.lock().expect("Loki advice state poisoned");
+            for span in &spans {
+                state.reviewed_spans.insert(
+                    (
+                        epoch,
+                        StepRef {
+                            god: span.target,
+                            ordinal: span.first_step,
+                        },
+                    ),
+                    span.clone(),
+                );
+            }
+        }
         *self.active.lock().await = Some(ActiveAdvice {
             id,
             epoch,
@@ -200,32 +332,59 @@ impl AdviceSlot {
     }
 
     async fn accept(&self, args: AdviseArgs) -> std::result::Result<Vec<Advice>, &'static str> {
-        let mut active = self.active.lock().await;
-        let Some(active) = active.as_mut() else {
-            return Err("no advisor update is active");
+        let mut active_guard = self.active.lock().await;
+        let mut state = self.state.lock().expect("Loki advice state poisoned");
+        let submission_summary = summarize_submission(&args.advice);
+        let review_context = active_guard.as_ref().map_or_else(
+            || "no active review".to_string(),
+            |active| format!("review #{}", active.id),
+        );
+        let reject = |state: &mut AdviceState, reason: &'static str| -> &'static str {
+            state.rejected_log.push(RejectedEntry {
+                context: review_context.clone(),
+                reason,
+                text: submission_summary.clone(),
+            });
+            reason
+        };
+        let Some(active) = active_guard.as_mut() else {
+            return Err(reject(&mut state, "no advisor update is active"));
         };
         if active.submitted {
-            return Err("only one structured advice list is allowed per review turn");
+            return Err(reject(
+                &mut state,
+                "only one structured advice list is allowed per review turn",
+            ));
         }
-        let mut state = self.state.lock().expect("Loki advice state poisoned");
         let mut referenced = HashSet::new();
         for item in &args.advice {
-            let valid = active.spans.iter().any(|span| {
+            let in_batch = active.spans.iter().any(|span| {
                 span.target == item.step.god
                     && span.first_step == item.step.ordinal
                     && span.last_step == item.step.ordinal
             });
-            if !valid {
-                return Err("advice referenced a step outside this review batch");
+            // A step reviewed in any earlier batch within the *same* epoch
+            // is also a valid reference, so Loki can re-raise an unresolved
+            // issue keyed to an older step instead of being forced to drop
+            // it. Steps from a prior epoch, or never reviewed at all, still
+            // fail this check.
+            let previously_reviewed = state
+                .reviewed_spans
+                .contains_key(&(active.epoch, item.step));
+            if !in_batch && !previously_reviewed {
+                return Err(reject(
+                    &mut state,
+                    "advice referenced a step outside this review batch",
+                ));
             }
             if item.note.trim().is_empty() || is_content_free(&item.note) {
                 continue;
             }
-            if !referenced.insert(item.step)
-                || active.accepted_steps.contains(&item.step)
-                || state.seen.contains(&item.step)
-            {
-                return Err("only one advice note is allowed per reviewed step");
+            if !referenced.insert(item.step) || active.accepted_steps.contains(&item.step) {
+                return Err(reject(
+                    &mut state,
+                    "only one advice note is allowed per reviewed step",
+                ));
             }
         }
         let mut accepted = Vec::new();
@@ -240,12 +399,17 @@ impl AdviceSlot {
                         && span.last_step == item.step.ordinal
                 })
                 .cloned()
+                .or_else(|| {
+                    state
+                        .reviewed_spans
+                        .get(&(active.epoch, item.step))
+                        .cloned()
+                })
                 .expect("advice step validated before queue mutation");
             if item.note.trim().is_empty() || is_content_free(&item.note) {
                 continue;
             }
             active.accepted_steps.insert(item.step);
-            state.seen.insert(item.step);
             state.next_advice_id = state.next_advice_id.saturating_add(1);
             let advice = Advice {
                 id: state.next_advice_id,
@@ -253,6 +417,7 @@ impl AdviceSlot {
                 target: item.step.god,
                 note: item.note.trim().to_string(),
                 span,
+                updated: false,
             };
             if advice.target == Target::Thor && advice.span.first_step <= state.thor_cutoff {
                 tracing::info!(
@@ -270,23 +435,53 @@ impl AdviceSlot {
                 dropped_eitri,
                 ..
             } = &mut *state;
-            match advice.target {
-                Target::Thor => push_bounded(thor, dropped_thor, advice.clone()),
-                Target::Eitri => push_bounded(eitri, dropped_eitri, advice.clone()),
+            let (queue, dropped) = match advice.target {
+                Target::Thor => (thor, dropped_thor),
+                Target::Eitri => (eitri, dropped_eitri),
+            };
+            // A note keyed to the same (god, ordinal) step already sitting
+            // in the queue is a re-raise, not new material: update it in
+            // place so Loki's re-raises are idempotent instead of growing
+            // the queue and risking an unrelated note's eviction (see
+            // `push_bounded`). Only a genuinely new step goes through the
+            // bounded push, so overflow accounting still only counts real
+            // new arrivals.
+            match queue.iter_mut().find(|queued| {
+                queued.span.target == advice.span.target
+                    && queued.span.first_step == advice.span.first_step
+            }) {
+                Some(queued) => {
+                    queued.note = advice.note.clone();
+                    queued.epoch = advice.epoch;
+                    queued.span = advice.span.clone();
+                    queued.updated = true;
+                    tracing::info!(
+                        event = "advice_updated",
+                        advice_id = queued.id,
+                        epoch = advice.epoch,
+                        review_target = advice.target.label(),
+                        reviewed_step = advice.span.first_step,
+                        advice = %advice.note,
+                        "Loki advice updated in place (deduplicated)"
+                    );
+                }
+                None => {
+                    push_bounded(queue, dropped, advice.clone());
+                    tracing::info!(
+                        event = "advice_routed",
+                        advice_id = advice.id,
+                        epoch = advice.epoch,
+                        review_target = advice.target.label(),
+                        reviewed_step = advice.span.first_step,
+                        delivery_route = match advice.target {
+                            Target::Thor => "thor_queue",
+                            Target::Eitri => "eitri_queue",
+                        },
+                        advice = %advice.note,
+                        "Loki advice routed"
+                    );
+                }
             }
-            tracing::info!(
-                event = "advice_routed",
-                advice_id = advice.id,
-                epoch = advice.epoch,
-                review_target = advice.target.label(),
-                reviewed_step = advice.span.first_step,
-                delivery_route = match advice.target {
-                    Target::Thor => "thor_queue",
-                    Target::Eitri => "eitri_queue",
-                },
-                advice = %advice.note,
-                "Loki advice routed"
-            );
             active.accepted_advice.push(advice.clone());
             accepted.push(advice);
         }
@@ -1221,6 +1416,13 @@ fn drain_for(state: &mut AdviceState, consumer: Consumer) -> PullOutcome {
         Consumer::Eitri => state.eitri.drain(..).collect(),
     };
     advice.sort_by_key(|advice: &Advice| advice.id);
+    for item in &advice {
+        state.delivered_log.push(DeliveredEntry {
+            id: item.id,
+            target: item.target,
+            note: item.note.clone(),
+        });
+    }
     let dropped = match consumer {
         Consumer::Thor => std::mem::take(&mut state.dropped_thor)
             .saturating_add(std::mem::take(&mut state.dropped_eitri)),
@@ -1251,6 +1453,26 @@ enum Request {
         target: Target,
         invocation: Option<u64>,
         checkpoint: Checkpoint,
+    },
+    /// Sent by `Handle::rendezvous` as a synchronization barrier: acked once
+    /// the worker has classified every request that was enqueued ahead of
+    /// it into this wake-up's dispatch decision -- claimed into the batch
+    /// about to be reviewed, or discarded as belonging to a stale epoch.
+    /// The main line has no group-size gate to force open (unlike the
+    /// grouped-review design this is ported from), so `Flush` never changes
+    /// what gets dispatched or when -- every checkpoint already goes out as
+    /// soon as the worker is free. What it gives `Handle::rendezvous` is a
+    /// definite fence: "the worker has now drained its request channel up
+    /// to this point," so step 1 of a rendezvous (confirm every checkpoint
+    /// produced so far is at least in the worker's hands) is a positive
+    /// confirmation rather than an inference from `pending_thor`/
+    /// `pending_eitri` counters that happen to also be accurate here.
+    /// `ack` is purely a synchronization point, not a payload: dropping it
+    /// without sending (the request is discarded as stale-epoch, or the
+    /// worker shuts down first) is equivalent to sending it.
+    Flush {
+        epoch: u64,
+        ack: oneshot::Sender<()>,
     },
     Compact {
         trigger: CompactTrigger,
@@ -1369,6 +1591,142 @@ impl Handle {
 
     pub async fn pull(&self, consumer: Consumer) -> PullOutcome {
         self.pull_inner(consumer).await
+    }
+
+    /// Blocking rendezvous for an injection point (turn boundary, the
+    /// pre-shutdown advice drain): confirm the worker has drained its
+    /// request channel of everything submitted so far (see `Request::Flush`),
+    /// then wait -- bounded by `RENDEZVOUS_TIMEOUT` -- for every review that
+    /// is either already in flight or was just picked up to finish, draining
+    /// and returning all of their advice as one outcome. Unlike `pull`, this
+    /// does not stop at the first review round relevant to `consumer`: it
+    /// keeps waiting as long as another review is pending or active, so a
+    /// caller gets one complete digest instead of having to pull repeatedly.
+    /// On timeout it gives up and returns whatever advice is already queued
+    /// rather than hanging the caller.
+    pub async fn rendezvous(&self, consumer: Consumer) -> PullOutcome {
+        self.rendezvous_bounded(consumer, RENDEZVOUS_TIMEOUT).await
+    }
+
+    /// `rendezvous`'s implementation, parameterized on the bound so tests
+    /// can exercise the timeout path without waiting out the real
+    /// `RENDEZVOUS_TIMEOUT`.
+    async fn rendezvous_bounded(&self, consumer: Consumer, timeout: Duration) -> PullOutcome {
+        let start = tokio::time::Instant::now();
+        let deadline = start + timeout;
+        let reviews_flushed = match consumer {
+            Consumer::Thor => {
+                self.pending_thor.load(Ordering::Relaxed)
+                    + self.pending_eitri.load(Ordering::Relaxed)
+            }
+            Consumer::Eitri => self.pending_eitri.load(Ordering::Relaxed),
+        };
+        let mut started = self.review_started.clone();
+        let _ = *started.borrow_and_update();
+        let mut finished = self.finished_reviews.clone();
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let _ = self.requests.send(Request::Flush {
+            epoch: self.current_epoch(),
+            ack: ack_tx,
+        });
+        // Wait (bounded) for the worker to actually drain its request
+        // channel up to this point before consulting
+        // `has_pending_review`/`active_review_relevant` below -- see
+        // `Request::Flush`'s doc comment. Any resolution (acked, or the
+        // sender dropped because the request was discarded or the worker
+        // shut down) is equivalent here: it is purely a synchronization
+        // point, not a payload. A timeout leaves `remaining` at ~0 for the
+        // loop below, so it reports `timed_out` rather than silently
+        // proceeding as if nothing were pending.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let _ = tokio::time::timeout(remaining, ack_rx).await;
+
+        let mut outcome = {
+            let mut state = self
+                .advice_state
+                .lock()
+                .expect("Loki advice state poisoned");
+            drain_for(&mut state, consumer)
+        };
+        let mut did_wait = false;
+        let mut timed_out = false;
+
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                if self.has_pending_review(consumer)
+                    || self.active_review_relevant(consumer).await.is_some()
+                {
+                    timed_out = true;
+                }
+                break;
+            }
+            let review_id = match self.active_review_relevant(consumer).await {
+                Some(id) => Some(id),
+                None if self.has_pending_review(consumer) => {
+                    did_wait = true;
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if tokio::time::timeout(remaining, started.changed())
+                        .await
+                        .is_err()
+                    {
+                        timed_out = true;
+                        break;
+                    }
+                    self.active_review_relevant(consumer).await
+                }
+                None => None,
+            };
+            let Some(review_id) = review_id else { break };
+            did_wait = true;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if tokio::time::timeout(
+                remaining,
+                finished.wait_for(|finished_id| *finished_id >= review_id),
+            )
+            .await
+            .is_err()
+            {
+                timed_out = true;
+                break;
+            }
+            let drained = {
+                let mut state = self
+                    .advice_state
+                    .lock()
+                    .expect("Loki advice state poisoned");
+                drain_for(&mut state, consumer)
+            };
+            outcome.advice.extend(drained.advice);
+            outcome.dropped = outcome.dropped.saturating_add(drained.dropped);
+        }
+
+        outcome.advice.sort_by_key(|advice| advice.id);
+        outcome.waited = did_wait;
+        let waited_ms = start.elapsed().as_millis() as u64;
+        let advice_delivered = outcome.advice.len();
+        if timed_out {
+            tracing::warn!(
+                event = "loki_rendezvous",
+                consumer = consumer.label(),
+                waited_ms,
+                reviews_flushed,
+                advice_delivered,
+                timed_out,
+                "Loki rendezvous hit its bound; delivering whatever advice is already queued"
+            );
+        } else {
+            tracing::info!(
+                event = "loki_rendezvous",
+                consumer = consumer.label(),
+                waited_ms,
+                reviews_flushed,
+                advice_delivered,
+                timed_out,
+                "Loki rendezvous completed"
+            );
+        }
+        outcome
     }
 
     pub async fn pull_manual(&self, consumer: Consumer) -> PullOutcome {
@@ -1614,6 +1972,14 @@ async fn worker(
     let mut review_state = LokiReviewState::default();
     let mut compact_threshold = CompactThreshold::default();
     let mut automatic_compact = None;
+    // Last-known `context_used` from a review's usage report, logged as the
+    // "before" side of a compact's context_used pair. There is no cheap way
+    // to get an "after" figure: `AgentCommandOutcome` carries no usage, and
+    // issuing an extra prompt just to read post-compact usage would spend
+    // the very tokens compaction exists to save. The next review's own
+    // `review_started`/`review_finished`+`CouncilUsage` logging is the
+    // observable "after" signal for benchmark analysis.
+    let mut last_context_used: Option<u64> = None;
     let advice = AdviceSlot {
         active: active_advice,
         state: advice_state,
@@ -1646,6 +2012,7 @@ async fn worker(
         };
         let mut batch = Vec::new();
         let mut compact_requests = Vec::new();
+        let mut flush_acks: Vec<oneshot::Sender<()>> = Vec::new();
         let mut incoming = VecDeque::from([request]);
         while let Ok(next) = requests.try_recv() {
             incoming.push_back(next);
@@ -1693,11 +2060,33 @@ async fn worker(
                     Target::Eitri => decrement_pending(&pending_eitri),
                 },
                 Request::TargetContext { .. } => {}
+                Request::Flush {
+                    epoch: request_epoch,
+                    ack,
+                } if request_epoch == epoch => {
+                    flush_acks.push(ack);
+                }
+                // Stale epoch: nothing of this turn's for the flush to act
+                // on. Ack immediately rather than dropping silently, so the
+                // caller's synchronization barrier resolves promptly instead
+                // of relying on drop-triggered `RecvError`.
+                Request::Flush { ack, .. } => {
+                    let _ = ack.send(());
+                }
                 Request::Compact { trigger, responder } => {
                     compact_requests.push((trigger, responder));
                 }
                 Request::Shutdown => break 'worker,
             }
+        }
+        // Release every rendezvous waiting on this flush now that every
+        // request enqueued ahead of it has been classified: `batch` holds
+        // everything that will be dispatched this wake-up, and
+        // `pending_thor`/`pending_eitri` (decremented below, once the batch
+        // is claimed) will correctly settle to reflect it. See
+        // `Request::Flush`.
+        for ack in flush_acks.drain(..) {
+            let _ = ack.send(());
         }
         if !batch.is_empty() {
             match role_pool.select_for_work().await {
@@ -1779,6 +2168,9 @@ async fn worker(
         if !compact_requests.is_empty() {
             let trigger = preferred_compact_trigger(&compact_requests)
                 .expect("non-empty Loki compact request set");
+            let is_automatic = compact_requests
+                .iter()
+                .any(|(trigger, _)| *trigger == CompactTrigger::Loki128k);
             tracing::info!(
                 event = "council_control",
                 god = "Loki",
@@ -1786,26 +2178,72 @@ async fn worker(
                 trigger = trigger.label(),
                 action = "request",
                 coalesced = compact_requests.len().saturating_sub(1),
+                context_used_before = last_context_used,
                 "Council role control command"
             );
+            let compact_started = tokio::time::Instant::now();
             let outcome = match session.as_mut() {
                 Some(agent) => agent.run_advertised_command("compact", trigger).await,
                 None => AgentCommandOutcome::Failed("Loki session is unavailable".to_string()),
             };
-            let (action, error) = match &outcome {
-                AgentCommandOutcome::Completed => ("completion", None),
-                AgentCommandOutcome::Skipped => ("skip", None),
-                AgentCommandOutcome::Failed(error) => ("failure", Some(error.as_str())),
-            };
-            tracing::info!(
-                event = "council_control",
-                god = "Loki",
-                command = "compact",
-                trigger = trigger.label(),
-                action,
-                error,
-                "Council role control command"
-            );
+            let duration_ms = compact_started.elapsed().as_millis() as u64;
+            match &outcome {
+                AgentCommandOutcome::Completed => {
+                    tracing::info!(
+                        event = "council_control",
+                        god = "Loki",
+                        command = "compact",
+                        trigger = trigger.label(),
+                        action = "completion",
+                        error = Option::<&str>::None,
+                        duration_ms,
+                        context_used_before = last_context_used,
+                        "Council role control command"
+                    );
+                }
+                AgentCommandOutcome::Skipped => {
+                    // Not a failure (e.g. Anvil's own no-op "nothing to
+                    // compress" case), but automatic compaction must not
+                    // stay disarmed forever just because one round skipped.
+                    let retry_armed = is_automatic && compact_threshold.rearm_for_retry(epoch);
+                    tracing::info!(
+                        event = "council_control",
+                        god = "Loki",
+                        command = "compact",
+                        trigger = trigger.label(),
+                        action = "skip",
+                        error = Option::<&str>::None,
+                        duration_ms,
+                        context_used_before = last_context_used,
+                        retry_armed,
+                        "Council role control command"
+                    );
+                }
+                AgentCommandOutcome::Failed(error) => {
+                    let retry_armed = is_automatic && compact_threshold.rearm_for_retry(epoch);
+                    tracing::warn!(
+                        event = "council_control",
+                        god = "Loki",
+                        command = "compact",
+                        trigger = trigger.label(),
+                        action = "failure",
+                        error = error.as_str(),
+                        duration_ms,
+                        context_used_before = last_context_used,
+                        retry_armed,
+                        "Council role control command"
+                    );
+                }
+            }
+            if !batch.is_empty() {
+                tracing::info!(
+                    event = "loki_round_delayed",
+                    god = "Loki",
+                    compact_duration_ms = duration_ms,
+                    batch_size = batch.len(),
+                    "Council review round dispatch delayed by a compact command"
+                );
+            }
             for (_, responder) in compact_requests {
                 if let Some(responder) = responder {
                     let _ = responder.send(outcome.clone());
@@ -1842,7 +2280,11 @@ async fn worker(
             }
         }
         let include_contract = review_state.include_contract();
-        let prompt = review_prompt(&batch, &spans, &context, include_contract);
+        let ledger = {
+            let mut state = advice.state.lock().expect("Loki advice state poisoned");
+            take_ledger_snapshot(&mut state)
+        };
+        let prompt = review_prompt(&batch, &spans, &context, include_contract, &ledger);
         tracing::info!(event = "review_started", council_session = %council_session, god = "Loki", model = %role.model.model, adapter = %role.launch.source_id, review_id = id, epoch, batch_size = batch.len(), review_target = %spans.iter().map(ReviewedSpan::marker).collect::<Vec<_>>().join(" | "), "Loki review started");
         let result = agent
             .prompt(prompt, REVIEW_TIMEOUT, |event| match event {
@@ -1871,10 +2313,11 @@ async fn worker(
                     .session_started()
                     .map(|(session_id, _)| session_id.to_string()),
             }));
-            if let Some(used) = outcome.usage_update.as_ref().map(|usage| usage.used)
-                && compact_threshold.observe(used)
-            {
-                automatic_compact = Some(CompactTrigger::Loki128k);
+            if let Some(used) = outcome.usage_update.as_ref().map(|usage| usage.used) {
+                last_context_used = Some(used);
+                if compact_threshold.observe(used) {
+                    automatic_compact = Some(CompactTrigger::Loki128k);
+                }
             }
         }
         let accepted = advice.finish(id).await;
@@ -2028,19 +2471,137 @@ async fn connect(
     .await
 }
 
+/// A submission argument summarized for the rejected-advice ledger: joins
+/// each item's step and truncated note, independent of whether the item
+/// itself later turns out to be the one that violated the gate.
+fn summarize_submission(items: &[AdviseItem]) -> String {
+    if items.is_empty() {
+        return "(empty submission)".to_string();
+    }
+    items
+        .iter()
+        .map(|item| {
+            format!(
+                "{} #{}: {}",
+                item.step.god.label(),
+                item.step.ordinal,
+                one_line(&item.note, 80)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Everything the advice-ledger section needs, snapshotted once per review
+/// prompt via `take_ledger_snapshot`. `queued` is always the *full* current
+/// queue contents (not a delta), so a compacted Loki -- whose model context
+/// no longer remembers earlier turns -- still gets the complete outstanding
+/// picture on its first post-compact review rather than only what changed
+/// since the previous prompt.
+#[derive(Debug, Default, Clone)]
+struct LedgerSnapshot {
+    queued: Vec<Advice>,
+    delivered: Vec<DeliveredEntry>,
+    rejected: Vec<RejectedEntry>,
+}
+
+impl LedgerSnapshot {
+    fn is_empty(&self) -> bool {
+        self.queued.is_empty() && self.delivered.is_empty() && self.rejected.is_empty()
+    }
+}
+
+/// Snapshot the ledger for the next review prompt. `delivered_log` and
+/// `rejected_log` are drained (cleared) so each is reported exactly once,
+/// covering everything since the previous review prompt was built; `queued`
+/// is read non-destructively since it must always reflect the full standing
+/// queue. This state lives in `AdviceState`, not in Loki's model context, so
+/// it is unaffected by `/compact` -- draining still only ever removes what
+/// this function itself already reported.
+fn take_ledger_snapshot(state: &mut AdviceState) -> LedgerSnapshot {
+    let mut queued: Vec<Advice> = state
+        .thor
+        .iter()
+        .chain(state.eitri.iter())
+        .cloned()
+        .collect();
+    queued.sort_by_key(|advice| advice.id);
+    LedgerSnapshot {
+        queued,
+        delivered: std::mem::take(&mut state.delivered_log),
+        rejected: std::mem::take(&mut state.rejected_log),
+    }
+}
+
+/// Render the "### Your advice ledger" section, or an empty string when all
+/// three categories are empty (the section is omitted entirely rather than
+/// shown hollow).
+fn render_ledger(ledger: &LedgerSnapshot) -> String {
+    if ledger.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from("### Your advice ledger\n\n");
+    if !ledger.delivered.is_empty() {
+        section.push_str("Delivered to their target (no action needed):\n");
+        for entry in &ledger.delivered {
+            section.push_str(&format!(
+                "- #{} → {}: {}\n",
+                entry.id,
+                entry.target.label(),
+                one_line(&entry.note, 80)
+            ));
+        }
+        section.push('\n');
+    }
+    if !ledger.queued.is_empty() {
+        section.push_str("Queued, awaiting a turn boundary (do NOT resubmit):\n");
+        for advice in &ledger.queued {
+            let updated = if advice.updated { " (updated)" } else { "" };
+            section.push_str(&format!(
+                "- #{} → {}: {}{}\n",
+                advice.id,
+                advice.target.label(),
+                one_line(&advice.note, 80),
+                updated
+            ));
+        }
+        section.push('\n');
+    }
+    if !ledger.rejected.is_empty() {
+        section.push_str("Rejected (resubmit only after fixing the reason, or if materially new information changes the advice):\n");
+        for entry in &ledger.rejected {
+            section.push_str(&format!(
+                "- [{}] \"{}\" — {}\n",
+                entry.context,
+                entry.reason,
+                one_line(&entry.text, 80)
+            ));
+        }
+        section.push('\n');
+    }
+    section
+}
+
 fn review_prompt(
     batch: &[ReviewItem],
     spans: &[ReviewedSpan],
     context: &[String],
     include_contract: bool,
+    ledger: &LedgerSnapshot,
 ) -> String {
     let mut prompt = String::new();
     if include_contract {
-        prompt.push_str("You are Loki, Mjolnir's one persistent read-only advisor. Take a different, user-aligned angle from Thor and implementation Eitri and verify assumptions when useful. You do not observe read-only Explore runs. Do not restate failures they already know. Stay silent for style, uncertainty, optional improvements, incomplete work, or activity that is on track. The advise tool accepts one structured list containing at most one note for each exact reviewed (god, ordinal) step. Advice is queued for the associated role and pulled at natural stopping points, never delivered as an interruption, so reserve it for material correctness, safety, scope, or strategy problems that remain worth raising even if later work may have already addressed them. Never implement changes yourself.\n\n");
+        prompt.push_str("You are Loki, Mjolnir's one persistent read-only advisor. Take a different, user-aligned angle from Thor and implementation Eitri and verify assumptions when useful. You do not observe read-only Explore runs. Do not restate failures they already know. Stay silent for style, uncertainty, optional improvements, incomplete work, or activity that is on track. The advise tool accepts one structured list containing at most one note for each exact reviewed (god, ordinal) step. Advice is queued for the associated role and pulled at natural stopping points, never delivered as an interruption, so reserve it for material correctness, safety, scope, or strategy problems that remain worth raising even if later work may have already addressed them. Never implement changes yourself. Advice is not delivered the moment you submit it: it is handed to its target only at that role's next turn boundary. Every review prompt you receive includes a \"Your advice ledger\" section reporting what happened to your recent advice. A note listed there as QUEUED has already been accepted and WILL be delivered at the next boundary -- do not resubmit it; near-duplicate resubmissions can overflow the queue and silently drop other advice. Only resubmit a note if the ledger shows its submission was REJECTED (and you have fixed the rejection reason) or if materially new information changes the advice.\n\n");
+        prompt.push_str("Three additional patterns are always material even though they look like passing verification, and you see the terminal commands and tool titles needed to catch them in your checkpoints. Regenerating golden files or snapshots (for example `-update` or snapshot-update flags) to match new output instead of investigating the mismatch is self-referential, not verification. Declaring a multi-part spec complete when the new feature's own tests were never executed is not verification, even when build, lint, or pre-existing suites passed. Narrowing the test-run scope after a failure (for example switching to `-run` filters that exclude previously failing or hanging tests) and then claiming completeness without disclosing the exclusion is also material.\n\n");
     }
     for context in context {
         prompt.push_str(context);
         prompt.push_str("\n\n");
+    }
+    let ledger_section = render_ledger(ledger);
+    if !ledger_section.is_empty() {
+        prompt.push_str(&ledger_section);
+        prompt.push('\n');
     }
     prompt.push_str("### Chronological session update\n\n");
     for item in batch {
@@ -2250,6 +2811,223 @@ mod tests {
         assert!(result.is_err());
         assert!(state.lock().unwrap().thor.is_empty());
         assert!(slot.finish(4).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gate_accepts_a_step_reviewed_earlier_this_epoch_and_still_rejects_never_reviewed_steps()
+     {
+        let state = SharedAdviceState::default();
+        let slot = AdviceSlot {
+            active: Arc::default(),
+            state: state.clone(),
+            posted: None,
+            finished_reviews: None,
+        };
+        let span = |ordinal| ReviewedSpan {
+            target: Target::Thor,
+            invocation: None,
+            first_step: ordinal,
+            last_step: ordinal,
+            activities: vec!["edit".into()],
+        };
+
+        // Batch 1 reviews step 1 only.
+        slot.begin(1, 1, vec![span(1)]).await;
+        slot.accept(AdviseArgs {
+            advice: vec![AdviseItem {
+                step: StepRef {
+                    god: Target::Thor,
+                    ordinal: 1,
+                },
+                note: "first diagnosis".to_string(),
+            }],
+        })
+        .await
+        .expect("step reviewed in this batch is accepted");
+        slot.finish(1).await;
+
+        // Batch 2, same epoch, reviews step 5 only -- but Loki re-raises the
+        // unresolved issue keyed to step 1 from batch 1. That must now be
+        // accepted because step 1 was reviewed earlier in this same epoch.
+        slot.begin(2, 1, vec![span(5)]).await;
+        let reraised = slot
+            .accept(AdviseArgs {
+                advice: vec![AdviseItem {
+                    step: StepRef {
+                        god: Target::Thor,
+                        ordinal: 1,
+                    },
+                    note: "still unresolved".to_string(),
+                }],
+            })
+            .await;
+        assert!(
+            reraised.is_ok(),
+            "re-raising a step reviewed earlier this epoch must be accepted"
+        );
+        slot.finish(2).await;
+
+        // Batch 3 tries to reference a step that was never reviewed at all
+        // (not in this batch, not in any earlier batch this epoch).
+        slot.begin(3, 1, vec![span(9)]).await;
+        let never_reviewed = slot
+            .accept(AdviseArgs {
+                advice: vec![AdviseItem {
+                    step: StepRef {
+                        god: Target::Thor,
+                        ordinal: 42,
+                    },
+                    note: "fabricated step".to_string(),
+                }],
+            })
+            .await;
+        assert_eq!(
+            never_reviewed.unwrap_err(),
+            "advice referenced a step outside this review batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn dedup_replaces_a_queued_note_for_the_same_step_instead_of_growing_the_queue() {
+        let state = SharedAdviceState::default();
+        let slot = AdviceSlot {
+            active: Arc::default(),
+            state: state.clone(),
+            posted: None,
+            finished_reviews: None,
+        };
+        let span = |ordinal| ReviewedSpan {
+            target: Target::Thor,
+            invocation: None,
+            first_step: ordinal,
+            last_step: ordinal,
+            activities: vec!["edit".into()],
+        };
+
+        slot.begin(1, 1, vec![span(1)]).await;
+        slot.accept(AdviseArgs {
+            advice: vec![AdviseItem {
+                step: StepRef {
+                    god: Target::Thor,
+                    ordinal: 1,
+                },
+                note: "original text".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+        slot.finish(1).await;
+        assert_eq!(state.lock().unwrap().thor.len(), 1);
+
+        // A later batch this epoch re-raises the same step with new text.
+        // It must replace the queued note in place, not append a second one.
+        slot.begin(2, 1, vec![span(2)]).await;
+        slot.accept(AdviseArgs {
+            advice: vec![AdviseItem {
+                step: StepRef {
+                    god: Target::Thor,
+                    ordinal: 1,
+                },
+                note: "updated text".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+        slot.finish(2).await;
+
+        let guard = state.lock().unwrap();
+        assert_eq!(guard.thor.len(), 1, "dedup must not grow the queue");
+        assert_eq!(guard.thor[0].note, "updated text");
+        assert!(
+            guard.thor[0].updated,
+            "replaced note must render as updated"
+        );
+        assert_eq!(
+            guard.dropped_thor, 0,
+            "an in-place update is not an overflow"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_only_fires_for_genuinely_new_notes_on_a_full_queue() {
+        let state = SharedAdviceState::default();
+        let slot = AdviceSlot {
+            active: Arc::default(),
+            state: state.clone(),
+            posted: None,
+            finished_reviews: None,
+        };
+        let span = |ordinal| ReviewedSpan {
+            target: Target::Thor,
+            invocation: None,
+            first_step: ordinal,
+            last_step: ordinal,
+            activities: vec!["edit".into()],
+        };
+
+        // Fill the queue to capacity with distinct steps.
+        for ordinal in 1..=ADVICE_QUEUE_CAPACITY as u64 {
+            slot.begin(ordinal, 1, vec![span(ordinal)]).await;
+            slot.accept(AdviseArgs {
+                advice: vec![AdviseItem {
+                    step: StepRef {
+                        god: Target::Thor,
+                        ordinal,
+                    },
+                    note: format!("note {ordinal}"),
+                }],
+            })
+            .await
+            .unwrap();
+            slot.finish(ordinal).await;
+        }
+        assert_eq!(state.lock().unwrap().thor.len(), ADVICE_QUEUE_CAPACITY);
+        assert_eq!(state.lock().unwrap().dropped_thor, 0);
+
+        // Re-raising a step already queued must dedup, not overflow, even
+        // though the queue is full.
+        slot.begin(100, 1, vec![span(1)]).await;
+        slot.accept(AdviseArgs {
+            advice: vec![AdviseItem {
+                step: StepRef {
+                    god: Target::Thor,
+                    ordinal: 1,
+                },
+                note: "re-raised while full".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+        slot.finish(100).await;
+        assert_eq!(state.lock().unwrap().thor.len(), ADVICE_QUEUE_CAPACITY);
+        assert_eq!(
+            state.lock().unwrap().dropped_thor,
+            0,
+            "dedup on a full queue must not count as overflow"
+        );
+
+        // A genuinely new step on a full queue must still evict the oldest
+        // and count as overflow.
+        let new_ordinal = ADVICE_QUEUE_CAPACITY as u64 + 1;
+        slot.begin(101, 1, vec![span(new_ordinal)]).await;
+        slot.accept(AdviseArgs {
+            advice: vec![AdviseItem {
+                step: StepRef {
+                    god: Target::Thor,
+                    ordinal: new_ordinal,
+                },
+                note: "genuinely new".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+        slot.finish(101).await;
+        let guard = state.lock().unwrap();
+        assert_eq!(guard.thor.len(), ADVICE_QUEUE_CAPACITY);
+        assert_eq!(
+            guard.dropped_thor, 1,
+            "a genuinely new note on a full queue overflows"
+        );
     }
 
     #[test]
@@ -2613,7 +3391,7 @@ mod tests {
             },
         }];
         let spans = reviewed_spans(&batch);
-        let prompt = review_prompt(&batch, &spans, &[], false);
+        let prompt = review_prompt(&batch, &spans, &[], false, &LedgerSnapshot::default());
         assert!(prompt.len() > 100 * 1024);
         assert!(prompt.contains(&text));
         assert!(!prompt.contains("earlier context omitted"));
@@ -2712,6 +3490,7 @@ mod tests {
                     last_step: 1,
                     activities: vec!["cargo test".into()],
                 },
+                updated: false,
             };
             state.thor.push_back(advice(2, "old turn advice"));
             state.eitri.push_back(advice(4, "current turn advice"));
@@ -2749,6 +3528,7 @@ mod tests {
                     last_step: 1,
                     activities: vec!["edit".into()],
                 },
+                updated: false,
             });
         }
 
@@ -2780,6 +3560,7 @@ mod tests {
                 last_step: id,
                 activities: vec!["test".into()],
             },
+            updated: false,
         };
         let mut state = AdviceState::default();
         state.thor.push_back(advice(2, Target::Thor));
@@ -2821,6 +3602,7 @@ mod tests {
                         last_step: id,
                         activities: vec!["test".into()],
                     },
+                    updated: false,
                 },
             );
         }
@@ -2956,6 +3738,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rendezvous_flushes_then_waits_for_an_in_flight_review_and_delivers_one_digest() {
+        let (mut handle, mut requests) = test_handle(1);
+        let (finished_tx, finished_rx) = watch::channel(0_u64);
+        handle.finished_reviews = finished_rx;
+        let slot = AdviceSlot {
+            active: handle.active.clone(),
+            state: handle.advice_state.clone(),
+            posted: None,
+            finished_reviews: Some(finished_tx),
+        };
+        let span = ReviewedSpan {
+            target: Target::Thor,
+            invocation: None,
+            first_step: 1,
+            last_step: 1,
+            activities: vec!["test".into()],
+        };
+        // A review is already active (e.g. dispatched by an earlier
+        // worker wake-up) before Thor reaches the injection point.
+        slot.begin(7, 1, vec![span]).await;
+
+        let rendezvousing = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.rendezvous(Consumer::Thor).await }
+        });
+        tokio::task::yield_now().await;
+        // The rendezvous unconditionally sends a flush barrier before it
+        // waits, even though there is nothing new to classify here. Ack it
+        // immediately, as the real worker would once it drains its request
+        // channel up to this point.
+        match requests.try_recv() {
+            Ok(Request::Flush { epoch: 1, ack }) => {
+                let _ = ack.send(());
+            }
+            _ => panic!("expected Request::Flush {{ epoch: 1, .. }}"),
+        }
+        // Let the rendezvous task actually run past the ack and reach its
+        // `finished_reviews` wait before this (single-threaded) test task
+        // moves on to `slot.finish` below -- otherwise `finish` (which
+        // clears `active`) could run first and the rendezvous would only
+        // ever observe the review as already gone, never as active.
+        tokio::task::yield_now().await;
+
+        slot.accept(AdviseArgs {
+            advice: vec![AdviseItem {
+                step: StepRef {
+                    god: Target::Thor,
+                    ordinal: 1,
+                },
+                note: "material advice".into(),
+            }],
+        })
+        .await
+        .unwrap();
+        assert!(
+            !rendezvousing.is_finished(),
+            "accepting advice alone must not release the rendezvous"
+        );
+        slot.finish(7).await;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), rendezvousing)
+            .await
+            .expect("rendezvous released")
+            .expect("rendezvous task");
+        assert!(outcome.waited);
+        assert_eq!(outcome.advice.len(), 1);
+        assert_eq!(outcome.advice[0].note, "material advice");
+    }
+
+    /// Regression-shaped test (adapted from the grouped-review design this
+    /// barrier is ported from) for the specific failure mode the ack guards
+    /// against: `rendezvous_bounded` must not conclude "nothing pending" by
+    /// reading `has_pending_review`/`active_review_relevant` before the
+    /// worker has drained its request channel up to the flush. Modeled here
+    /// without a real worker: nothing is pending or active by the pure
+    /// counter/watch state at the moment `rendezvous_bounded` is called
+    /// (exactly what a not-yet-processed flush looks like from the caller's
+    /// side), and the implementation must still not return until the
+    /// flush's `ack` resolves -- only then may it conclude there was
+    /// nothing to wait for, or (as simulated here) go on to observe the
+    /// dispatch the flush's caught-up worker performs and deliver its
+    /// advice.
+    #[tokio::test]
+    async fn rendezvous_waits_for_the_flush_ack_before_concluding_nothing_is_pending() {
+        let (mut handle, mut requests) = test_handle(1);
+        let (started_tx, started_rx) = watch::channel(0_u64);
+        let (finished_tx, finished_rx) = watch::channel(0_u64);
+        handle.review_started = started_rx;
+        handle.finished_reviews = finished_rx;
+        // Nothing is pending or active by the counters/watches a
+        // not-yet-processed flush would leave untouched: this is exactly
+        // the state that made the buggy implementation return immediately.
+        assert_eq!(handle.pending_thor.load(Ordering::Relaxed), 0);
+        assert_eq!(handle.pending_eitri.load(Ordering::Relaxed), 0);
+
+        let slot = AdviceSlot {
+            active: handle.active.clone(),
+            state: handle.advice_state.clone(),
+            posted: None,
+            finished_reviews: Some(finished_tx),
+        };
+
+        let rendezvousing = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .rendezvous_bounded(Consumer::Thor, Duration::from_millis(500))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !rendezvousing.is_finished(),
+            "must not conclude 'nothing pending' before the flush's ack resolves, \
+             even though has_pending_review/active_review_relevant read empty right now"
+        );
+
+        let ack = match requests.try_recv() {
+            Ok(Request::Flush { epoch: 1, ack }) => ack,
+            _ => panic!("expected Request::Flush {{ epoch: 1, .. }}"),
+        };
+        // Hold the ack a bit longer to prove the wait is genuinely blocked
+        // on it, not on some other timer.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !rendezvousing.is_finished(),
+            "must still be waiting on the ack while the worker hasn't caught up yet"
+        );
+
+        // The worker "catches up": it drains its channel (releasing the
+        // ack), then dispatches the review it picked up.
+        let _ = ack.send(());
+        let span = ReviewedSpan {
+            target: Target::Thor,
+            invocation: None,
+            first_step: 1,
+            last_step: 1,
+            activities: vec!["test".into()],
+        };
+        slot.begin(9, 1, vec![span]).await;
+        let _ = started_tx.send(9);
+        slot.accept(AdviseArgs {
+            advice: vec![AdviseItem {
+                step: StepRef {
+                    god: Target::Thor,
+                    ordinal: 1,
+                },
+                note: "flushed group advice".into(),
+            }],
+        })
+        .await
+        .unwrap();
+        slot.finish(9).await;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), rendezvousing)
+            .await
+            .expect("rendezvous released")
+            .expect("rendezvous task");
+        assert!(
+            !outcome.advice.is_empty(),
+            "must deliver the flushed review's advice"
+        );
+        assert_eq!(outcome.advice[0].note, "flushed group advice");
+    }
+
+    #[tokio::test]
+    async fn rendezvous_timeout_delivers_already_queued_advice_without_hanging() {
+        let (mut handle, _requests) = test_handle(1);
+        let (_started_tx, started_rx) = watch::channel(0_u64);
+        let (_finished_tx, finished_rx) = watch::channel(0_u64);
+        handle.review_started = started_rx;
+        handle.finished_reviews = finished_rx;
+        // Advice already sitting in the queue from an earlier, already
+        // finished review round.
+        {
+            let mut state = handle.advice_state.lock().unwrap();
+            state.thor.push_back(Advice {
+                id: 1,
+                epoch: 1,
+                target: Target::Thor,
+                note: "already queued advice".into(),
+                span: ReviewedSpan {
+                    target: Target::Thor,
+                    invocation: None,
+                    first_step: 1,
+                    last_step: 1,
+                    activities: vec!["test".into()],
+                },
+                updated: false,
+            });
+        }
+        // A second checkpoint is still pending and never starts reviewing
+        // within the bound: `started_tx` is never sent.
+        handle.pending_thor.store(1, Ordering::Relaxed);
+
+        let start = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.rendezvous_bounded(Consumer::Thor, Duration::from_millis(30)),
+        )
+        .await
+        .expect("rendezvous must return by its own bound, not hang the caller");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "rendezvous must not overrun its own timeout by more than test slack"
+        );
+        assert_eq!(outcome.advice.len(), 1);
+        assert_eq!(outcome.advice[0].note, "already queued advice");
+    }
+
+    #[tokio::test]
     async fn handoff_cutoff_discards_late_thor_advice_but_keeps_eitri_advice() {
         let state = SharedAdviceState::default();
         state.lock().unwrap().thor_cutoff = 3;
@@ -2997,6 +3990,136 @@ mod tests {
         let state = state.lock().unwrap();
         assert!(state.thor.is_empty());
         assert_eq!(state.eitri[0].note, "current Eitri note");
+    }
+
+    #[tokio::test]
+    async fn ledger_renders_delivered_queued_and_rejected_categories() {
+        let state = SharedAdviceState::default();
+        let slot = AdviceSlot {
+            active: Arc::default(),
+            state: state.clone(),
+            posted: None,
+            finished_reviews: None,
+        };
+
+        slot.begin(
+            1,
+            1,
+            vec![ReviewedSpan {
+                target: Target::Thor,
+                invocation: None,
+                first_step: 1,
+                last_step: 1,
+                activities: vec!["edit".into()],
+            }],
+        )
+        .await;
+
+        // Rejected: references a step outside this review batch.
+        let rejection = slot
+            .accept(AdviseArgs {
+                advice: vec![AdviseItem {
+                    step: StepRef {
+                        god: Target::Thor,
+                        ordinal: 99,
+                    },
+                    note: "out of batch note".to_string(),
+                }],
+            })
+            .await;
+        assert!(rejection.is_err());
+
+        // Queued: valid submission, never drained.
+        slot.accept(AdviseArgs {
+            advice: vec![AdviseItem {
+                step: StepRef {
+                    god: Target::Thor,
+                    ordinal: 1,
+                },
+                note: "queued advice note".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+        slot.finish(1).await;
+
+        // Delivered: a note placed directly in Eitri's queue, then drained.
+        {
+            let mut guard = state.lock().unwrap();
+            guard.eitri.push_back(Advice {
+                id: 500,
+                epoch: 1,
+                target: Target::Eitri,
+                note: "delivered advice note".to_string(),
+                span: ReviewedSpan {
+                    target: Target::Eitri,
+                    invocation: None,
+                    first_step: 2,
+                    last_step: 2,
+                    activities: vec!["edit".into()],
+                },
+                updated: false,
+            });
+            drain_for(&mut guard, Consumer::Eitri);
+        }
+
+        let ledger = {
+            let mut guard = state.lock().unwrap();
+            take_ledger_snapshot(&mut guard)
+        };
+        let rendered = render_ledger(&ledger);
+        assert!(rendered.starts_with("### Your advice ledger"));
+        assert!(rendered.contains("Delivered"));
+        assert!(rendered.contains("#500 → Eitri: delivered advice note"));
+        assert!(rendered.contains("Queued"));
+        assert!(rendered.contains("→ Thor: queued advice note"));
+        assert!(rendered.contains("Rejected"));
+        assert!(rendered.contains("advice referenced a step outside this review batch"));
+        assert!(rendered.contains("out of batch note"));
+    }
+
+    #[test]
+    fn empty_ledger_omits_the_advice_ledger_section() {
+        let ledger = LedgerSnapshot::default();
+        assert!(render_ledger(&ledger).is_empty());
+        let prompt = review_prompt(&[], &[], &[], false, &ledger);
+        assert!(!prompt.contains("Your advice ledger"));
+    }
+
+    #[test]
+    fn ledger_gives_full_outstanding_queue_after_compaction_not_just_deltas() {
+        let mut state = AdviceState::default();
+        state.thor.push_back(Advice {
+            id: 1,
+            epoch: 1,
+            target: Target::Thor,
+            note: "still-queued before compaction".to_string(),
+            span: ReviewedSpan {
+                target: Target::Thor,
+                invocation: None,
+                first_step: 1,
+                last_step: 1,
+                activities: vec!["edit".into()],
+            },
+            updated: false,
+        });
+
+        // A review prompt is built (the normal per-review snapshot). The
+        // still-undelivered note is read, not drained: `queued` is always
+        // the live queue, never a consumed delta.
+        let first = take_ledger_snapshot(&mut state);
+        assert_eq!(first.queued.len(), 1);
+
+        // Loki's session compacts here. `/compact` only touches Loki's
+        // *model* context; the ledger lives in `AdviceState` (mj-side, in
+        // the worker), so it is untouched by compaction. The very next
+        // review must still report the still-undelivered note in full, not
+        // as an empty delta just because nothing new happened since the
+        // prior snapshot.
+        let second = take_ledger_snapshot(&mut state);
+        assert_eq!(second.queued.len(), 1);
+        assert_eq!(second.queued[0].note, "still-queued before compaction");
+        assert!(render_ledger(&second).contains("still-queued before compaction"));
     }
 
     #[test]
@@ -3061,24 +4184,78 @@ mod tests {
         assert_eq!(state.resume_session(), retained_id);
         assert_eq!(state.primed, prior_primed);
         assert!(
-            review_prompt(&[], &[], &[], true).contains("persistent read-only advisor"),
+            review_prompt(&[], &[], &[], true, &LedgerSnapshot::default())
+                .contains("persistent read-only advisor"),
             "an initial session receives Loki's contract"
         );
         assert!(
-            !review_prompt(&[], &[], &[], false).contains("persistent read-only advisor"),
+            !review_prompt(&[], &[], &[], false, &LedgerSnapshot::default())
+                .contains("persistent read-only advisor"),
             "a primed session does not repeat Loki's contract"
         );
     }
 
     #[test]
-    fn compact_threshold_coalesces_and_rearms_below_128k() {
+    fn contract_text_tells_loki_not_to_resubmit_queued_advice() {
+        let contract = review_prompt(&[], &[], &[], true, &LedgerSnapshot::default());
+        assert!(contract.contains("advice ledger"));
+        assert!(contract.contains("do not resubmit"));
+        assert!(contract.contains("REJECTED"));
+        assert!(contract.contains("QUEUED"));
+    }
+
+    #[test]
+    fn contract_text_flags_the_three_verification_laundering_patterns() {
+        let contract = review_prompt(&[], &[], &[], true, &LedgerSnapshot::default());
+        assert!(contract.contains(
+            "Regenerating golden files or snapshots (for example `-update` or snapshot-update flags) to match new output instead of investigating the mismatch is self-referential, not verification."
+        ));
+        assert!(contract.contains(
+            "Declaring a multi-part spec complete when the new feature's own tests were never executed is not verification, even when build, lint, or pre-existing suites passed."
+        ));
+        assert!(contract.contains(
+            "Narrowing the test-run scope after a failure (for example switching to `-run` filters that exclude previously failing or hanging tests) and then claiming completeness without disclosing the exclusion is also material."
+        ));
+    }
+
+    #[test]
+    fn compact_threshold_coalesces_and_rearms_below_32k() {
         let mut threshold = CompactThreshold::default();
 
-        assert!(!threshold.observe(127_999));
-        assert!(threshold.observe(128_000));
-        assert!(!threshold.observe(160_000));
-        assert!(!threshold.observe(64_000));
-        assert!(threshold.observe(128_001));
+        assert!(!threshold.observe(31_999));
+        assert!(threshold.observe(32_000));
+        assert!(!threshold.observe(40_000));
+        assert!(!threshold.observe(16_000));
+        assert!(threshold.observe(32_001));
+    }
+
+    #[test]
+    fn compact_threshold_retry_after_failure_is_capped_at_one_per_epoch() {
+        let mut threshold = CompactThreshold::default();
+
+        // Initial automatic fire.
+        assert!(threshold.observe(40_000));
+        // Compact failed; a retry is granted once for this epoch...
+        assert!(threshold.rearm_for_retry(1));
+        assert!(threshold.observe(40_000));
+        // ...but a second failure in the same epoch does not get another.
+        assert!(!threshold.rearm_for_retry(1));
+        assert!(!threshold.observe(40_000));
+
+        // A new epoch (the next Loki turn) earns a fresh retry.
+        assert!(threshold.rearm_for_retry(2));
+        assert!(threshold.observe(40_000));
+    }
+
+    #[test]
+    fn compact_threshold_retry_is_superseded_by_a_genuine_usage_dip() {
+        let mut threshold = CompactThreshold::default();
+
+        assert!(threshold.observe(40_000));
+        // Usage actually falling below the threshold re-arms independently
+        // of the retry-cap bookkeeping.
+        assert!(!threshold.observe(16_000));
+        assert!(threshold.observe(40_000));
     }
 
     #[test]
