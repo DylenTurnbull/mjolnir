@@ -256,6 +256,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             adapter_source_id: thor.launch.source_id.clone(),
             permission: thor_permission,
             council_session: None,
+            reasoning_effort: thor.reasoning_effort.clone(),
         }),
         code_agent: eitri_pool.map(|eitri_pool| {
             code_agent::Config::council(eitri_pool, cfg.agent_stderr.clone(), loki_handle.clone())

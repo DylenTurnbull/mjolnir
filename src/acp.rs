@@ -102,6 +102,10 @@ pub struct RuntimeRoleConfig {
     pub permission: Option<crate::council::RuntimePermissionConfig>,
     /// Correlates Thor, Eitri, and Loki records in one interactive session.
     pub council_session: Option<String>,
+    /// Per-seat reasoning-effort override (e.g. `high`, `medium`, `off`)
+    /// applied to this seat's ACP session after the model is set. `None`
+    /// leaves the adapter's own default effort untouched.
+    pub reasoning_effort: Option<String>,
 }
 
 const MAX_LOGGED_UPDATE_BYTES: usize = 4096;
@@ -4302,6 +4306,44 @@ fn select_role_model(
     }
 }
 
+/// Wire id for the ACP reasoning-effort config option. Mirrors Anvil's
+/// `REASONING_EFFORT_CONFIG_ID` (anvil/src/acp.rs) and its always-present
+/// "off" sentinel (anvil's `REASONING_EFFORT_OFF_VALUE`, session.rs), which
+/// explicitly disables reasoning rather than falling back to the model's
+/// default.
+const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
+
+/// Locates the session's reasoning-effort selector, if the adapter
+/// advertises one.
+///
+/// ACP defines `SessionConfigOptionCategory::ThoughtLevel` for exactly this
+/// purpose, so that's tried first. In practice Anvil (the only adapter this
+/// ships against today) tags its reasoning-effort option `Model` instead —
+/// the same category as the model selector itself, since which efforts are
+/// valid depends on the chosen model — so category matching alone would
+/// never find it there. The fallback matches the well-known
+/// `reasoning_effort` config id, which is stable across adapters.
+fn find_reasoning_effort_option(session_config: &SessionConfigCache) -> Option<usize> {
+    session_config
+        .options
+        .iter()
+        .position(|option| {
+            matches!(
+                option.category,
+                Some(SessionConfigOptionCategory::ThoughtLevel)
+            )
+        })
+        .or_else(|| {
+            session_config.targets.iter().position(|target| {
+                matches!(
+                    target,
+                    SessionConfigTarget::ConfigOption { config_id }
+                        if config_id.to_string() == REASONING_EFFORT_CONFIG_ID
+                )
+            })
+        })
+}
+
 async fn apply_runtime_role_config(
     conn: &ConnectionTo<Agent>,
     session_id: &SessionId,
@@ -4339,42 +4381,82 @@ async fn apply_runtime_role_config(
     }
 
     let mut warnings = Vec::new();
-    let Some(permission) = role.permission.as_ref() else {
-        return Ok(warnings);
-    };
-    let option_index = session_config
-        .targets
-        .iter()
-        .position(|target| {
-            matches!(target, SessionConfigTarget::ConfigOption { config_id } if config_id.to_string() == permission.config_id)
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "ACP adapter did not advertise permission configuration '{}'",
-                permission.config_id
-            )
-        })?;
-    let (value, used_fallback) =
-        select_runtime_permission_value(&session_config.options[option_index], permission)?;
-    if used_fallback {
-        warnings.push(format!(
-            "{} does not support Auto permissions for this model; using Manual",
-            role.label
-        ));
-    }
-    if config_option_current_value(&session_config.options[option_index]) != Some(&value) {
-        let target = session_config.targets[option_index].clone();
-        match send_config_update(conn, session_id, target.clone(), value.clone()).await? {
-            Some(options) => {
-                session_config.targets = config_option_targets(&options);
-                session_config.options = options;
+    if let Some(permission) = role.permission.as_ref() {
+        let option_index = session_config
+            .targets
+            .iter()
+            .position(|target| {
+                matches!(target, SessionConfigTarget::ConfigOption { config_id } if config_id.to_string() == permission.config_id)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ACP adapter did not advertise permission configuration '{}'",
+                    permission.config_id
+                )
+            })?;
+        let (value, used_fallback) =
+            select_runtime_permission_value(&session_config.options[option_index], permission)?;
+        if used_fallback {
+            warnings.push(format!(
+                "{} does not support Auto permissions for this model; using Manual",
+                role.label
+            ));
+        }
+        if config_option_current_value(&session_config.options[option_index]) != Some(&value) {
+            let target = session_config.targets[option_index].clone();
+            match send_config_update(conn, session_id, target.clone(), value.clone()).await? {
+                Some(options) => {
+                    session_config.targets = config_option_targets(&options);
+                    session_config.options = options;
+                }
+                None => set_current_config_value(
+                    &mut session_config.options,
+                    &session_config.targets,
+                    &target,
+                    &value,
+                ),
             }
-            None => set_current_config_value(
-                &mut session_config.options,
-                &session_config.targets,
-                &target,
-                &value,
-            ),
+        }
+    }
+
+    if let Some(effort) = role.reasoning_effort.as_ref() {
+        match find_reasoning_effort_option(session_config) {
+            Some(option_index) => {
+                let value = SessionConfigValueId::from(effort.clone());
+                if !session_config_option_contains_value(
+                    &session_config.options[option_index],
+                    &value,
+                ) {
+                    warnings.push(format!(
+                        "{} does not support reasoning effort '{effort}' for this model",
+                        role.label
+                    ));
+                } else if config_option_current_value(&session_config.options[option_index])
+                    != Some(&value)
+                {
+                    let target = session_config.targets[option_index].clone();
+                    match send_config_update(conn, session_id, target.clone(), value.clone())
+                        .await?
+                    {
+                        Some(options) => {
+                            session_config.targets = config_option_targets(&options);
+                            session_config.options = options;
+                        }
+                        None => set_current_config_value(
+                            &mut session_config.options,
+                            &session_config.targets,
+                            &target,
+                            &value,
+                        ),
+                    }
+                }
+            }
+            None => {
+                warnings.push(format!(
+                    "{} does not support a reasoning-effort control for this model",
+                    role.label
+                ));
+            }
         }
     }
 
@@ -6206,6 +6288,7 @@ mod tests {
             adapter_source_id: "claude-acp".to_string(),
             permission: None,
             council_session: None,
+            reasoning_effort: None,
         };
         assert_eq!(
             select_role_model(&claude_model, &claude_role).map(|value| value.to_string()),
@@ -6229,11 +6312,82 @@ mod tests {
             adapter_source_id: "codex-acp".to_string(),
             permission: None,
             council_session: None,
+            reasoning_effort: None,
         };
         assert_eq!(
             select_role_model(&codex_model, &codex_role).map(|value| value.to_string()),
             Some("gpt-5.6-sol".to_string())
         );
+    }
+
+    #[test]
+    fn reasoning_effort_option_is_found_by_thought_level_category_when_advertised() {
+        let option = SessionConfigOption::select(
+            "thinking",
+            "Reasoning effort",
+            "medium",
+            vec![
+                SessionConfigSelectOption::new("low", "Low"),
+                SessionConfigSelectOption::new("medium", "Medium"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel);
+        let options = vec![option];
+        let session_config = SessionConfigCache {
+            targets: config_option_targets(&options),
+            options,
+        };
+        assert_eq!(find_reasoning_effort_option(&session_config), Some(0));
+    }
+
+    #[test]
+    fn reasoning_effort_option_falls_back_to_well_known_id_when_category_is_model() {
+        // Mirrors Anvil, which tags its reasoning-effort selector `Model`
+        // (the same category as the model selector) rather than
+        // `ThoughtLevel`, since which efforts are valid depends on the
+        // chosen model. Category matching alone would never find it there,
+        // so the well-known `reasoning_effort` config id is the fallback.
+        let model_option = SessionConfigOption::select(
+            "model",
+            "Model",
+            "gpt-5.6-sol",
+            vec![SessionConfigSelectOption::new("gpt-5.6-sol", "GPT-5.6 Sol")],
+        )
+        .category(SessionConfigOptionCategory::Model);
+        let effort_option = SessionConfigOption::select(
+            REASONING_EFFORT_CONFIG_ID,
+            "Reasoning effort",
+            "(default)",
+            vec![
+                SessionConfigSelectOption::new("(default)", "Default"),
+                SessionConfigSelectOption::new("off", "Off"),
+                SessionConfigSelectOption::new("high", "High"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model);
+        let options = vec![model_option, effort_option];
+        let session_config = SessionConfigCache {
+            targets: config_option_targets(&options),
+            options,
+        };
+        assert_eq!(find_reasoning_effort_option(&session_config), Some(1));
+    }
+
+    #[test]
+    fn reasoning_effort_option_is_none_when_not_advertised() {
+        let model_option = SessionConfigOption::select(
+            "model",
+            "Model",
+            "gpt-5.6-sol",
+            vec![SessionConfigSelectOption::new("gpt-5.6-sol", "GPT-5.6 Sol")],
+        )
+        .category(SessionConfigOptionCategory::Model);
+        let options = vec![model_option];
+        let session_config = SessionConfigCache {
+            targets: config_option_targets(&options),
+            options,
+        };
+        assert_eq!(find_reasoning_effort_option(&session_config), None);
     }
 
     #[test]

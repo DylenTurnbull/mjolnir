@@ -139,6 +139,7 @@ mod tests {
                 env: Default::default(),
             },
             ranked: true,
+            reasoning_effort: None,
         }
     }
 

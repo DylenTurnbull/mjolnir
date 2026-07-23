@@ -332,6 +332,7 @@ mod tests {
                 env: HashMap::new(),
             },
             ranked: true,
+            reasoning_effort: None,
         }
     }
 

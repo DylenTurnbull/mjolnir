@@ -19,8 +19,11 @@ pub const CONFIG_VERSION: u32 = 2;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoleModelOverrides {
     pub thor: Option<String>,
+    pub thor_reasoning_effort: Option<String>,
     pub loki: Option<String>,
+    pub loki_reasoning_effort: Option<String>,
     pub eitri: Option<String>,
+    pub eitri_reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -138,6 +141,11 @@ impl Default for ModelsConfig {
 pub struct ThorConfig {
     #[serde(default = "default_auto")]
     pub model: String,
+    /// Per-invocation reasoning-effort override for Thor's ACP session
+    /// (e.g. from `--thor MODEL+high`). Not meaningful outside a single
+    /// `--print` invocation; never written to the on-disk default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(default = "default_true")]
     pub discrete_review: bool,
 }
@@ -146,6 +154,7 @@ impl Default for ThorConfig {
     fn default() -> Self {
         Self {
             model: default_auto(),
+            reasoning_effort: None,
             discrete_review: true,
         }
     }
@@ -161,12 +170,18 @@ impl ThorConfig {
 pub struct LokiConfig {
     #[serde(default = "default_auto")]
     pub model: String,
+    /// Per-invocation reasoning-effort override for Loki's ACP session
+    /// (e.g. from `--loki MODEL+high`). Not meaningful outside a single
+    /// `--print` invocation; never written to the on-disk default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for LokiConfig {
     fn default() -> Self {
         Self {
             model: default_auto(),
+            reasoning_effort: None,
         }
     }
 }
@@ -175,6 +190,11 @@ impl Default for LokiConfig {
 pub struct EitriConfig {
     #[serde(default = "default_auto")]
     pub model: String,
+    /// Per-invocation reasoning-effort override for Eitri's ACP session
+    /// (e.g. from `--eitri MODEL+high`). Not meaningful outside a single
+    /// `--print` invocation; never written to the on-disk default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(default = "default_max_parallel_explores")]
     pub max_parallel_explores: usize,
 }
@@ -183,6 +203,7 @@ impl Default for EitriConfig {
     fn default() -> Self {
         Self {
             model: default_auto(),
+            reasoning_effort: None,
             max_parallel_explores: default_max_parallel_explores(),
         }
     }
@@ -324,12 +345,15 @@ impl Config {
     pub fn apply_role_model_overrides(&mut self, overrides: &RoleModelOverrides) {
         if let Some(model) = &overrides.thor {
             self.thor.model.clone_from(model);
+            self.thor.reasoning_effort = overrides.thor_reasoning_effort.clone();
         }
         if let Some(model) = &overrides.loki {
             self.loki.model.clone_from(model);
+            self.loki.reasoning_effort = overrides.loki_reasoning_effort.clone();
         }
         if let Some(model) = &overrides.eitri {
             self.eitri.model.clone_from(model);
+            self.eitri.reasoning_effort = overrides.eitri_reasoning_effort.clone();
         }
     }
 
@@ -650,6 +674,7 @@ mod tests {
             theme: TerminalThemeKind::Light,
             thor: ThorConfig {
                 model: "gpt-5-6-sol".to_string(),
+                reasoning_effort: None,
                 discrete_review: false,
             },
             council: CouncilConfig {
@@ -690,14 +715,36 @@ mod tests {
         let mut invocation = saved.clone();
         invocation.apply_role_model_overrides(&RoleModelOverrides {
             thor: Some("gpt-test".to_string()),
+            thor_reasoning_effort: Some("high".to_string()),
             loki: Some(DISABLED_MODEL.to_string()),
+            loki_reasoning_effort: None,
             eitri: Some("qwen-test".to_string()),
+            eitri_reasoning_effort: Some("medium".to_string()),
         });
 
         assert_eq!(saved.role_models(), ModelsConfig::default());
         assert_eq!(invocation.thor.model, "gpt-test");
+        assert_eq!(invocation.thor.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(invocation.loki.model, DISABLED_MODEL);
+        assert_eq!(invocation.loki.reasoning_effort, None);
         assert_eq!(invocation.eitri.model, "qwen-test");
+        assert_eq!(invocation.eitri.reasoning_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn role_model_overrides_without_effort_leave_reasoning_effort_unset() {
+        let mut invocation = Config::default();
+        invocation.apply_role_model_overrides(&RoleModelOverrides {
+            thor: Some("deepseek-v4-pro".to_string()),
+            thor_reasoning_effort: None,
+            loki: None,
+            loki_reasoning_effort: None,
+            eitri: None,
+            eitri_reasoning_effort: None,
+        });
+
+        assert_eq!(invocation.thor.model, "deepseek-v4-pro");
+        assert_eq!(invocation.thor.reasoning_effort, None);
     }
 
     #[test]

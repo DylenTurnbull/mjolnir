@@ -13488,6 +13488,7 @@ mod tests {
                 env: Default::default(),
             },
             ranked: true,
+            reasoning_effort: None,
         })
         .collect();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
@@ -13552,6 +13553,7 @@ mod tests {
                     env: Default::default(),
                 },
                 ranked: true,
+                reasoning_effort: None,
             })
             .collect();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
@@ -13586,6 +13588,7 @@ mod tests {
                     env: Default::default(),
                 },
                 ranked: true,
+                reasoning_effort: None,
             })
             .collect();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
@@ -13618,6 +13621,7 @@ mod tests {
                     env: Default::default(),
                 },
                 ranked: true,
+                reasoning_effort: None,
             })
             .collect();
         state.set_connection_state(ConnectionState::Streaming);

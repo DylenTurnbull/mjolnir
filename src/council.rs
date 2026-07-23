@@ -100,6 +100,10 @@ pub struct ResolvedRole {
     pub model_value: String,
     pub launch: AdapterLaunch,
     pub ranked: bool,
+    /// Per-seat reasoning-effort override applied to this role's ACP
+    /// session (e.g. from `--thor MODEL+high`). `None` leaves the
+    /// adapter's own default effort untouched.
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -618,6 +622,7 @@ fn resolve_probes(rows: &[Row], mut probes: Vec<(usize, AdapterLaunch, ProbeResu
                     model_value: option.value.clone(),
                     launch: launch.clone(),
                     ranked: true,
+                    reasoning_effort: None,
                 });
             }
         }
@@ -637,6 +642,7 @@ fn resolve_probes(rows: &[Row], mut probes: Vec<(usize, AdapterLaunch, ProbeResu
                     model_value: option.value.clone(),
                     launch: launch.clone(),
                     ranked: false,
+                    reasoning_effort: None,
                 });
             }
         }
@@ -1139,12 +1145,25 @@ fn assemble_council(
     } else {
         explicit("Thor", &config.thor.model, rows, &available)?
     };
-    let loki = resolve_loki(&config.loki.model, thor, rows, &available)?;
+    let mut loki = resolve_loki(&config.loki.model, thor, rows, &available)?;
     let mut occupied = vec![thor.model.model.as_str()];
     if let Some(loki) = loki.as_ref() {
         occupied.push(loki.model.model.as_str());
     }
-    let eitri = resolve_eitri(&config.eitri.model, rows, &available, &occupied)?;
+    let mut eitri = resolve_eitri(&config.eitri.model, rows, &available, &occupied)?;
+
+    // Attach each seat's per-invocation reasoning-effort override (from
+    // `--thor/--loki/--eitri MODEL+effort`, threaded via `Config`). This
+    // only touches the exact role selected for the seat; failover
+    // alternates discovered elsewhere in `available` are unaffected.
+    let mut thor = thor.clone();
+    thor.reasoning_effort = config.thor.reasoning_effort.clone();
+    if let Some(loki) = loki.as_mut() {
+        loki.reasoning_effort = config.loki.reasoning_effort.clone();
+    }
+    if let Some(eitri) = eitri.as_mut() {
+        eitri.reasoning_effort = config.eitri.reasoning_effort.clone();
+    }
 
     let mut warned = WARNED_ADAPTERS
         .lock()
@@ -1171,7 +1190,7 @@ fn assemble_council(
     }
     warnings.sort();
     Ok(ResolvedCouncil {
-        thor: thor.clone(),
+        thor,
         loki,
         eitri,
         available,
@@ -1247,6 +1266,7 @@ mod tests {
             model_value: model.to_string(),
             launch: launch_for(adapter_kind(model)),
             ranked: true,
+            reasoning_effort: None,
         }
     }
 
@@ -1708,6 +1728,51 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn assemble_council_threads_reasoning_effort_onto_the_selected_roles_only() {
+        let thor_role = role_at("gpt-5-6-sol", 0.70, 3.0);
+        let loki_role = role_at("claude-sonnet-5", 0.60, 4.0);
+        let rows = vec![thor_role.model.clone(), loki_role.model.clone()];
+        let available = vec![thor_role.clone(), loki_role.clone()];
+        let discovery = Discovery {
+            available,
+            adapter_errors: HashMap::new(),
+        };
+        let availability = Availability {
+            codex_credentials: false,
+            claude_credentials: false,
+            kimi_credentials: false,
+            kimi: None,
+            anvil: None,
+        };
+
+        let mut config = Config::default();
+        config.thor.model = "gpt-5-6-sol".to_string();
+        config.thor.reasoning_effort = Some("high".to_string());
+        config.loki.model = "claude-sonnet-5".to_string();
+        config.loki.reasoning_effort = None;
+        config.eitri.model = crate::config::DISABLED_MODEL.to_string();
+
+        let resolved = assemble_council(
+            &config,
+            &rows,
+            &availability,
+            AcpInventory::default(),
+            discovery,
+        )
+        .expect("assemble council");
+
+        assert_eq!(resolved.thor.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            resolved
+                .loki
+                .as_ref()
+                .and_then(|loki| loki.reasoning_effort.clone()),
+            None
+        );
+        assert!(resolved.eitri.is_none());
     }
 
     #[test]

@@ -100,16 +100,25 @@ struct Cli {
     print: Option<String>,
 
     /// Override Thor's model for this non-interactive invocation.
-    #[arg(long, value_name = "MODEL", requires = "print", value_parser = parse_thor_override)]
-    thor: Option<String>,
+    ///
+    /// Accepts an optional trailing `+<effort>` (off, none, minimal, low,
+    /// medium, high, xhigh) to set this seat's ACP reasoning effort
+    /// independent of the shared Anvil server default, e.g.
+    /// `custom/bpr-agent/bedrock::openai.gpt-5.6-sol+high`.
+    #[arg(long, value_name = "MODEL[+EFFORT]", requires = "print", value_parser = parse_thor_override)]
+    thor: Option<(String, Option<String>)>,
 
     /// Override Loki's model, or disable Loki, for this non-interactive invocation.
-    #[arg(long, value_name = "MODEL|disabled|none", requires = "print", value_parser = parse_optional_role_override)]
-    loki: Option<String>,
+    ///
+    /// Accepts an optional trailing `+<effort>` on the model, same as `--thor`.
+    #[arg(long, value_name = "MODEL[+EFFORT]|disabled|none", requires = "print", value_parser = parse_optional_role_override)]
+    loki: Option<(String, Option<String>)>,
 
     /// Override Eitri's model, or disable Eitri, for this non-interactive invocation.
-    #[arg(long, value_name = "MODEL|disabled|none", requires = "print", value_parser = parse_optional_role_override)]
-    eitri: Option<String>,
+    ///
+    /// Accepts an optional trailing `+<effort>` on the model, same as `--thor`.
+    #[arg(long, value_name = "MODEL[+EFFORT]|disabled|none", requires = "print", value_parser = parse_optional_role_override)]
+    eitri: Option<(String, Option<String>)>,
 
     /// Output format for `--print`.
     #[arg(long, value_enum, default_value_t = HeadlessOutputFormat::Text)]
@@ -214,22 +223,74 @@ fn parse_fs_max_text_bytes(value: &str) -> std::result::Result<u64, String> {
     Ok(bytes)
 }
 
-fn parse_thor_override(value: &str) -> std::result::Result<String, String> {
-    match value.to_ascii_lowercase().as_str() {
-        "auto" => Err("--thor requires an explicit model, not 'auto'".to_string()),
-        "disabled" | "none" => Err("Thor cannot be disabled".to_string()),
-        _ if value.trim().is_empty() => Err("--thor requires a model".to_string()),
-        _ => Ok(value.to_string()),
+/// Reasoning-effort tokens accepted as a trailing `+<effort>` suffix on a
+/// role-override model selector, e.g. `custom/bpr-agent/...::model+high`.
+/// Case-insensitive; `none` canonicalizes to `off` (matches Anvil's
+/// `REASONING_EFFORT_OFF_VALUE`, which explicitly turns reasoning off
+/// rather than leaving the adapter's default effort untouched).
+const KNOWN_REASONING_EFFORTS: &[&str] =
+    &["off", "none", "minimal", "low", "medium", "high", "xhigh"];
+
+/// Splits a trailing `+<effort>` suffix off a role-override selector.
+///
+/// Model wire ids from every current adapter (bedrock/deepseek/openai
+/// selectors) never contain `+`, so a trailing `+<known-effort>` is
+/// unambiguous: only the *last* `+`-delimited segment is considered, and
+/// only when it matches a known effort token exactly (case-insensitively).
+/// Anything else (including a selector with no `+` at all) is returned
+/// unsplit with no effort.
+fn split_role_effort(value: &str) -> (&str, Option<String>) {
+    let Some(idx) = value.rfind('+') else {
+        return (value, None);
+    };
+    let (model, suffix) = value.split_at(idx);
+    let suffix = &suffix[1..];
+    let lower = suffix.to_ascii_lowercase();
+    if !KNOWN_REASONING_EFFORTS.contains(&lower.as_str()) {
+        return (value, None);
     }
+    let effort = if lower == "none" {
+        "off".to_string()
+    } else {
+        lower
+    };
+    (model, Some(effort))
 }
 
-fn parse_optional_role_override(value: &str) -> std::result::Result<String, String> {
+fn parse_thor_override(value: &str) -> std::result::Result<(String, Option<String>), String> {
     match value.to_ascii_lowercase().as_str() {
-        "auto" => Err("role override requires an explicit model or 'disabled'".to_string()),
-        "disabled" | "none" => Ok(config::DISABLED_MODEL.to_string()),
-        _ if value.trim().is_empty() => Err("role override requires a model".to_string()),
-        _ => Ok(value.to_string()),
+        "auto" => return Err("--thor requires an explicit model, not 'auto'".to_string()),
+        "disabled" | "none" => return Err("Thor cannot be disabled".to_string()),
+        _ => {}
     }
+    if value.trim().is_empty() {
+        return Err("--thor requires a model".to_string());
+    }
+    let (model, effort) = split_role_effort(value);
+    if model.trim().is_empty() {
+        return Err("--thor requires a model".to_string());
+    }
+    Ok((model.to_string(), effort))
+}
+
+fn parse_optional_role_override(
+    value: &str,
+) -> std::result::Result<(String, Option<String>), String> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" => {
+            return Err("role override requires an explicit model or 'disabled'".to_string());
+        }
+        "disabled" | "none" => return Ok((config::DISABLED_MODEL.to_string(), None)),
+        _ => {}
+    }
+    if value.trim().is_empty() {
+        return Err("role override requires a model".to_string());
+    }
+    let (model, effort) = split_role_effort(value);
+    if model.trim().is_empty() {
+        return Err("role override requires a model".to_string());
+    }
+    Ok((model.to_string(), effort))
 }
 
 #[derive(Debug, clap::Args, Default)]
@@ -434,9 +495,12 @@ async fn main() -> Result<()> {
             output_format: cli.output_format.into(),
             permission_mode: cli.permission_mode.into(),
             role_overrides: config::RoleModelOverrides {
-                thor: cli.thor,
-                loki: cli.loki,
-                eitri: cli.eitri,
+                thor: cli.thor.as_ref().map(|(model, _)| model.clone()),
+                thor_reasoning_effort: cli.thor.and_then(|(_, effort)| effort),
+                loki: cli.loki.as_ref().map(|(model, _)| model.clone()),
+                loki_reasoning_effort: cli.loki.and_then(|(_, effort)| effort),
+                eitri: cli.eitri.as_ref().map(|(model, _)| model.clone()),
+                eitri_reasoning_effort: cli.eitri.and_then(|(_, effort)| effort),
             },
             termination: termination.token(),
         })
@@ -1978,6 +2042,7 @@ async fn run_session(
             adapter_source_id: council.thor.launch.source_id.clone(),
             permission: None,
             council_session: Some(council_session.clone()),
+            reasoning_effort: council.thor.reasoning_effort.clone(),
         }),
         code_agent: eitri_pool.map(|eitri_pool| {
             let mut config = code_agent::Config::council(
@@ -3047,6 +3112,7 @@ mod tests {
                 env: Default::default(),
             },
             ranked: true,
+            reasoning_effort: None,
         }
     }
 
@@ -3247,9 +3313,9 @@ mod tests {
         ])
         .expect("parse role overrides");
 
-        assert_eq!(cli.thor.as_deref(), Some("gpt-test"));
-        assert_eq!(cli.loki.as_deref(), Some(config::DISABLED_MODEL));
-        assert_eq!(cli.eitri.as_deref(), Some(config::DISABLED_MODEL));
+        assert_eq!(cli.thor, Some(("gpt-test".to_string(), None)));
+        assert_eq!(cli.loki, Some((config::DISABLED_MODEL.to_string(), None)));
+        assert_eq!(cli.eitri, Some((config::DISABLED_MODEL.to_string(), None)));
     }
 
     #[test]
@@ -3260,8 +3326,8 @@ mod tests {
         .expect("parse role overrides after stdin sentinel");
 
         assert_eq!(cli.print.as_deref(), Some("-"));
-        assert_eq!(cli.thor.as_deref(), Some("gpt-test"));
-        assert_eq!(cli.loki.as_deref(), Some(config::DISABLED_MODEL));
+        assert_eq!(cli.thor, Some(("gpt-test".to_string(), None)));
+        assert_eq!(cli.loki, Some((config::DISABLED_MODEL.to_string(), None)));
     }
 
     #[test]
@@ -3269,6 +3335,113 @@ mod tests {
         let error = Cli::try_parse_from(["mj", "--thor", "gpt-test"])
             .expect_err("--thor must require --print");
         assert!(error.to_string().contains("--print"), "{error}");
+    }
+
+    #[test]
+    fn parse_thor_override_splits_trailing_effort() {
+        assert_eq!(
+            parse_thor_override("custom/bpr-agent/bedrock::openai.gpt-5.6-sol+high"),
+            Ok((
+                "custom/bpr-agent/bedrock::openai.gpt-5.6-sol".to_string(),
+                Some("high".to_string())
+            ))
+        );
+        assert_eq!(
+            parse_thor_override("custom/bpr-agent/bedrock::us.anthropic.claude-opus-4-8+high"),
+            Ok((
+                "custom/bpr-agent/bedrock::us.anthropic.claude-opus-4-8".to_string(),
+                Some("high".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_thor_override_leaves_effort_less_selectors_unchanged() {
+        assert_eq!(
+            parse_thor_override("custom/bpr-agent/deepseek::deepseek-v4-pro"),
+            Ok((
+                "custom/bpr-agent/deepseek::deepseek-v4-pro".to_string(),
+                None
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_thor_override_still_rejects_disabled_and_auto() {
+        assert!(parse_thor_override("disabled").is_err());
+        assert!(parse_thor_override("none").is_err());
+        assert!(parse_thor_override("auto").is_err());
+    }
+
+    #[test]
+    fn parse_optional_role_override_splits_trailing_effort() {
+        assert_eq!(
+            parse_optional_role_override("custom/bpr-agent/bedrock::openai.gpt-5.6-terra+medium"),
+            Ok((
+                "custom/bpr-agent/bedrock::openai.gpt-5.6-terra".to_string(),
+                Some("medium".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_optional_role_override_plus_none_maps_to_off_effort_not_disabled() {
+        assert_eq!(
+            parse_optional_role_override("custom/bpr-agent/bedrock::model+none"),
+            Ok((
+                "custom/bpr-agent/bedrock::model".to_string(),
+                Some("off".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_optional_role_override_bare_none_and_disabled_still_disable_the_role() {
+        assert_eq!(
+            parse_optional_role_override("none"),
+            Ok((config::DISABLED_MODEL.to_string(), None))
+        );
+        assert_eq!(
+            parse_optional_role_override("disabled"),
+            Ok((config::DISABLED_MODEL.to_string(), None))
+        );
+        assert_eq!(
+            parse_optional_role_override("NONE"),
+            Ok((config::DISABLED_MODEL.to_string(), None))
+        );
+    }
+
+    #[test]
+    fn parse_optional_role_override_leaves_effort_less_selectors_unchanged() {
+        assert_eq!(
+            parse_optional_role_override("custom/bpr-agent/deepseek::deepseek-v4-pro"),
+            Ok((
+                "custom/bpr-agent/deepseek::deepseek-v4-pro".to_string(),
+                None
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_role_override_effort_is_case_insensitive_and_off_passes_through() {
+        assert_eq!(
+            parse_optional_role_override("some-model+OFF"),
+            Ok(("some-model".to_string(), Some("off".to_string())))
+        );
+        assert_eq!(
+            parse_optional_role_override("some-model+XHIGH"),
+            Ok(("some-model".to_string(), Some("xhigh".to_string())))
+        );
+    }
+
+    #[test]
+    fn parse_role_override_ignores_unknown_plus_suffix() {
+        // A `+` that isn't a known effort token is left as part of the
+        // model selector rather than misparsed as an effort split.
+        assert_eq!(
+            parse_optional_role_override("some-model+not-an-effort"),
+            Ok(("some-model+not-an-effort".to_string(), None))
+        );
     }
 
     #[test]

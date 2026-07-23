@@ -2464,6 +2464,7 @@ async fn connect(
             adapter_source_id: role.launch.source_id.clone(),
             permission: None,
             council_session: Some(council_session.to_string()),
+            reasoning_effort: role.reasoning_effort.clone(),
         }),
         vec![advise_server],
         resume_session,
@@ -2664,6 +2665,25 @@ pub fn format_pull_outcome(
     }
     if !outcome.advice.is_empty() {
         sections.push(format_deferred(&outcome.advice, current_epoch));
+        // Verification protocol: offline loss-point replays showed the
+        // dominant advice-uptake failure is concluding "already resolved"
+        // from insufficient evidence (narrow greps, truncated reads, trusting
+        // quoted test results). Appending this protocol cut declare-resolved-
+        // without-evidence from 91% to 55% and quadrupled execute-first
+        // responses in those replays.
+        sections.push(
+            "Verification protocol for these notes: (1) To conclude any note is already \
+             resolved, run a test or reproduction that would fail if the note were still \
+             valid; reading or searching the code is not sufficient evidence. (2) If a note \
+             names one instance of a repeating pattern (one dialect, one branch, one parser \
+             production), enumerate and check every sibling instance before declaring \
+             resolution. (3) Never rely on test results quoted in this conversation, \
+             including in this receipt; re-run them yourself before citing them. (4) A \
+             rebuttal must quote the exact source text (file line or spec sentence) it \
+             relies on; if the disagreement reduces to an ambiguity, write a discriminating \
+             test instead of arguing."
+                .to_string(),
+        );
     }
     sections.join("\n\n")
 }

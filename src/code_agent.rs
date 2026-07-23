@@ -197,6 +197,7 @@ impl Config {
         loki: Option<loki::Handle>,
     ) -> Self {
         let role = role_pool.current();
+        let reasoning_effort = role.reasoning_effort.clone();
         Self {
             display_label: format!("Eitri · {}", role.model.model),
             command: role.launch.command,
@@ -210,6 +211,7 @@ impl Config {
                 adapter_source_id: role.launch.source_id,
                 permission: None,
                 council_session: None,
+                reasoning_effort,
             }),
             loki,
             implementation_handoff_counter: None,
@@ -316,6 +318,7 @@ impl Config {
             .role_config
             .as_ref()
             .and_then(|config| config.council_session.clone());
+        let reasoning_effort = role.reasoning_effort.clone();
         self.role_config = Some(acp::RuntimeRoleConfig {
             label: LABEL.to_string(),
             model_id: role.model.model,
@@ -323,6 +326,7 @@ impl Config {
             adapter_source_id: role.launch.source_id,
             permission: None,
             council_session,
+            reasoning_effort,
         });
     }
 }

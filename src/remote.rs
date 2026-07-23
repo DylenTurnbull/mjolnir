@@ -2419,6 +2419,7 @@ fn start_server_agent_session(
         adapter_source_id: resolved.thor.launch.source_id.clone(),
         permission: None,
         council_session: None,
+        reasoning_effort: resolved.thor.reasoning_effort.clone(),
     });
     let implementation_handoffs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let active_implementation_workers = code_agent::ActiveCodeWorkers::default();
